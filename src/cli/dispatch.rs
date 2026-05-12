@@ -353,7 +353,7 @@ pub fn session_converge(
     Ok(())
 }
 
-pub fn session_deadlock(
+pub async fn session_deadlock(
     repo: &Path,
     format: OutputFormat,
     args: SessionDeadlockArgs,
@@ -362,12 +362,149 @@ pub fn session_deadlock(
     let mut session = read_session(repo, id)?;
     session.transition(SessionState::MeetingDeadlocked)?;
     write_session(&session)?;
+
+    if args.escalate {
+        let signal_path = session.session_root.join("escalated.signal");
+        let body = serde_json::json!({
+            "session_id": id.to_string(),
+            "topic": session.topic,
+            "ts": chrono::Utc::now(),
+            "reason": "deadlock_escalated",
+            "max_rounds": session.max_rounds,
+            "current_round": session.current_round,
+        });
+        std::fs::write(&signal_path, serde_json::to_vec_pretty(&body)?)?;
+        // Move to Abandoned — escalation means caucus's own loop is done;
+        // a human (or some other tool reading escalated.signal) takes over.
+        session.transition(SessionState::Abandoned)?;
+        write_session(&session)?;
+        emit(
+            format,
+            &serde_json::json!({
+                "session_id": id.to_string(),
+                "state": session.state,
+                "escalation_signal": signal_path,
+                "policy": "escalate",
+            }),
+            || {
+                format!(
+                    "session {id} deadlocked; escalation signal at {}",
+                    signal_path.display()
+                )
+            },
+        );
+        return Ok(());
+    }
+
+    if args.explore {
+        return session_deadlock_explore(repo, format, session, args).await;
+    }
+
     emit(
         format,
-        &serde_json::json!({"session_id": id.to_string(), "state": session.state}),
-        || format!("session {id} marked deadlocked"),
+        &serde_json::json!({
+            "session_id": id.to_string(),
+            "state": session.state,
+            "policy": "manual",
+        }),
+        || format!("session {id} marked deadlocked (no policy flag — manual follow-up)"),
     );
     Ok(())
+}
+
+async fn session_deadlock_explore(
+    repo: &Path,
+    format: OutputFormat,
+    mut session: Session,
+    args: SessionDeadlockArgs,
+) -> Result<()> {
+    // Bridge: deadlocked → executing (legal per state machine §3).
+    session.transition(SessionState::Executing)?;
+    let registry = build_registry(repo)?;
+    let tmux = TmuxService::new();
+
+    let mut spawned = Vec::new();
+    let mut skipped = Vec::new();
+    let role_names = session.roles.clone();
+    for role_name in &role_names {
+        let role = match registry.get(role_name) {
+            Ok(r) => r,
+            Err(err) => {
+                skipped.push(serde_json::json!({"role": role_name, "reason": err.to_string()}));
+                continue;
+            }
+        };
+        // Use the role's last non-empty round response as the explore task.
+        let last_response = find_last_response(&session, role_name);
+        let Some(task_source) = last_response else {
+            skipped.push(serde_json::json!({
+                "role": role_name,
+                "reason": "no prior response to use as task.md",
+            }));
+            continue;
+        };
+        let role_template = resolve_role_template(repo, &role.system_prompt_template);
+        let outcome = crate::execute::start(
+            &tmux,
+            crate::execute::ExecuteStartRequest {
+                session_id: session.id,
+                repo_root: repo.to_path_buf(),
+                session_root: session.session_root.clone(),
+                role,
+                role_template_path: role_template,
+                task_source: task_source.clone(),
+                model: args.model.clone(),
+                title: Some(format!("{role_name}-explore")),
+                base_ref: args.base_ref.clone(),
+                sentinel_hook_path: Some(repo.join(".caucus").join("bin").join("sentinel-stop")),
+            },
+        )
+        .await?;
+        session.register_agent(role_name, outcome.agent.agent_id);
+        spawned.push(serde_json::json!({
+            "role": role_name,
+            "agent_id": outcome.agent.agent_id.to_string(),
+            "worktree_path": outcome.worktree.path,
+            "branch": outcome.worktree.branch,
+            "task_source": task_source,
+        }));
+    }
+    write_session(&session)?;
+
+    emit(
+        format,
+        &serde_json::json!({
+            "session_id": session.id.to_string(),
+            "state": session.state,
+            "policy": "explore",
+            "spawned": spawned,
+            "skipped": skipped,
+        }),
+        || {
+            format!(
+                "explore-on-deadlock: {} role(s) spawned, {} skipped",
+                spawned.len(),
+                skipped.len()
+            )
+        },
+    );
+    Ok(())
+}
+
+/// Walk round-NN/response-<role>.md from the highest round down, returning
+/// the first non-empty path. Used by `--explore` to seed each explore agent
+/// with that role's last argument.
+fn find_last_response(session: &Session, role: &str) -> Option<PathBuf> {
+    for round in (1..=session.current_round).rev() {
+        let layout = crate::round::RoundLayout::new(session.session_root.clone(), round);
+        let path = layout.response_path(role);
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > 0 {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 pub async fn session_kill(repo: &Path, format: OutputFormat, args: SessionKillArgs) -> Result<()> {
@@ -1034,7 +1171,7 @@ pub async fn dispatch(cli: Cli) -> Result<u8> {
             SessionAction::List => session_list(&repo, format)?,
             SessionAction::Show(args) => session_show(&repo, format, args)?,
             SessionAction::Converge(args) => session_converge(&repo, format, args)?,
-            SessionAction::Deadlock(args) => session_deadlock(&repo, format, args)?,
+            SessionAction::Deadlock(args) => session_deadlock(&repo, format, args).await?,
             SessionAction::Kill(args) => session_kill(&repo, format, args).await?,
             SessionAction::Transcript(args) => session_transcript(&repo, format, args)?,
         },

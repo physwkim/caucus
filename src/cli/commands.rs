@@ -131,6 +131,23 @@ pub struct SessionConvergeArgs {
 #[derive(Debug, Args)]
 pub struct SessionDeadlockArgs {
     pub session_id: String,
+    /// On deadlock, emit an `escalated.signal` and an `escalation` event so
+    /// a human can take over. Implies session goes to `Abandoned` after
+    /// the signal is written.
+    #[arg(long, conflicts_with = "explore")]
+    pub escalate: bool,
+    /// On deadlock, spawn one execute agent per role using each role's last
+    /// round response as its task.md — the "try every option in parallel"
+    /// branch (dmux's multi-select philosophy). Session transitions to
+    /// `Executing`.
+    #[arg(long)]
+    pub explore: bool,
+    /// When --explore is set, an optional base ref for the new worktrees.
+    #[arg(long, requires = "explore")]
+    pub base_ref: Option<String>,
+    /// When --explore is set, an optional model override.
+    #[arg(long, requires = "explore")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Args)]
