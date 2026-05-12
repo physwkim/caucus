@@ -237,7 +237,7 @@ pub async fn nudge_role(
         agenda = agenda.display(),
         response = response.display(),
     );
-    tmux.send_shell(pane_id, &message, true).await?;
+    tmux.send_text(pane_id, &message, true).await?;
     Ok(())
 }
 

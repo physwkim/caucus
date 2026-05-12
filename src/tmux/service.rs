@@ -282,6 +282,101 @@ impl TmuxService {
         Ok(self.list_pane_ids().await?.iter().any(|p| p == pane))
     }
 
+    /// Deliver `text` to a TUI pane as a single paste, optionally followed by
+    /// `Enter`. Implemented as `load-buffer -b <unique> -` (stdin) +
+    /// `paste-buffer -d -b <unique> -t PANE` + `send-keys Enter` so the
+    /// running TUI receives the whole payload in one shot (which most input
+    /// handlers, including Claude Code and Codex, treat as a paste and
+    /// then a submit) rather than as a stream of individual keystrokes that
+    /// races with the input handler and risks losing the Enter.
+    ///
+    /// This is the **only** correct path for nudging an interactive `claude`
+    /// or `codex` pane. [`send_shell`] is reserved for plain shell panes
+    /// (tests, ad-hoc bash use).
+    pub async fn send_text(&self, pane: &str, text: &str, enter: bool) -> Result<(), TmuxError> {
+        // Unique buffer name so concurrent agents don't collide. Buffer is
+        // auto-deleted by `paste-buffer -d`.
+        let buf = format!(
+            "caucus-{:016x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64 ^ std::process::id() as u64)
+                .unwrap_or(0)
+        );
+        self.run_with_stdin(
+            vec!["load-buffer".into(), "-b".into(), buf.clone(), "-".into()],
+            text.as_bytes(),
+        )
+        .await?;
+        self.run(vec![
+            "paste-buffer".into(),
+            "-d".into(),
+            "-b".into(),
+            buf,
+            "-t".into(),
+            pane.into(),
+        ])
+        .await?;
+        if enter {
+            self.run(vec![
+                "send-keys".into(),
+                "-t".into(),
+                pane.into(),
+                "Enter".into(),
+            ])
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Same as [`run`] but pipes `stdin` into the spawned tmux command.
+    async fn run_with_stdin(&self, args: Vec<String>, stdin: &[u8]) -> Result<String, TmuxError> {
+        use tokio::io::AsyncWriteExt as _;
+        let label = format!("tmux {}", args.join(" "));
+        let mut child = Command::new(&self.config.binary)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| TmuxError::Spawn {
+                command: label.clone(),
+                source,
+            })?;
+        if let Some(mut child_stdin) = child.stdin.take() {
+            child_stdin
+                .write_all(stdin)
+                .await
+                .map_err(|source| TmuxError::Spawn {
+                    command: label.clone(),
+                    source,
+                })?;
+            // Drop closes stdin → tmux sees EOF.
+        }
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|source| TmuxError::Spawn {
+                command: label.clone(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(TmuxError::NonZero {
+                command: label,
+                code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if stdout.ends_with('\n') {
+            stdout.pop();
+            if stdout.ends_with('\r') {
+                stdout.pop();
+            }
+        }
+        Ok(stdout)
+    }
+
     /// Lowest-level invocation. Returns stdout (trimmed of a single trailing newline).
     async fn run(&self, args: Vec<String>) -> Result<String, TmuxError> {
         let mut cmd = Command::new(&self.config.binary);
@@ -378,6 +473,31 @@ mod tests {
         let captured = svc.capture_pane(&panes_before[0], None, None).await?;
         assert!(captured.contains("caucus-marker"));
 
+        svc.kill_session(&session).await?;
+        Ok(())
+    }
+
+    /// Round-trip a multi-word, special-char-laden payload through
+    /// `send_text` and confirm the pane shell received it as one paste +
+    /// executed it (the body contains `&&` and a single quote, both of
+    /// which are murderous for naive send-keys).
+    #[tokio::test]
+    #[ignore = "requires tmux on PATH"]
+    async fn send_text_pastes_multi_line_payload_intact() -> Result<(), TmuxError> {
+        let svc = TmuxService::new();
+        let session = format!("caucus-paste-{}", std::process::id());
+        svc.new_session(&session).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let panes = svc.list_pane_ids_in_session(&session).await?;
+        let pane = panes[0].clone();
+
+        let payload = "echo 'caucus-paste' && echo it-works";
+        svc.send_text(&pane, payload, true).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let captured = svc.capture_pane(&pane, None, None).await?;
+        assert!(captured.contains("caucus-paste"), "captured:\n{captured}");
+        assert!(captured.contains("it-works"), "captured:\n{captured}");
         svc.kill_session(&session).await?;
         Ok(())
     }

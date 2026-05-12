@@ -911,7 +911,7 @@ pub async fn agent_send(_repo: &Path, args: AgentSendArgs) -> Result<()> {
         .tmux_pane_id
         .ok_or_else(|| anyhow!("agent has no tmux pane attached"))?;
     let tmux = TmuxService::new();
-    tmux.send_shell(&pane, &args.message, true).await?;
+    tmux.send_text(&pane, &args.message, true).await?;
     note(&format!("sent {} bytes to pane {pane}", args.message.len()));
     Ok(())
 }
