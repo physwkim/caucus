@@ -35,7 +35,10 @@ pub struct SpawnRequest<'a> {
     /// via `CAUCUS_SENTINEL_HOOK` so the Claude Stop hook script knows
     /// which caucus binary to invoke.
     pub sentinel_hook_path: Option<PathBuf>,
-    /// Optional model id; defaults to `claude-opus-4-7` if `None`.
+    /// Optional model id override. When `None`, the per-role default is
+    /// used; if the role also has no default, `resolve_model` falls back to
+    /// `DEFAULT_MODEL` for claude roles and `None` for codex roles. See
+    /// `resolve_model` for the exact precedence.
     pub model: Option<String>,
     /// Pane title; defaults to "<role>" if `None`.
     pub title: Option<String>,
@@ -86,15 +89,33 @@ pub const DEFAULT_MODEL: &str = "claude-opus-4-7";
 
 /// Resolve the final `--model` value from the available sources.
 ///
-/// **Precedence (changed in v0.x):** `request` > `per_role` > `DEFAULT_MODEL`.
+/// **Precedence:** `request` > `per_role` > role-CLI-specific default.
 /// The request-level flag wins so an operator can override every role with
 /// one `caucus session new --model claude-opus-4-7` (e.g. "today everything
 /// gets Opus"). Per-role values act as the role's *default*, not a hard pin.
-pub fn resolve_model(per_role: Option<&str>, request: Option<&str>) -> String {
-    request
-        .map(str::to_string)
-        .or_else(|| per_role.map(str::to_string))
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+///
+/// When neither request nor per-role model is set, the fallback depends on
+/// the role's agent CLI:
+/// - `AgentCli::Claude` → `DEFAULT_MODEL` (`claude-opus-4-7`).
+/// - `AgentCli::Codex`  → `None`; codex picks its own default. **Critical:**
+///   codex rejects claude model ids outright (e.g.
+///   `claude-opus-4-7 model is not supported when using Codex`), so the
+///   claude default must never leak into a codex invocation.
+pub fn resolve_model(
+    agent_cli: crate::role::spec::AgentCli,
+    per_role: Option<&str>,
+    request: Option<&str>,
+) -> Option<String> {
+    if let Some(m) = request {
+        return Some(m.to_string());
+    }
+    if let Some(m) = per_role {
+        return Some(m.to_string());
+    }
+    match agent_cli {
+        crate::role::spec::AgentCli::Claude => Some(DEFAULT_MODEL.to_string()),
+        crate::role::spec::AgentCli::Codex => None,
+    }
 }
 
 /// Render the agent CLI invocation as a single shell-quotable string. The
@@ -112,20 +133,29 @@ pub fn render_command_line(
     system_prompt_path: &Path,
     response_path: &Path,
     initial_prompt_path: Option<&Path>,
-    model: &str,
+    model: Option<&str>,
     skip_permissions: bool,
     resume_session_id: Option<&str>,
 ) -> String {
     match role.agent_cli {
-        crate::role::spec::AgentCli::Claude => render_claude_command(
-            role,
-            system_prompt_path,
-            response_path,
-            initial_prompt_path,
-            model,
-            skip_permissions,
-            resume_session_id,
-        ),
+        crate::role::spec::AgentCli::Claude => {
+            // Claude path always has a model: `resolve_model` returns
+            // `Some(DEFAULT_MODEL)` when no per-role / request value is set.
+            // A `None` here would be a caller bug, not a runtime condition.
+            let model = model.expect(
+                "render_command_line: claude role invoked without a resolved model — \
+                 resolve_model should have returned DEFAULT_MODEL",
+            );
+            render_claude_command(
+                role,
+                system_prompt_path,
+                response_path,
+                initial_prompt_path,
+                model,
+                skip_permissions,
+                resume_session_id,
+            )
+        }
         crate::role::spec::AgentCli::Codex => {
             // codex --resume opens a session picker by default and doesn't
             // accept a session-id as a flag, so --continue-meeting is
@@ -200,11 +230,16 @@ fn render_codex_command(
     system_prompt_path: &Path,
     response_path: &Path,
     initial_prompt_path: Option<&Path>,
-    model: &str,
+    model: Option<&str>,
     skip_permissions: bool,
 ) -> String {
+    // Omit `--model` entirely when the role has no explicit value. codex
+    // rejects claude model ids outright, so passing the workspace-wide
+    // `DEFAULT_MODEL` here would break every codex spawn the moment a
+    // claude default is in play. See `resolve_model`.
+    let model_arg = model.map(|m| format!("--model {m} ")).unwrap_or_default();
     let mut cmd = format!(
-        "codex --model {model} -C {cwd}",
+        "codex {model_arg}-C {cwd}",
         cwd = shell_quote(&cwd.display().to_string()),
     );
     if skip_permissions {
@@ -262,14 +297,18 @@ pub async fn spawn(tmux: &TmuxService, req: SpawnRequest<'_>) -> Result<SpawnOut
         return Err(SpawnError::MissingPrompt(req.system_prompt_path.clone()));
     }
 
-    let model = resolve_model(req.role.model.as_deref(), req.model.as_deref());
+    let model = resolve_model(
+        req.role.agent_cli,
+        req.role.model.as_deref(),
+        req.model.as_deref(),
+    );
     let command_line = render_command_line(
         req.role,
         &req.cwd,
         &req.system_prompt_path,
         &req.response_path,
         req.initial_prompt_path.as_deref(),
-        &model,
+        model.as_deref(),
         req.skip_permissions,
         req.resume_session_id.as_deref(),
     );
@@ -281,7 +320,7 @@ pub async fn spawn(tmux: &TmuxService, req: SpawnRequest<'_>) -> Result<SpawnOut
         req.role.name.clone(),
         req.title.clone().unwrap_or_else(|| req.role.name.clone()),
         req.kind,
-        Some(model.clone()),
+        model.clone(),
     );
     // Carry the inherited claude session id forward so subsequent sentinel
     // ingests can't accidentally treat the resumed pane as a fresh agent
@@ -373,31 +412,69 @@ mod tests {
 
     #[test]
     fn request_model_beats_role_model() {
-        // Precedence: request > role > DEFAULT.
+        // Precedence: request > role > CLI default.
         assert_eq!(
-            resolve_model(Some("claude-sonnet-4-6"), Some("claude-opus-4-7")),
-            "claude-opus-4-7"
+            resolve_model(
+                crate::role::spec::AgentCli::Claude,
+                Some("claude-sonnet-4-6"),
+                Some("claude-opus-4-7"),
+            ),
+            Some("claude-opus-4-7".to_string())
         );
     }
 
     #[test]
     fn role_model_used_when_no_request_model() {
         assert_eq!(
-            resolve_model(Some("claude-sonnet-4-6"), None),
-            "claude-sonnet-4-6"
+            resolve_model(
+                crate::role::spec::AgentCli::Claude,
+                Some("claude-sonnet-4-6"),
+                None,
+            ),
+            Some("claude-sonnet-4-6".to_string())
         );
     }
 
     #[test]
-    fn falls_back_to_default_when_neither_set() {
-        assert_eq!(resolve_model(None, None), DEFAULT_MODEL);
+    fn claude_role_falls_back_to_default_when_neither_set() {
+        assert_eq!(
+            resolve_model(crate::role::spec::AgentCli::Claude, None, None),
+            Some(DEFAULT_MODEL.to_string())
+        );
+    }
+
+    #[test]
+    fn codex_role_returns_none_when_neither_set() {
+        // Regression: previously the claude `DEFAULT_MODEL` leaked into codex
+        // invocations and codex rejected it ("claude-opus-4-7 model is not
+        // supported when using Codex with a ChatGPT account").
+        assert_eq!(
+            resolve_model(crate::role::spec::AgentCli::Codex, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_role_request_overrides_none_default() {
+        assert_eq!(
+            resolve_model(
+                crate::role::spec::AgentCli::Codex,
+                None,
+                Some("gpt-5.1-codex"),
+            ),
+            Some("gpt-5.1-codex".to_string())
+        );
     }
 
     #[test]
     fn request_model_used_when_no_role_model() {
         assert_eq!(
-            resolve_model(None, Some("claude-haiku-4-5")),
-            "claude-haiku-4-5"
+            resolve_model(
+                crate::role::spec::AgentCli::Claude,
+                None,
+                Some("claude-haiku-4-5"),
+            ),
+            Some("claude-haiku-4-5".to_string())
         );
     }
 
@@ -410,7 +487,7 @@ mod tests {
             Path::new("/repo/.caucus/s/round-1/system-reviewer.md"),
             Path::new("/repo/.caucus/s/round-1/response-reviewer.md"),
             None,
-            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
             false,
             None,
         );
@@ -434,7 +511,7 @@ mod tests {
             Path::new("/repo/.caucus/sys.md"),
             &response,
             Some(&prompt),
-            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
             false,
             None,
         );
@@ -453,7 +530,7 @@ mod tests {
             Path::new("/sys.md"),
             Path::new("/r.md"),
             None,
-            "claude-opus-4-7",
+            Some("claude-opus-4-7"),
             false,
             None,
         );
@@ -469,7 +546,7 @@ mod tests {
             Path::new("/sys.md"),
             Path::new("/r.md"),
             None,
-            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
             true,
             None,
         );
@@ -486,7 +563,7 @@ mod tests {
             Path::new("/sys.md"),
             Path::new("/r.md"),
             None,
-            "gpt-5.1-codex",
+            Some("gpt-5.1-codex"),
             true,
             None,
         );
@@ -501,6 +578,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_role_with_no_model_omits_model_flag_entirely() {
+        // Regression: the codex `serious-reviewer` role has `model: None` so
+        // codex can pick its own default. Previously `--model claude-opus-4-7`
+        // was injected anyway (via `DEFAULT_MODEL`), and codex rejected the
+        // claude id at startup. Confirm the flag is now absent.
+        let mut role = reviewer_spec();
+        role.agent_cli = crate::role::spec::AgentCli::Codex;
+        let cmd = render_command_line(
+            &role,
+            Path::new("/repo"),
+            Path::new("/sys.md"),
+            Path::new("/r.md"),
+            None,
+            None, // codex picks its own model
+            true,
+            None,
+        );
+        assert!(cmd.starts_with("codex"));
+        assert!(
+            !cmd.contains("--model"),
+            "codex with model=None must omit --model flag; got: {cmd}"
+        );
+        assert!(cmd.contains("-C '/repo'"));
+        assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
     fn codex_without_skip_permissions_picks_sandbox_by_mode() {
         let mut role = reviewer_spec(); // PermissionMode::Default → read-only
         role.agent_cli = crate::role::spec::AgentCli::Codex;
@@ -510,7 +614,7 @@ mod tests {
             Path::new("/sys.md"),
             Path::new("/r.md"),
             None,
-            "gpt-5.1-codex",
+            Some("gpt-5.1-codex"),
             false,
             None,
         );
@@ -527,7 +631,7 @@ mod tests {
             Path::new("/sys.md"),
             Path::new("/r.md"),
             Some(Path::new("/p/task.md")),
-            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
             true,
             Some("abc-123-session-id"),
         );
