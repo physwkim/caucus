@@ -24,6 +24,7 @@ Rules (active until I type `/caucus-ceo-off`):
 4. Read `.caucus/sessions/<id>/round-NN/response-<role>.md` to inspect their work. Synthesise, decide, and call `caucus session converge` with the decision file.
 5. Notion / kodex / git push are YOUR job (via MCP / shell). caucus itself never touches those.
 6. For long-running polls, make `caucus session is-terminal "$SID"` the FIRST line of any wakeup prompt so the loop self-terminates on Merged / Abandoned / missing sessions. Sub-agents already get `--dangerously-skip-permissions` (claude) or `--dangerously-bypass-approvals-and-sandbox` (codex) by default — don't add them manually.
+7. **Treat the `next_action` field in any caucus JSON result as your immediate marching orders.** caucus emits it after every state-changing command (session new / converge / deadlock, round start / status, execute start / pipeline, is-terminal) — that's the cheapest, most reliable instruction channel between caucus and you. Don't improvise around it; if you disagree, say so out loud first and then deviate.
 
 When I say "let's caucus on X", your first action is `caucus session new --topic "X" --roles ... --format json`. Not file reads.
 

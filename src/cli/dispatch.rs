@@ -256,6 +256,15 @@ pub async fn session_new(repo: &Path, format: OutputFormat, args: SessionNewArgs
             serde_json::json!({"role": role, "agent_id": id.to_string()})
         }).collect::<Vec<_>>(),
         "session_root": session.session_root,
+        "next_action": format!(
+            "Write a SHORT round-1 agenda to a temp file (one paragraph stating the topic + what each role should produce). \
+             Then call `caucus round start {}` with that agenda. Do NOT read source files yourself — that's the architect/reviewer's job.",
+            session.id
+        ),
+        "next_command_suggestion": format!(
+            "caucus round start {} --agenda-file <path-to-agenda.md> --format json",
+            session.id
+        ),
     });
     emit(format, &json, || {
         format!(
@@ -367,9 +376,24 @@ pub fn session_converge(
     std::fs::write(session.session_root.join("decision.md"), &decision)?;
     session.transition(SessionState::MeetingConverged)?;
     write_session(&session)?;
+    let decision_path = session.session_root.join("decision.md");
     emit(
         format,
-        &serde_json::json!({"session_id": id.to_string(), "state": session.state}),
+        &serde_json::json!({
+            "session_id": id.to_string(),
+            "state": session.state,
+            "decision_path": decision_path,
+            "next_action": format!(
+                "Decision locked. Run the execute pipeline to chain plan → impl → review automatically: \
+                 `caucus execute pipeline {id} --task-file {dec} --plan architect --implement backend --review reviewer`. \
+                 Prefer pipeline over manual `execute start` unless you need step-by-step control.",
+                dec = decision_path.display(),
+            ),
+            "next_command_suggestion": format!(
+                "caucus execute pipeline {id} --task-file {dec} --plan architect --implement backend --review reviewer --format json",
+                dec = decision_path.display(),
+            ),
+        }),
         || format!("session {id} converged"),
     );
     Ok(())
@@ -428,6 +452,11 @@ pub async fn session_deadlock(
             "session_id": id.to_string(),
             "state": session.state,
             "policy": "manual",
+            "next_action": format!(
+                "Session is deadlocked. Pick a policy: re-run `caucus session deadlock {id} --escalate` \
+                 (writes escalated.signal then Abandoned) or `--explore` (one execute agent per role \
+                 in parallel worktrees). If you genuinely want to leave it stuck, do nothing.",
+            ),
         }),
         || format!("session {id} marked deadlocked (no policy flag — manual follow-up)"),
     );
@@ -616,6 +645,17 @@ pub async fn round_start(repo: &Path, format: OutputFormat, args: RoundStartArgs
             "session_id": id.to_string(),
             "round": round,
             "roles": session.roles,
+            "next_action": format!(
+                "Roles are working. Schedule a wakeup ~5 minutes out. On wake, FIRST run \
+                 `caucus session is-terminal {id}` — exit 0 means stop polling. Otherwise check \
+                 `caucus round status {id} --format json` and read response files when \
+                 `all_responses_complete` is true. Do NOT read project source files yourself.",
+            ),
+            "polling_hint": serde_json::json!({
+                "first_check": format!("caucus session is-terminal {id}"),
+                "status_check": format!("caucus round status {id} --format json"),
+                "ready_when": ".all_responses_complete == true"
+            }),
         }),
         || format!("round {round} started for session {id}"),
     );
@@ -632,7 +672,26 @@ pub fn round_status(repo: &Path, format: OutputFormat, args: RoundStatusArgs) ->
         crate::round::RoundLayout::new(session.session_root.clone(), session.current_round);
     let status =
         crate::round::round_status(&layout, &session.agents).context("collecting round status")?;
-    emit(format, &status, || {
+    let mut payload = serde_json::to_value(&status).unwrap_or_else(|_| serde_json::json!({}));
+    let next_action = if status.all_responses_complete {
+        format!(
+            "All response files are populated. Read each `.caucus/sessions/{id}/round-{rn:02}/response-<role>.md`, \
+             synthesize, and decide:\n\
+             - Consensus reached → write decision.md and run `caucus session converge {id} --decision-file <path>`.\n\
+             - Need another round → write next agenda and run `caucus round next {id} --agenda-file <path>`.\n\
+             - Stuck → `caucus session deadlock {id}` then pick --escalate or --explore.",
+            rn = status.round_number
+        )
+    } else {
+        format!(
+            "Some roles haven't responded yet. Schedule another wakeup (~5 min). First call \
+             `caucus session is-terminal {id}` on wake to bail out cleanly if the session was killed."
+        )
+    };
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("next_action".into(), serde_json::Value::String(next_action));
+    }
+    emit(format, &payload, || {
         let header = format!(
             "round {}/{}: all_complete={}",
             status.round_number, session.max_rounds, status.all_responses_complete
@@ -663,6 +722,200 @@ pub async fn round_next(repo: &Path, format: OutputFormat, args: RoundNextArgs) 
         },
     )
     .await
+}
+
+/// Exit-code gate for CEO wakeup loops on a single round. Returns
+/// `Ok(exit::OK)` (0) once every role's response file is non-empty,
+/// `Ok(exit::GENERIC_FAILURE)` (1) on timeout / ctrl-c / watcher tear-down
+/// **or any infrastructure error** (read_session / round_status /
+/// sentinel::watch / fs::create_dir_all), and `Ok(exit::SESSION_TERMINAL)`
+/// (3) when the session reached a terminal state before the round could
+/// complete. Only user-error paths (`parse_session_id`, invalid round
+/// argument) return `Err` so the dispatch layer can map them to
+/// `exit::USER_ERROR` (2). Infrastructure errors are *not* propagated as
+/// `Err` because `map_error_to_code` may pattern-match them onto
+/// `exit::ENVIRONMENT_ERROR` (3), which numerically collides with
+/// `exit::SESSION_TERMINAL` and would make those two outcomes
+/// indistinguishable to a CEO wakeup loop.
+///
+/// After arming the notify watcher the handler writes the single line
+/// `ready` to stderr — integration tests synchronise on it to avoid the
+/// FSEvents arm-race under parallel test execution. Stdout is reserved
+/// for the JSON result (R3), so the marker stays on stderr.
+///
+/// Read-only: no `record_sentinel`, no `write_json`, no `transition`. Uses
+/// `sentinel::watch` purely as a wake-up source — each notify event
+/// triggers a fresh `round::round_status` re-read off disk.
+pub async fn round_wait(repo: &Path, format: OutputFormat, args: RoundWaitArgs) -> Result<u8> {
+    // User-error path — keep `?` / `bail` so the dispatch layer maps to
+    // exit code 2 via `map_error_to_code` substring rules.
+    let id = parse_session_id(&args.session_id)?;
+
+    let session = match read_session(repo, id) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("caucus round wait: read_session failed: {err:#}");
+            return Ok(exit::GENERIC_FAILURE);
+        }
+    };
+
+    let target_round = args.round.unwrap_or(session.current_round);
+    if target_round == 0 {
+        return Err(anyhow!("no round has been started yet"));
+    }
+    if target_round > session.current_round {
+        return Err(anyhow!(
+            "round {target_round} not started yet (current={})",
+            session.current_round
+        ));
+    }
+
+    let layout = crate::round::RoundLayout::new(session.session_root.clone(), target_round);
+    let initial = match crate::round::round_status(&layout, &session.agents) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("caucus round wait: round_status failed: {err:#}");
+            return Ok(exit::GENERIC_FAILURE);
+        }
+    };
+
+    // Terminal-session short-circuit: the round can never complete on its
+    // own past this point. Exit 3 before installing the watcher.
+    if session.state.is_terminal() {
+        emit_wait_result(format, id, target_round, "session_terminal", &initial);
+        return Ok(exit::SESSION_TERMINAL);
+    }
+
+    // Pre-read guard: already-complete round → exit 0 without arming
+    // notify (cheap idempotent re-call).
+    if initial.all_responses_complete {
+        emit_wait_result(format, id, target_round, "completed_already", &initial);
+        return Ok(exit::OK);
+    }
+
+    let agents_dir = session.session_root.join("agents");
+    if let Err(err) = std::fs::create_dir_all(&agents_dir) {
+        eprintln!(
+            "caucus round wait: create_dir_all({}) failed: {err}",
+            agents_dir.display()
+        );
+        return Ok(exit::GENERIC_FAILURE);
+    }
+    let (_w, mut rx) = match crate::sentinel::watch(&agents_dir) {
+        Ok(pair) => pair,
+        Err(err) => {
+            eprintln!("caucus round wait: sentinel::watch failed: {err}");
+            return Ok(exit::GENERIC_FAILURE);
+        }
+    };
+
+    // Watcher armed; signal readiness on stderr so integration tests can
+    // synchronise on it instead of sleeping. Stdout stays clean for the
+    // JSON result (parsed by `parse_wait_stdout`).
+    eprintln!("ready");
+
+    // `--timeout-secs 0` → wait forever (only ctrl-c / completion / session
+    // terminal can break the loop). std::future::pending keeps the timeout
+    // arm from ever firing.
+    let timeout_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        if args.timeout_secs == 0 {
+            Box::pin(std::future::pending())
+        } else {
+            Box::pin(tokio::time::sleep(std::time::Duration::from_secs(
+                args.timeout_secs,
+            )))
+        };
+    tokio::pin!(timeout_fut);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                let s = crate::round::round_status(&layout, &session.agents)
+                    .unwrap_or_else(|_| initial.clone());
+                emit_wait_result(format, id, target_round, "interrupted", &s);
+                return Ok(exit::GENERIC_FAILURE);
+            }
+            _ = &mut timeout_fut => {
+                let s = crate::round::round_status(&layout, &session.agents)
+                    .unwrap_or_else(|_| initial.clone());
+                emit_wait_result(format, id, target_round, "timed_out", &s);
+                return Ok(exit::GENERIC_FAILURE);
+            }
+            event = rx.recv() => {
+                match event {
+                    None => {
+                        let s = crate::round::round_status(&layout, &session.agents)
+                            .unwrap_or_else(|_| initial.clone());
+                        emit_wait_result(format, id, target_round, "watcher_closed", &s);
+                        return Ok(exit::GENERIC_FAILURE);
+                    }
+                    Some(_) => {
+                        // Re-read the session record so a converge /
+                        // deadlock / kill that landed mid-wait is observed.
+                        if let Ok(refreshed) = read_session(repo, id) {
+                            if refreshed.state.is_terminal() {
+                                let s = crate::round::round_status(&layout, &session.agents)
+                                    .unwrap_or_else(|_| initial.clone());
+                                emit_wait_result(
+                                    format,
+                                    id,
+                                    target_round,
+                                    "session_terminal",
+                                    &s,
+                                );
+                                return Ok(exit::SESSION_TERMINAL);
+                            }
+                        }
+                        let s = match crate::round::round_status(&layout, &session.agents) {
+                            Ok(s) => s,
+                            Err(err) => {
+                                eprintln!(
+                                    "caucus round wait: round_status failed mid-wait: {err:#}"
+                                );
+                                return Ok(exit::GENERIC_FAILURE);
+                            }
+                        };
+                        if s.all_responses_complete {
+                            emit_wait_result(format, id, target_round, "completed", &s);
+                            return Ok(exit::OK);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Emit the single-line JSON result for `caucus round wait` on stdout.
+///
+/// Bypasses [`emit`]'s pretty-printer so stdout contains exactly one line
+/// — robust against future tracing leakage and easy for the integration
+/// tests' "last non-empty line" parser to consume.
+fn emit_wait_result(
+    format: OutputFormat,
+    session_id: SessionId,
+    round: u32,
+    status: &str,
+    s: &crate::round::RoundStatus,
+) {
+    if !matches!(format, OutputFormat::Json) {
+        return;
+    }
+    let total = s.roles.len() as u32;
+    let completed = s
+        .roles
+        .iter()
+        .filter(|r| r.response_bytes.unwrap_or(0) > 0)
+        .count() as u32;
+    let line = serde_json::json!({
+        "session_id": session_id.to_string(),
+        "round": round,
+        "status": status,
+        "completed": completed,
+        "total": total,
+    });
+    println!("{line}");
 }
 
 // ---- execute -------------------------------------------------------------
@@ -733,6 +986,7 @@ pub async fn execute_start(
             .ok();
     }
     write_session(&session)?;
+    let role_for_hint = args.role.clone();
     emit(
         format,
         &serde_json::json!({
@@ -740,6 +994,20 @@ pub async fn execute_start(
             "agent_id": outcome.agent.agent_id.to_string(),
             "worktree_path": outcome.worktree.path,
             "branch": outcome.worktree.branch,
+            "next_action": format!(
+                "Execute agent is working. Schedule a wakeup (~10 min — implementation takes longer than meeting). \
+                 On wake: FIRST `caucus session is-terminal {id}` (exit 0 → stop). Otherwise check \
+                 `caucus execute status {id} --format json` until the agent's derived_state is \
+                 `finished_cleanable` or blocked. Then `caucus execute finish {id} --role {role}` \
+                 (captures commit_provenance + queues worktree cleanup). Don't forget the reviewer \
+                 step — consider re-running with `caucus execute pipeline` if you want auto-review.",
+                role = role_for_hint
+            ),
+            "polling_hint": serde_json::json!({
+                "first_check": format!("caucus session is-terminal {id}"),
+                "status_check": format!("caucus execute status {id} --format json"),
+                "ready_when": ".[].derived_state == \"finished_cleanable\""
+            }),
         }),
         || {
             format!(
@@ -901,6 +1169,38 @@ pub async fn execute_pipeline(
     }
     write_session(&session)?;
 
+    let next_action = match &outcome.status {
+        crate::execute::PipelineStatus::Approved => format!(
+            "Reviewer approved. The implementation is at `{}` (branch `{}`). Inspect the diff \
+             yourself or trust the review. To merge, switch to your main branch in the repo and run \
+             `git merge {}` (caucus deliberately does NOT auto-merge). Then sync Notion / kodex if \
+             you do that.",
+            outcome.worktree_path.display(),
+            outcome.worktree_branch,
+            outcome.worktree_branch
+        ),
+        crate::execute::PipelineStatus::NoReviewer => format!(
+            "Implementation done without a review step. Read \
+             `<session_root>/pipeline-{:02}/attempt-{:02}/implement/response.md` and decide: \
+             merge `{}` directly, or re-run with `--review reviewer`.",
+            outcome.pipeline_number, outcome.attempts, outcome.worktree_branch
+        ),
+        crate::execute::PipelineStatus::Blocked { attempts } => format!(
+            "Reviewer flagged BLOCK after {attempts} attempt(s). Read the review at \
+             `<session_root>/pipeline-{pn:02}/attempt-{att:02}/review/response.md`. Then choose: \
+             (a) re-run pipeline with a bigger `--retry-on-block`, (b) edit decision.md and re-run, \
+             (c) `caucus execute abandon` the worktree, or (d) escalate to a human.",
+            attempts = attempts,
+            pn = outcome.pipeline_number,
+            att = outcome.attempts
+        ),
+        crate::execute::PipelineStatus::StepFailed { step } => format!(
+            "Pipeline aborted at step {step:?}. Inspect that step's sentinel + response.md under \
+             `<session_root>/pipeline-{:02}/attempt-{:02}/`. Decide whether to retry the pipeline \
+             or abandon the worktree (`caucus execute abandon`).",
+            outcome.pipeline_number, outcome.attempts
+        ),
+    };
     emit(
         format,
         &serde_json::json!({
@@ -913,6 +1213,7 @@ pub async fn execute_pipeline(
             "plan": outcome.plan,
             "implement": outcome.implement,
             "review": outcome.review,
+            "next_action": next_action,
         }),
         || {
             format!(
@@ -988,6 +1289,13 @@ pub fn session_is_terminal(
         Err(other) => return Err(other.into()),
     };
     if matches!(format, OutputFormat::Json) {
+        let next_action = if terminal {
+            "Session is terminal. Stop polling. If you have post-merge work \
+             (Notion / kodex / git push), run it now once and exit the wakeup loop."
+        } else {
+            "Session still active. Continue the wakeup loop — check `caucus round status` \
+             or `caucus execute status` per the most recent next_action you received."
+        };
         emit(
             format,
             &serde_json::json!({
@@ -995,6 +1303,7 @@ pub fn session_is_terminal(
                 "state": state,
                 "terminal": terminal,
                 "kind": kind,
+                "next_action": next_action,
             }),
             String::new,
         );
@@ -1570,6 +1879,7 @@ pub async fn dispatch(cli: Cli) -> Result<u8> {
             RoundAction::Start(args) => round_start(&repo, format, args).await?,
             RoundAction::Status(args) => round_status(&repo, format, args)?,
             RoundAction::Next(args) => round_next(&repo, format, args).await?,
+            RoundAction::Wait(args) => return round_wait(&repo, format, args).await,
         },
         Command::Execute(ExecuteArgs { action }) => match action {
             ExecuteAction::Start(args) => execute_start(&repo, format, args).await?,

@@ -283,6 +283,17 @@ pub enum RoundAction {
     Status(RoundStatusArgs),
     /// Begin a new round, re-using the existing meeting panes.
     Next(RoundNextArgs),
+    /// Block until the target round's response files are all non-empty
+    /// (or `--timeout-secs` elapses, or the session reaches a terminal
+    /// state). Cheap polling-gate for CEO wakeup loops; companion to
+    /// `caucus session is-terminal`.
+    ///
+    /// Exit codes:
+    ///   0  — round completed (all response files non-empty)
+    ///   1  — timeout, ctrl-c, or watcher closed unexpectedly
+    ///   2  — user error (no such session, future round, no round started)
+    ///   3  — session reached a terminal state before completion
+    Wait(RoundWaitArgs),
 }
 
 #[derive(Debug, Args)]
@@ -303,6 +314,20 @@ pub struct RoundNextArgs {
     pub session_id: String,
     #[arg(long)]
     pub agenda_file: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct RoundWaitArgs {
+    pub session_id: String,
+    /// Round to wait on. Defaults to `session.current_round`. Errors out
+    /// (exit 2) if greater than `current_round` — the round must already
+    /// have been started.
+    #[arg(long)]
+    pub round: Option<u32>,
+    /// Maximum wait in seconds. `0` means wait forever — only valid when
+    /// explicitly set; the default is bounded.
+    #[arg(long, default_value_t = 1800)]
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Args)]

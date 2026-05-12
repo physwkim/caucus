@@ -49,6 +49,7 @@ fn map_error_to_code(err: &anyhow::Error) -> u8 {
         || msg.contains("invalid session id")
         || msg.contains("invalid agent id")
         || msg.contains("no round has been started")
+        || msg.contains("not started yet")
     {
         return exit::USER_ERROR;
     }

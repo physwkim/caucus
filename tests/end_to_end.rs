@@ -536,6 +536,239 @@ fn watch_emits_round_complete_once() {
     );
 }
 
+/// Run `caucus round wait` to completion. Smaller than [`WatchProc`]
+/// because `round wait` is an exit-code gate (one JSON line on stdout +
+/// exit, no live stream).
+struct WaitProc {
+    child: Child,
+    ready_rx: Receiver<()>,
+    stdout_thread: JoinHandle<String>,
+    stderr_thread: JoinHandle<String>,
+}
+
+impl WaitProc {
+    fn spawn(repo: &Path, session_id: &str, extra: &[&str]) -> Self {
+        let mut child = Command::new(caucus_bin())
+            .arg("--repo")
+            .arg(repo)
+            .args(["--format", "json", "round", "wait", session_id])
+            .args(extra)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn caucus round wait");
+
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (ready_tx, ready_rx) = channel::<()>();
+
+        let stdout_thread = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+            buf
+        });
+
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                if line.trim() == "ready" {
+                    let _ = ready_tx.send(());
+                }
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+            buf
+        });
+
+        Self {
+            child,
+            ready_rx,
+            stdout_thread,
+            stderr_thread,
+        }
+    }
+
+    /// Block until the `round_wait` handler has emitted `ready` on stderr
+    /// — i.e. the sentinel watcher is armed. Panics on timeout so the
+    /// failing test fails fast instead of stalling.
+    fn wait_for_ready(&self, timeout: Duration) {
+        match self.ready_rx.recv_timeout(timeout) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("round_wait did not emit 'ready' within {timeout:?}")
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("round_wait stderr closed before emitting 'ready'")
+            }
+        }
+    }
+
+    fn wait(mut self) -> (std::process::ExitStatus, String, String) {
+        let status = self.child.wait().expect("wait on caucus round wait");
+        let stdout = self.stdout_thread.join().expect("stdout reader join");
+        let stderr = self.stderr_thread.join().expect("stderr reader join");
+        (status, stdout, stderr)
+    }
+}
+
+/// Parse the JSON result emitted by `caucus round wait`. The handler
+/// prints exactly one compact JSON line on stdout (see `emit_wait_result`
+/// in `src/cli/dispatch.rs`); we tolerate trailing blanks and any future
+/// tracing-style noise by taking the *last* non-empty line.
+fn parse_wait_stdout(stdout: &str) -> serde_json::Value {
+    let last = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| panic!("no non-empty line on stdout:\n{stdout}"));
+    serde_json::from_str(last)
+        .unwrap_or_else(|err| panic!("parse stdout JSON: {err}\nlast_line={last}\nstdout={stdout}"))
+}
+
+#[test]
+fn round_wait_exits_zero_when_already_complete() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().to_path_buf();
+    let (session_id, _session_root, _agents) = build_meeting_session(&repo, &["scribe"], true);
+
+    let (status, stdout, stderr) =
+        WaitProc::spawn(&repo, &session_id.to_string(), &["--timeout-secs", "10"]).wait();
+    assert!(
+        status.success(),
+        "expected exit 0; got {:?}\nstdout={stdout}\nstderr={stderr}",
+        status.code()
+    );
+    let v = parse_wait_stdout(&stdout);
+    assert_eq!(v["status"].as_str(), Some("completed_already"));
+    assert_eq!(v["round"].as_u64(), Some(1));
+    assert_eq!(v["completed"].as_u64(), Some(1));
+    assert_eq!(v["total"].as_u64(), Some(1));
+}
+
+#[test]
+fn round_wait_blocks_then_exits_zero_on_completion() {
+    use caucus::sentinel::writer::{Sentinel, SentinelKind, write_sentinel};
+
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().to_path_buf();
+    let (session_id, session_root, agents) =
+        build_meeting_session(&repo, &["reviewer", "qa"], false);
+
+    let waiter = WaitProc::spawn(&repo, &session_id.to_string(), &["--timeout-secs", "30"]);
+
+    // Synchronise on the handler's `ready` line — emitted right after
+    // `sentinel::watch` is armed. Robust under parallel-test contention,
+    // unlike a fixed sleep.
+    waiter.wait_for_ready(Duration::from_secs(10));
+
+    for (role, _agent_id) in &agents {
+        let path = session_root
+            .join("round-01")
+            .join(format!("response-{role}.md"));
+        std::fs::write(&path, "# response\nok\n").unwrap();
+    }
+    for (_role, agent_id) in &agents {
+        let s = Sentinel::new(
+            session_id,
+            *agent_id,
+            SentinelKind::Stop,
+            Some("done".into()),
+            None,
+        );
+        write_sentinel(&session_root, &s).unwrap();
+    }
+
+    let (status, stdout, stderr) = waiter.wait();
+    assert!(
+        status.success(),
+        "expected exit 0; got {:?}\nstdout={stdout}\nstderr={stderr}",
+        status.code()
+    );
+    let v = parse_wait_stdout(&stdout);
+    assert_eq!(v["status"].as_str(), Some("completed"));
+    assert_eq!(v["completed"].as_u64(), Some(2));
+    assert_eq!(v["total"].as_u64(), Some(2));
+}
+
+#[test]
+fn round_wait_exits_one_on_timeout() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().to_path_buf();
+    let (session_id, _session_root, _agents) =
+        build_meeting_session(&repo, &["reviewer", "qa"], false);
+
+    let (status, stdout, stderr) =
+        WaitProc::spawn(&repo, &session_id.to_string(), &["--timeout-secs", "1"]).wait();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected exit 1; got {:?}\nstdout={stdout}\nstderr={stderr}",
+        status.code()
+    );
+    let v = parse_wait_stdout(&stdout);
+    assert_eq!(v["status"].as_str(), Some("timed_out"));
+    assert_eq!(v["completed"].as_u64(), Some(0));
+    assert_eq!(v["total"].as_u64(), Some(2));
+}
+
+#[test]
+fn round_wait_errors_on_future_round() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().to_path_buf();
+    let (session_id, _session_root, _agents) = build_meeting_session(&repo, &["scribe"], false);
+
+    let (status, stdout, stderr) = WaitProc::spawn(
+        &repo,
+        &session_id.to_string(),
+        &["--round", "5", "--timeout-secs", "10"],
+    )
+    .wait();
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "expected exit 2 (USER_ERROR); got {:?}\nstdout={stdout}\nstderr={stderr}",
+        status.code()
+    );
+    assert!(
+        stderr.contains("round 5 not started yet"),
+        "stderr should mention the future-round rejection, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn round_wait_exits_three_when_session_terminal() {
+    use caucus::session::record::{read_session, write_session};
+    use caucus::session::state::SessionState;
+
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().to_path_buf();
+    let (session_id, _session_root, _agents) = build_meeting_session(&repo, &["scribe"], false);
+
+    // Force the session into a terminal state (MeetingInProgress →
+    // MeetingDeadlocked → Abandoned) so `round wait` short-circuits.
+    let mut session = read_session(&repo, session_id).unwrap();
+    session.transition(SessionState::MeetingDeadlocked).unwrap();
+    session.transition(SessionState::Abandoned).unwrap();
+    write_session(&session).unwrap();
+
+    let (status, stdout, stderr) =
+        WaitProc::spawn(&repo, &session_id.to_string(), &["--timeout-secs", "30"]).wait();
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "expected exit 3 (SESSION_TERMINAL); got {:?}\nstdout={stdout}\nstderr={stderr}",
+        status.code()
+    );
+    let v = parse_wait_stdout(&stdout);
+    assert_eq!(v["status"].as_str(), Some("session_terminal"));
+    assert_eq!(v["round"].as_u64(), Some(1));
+}
+
 #[test]
 fn caucus_role_list_text_format_is_human_readable() {
     let tmp = TempDir::new().unwrap();
