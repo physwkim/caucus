@@ -71,14 +71,35 @@ impl RegistryBuilder {
 /// `backend`, `reviewer`, `qa`, `scribe` even with no config files present.
 pub fn embedded_defaults() -> Vec<RoleSpec> {
     use crate::role::spec::AgentCli;
-    fn role(name: &str, desc: &str, mode: PermissionMode, tools: &[&str]) -> RoleSpec {
+    // Cost-tier baseline. Per the precedence rule in
+    // `agent::spawn::resolve_model`, an operator's `--model` flag still
+    // overrides any of these; they're just the role-typed *default*.
+    //
+    // - Opus when the role's job is "find subtle issues" or "decide the
+    //   shape of the work" (architect, reviewer): the reasoning quality
+    //   gap is meaningful.
+    // - Sonnet when the role's job is "execute a defined plan" (backend):
+    //   Sonnet codes well at a fraction of Opus's cost.
+    // - Haiku when the role's job is mechanical (qa runs tests + classifies
+    //   failures; scribe stitches markdown). No deep reasoning needed.
+    const OPUS: &str = "claude-opus-4-7";
+    const SONNET: &str = "claude-sonnet-4-6";
+    const HAIKU: &str = "claude-haiku-4-5";
+
+    fn role(
+        name: &str,
+        desc: &str,
+        mode: PermissionMode,
+        tools: &[&str],
+        model: Option<&str>,
+    ) -> RoleSpec {
         RoleSpec {
             name: name.into(),
             description: desc.into(),
             allowed_tools: tools.iter().map(|t| (*t).to_string()).collect(),
             permission_mode: mode,
             system_prompt_template: PathBuf::from(format!("roles/{name}.md")),
-            model: None,
+            model: model.map(|s| s.to_string()),
             agent_cli: AgentCli::Claude,
         }
     }
@@ -88,40 +109,48 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             "Designs the approach, decomposes tasks, no code edits.",
             PermissionMode::Plan,
             &["Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite"],
+            Some(OPUS),
         ),
         role(
             "backend",
             "Implements changes. Full file edit + bash.",
             PermissionMode::AcceptEdits,
             &["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite"],
+            Some(SONNET),
         ),
         role(
             "reviewer",
             "Reads only. Critiques approach and code.",
             PermissionMode::Default,
             &["Read", "Glob", "Grep", "Bash"],
+            Some(OPUS),
         ),
         role(
             "qa",
             "Runs tests. Reports failures.",
             PermissionMode::Default,
             &["Read", "Glob", "Grep", "Bash"],
+            Some(HAIKU),
         ),
         role(
             "scribe",
             "Compiles final meeting transcript. No external sync.",
             PermissionMode::AcceptEdits,
             &["Read", "Glob", "Grep", "Edit", "Write"],
+            Some(HAIKU),
         ),
     ];
 
     // serious-reviewer runs on codex instead of claude — used as an
     // adversarial second opinion when Claude review stalls or rubber-stamps.
+    // No `model` on the Rust side; codex picks its own default unless the
+    // operator overrides via roles.toml.
     let mut codex_reviewer = role(
         "serious-reviewer",
         "Adversarial second-opinion reviewer running on codex.",
         PermissionMode::Default,
         &["Read", "Glob", "Grep", "Bash"],
+        None,
     );
     codex_reviewer.agent_cli = AgentCli::Codex;
 
@@ -181,6 +210,26 @@ mod tests {
         let specs = embedded_defaults();
         let sr = specs.iter().find(|s| s.name == "serious-reviewer").unwrap();
         assert_eq!(sr.agent_cli, AgentCli::Codex);
+    }
+
+    #[test]
+    fn embedded_model_tiers_match_cost_optimization() {
+        // Lock in the cost-tier baseline so a future refactor can't silently
+        // re-default everything to Opus.
+        let specs = embedded_defaults();
+        let model = |name: &str| {
+            specs
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.model.clone())
+        };
+        assert_eq!(model("architect").as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(model("backend").as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(model("reviewer").as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(model("qa").as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(model("scribe").as_deref(), Some("claude-haiku-4-5"));
+        // serious-reviewer is codex; no Claude model is meaningful.
+        assert_eq!(model("serious-reviewer"), None);
     }
 
     #[test]

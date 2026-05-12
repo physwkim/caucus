@@ -78,9 +78,24 @@ pub enum SpawnError {
     MissingPrompt(PathBuf),
 }
 
-/// Default model when the caller doesn't pin one. Matches the env Claude
-/// Code expects via `--model`.
+/// Default model when neither the role nor the request pins one. Opus is the
+/// safety floor — pick it when in doubt — but most embedded roles override
+/// (backend → Sonnet, qa/scribe → Haiku) to cut cost where the role's job
+/// doesn't need top-tier reasoning.
 pub const DEFAULT_MODEL: &str = "claude-opus-4-7";
+
+/// Resolve the final `--model` value from the available sources.
+///
+/// **Precedence (changed in v0.x):** `request` > `per_role` > `DEFAULT_MODEL`.
+/// The request-level flag wins so an operator can override every role with
+/// one `caucus session new --model claude-opus-4-7` (e.g. "today everything
+/// gets Opus"). Per-role values act as the role's *default*, not a hard pin.
+pub fn resolve_model(per_role: Option<&str>, request: Option<&str>) -> String {
+    request
+        .map(str::to_string)
+        .or_else(|| per_role.map(str::to_string))
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
 
 /// Render the agent CLI invocation as a single shell-quotable string. The
 /// caller uses this for `tmux send-shell` (which adds the outer quotes) and
@@ -247,13 +262,7 @@ pub async fn spawn(tmux: &TmuxService, req: SpawnRequest<'_>) -> Result<SpawnOut
         return Err(SpawnError::MissingPrompt(req.system_prompt_path.clone()));
     }
 
-    // Precedence: per-role model > request-level model > DEFAULT_MODEL.
-    let model = req
-        .role
-        .model
-        .clone()
-        .or_else(|| req.model.clone())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let model = resolve_model(req.role.model.as_deref(), req.model.as_deref());
     let command_line = render_command_line(
         req.role,
         &req.cwd,
@@ -363,25 +372,33 @@ mod tests {
     }
 
     #[test]
-    fn per_role_model_overrides_request_model() {
-        // Even when a request supplies `model = "claude-opus-4-7"`, the role's
-        // own pin wins.
-        let mut role = reviewer_spec();
-        role.model = Some("claude-sonnet-4-6".into());
-        let cmd = render_command_line(
-            &role,
-            Path::new("/repo"),
-            Path::new("/sys.md"),
-            Path::new("/r.md"),
-            None,
-            DEFAULT_MODEL, // request-level
-            false,
-            None,
+    fn request_model_beats_role_model() {
+        // Precedence: request > role > DEFAULT.
+        assert_eq!(
+            resolve_model(Some("claude-sonnet-4-6"), Some("claude-opus-4-7")),
+            "claude-opus-4-7"
         );
-        // render_command_line itself takes a model argument; the precedence
-        // is resolved in spawn() before this call. Sanity: our request-level
-        // model is the default, so the rendered command line shows that.
-        assert!(cmd.contains(&format!("--model {DEFAULT_MODEL}")));
+    }
+
+    #[test]
+    fn role_model_used_when_no_request_model() {
+        assert_eq!(
+            resolve_model(Some("claude-sonnet-4-6"), None),
+            "claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_default_when_neither_set() {
+        assert_eq!(resolve_model(None, None), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn request_model_used_when_no_role_model() {
+        assert_eq!(
+            resolve_model(None, Some("claude-haiku-4-5")),
+            "claude-haiku-4-5"
+        );
     }
 
     #[test]

@@ -251,16 +251,57 @@ the CEO can see the underlying state in the same call.
 
 The five embedded roles are read-only defaults; override per-project in `<repo>/.caucus/roles.toml` or globally in `~/.caucus/roles.toml`:
 
-| Role               | Agent CLI | Tools                                            | Permission mode |
-|--------------------|-----------|--------------------------------------------------|------------------|
-| `architect`        | claude    | Read, Glob, Grep, WebFetch, WebSearch, TodoWrite | `plan`           |
-| `backend`          | claude    | + Edit, Write, Bash                              | `acceptEdits`    |
-| `reviewer`         | claude    | Read, Glob, Grep, Bash                           | `default`        |
-| `qa`               | claude    | Read, Glob, Grep, Bash                           | `default`        |
-| `scribe`           | claude    | Read, Glob, Grep, Edit, Write                    | `acceptEdits`    |
-| `serious-reviewer` | **codex** | Read, Glob, Grep, Bash                           | `default`        |
+| Role               | Agent CLI | Default model              | Tools                                            | Permission mode |
+|--------------------|-----------|----------------------------|--------------------------------------------------|------------------|
+| `architect`        | claude    | claude-opus-4-7            | Read, Glob, Grep, WebFetch, WebSearch, TodoWrite | `plan`           |
+| `backend`          | claude    | **claude-sonnet-4-6**      | + Edit, Write, Bash                              | `acceptEdits`    |
+| `reviewer`         | claude    | claude-opus-4-7            | Read, Glob, Grep, Bash                           | `default`        |
+| `qa`               | claude    | **claude-haiku-4-5**       | Read, Glob, Grep, Bash                           | `default`        |
+| `scribe`           | claude    | **claude-haiku-4-5**       | Read, Glob, Grep, Edit, Write                    | `acceptEdits`    |
+| `serious-reviewer` | **codex** | (codex picks)              | Read, Glob, Grep, Bash                           | `default`        |
+
+Cost tiers reflect each role's actual cognitive load: Opus where finding
+subtle issues / shaping decisions matters (architect / reviewer), Sonnet
+where executing a defined plan suffices (backend), Haiku where the role's
+work is mechanical (qa runs tests, scribe stitches markdown).
+
+**Override precedence** (highest first):
+1. `--model <id>` on the CLI invocation (e.g. `caucus session new --model claude-opus-4-7` to force Opus everywhere for one run)
+2. `model = "..."` in the role's `roles.toml` entry
+3. Per-role embedded defaults (the table above)
+4. Hard-coded `DEFAULT_MODEL = "claude-opus-4-7"` if nothing else matches
 
 System-prompt templates live under `roles/`. Each role inherits the claw-code "4-constraint scaffolding" (delegated task / only tools / no questions / concise result).
+
+### Adding specialised roles
+
+The embedded six cover the meeting + execute lifecycle. Roles that are
+useful but utility-shaped (not part of every session) belong in your own
+`<repo>/.caucus/roles.toml` or `~/.caucus/roles.toml`. Two recipes worth
+having on file:
+
+```toml
+# Cheap navigator: finds relevant files for the architect / reviewer
+# without burning Opus tokens on grep results.
+[roles.search-agent]
+description = "Codebase navigator. Returns file:line pointers, no analysis."
+allowed_tools = ["Read", "Glob", "Grep", "WebSearch"]
+permission_mode = "default"
+system_prompt_template = "roles/search-agent.md"   # write your own brief
+model = "claude-sonnet-4-6"
+
+# Git hygiene operator: rebases, resolves trivial conflicts, names commits.
+# Mechanical operations — Haiku is enough most of the time.
+[roles.git-manager]
+description = "Branch / rebase / cherry-pick / commit-message work."
+allowed_tools = ["Read", "Glob", "Grep", "Bash"]
+permission_mode = "acceptEdits"
+system_prompt_template = "roles/git-manager.md"
+model = "claude-haiku-4-5"
+```
+
+You provide the matching `roles/*.md` system-prompt files alongside the
+TOML. Caucus loads them through the same registry as the built-in roles.
 
 ### Mixing agent CLIs
 
