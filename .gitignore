@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# caucus runtime state — never tracked
+.caucus/
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
