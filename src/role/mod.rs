@@ -2,4 +2,5 @@
 //! and a system-prompt template — the same structure claw-code uses for
 //! subagent types (see `docs/claw-code-analysis.md` §3).
 
+pub mod registry;
 pub mod spec;

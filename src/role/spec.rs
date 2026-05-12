@@ -7,19 +7,24 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Claude CLI `--permission-mode` values that caucus knows about.
+/// Claude CLI `--permission-mode` values that caucus knows about. The
+/// serde representation matches the exact strings the `claude` binary
+/// accepts, so a `roles.toml` value can be copy-pasted from `claude --help`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
     /// `--permission-mode default` — Claude asks before any write/bash.
+    #[serde(rename = "default")]
     Default,
     /// `--permission-mode acceptEdits` — write/edit are auto-approved.
     /// Bash still prompts.
+    #[serde(rename = "acceptEdits")]
     AcceptEdits,
     /// `--permission-mode plan` — read-only planning mode.
+    #[serde(rename = "plan")]
     Plan,
     /// `--permission-mode bypassPermissions` — skip every prompt. Dangerous;
     /// reserve for sandboxed roles.
+    #[serde(rename = "bypassPermissions")]
     BypassPermissions,
 }
 
