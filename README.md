@@ -118,9 +118,16 @@ Pin the agenda by writing it to a file and pointing the flag at it:
 caucus auto "<task>" --agenda-file /tmp/agenda.md
 ```
 
-The decision (== task text verbatim) and pipeline shape are still
-hard-coded in this version; convergence judgment, adaptive retry
-budget, and optional merge-on-approve are next.
+**Decision.** After round 1 completes, caucus synthesizes
+`decision.md` from the task + every role's `response.md` via a third
+`claude --print` call, then hands it to `session converge` and from
+there to the pipeline. Pass `--decision-file <path>` to skip this
+step and supply your own decision verbatim. v2c only loops round 1
+once — "should we run another round?" judgment is a later commit.
+
+The pipeline shape (plan/impl/review mapping + `--continue-meeting`
++ `--retry-on-block 1`) is still hard-coded; adaptive retry budget
+and optional merge-on-approve are next.
 
 Requires `caucus init --install-hook` to have run in the repo first
 (otherwise no Stop hook → no sentinels → `auto` would block forever on

@@ -85,6 +85,12 @@ pub struct AutoArgs {
     /// roles via `claude --print`.
     #[arg(long)]
     pub agenda_file: Option<PathBuf>,
+    /// Path to a markdown file used verbatim as the meeting's decision
+    /// (passed to `session converge` and from there to the pipeline). When
+    /// omitted, caucus synthesizes the decision from the task and every
+    /// role's round-1 response via `claude --print`.
+    #[arg(long)]
+    pub decision_file: Option<PathBuf>,
     /// Meeting agenda timeout (seconds). caucus waits up to this long for
     /// every meeting agent's first sentinel before giving up. Default 1800.
     #[arg(long, default_value_t = 1800)]

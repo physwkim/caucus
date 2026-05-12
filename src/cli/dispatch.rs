@@ -2263,8 +2263,6 @@ pub async fn auto(repo: &Path, format: OutputFormat, args: AutoArgs) -> Result<(
     };
     let agenda_path = session_root.join("auto-agenda.md");
     std::fs::write(&agenda_path, &agenda_body)?;
-    let task_copy_path = session_root.join("auto-task.md");
-    std::fs::write(&task_copy_path, &args.task)?;
     emit(
         format,
         &serde_json::json!({
@@ -2303,9 +2301,47 @@ pub async fn auto(repo: &Path, format: OutputFormat, args: AutoArgs) -> Result<(
         ));
     }
 
+    let decision_source: &'static str;
+    let decision_path = match args.decision_file.as_ref() {
+        Some(path) => {
+            decision_source = "file";
+            let dst = session_root.join("auto-decision.md");
+            std::fs::copy(path, &dst).map_err(|e| {
+                anyhow!(
+                    "auto: failed to copy --decision-file {}: {e}",
+                    path.display()
+                )
+            })?;
+            dst
+        }
+        None => {
+            decision_source = "synthesized";
+            let responses = read_round_responses(&session_root, 1, &roles)?;
+            let body =
+                synthesize_decision(&args.task, &roles, &responses, args.model.as_deref()).await?;
+            let dst = session_root.join("auto-decision.md");
+            std::fs::write(&dst, body)?;
+            dst
+        }
+    };
+    emit(
+        format,
+        &serde_json::json!({
+            "auto_step": "decision_composed",
+            "decision_path": decision_path,
+            "source": decision_source,
+        }),
+        || {
+            format!(
+                "auto: decision ({decision_source}) at {}",
+                decision_path.display()
+            )
+        },
+    );
+
     let converge_args = SessionConvergeArgs {
         session_id: session_id.to_string(),
-        decision_file: task_copy_path,
+        decision_file: decision_path,
     };
     session_converge(repo, format, converge_args)?;
 
@@ -2432,6 +2468,74 @@ async fn synthesize_agenda(task: &str, roles: &[String], model: Option<&str>) ->
         ));
     }
     Ok(body)
+}
+
+/// Synthesize the meeting's decision from the round-1 responses. The output
+/// becomes `decision.md` for `caucus session converge` and from there the
+/// task that `execute pipeline` runs against. Errors when the response is
+/// empty so silent fallback never sneaks in.
+async fn synthesize_decision(
+    task: &str,
+    roles: &[String],
+    responses: &[(String, String)],
+    model: Option<&str>,
+) -> Result<String> {
+    let mut responses_block = String::new();
+    for (role, body) in responses {
+        responses_block.push_str(&format!("## {role}\n\n{}\n\n", body.trim()));
+    }
+    let prompt = format!(
+        "You are the orchestrator for caucus. Compose `decision.md` for an \
+         implementer to act on, based on the task and each role's round-1 \
+         response below.\n\n\
+         Requirements:\n\
+         - Under 400 words.\n\
+         - Markdown. Start with `# Decision`.\n\
+         - State what to do concretely: file paths, behaviours, acceptance \
+           criteria.\n\
+         - When responses disagree, pick the option you find most defensible \
+           and say so in one line; do NOT punt to the implementer.\n\
+         - If round-1 responses are clearly insufficient, add one line at the \
+           top: `Note: round-1 outputs are thin — implementer should escalate \
+           if blocked.`\n\n\
+         Output ONLY the markdown decision. No preamble, no code fences \
+         wrapping the whole thing.\n\n\
+         Roles in the meeting: {role_list}\n\n\
+         Task:\n{task}\n\n\
+         Round-1 responses:\n{responses_block}",
+        role_list = roles.join(", "),
+        task = task.trim()
+    );
+    let stdout = claude_print(&prompt, model, "decision synthesis").await?;
+    let body = stdout.trim().to_string();
+    if body.is_empty() {
+        return Err(anyhow!(
+            "auto: claude returned an empty decision. \
+             Re-run with `--decision-file <path>` to skip synthesis."
+        ));
+    }
+    Ok(body)
+}
+
+/// Read every role's response file for the given round. Returns
+/// `(role, body)` pairs in the same order as `roles`. Missing files error
+/// (round_wait should have already gated on non-empty responses; a missing
+/// file at this point is a state-corruption bug, not a quiet skip).
+fn read_round_responses(
+    session_root: &Path,
+    round: u32,
+    roles: &[String],
+) -> Result<Vec<(String, String)>> {
+    let layout = crate::round::RoundLayout::new(session_root.to_path_buf(), round);
+    let mut out = Vec::with_capacity(roles.len());
+    for role in roles {
+        let path = layout.response_path(role);
+        let body = std::fs::read_to_string(&path).with_context(|| {
+            format!("read round-{round} response for {role}: {}", path.display())
+        })?;
+        out.push((role.clone(), body));
+    }
+    Ok(out)
 }
 
 /// Robust parser for `claude --print` output. Tokenises on any
@@ -2587,5 +2691,48 @@ mod auto_tests {
         // Unknown names are silently dropped; known names are kept.
         let got = parse_role_list("architect, security, backend, reviewer", &avail).unwrap();
         assert_eq!(got, v(&["architect", "backend", "reviewer"]));
+    }
+
+    #[test]
+    fn read_round_responses_returns_each_roles_body_in_input_order() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let round_dir = tmp.path().join("round-01");
+        fs::create_dir_all(&round_dir).unwrap();
+        fs::write(round_dir.join("response-architect.md"), "plan: do X").unwrap();
+        fs::write(
+            round_dir.join("response-backend.md"),
+            "i'll write the patch",
+        )
+        .unwrap();
+        fs::write(
+            round_dir.join("response-reviewer.md"),
+            "watch for regressions in Y",
+        )
+        .unwrap();
+
+        let roles = v(&["backend", "architect", "reviewer"]); // out of disk order
+        let got = read_round_responses(tmp.path(), 1, &roles).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].0, "backend");
+        assert_eq!(got[0].1, "i'll write the patch");
+        assert_eq!(got[1].0, "architect");
+        assert_eq!(got[1].1, "plan: do X");
+        assert_eq!(got[2].0, "reviewer");
+    }
+
+    #[test]
+    fn read_round_responses_errors_when_a_role_response_is_missing() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let round_dir = tmp.path().join("round-01");
+        fs::create_dir_all(&round_dir).unwrap();
+        fs::write(round_dir.join("response-architect.md"), "plan").unwrap();
+        // backend file deliberately missing
+
+        let roles = v(&["architect", "backend"]);
+        let err = read_round_responses(tmp.path(), 1, &roles).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("backend"), "unexpected error chain: {s}");
     }
 }
