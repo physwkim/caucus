@@ -44,14 +44,21 @@ From any git repository where you want to run a meeting:
 #    Claude Stop hook into ~/.claude/settings.json (with .bak backup).
 caucus init --install-hook
 
-# 3. Health check.
+# 2. Install the CEO slash commands. After this, your main `claude` session
+#    in this repo gets `/caucus-ceo` and `/caucus-ceo-off`. Type the first
+#    one once and Claude will follow CEO discipline (don't read source
+#    files, honour the next_action hints, etc.) — see "CEO mode" below.
+caucus ceo enable
+
+# 3. Health check — should be 7/7 green.
 caucus doctor
 #   ✓ tmux: tmux 3.6a
 #   ✓ git: git version 2.53.0
 #   ✓ claude: 2.1.x (Claude Code)
 #   ✓ .caucus dir
 #   ✓ sentinel hook
-#   ✓ roles: 5 role(s): architect, backend, qa, reviewer, scribe
+#   ✓ hook registered
+#   ✓ roles: 6 role(s): architect, backend, qa, reviewer, scribe, serious-reviewer
 
 # 4. Start a meeting. Each role becomes its own tmux pane.
 caucus session new \
@@ -70,11 +77,17 @@ caucus round next <session-id> --agenda-file /tmp/agenda-r2.md
 # 8. Lock in a decision. Transitions Meeting* → MeetingConverged.
 caucus session converge <session-id> --decision-file /tmp/decision.md
 
-# 9. Spawn execute agents in their own worktrees.
-caucus execute start <session-id> --role backend --task-file /tmp/decision.md
-caucus execute status <session-id> --format json
-caucus execute finish <session-id> --role backend   # captures commit_provenance
+# 9. Spawn execute agents in their own worktrees. Easiest path: run the
+#    plan → impl → review pipeline in one shot.
+caucus execute pipeline <session-id> \
+  --task-file /tmp/decision.md \
+  --plan architect --implement backend --review reviewer \
+  --retry-on-block 1
 ```
+
+Then in your `claude` session in this repo, type `/caucus-ceo` to switch
+that session into CEO orchestration mode and start driving the workflow
+above. `/caucus-ceo-off` releases the role when you're done.
 
 ## CLI surface
 
