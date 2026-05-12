@@ -60,6 +60,52 @@ pub enum Command {
 
     /// Toggle the CAUCUS CEO orientation block in `<repo>/CLAUDE.md`.
     Ceo(CeoArgs),
+
+    /// Fully autonomous run: session new → round → converge → pipeline,
+    /// no human in the loop. v1 hard-codes roles, agenda, decision, and
+    /// retry policy; later versions will synthesise each via `claude --print`.
+    Auto(AutoArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AutoArgs {
+    /// Free-form task description. v1 copies this text verbatim into both
+    /// the agenda (meeting input) and the decision (pipeline input). Later
+    /// versions will let an LLM rewrite each.
+    pub task: String,
+    /// Comma-separated role names. v1 default
+    /// `architect,backend,reviewer` is hard-coded to match the pipeline
+    /// shape (plan / impl / review). Later versions will pick from the
+    /// task text.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        num_args = 1..,
+        default_value = "architect,backend,reviewer"
+    )]
+    pub roles: Vec<String>,
+    /// Meeting agenda timeout (seconds). caucus waits up to this long for
+    /// every meeting agent's first sentinel before giving up. Default 1800.
+    #[arg(long, default_value_t = 1800)]
+    pub round_timeout_secs: u64,
+    /// Per-pipeline-step sentinel timeout (seconds). Default 1800.
+    #[arg(long, default_value_t = 1800)]
+    pub step_timeout_secs: u64,
+    /// Retry budget for the reviewer's BLOCK verdict. Default 1.
+    #[arg(long, default_value_t = 1)]
+    pub retry_on_block: u32,
+    /// Pane placement. Default `window` — auto runs are unattended, so
+    /// per-role tabs read more cleanly than split panes when you come
+    /// back to inspect.
+    #[arg(long, value_enum, default_value_t = PlacementMode::Window)]
+    pub placement: PlacementMode,
+    /// Model override forwarded to every spawned agent. Per-role defaults
+    /// still apply when this is unset.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Optional base ref for the pipeline worktree.
+    #[arg(long)]
+    pub base_ref: Option<String>,
 }
 
 #[derive(Debug, Args)]

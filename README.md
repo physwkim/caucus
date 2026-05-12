@@ -89,6 +89,30 @@ Then in your `claude` session in this repo, type `/caucus-ceo` to switch
 that session into CEO orchestration mode and start driving the workflow
 above. `/caucus-ceo-off` releases the role when you're done.
 
+### Hands-off mode (`caucus auto`)
+
+`caucus auto "<task>"` runs the entire spine — `session new` → round →
+converge → pipeline — with no human in the loop. v1 hard-codes the
+agenda template, the decision (== your task text), and the pipeline
+shape (architect → backend → reviewer with `--continue-meeting` and
+`--retry-on-block 1`); later versions will replace each decision with
+an LLM synthesis step.
+
+```bash
+caucus auto "fix the foo bug in bar.rs; add a regression test"
+# emits JSON for every stage as it runs (session_new, round_start,
+# round_wait, session_converge, execute_pipeline) and a final
+# {"auto":"complete", ...} line.
+```
+
+Requires `caucus init --install-hook` to have run in the repo first
+(otherwise no Stop hook → no sentinels → `auto` would block forever on
+round_wait, so it fails fast with a clear message instead).
+
+caucus deliberately does **not** auto-merge on `approved` — that's a
+human decision. The final JSON includes the worktree branch so you can
+`git merge <branch>` when you're ready.
+
 ## CLI surface
 
 ```
@@ -102,6 +126,7 @@ caucus agent      show | send | kill
 caucus role       list | show
 caucus sentinel   write              # the Claude Stop hook calls this
 caucus watch      <session-id>       # foreground stdout event stream for the CEO
+caucus auto       <task>             # end-to-end hands-off run
 ```
 
 Every command accepts `--format json | text` (text is default) and `--repo <path>` (defaults to CWD). Exit codes follow `docs/design.md` §10.1 — `0` success, `2` user error, `3` environment error, `4` state corruption.

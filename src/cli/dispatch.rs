@@ -158,6 +158,44 @@ fn render_doctor_text(r: &DoctorReport) -> String {
 // ---- session --------------------------------------------------------------
 
 pub async fn session_new(repo: &Path, format: OutputFormat, args: SessionNewArgs) -> Result<()> {
+    let session = create_session_with_meeting_agents(repo, &args).await?;
+    let json = serde_json::json!({
+        "session_id": session.id.to_string(),
+        "state": session.state,
+        "roles": session.roles,
+        "agents": session.agents.iter().map(|(role, id)| {
+            serde_json::json!({"role": role, "agent_id": id.to_string()})
+        }).collect::<Vec<_>>(),
+        "session_root": session.session_root,
+        "next_action": format!(
+            "Write a SHORT round-1 agenda to a temp file (one paragraph stating the topic + what each role should produce). \
+             Then call `caucus round start {}` with that agenda. Do NOT read source files yourself — that's the architect/reviewer's job.",
+            session.id
+        ),
+        "next_command_suggestion": format!(
+            "caucus round start {} --agenda-file <path-to-agenda.md> --format json",
+            session.id
+        ),
+    });
+    emit(format, &json, || {
+        format!(
+            "session {} started in state {:?} with roles {}",
+            session.id,
+            session.state,
+            session.roles.join(", ")
+        )
+    });
+    Ok(())
+}
+
+/// Inner helper: validate roles, write the session JSON, transition to
+/// `MeetingInProgress`, and spawn one meeting pane per role. Returns the
+/// freshly-written `Session` so callers (`session_new`, `auto`) can chain
+/// further work without re-parsing it from disk.
+pub(crate) async fn create_session_with_meeting_agents(
+    repo: &Path,
+    args: &SessionNewArgs,
+) -> Result<Session> {
     let registry = build_registry(repo)?;
     for role in &args.roles {
         if !registry.contains(role) {
@@ -170,7 +208,7 @@ pub async fn session_new(repo: &Path, format: OutputFormat, args: SessionNewArgs
 
     let mut session = Session::new(
         repo.to_path_buf(),
-        args.topic,
+        args.topic.clone(),
         args.roles.clone(),
         args.max_rounds,
     );
@@ -248,33 +286,7 @@ pub async fn session_new(repo: &Path, format: OutputFormat, args: SessionNewArgs
 
     write_session(&session)?;
 
-    let json = serde_json::json!({
-        "session_id": session.id.to_string(),
-        "state": session.state,
-        "roles": session.roles,
-        "agents": session.agents.iter().map(|(role, id)| {
-            serde_json::json!({"role": role, "agent_id": id.to_string()})
-        }).collect::<Vec<_>>(),
-        "session_root": session.session_root,
-        "next_action": format!(
-            "Write a SHORT round-1 agenda to a temp file (one paragraph stating the topic + what each role should produce). \
-             Then call `caucus round start {}` with that agenda. Do NOT read source files yourself — that's the architect/reviewer's job.",
-            session.id
-        ),
-        "next_command_suggestion": format!(
-            "caucus round start {} --agenda-file <path-to-agenda.md> --format json",
-            session.id
-        ),
-    });
-    emit(format, &json, || {
-        format!(
-            "session {} started in state {:?} with roles {}",
-            session.id,
-            session.state,
-            session.roles.join(", ")
-        )
-    });
-    Ok(())
+    Ok(session)
 }
 
 fn resolve_role_template(repo: &Path, template_path: &Path) -> PathBuf {
@@ -2110,6 +2122,7 @@ pub async fn dispatch(cli: Cli) -> Result<u8> {
         },
         Command::Watch(args) => watch(&repo, args).await?,
         Command::Ceo(CeoArgs { action }) => ceo(&repo, format, action)?,
+        Command::Auto(args) => auto(&repo, format, args).await?,
     }
     Ok(exit::OK)
 }
@@ -2174,4 +2187,248 @@ fn ceo(repo: &Path, format: OutputFormat, action: CeoAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `caucus auto`: end-to-end spine. v1 hardcodes the agenda, the decision
+/// (= task text), and the pipeline shape; later versions replace each with
+/// `claude --print` synthesis. The current value is the *spine* — it
+/// proves caucus can drive a session from start to PR-ready without a
+/// human in the loop, and it's the substrate every v2 decision-point edit
+/// will plug into.
+pub async fn auto(repo: &Path, format: OutputFormat, args: AutoArgs) -> Result<()> {
+    let hook_path = repo.join(".caucus").join("bin").join("sentinel-stop");
+    if !hook_path.exists() {
+        return Err(anyhow!(
+            "caucus is not initialised in {}. Run `caucus init --install-hook` \
+             first, then re-run `caucus auto`. Without the Stop hook the meeting \
+             agents produce no sentinels and `caucus auto` would block forever \
+             on round_wait.",
+            repo.display()
+        ));
+    }
+    if args.roles.is_empty() {
+        return Err(anyhow!("--roles cannot be empty"));
+    }
+
+    let session_args = SessionNewArgs {
+        topic: args.task.clone(),
+        roles: args.roles.clone(),
+        max_rounds: 5,
+        model: args.model.clone(),
+        require_permissions: false,
+        layout: LayoutPreset::Auto,
+        placement: args.placement,
+    };
+    let session = create_session_with_meeting_agents(repo, &session_args).await?;
+    let session_id = session.id;
+    let session_root = session.session_root.clone();
+    emit(
+        format,
+        &serde_json::json!({
+            "auto_step": "session_new",
+            "session_id": session_id.to_string(),
+            "roles": args.roles,
+        }),
+        || format!("auto: session {session_id} created"),
+    );
+
+    let agenda_path = session_root.join("auto-agenda.md");
+    std::fs::write(&agenda_path, compose_auto_agenda(&args.task, &args.roles))?;
+    let task_copy_path = session_root.join("auto-task.md");
+    std::fs::write(&task_copy_path, &args.task)?;
+
+    let lead = args
+        .roles
+        .iter()
+        .find(|r| r.as_str() == "architect")
+        .cloned();
+    let round_args = RoundStartArgs {
+        session_id: session_id.to_string(),
+        agenda_file: agenda_path,
+        lead,
+        lead_timeout_secs: args.round_timeout_secs,
+    };
+    round_start(repo, format, round_args).await?;
+
+    let wait_args = RoundWaitArgs {
+        session_id: session_id.to_string(),
+        round: None,
+        timeout_secs: args.round_timeout_secs,
+    };
+    let rc = round_wait(repo, format, wait_args).await?;
+    if rc != 0 {
+        return Err(anyhow!(
+            "auto: round_wait exit={rc} (1=timeout, 2=user_error, 3=session terminal). \
+             Inspect session {session_id} and re-drive manually."
+        ));
+    }
+
+    let converge_args = SessionConvergeArgs {
+        session_id: session_id.to_string(),
+        decision_file: task_copy_path,
+    };
+    session_converge(repo, format, converge_args)?;
+
+    let (plan_role, impl_role, review_role) = pick_pipeline_roles(&args.roles)?;
+    let pipeline_args = ExecutePipelineCliArgs {
+        session_id: session_id.to_string(),
+        task_file: session_root.join("decision.md"),
+        plan: plan_role,
+        implement: impl_role,
+        review: review_role,
+        retry_on_block: args.retry_on_block,
+        step_timeout_secs: args.step_timeout_secs,
+        base_ref: args.base_ref,
+        model: args.model,
+        require_permissions: false,
+        placement: args.placement,
+        continue_meeting: true,
+    };
+    execute_pipeline(repo, format, pipeline_args).await?;
+
+    emit(
+        format,
+        &serde_json::json!({
+            "auto": "complete",
+            "session_id": session_id.to_string(),
+            "next_action":
+                "auto run done. Read the final pipeline status emitted above. If \
+                 `approved`, merge the worktree branch (caucus deliberately does NOT \
+                 auto-merge). If `blocked` or `step_failed`, open the session and \
+                 either re-pipeline with more retry budget, escalate to a human, or \
+                 `caucus execute abandon` the worktree.",
+        }),
+        || format!("auto run complete for session {session_id}"),
+    );
+    Ok(())
+}
+
+fn compose_auto_agenda(task: &str, roles: &[String]) -> String {
+    let mut s = String::new();
+    s.push_str("# Round 1 — automated meeting (caucus auto)\n\n");
+    s.push_str("## Task\n\n");
+    s.push_str(task.trim());
+    s.push_str("\n\n## Your job\n\n");
+    for r in roles {
+        match r.as_str() {
+            "architect" => s.push_str(
+                "- **architect**: produce a concrete plan. Specific file paths, \
+                 concrete changes, no hedging. Don't write code.\n",
+            ),
+            "backend" => s.push_str(
+                "- **backend**: read the task; flag concerns or ambiguities you'd \
+                 hit during implementation. Suggest your approach. Don't write \
+                 code yet.\n",
+            ),
+            "reviewer" => s.push_str(
+                "- **reviewer**: identify what \"approved\" looks like and what \
+                 regressions to watch for.\n",
+            ),
+            other => s.push_str(&format!("- **{other}**: contribute per your role.\n")),
+        }
+    }
+    s.push_str(
+        "\nEach role: write your response to your `response.md` and stop. \
+         Markdown OK.\n",
+    );
+    s
+}
+
+/// Map the meeting roster onto the plan / implement / review slots that
+/// `caucus execute pipeline` expects. v1 honours canonical names first and
+/// falls back to positional assignment for non-canonical names. Plan and
+/// review are optional; implement is required.
+fn pick_pipeline_roles(roles: &[String]) -> Result<(Option<String>, String, Option<String>)> {
+    let plan = roles.iter().find(|r| r.as_str() == "architect").cloned();
+    let review = roles.iter().find(|r| r.as_str() == "reviewer").cloned();
+    let impl_role = roles
+        .iter()
+        .find(|r| r.as_str() == "backend")
+        .cloned()
+        .or_else(|| {
+            roles
+                .iter()
+                .find(|r| r.as_str() != "architect" && r.as_str() != "reviewer")
+                .cloned()
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "--roles must include an implementer role (backend, or any \
+                 non-architect/non-reviewer role). Got: {roles:?}"
+            )
+        })?;
+    Ok((plan, impl_role, review))
+}
+
+#[cfg(test)]
+mod auto_tests {
+    use super::*;
+
+    fn v(roles: &[&str]) -> Vec<String> {
+        roles.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_three_roles_map_to_canonical_pipeline_slots() {
+        let (plan, impl_, review) =
+            pick_pipeline_roles(&v(&["architect", "backend", "reviewer"])).unwrap();
+        assert_eq!(plan.as_deref(), Some("architect"));
+        assert_eq!(impl_, "backend");
+        assert_eq!(review.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn missing_architect_makes_plan_none() {
+        let (plan, impl_, review) = pick_pipeline_roles(&v(&["backend", "reviewer"])).unwrap();
+        assert!(plan.is_none());
+        assert_eq!(impl_, "backend");
+        assert_eq!(review.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn non_canonical_role_fills_implementer_slot_when_backend_absent() {
+        let (plan, impl_, review) =
+            pick_pipeline_roles(&v(&["architect", "scribe", "reviewer"])).unwrap();
+        assert_eq!(plan.as_deref(), Some("architect"));
+        assert_eq!(impl_, "scribe");
+        assert_eq!(review.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn architect_only_errors_without_an_implementer() {
+        let err = pick_pipeline_roles(&v(&["architect"])).unwrap_err();
+        assert!(
+            err.to_string().contains("implementer"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reviewer_only_errors_without_an_implementer() {
+        let err = pick_pipeline_roles(&v(&["reviewer"])).unwrap_err();
+        assert!(
+            err.to_string().contains("implementer"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn agenda_embeds_task_text_and_canonical_role_blurbs() {
+        let body = compose_auto_agenda(
+            "fix the foo bug in bar.rs",
+            &v(&["architect", "backend", "reviewer"]),
+        );
+        assert!(body.contains("fix the foo bug in bar.rs"));
+        assert!(body.contains("**architect**"));
+        assert!(body.contains("**backend**"));
+        assert!(body.contains("**reviewer**"));
+        assert!(body.contains("response.md"));
+    }
+
+    #[test]
+    fn agenda_falls_back_to_generic_blurb_for_unknown_roles() {
+        let body = compose_auto_agenda("do thing", &v(&["scribe"]));
+        assert!(body.contains("**scribe**"));
+        assert!(body.contains("contribute per your role"));
+    }
 }

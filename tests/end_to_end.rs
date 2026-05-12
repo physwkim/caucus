@@ -143,6 +143,7 @@ fn caucus_help_lists_every_top_level_subcommand() {
     let body = String::from_utf8_lossy(&out.stdout);
     for sub in [
         "init", "doctor", "session", "round", "execute", "agent", "role", "sentinel", "watch",
+        "auto",
     ] {
         assert!(
             body.contains(sub),
