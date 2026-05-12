@@ -85,22 +85,29 @@ pub enum SpawnError {
 /// safety floor — pick it when in doubt — but most embedded roles override
 /// (backend → Sonnet, qa/scribe → Haiku) to cut cost where the role's job
 /// doesn't need top-tier reasoning.
-pub const DEFAULT_MODEL: &str = "claude-opus-4-7";
+///
+/// Stored as the claude CLI alias (`opus` / `sonnet` / `haiku`) rather than
+/// a pinned version (`claude-opus-4-7`) so caucus inherits the latest
+/// generation from claude automatically and the constant doesn't bit-rot
+/// when Anthropic ships a new release. The CLI docs the alias surface:
+/// "Provide an alias for the latest model (e.g. 'sonnet' or 'opus') or a
+///  model's full name (e.g. 'claude-sonnet-4-6')."
+pub const DEFAULT_MODEL: &str = "opus";
 
 /// Resolve the final `--model` value from the available sources.
 ///
 /// **Precedence:** `request` > `per_role` > role-CLI-specific default.
 /// The request-level flag wins so an operator can override every role with
-/// one `caucus session new --model claude-opus-4-7` (e.g. "today everything
-/// gets Opus"). Per-role values act as the role's *default*, not a hard pin.
+/// one `caucus session new --model opus` (e.g. "today everything gets
+/// Opus"). Per-role values act as the role's *default*, not a hard pin.
 ///
 /// When neither request nor per-role model is set, the fallback depends on
 /// the role's agent CLI:
-/// - `AgentCli::Claude` → `DEFAULT_MODEL` (`claude-opus-4-7`).
+/// - `AgentCli::Claude` → `DEFAULT_MODEL` (alias `opus`).
 /// - `AgentCli::Codex`  → `None`; codex picks its own default. **Critical:**
-///   codex rejects claude model ids outright (e.g.
-///   `claude-opus-4-7 model is not supported when using Codex`), so the
-///   claude default must never leak into a codex invocation.
+///   codex rejects claude model ids outright (e.g. `claude-opus-4-7 model
+///   is not supported when using Codex`), so the claude default must never
+///   leak into a codex invocation.
 pub fn resolve_model(
     agent_cli: crate::role::spec::AgentCli,
     per_role: Option<&str>,

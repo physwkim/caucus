@@ -292,7 +292,7 @@ exec caucus sentinel write \
   "agent_name": "reviewer-r1",
   "tmux_pane_id": "%42",
   "worktree_path": null,
-  "model": "claude-opus-4-7",
+  "model": "opus",
   "status": "running",
   "created_at": "2026-05-12T14:20:00Z",
   "started_at": "2026-05-12T14:20:02Z",

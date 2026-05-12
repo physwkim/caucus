@@ -82,9 +82,14 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
     //   Sonnet codes well at a fraction of Opus's cost.
     // - Haiku when the role's job is mechanical (qa runs tests + classifies
     //   failures; scribe stitches markdown). No deep reasoning needed.
-    const OPUS: &str = "claude-opus-4-7";
-    const SONNET: &str = "claude-sonnet-4-6";
-    const HAIKU: &str = "claude-haiku-4-5";
+    // Claude CLI accepts both `--model <alias>` ("opus" / "sonnet" / "haiku"
+    // → latest generation of that tier) and pinned ids (e.g.
+    // "claude-sonnet-4-6"). We use aliases here so the embedded defaults
+    // inherit each new generation without a code change. Override via
+    // `roles.toml` if you need a specific pinned version.
+    const OPUS: &str = "opus";
+    const SONNET: &str = "sonnet";
+    const HAIKU: &str = "haiku";
 
     fn role(
         name: &str,
@@ -223,11 +228,11 @@ mod tests {
                 .find(|s| s.name == name)
                 .and_then(|s| s.model.clone())
         };
-        assert_eq!(model("architect").as_deref(), Some("claude-opus-4-7"));
-        assert_eq!(model("backend").as_deref(), Some("claude-sonnet-4-6"));
-        assert_eq!(model("reviewer").as_deref(), Some("claude-opus-4-7"));
-        assert_eq!(model("qa").as_deref(), Some("claude-haiku-4-5"));
-        assert_eq!(model("scribe").as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(model("architect").as_deref(), Some("opus"));
+        assert_eq!(model("backend").as_deref(), Some("sonnet"));
+        assert_eq!(model("reviewer").as_deref(), Some("opus"));
+        assert_eq!(model("qa").as_deref(), Some("haiku"));
+        assert_eq!(model("scribe").as_deref(), Some("haiku"));
         // serious-reviewer is codex; no Claude model is meaningful.
         assert_eq!(model("serious-reviewer"), None);
     }
