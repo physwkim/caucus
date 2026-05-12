@@ -73,9 +73,13 @@ pub enum SpawnError {
 /// Code expects via `--model`.
 pub const DEFAULT_MODEL: &str = "claude-opus-4-7";
 
-/// Render the Claude CLI invocation as a single shell-quotable string. The
+/// Render the agent CLI invocation as a single shell-quotable string. The
 /// caller uses this for `tmux send-shell` (which adds the outer quotes) and
 /// for the manifest's `command_line` field (purely informational).
+///
+/// Dispatches on `role.agent_cli`: Claude and Codex have different flag
+/// surfaces so we keep them in two named helpers. The only shared output is
+/// the bootstrap user message — both agents accept a positional prompt.
 pub fn render_command_line(
     role: &RoleSpec,
     cwd: &Path,
@@ -85,12 +89,35 @@ pub fn render_command_line(
     model: &str,
     skip_permissions: bool,
 ) -> String {
-    // The agent reads the response_path from its env, but we also pass it
-    // as part of the first user message so Claude doesn't have to peek at
-    // env. Keep the env wiring as the *contract*; the first message is a
-    // convenience.
-    let _ = cwd; // cwd is set via tmux split-window -c, not via claude flag.
+    match role.agent_cli {
+        crate::role::spec::AgentCli::Claude => render_claude_command(
+            role,
+            system_prompt_path,
+            response_path,
+            initial_prompt_path,
+            model,
+            skip_permissions,
+        ),
+        crate::role::spec::AgentCli::Codex => render_codex_command(
+            role,
+            cwd,
+            system_prompt_path,
+            response_path,
+            initial_prompt_path,
+            model,
+            skip_permissions,
+        ),
+    }
+}
 
+fn render_claude_command(
+    role: &RoleSpec,
+    system_prompt_path: &Path,
+    response_path: &Path,
+    initial_prompt_path: Option<&Path>,
+    model: &str,
+    skip_permissions: bool,
+) -> String {
     let allowed = role.allowed_tools_csv();
     let mut cmd = format!(
         "claude --model {model} --permission-mode {mode} --append-system-prompt @{prompt}",
@@ -104,21 +131,72 @@ pub fn render_command_line(
     if skip_permissions {
         cmd.push_str(" --dangerously-skip-permissions");
     }
-
     if let Some(prompt_file) = initial_prompt_path {
-        // Bootstrap message: pre-typed so the pane starts the round
-        // immediately without the operator manually re-typing.
         cmd.push_str(" --print ");
-        let bootstrap = format!(
-            "Read {prompt} and write your reply to {response}. \
-             Finish with a one-line summary.",
-            prompt = prompt_file.display(),
-            response = response_path.display(),
-        );
-        cmd.push_str(&shell_quote(&bootstrap));
+        cmd.push_str(&shell_quote(&bootstrap_message(prompt_file, response_path)));
     }
-
     cmd
+}
+
+/// Codex doesn't ship an `--append-system-prompt @FILE` equivalent, so we
+/// fold the role's system prompt into the bootstrap user message and inline
+/// it as the positional prompt argument. The trade-off vs. Claude: the role
+/// identity arrives as a user message instead of a system message, which is
+/// slightly weaker as a constraint but works well in practice (codex review
+/// honours role framing the same way).
+fn render_codex_command(
+    role: &RoleSpec,
+    cwd: &Path,
+    system_prompt_path: &Path,
+    response_path: &Path,
+    initial_prompt_path: Option<&Path>,
+    model: &str,
+    skip_permissions: bool,
+) -> String {
+    let mut cmd = format!(
+        "codex --model {model} -C {cwd}",
+        cwd = shell_quote(&cwd.display().to_string()),
+    );
+    if skip_permissions {
+        cmd.push_str(" --dangerously-bypass-approvals-and-sandbox");
+    } else {
+        // Match the role's permission_mode coarsely: anything stricter than
+        // Default → read-only sandbox.
+        let sandbox = match role.permission_mode {
+            crate::role::spec::PermissionMode::Plan
+            | crate::role::spec::PermissionMode::Default => "read-only",
+            crate::role::spec::PermissionMode::AcceptEdits => "workspace-write",
+            crate::role::spec::PermissionMode::BypassPermissions => "danger-full-access",
+        };
+        cmd.push_str(" --sandbox ");
+        cmd.push_str(sandbox);
+    }
+    // The user prompt: role identity (read from disk) + bootstrap.
+    let header = format!(
+        "Read your role instructions at {system}. {tools_hint}",
+        system = system_prompt_path.display(),
+        tools_hint = if role.allowed_tools.is_empty() {
+            String::new()
+        } else {
+            format!("Permitted tools: {}.", role.allowed_tools_csv())
+        }
+    );
+    let body = match initial_prompt_path {
+        Some(p) => format!("\n\n{}", bootstrap_message(p, response_path)),
+        None => String::new(),
+    };
+    cmd.push(' ');
+    cmd.push_str(&shell_quote(&format!("{header}{body}")));
+    cmd
+}
+
+fn bootstrap_message(prompt_file: &Path, response_path: &Path) -> String {
+    format!(
+        "Read {prompt} and write your reply to {response}. \
+         Finish with a one-line summary.",
+        prompt = prompt_file.display(),
+        response = response_path.display(),
+    )
 }
 
 fn shell_quote(s: &str) -> String {
@@ -222,6 +300,7 @@ mod tests {
             permission_mode: PermissionMode::Default,
             system_prompt_template: PathBuf::from("roles/reviewer.md"),
             model: None,
+            agent_cli: crate::role::spec::AgentCli::Claude,
         }
     }
 
@@ -315,5 +394,45 @@ mod tests {
             true,
         );
         assert!(cmd.contains("--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn codex_role_renders_codex_invocation() {
+        let mut role = reviewer_spec();
+        role.agent_cli = crate::role::spec::AgentCli::Codex;
+        let cmd = render_command_line(
+            &role,
+            Path::new("/repo"),
+            Path::new("/sys.md"),
+            Path::new("/r.md"),
+            None,
+            "gpt-5.1-codex",
+            true,
+        );
+        assert!(cmd.starts_with("codex"));
+        assert!(cmd.contains("--model gpt-5.1-codex"));
+        assert!(cmd.contains("-C '/repo'"));
+        assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
+        // System prompt is inlined into the user message, not a separate flag.
+        assert!(!cmd.contains("--append-system-prompt"));
+        // The user message references the role prompt path.
+        assert!(cmd.contains("/sys.md"));
+    }
+
+    #[test]
+    fn codex_without_skip_permissions_picks_sandbox_by_mode() {
+        let mut role = reviewer_spec(); // PermissionMode::Default → read-only
+        role.agent_cli = crate::role::spec::AgentCli::Codex;
+        let cmd = render_command_line(
+            &role,
+            Path::new("/repo"),
+            Path::new("/sys.md"),
+            Path::new("/r.md"),
+            None,
+            "gpt-5.1-codex",
+            false,
+        );
+        assert!(cmd.contains("--sandbox read-only"));
+        assert!(!cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
     }
 }

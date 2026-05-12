@@ -32,6 +32,7 @@ Requirements:
 - tmux 3.0+
 - git 2.20+
 - Claude Code CLI (`claude` 2.x) on `PATH`
+- Codex CLI (`codex`) on `PATH` — optional, only needed if you use a Codex-backed role like `serious-reviewer`
 - Rust 1.85+ (edition 2024)
 
 ## Quick start
@@ -95,15 +96,41 @@ Every command accepts `--format json | text` (text is default) and `--repo <path
 
 The five embedded roles are read-only defaults; override per-project in `<repo>/.caucus/roles.toml` or globally in `~/.caucus/roles.toml`:
 
-| Role        | Tools                                              | Permission mode |
-|-------------|----------------------------------------------------|------------------|
-| `architect` | Read, Glob, Grep, WebFetch, WebSearch, TodoWrite   | `plan`           |
-| `backend`   | + Edit, Write, Bash                                | `acceptEdits`    |
-| `reviewer`  | Read, Glob, Grep, Bash                             | `default`        |
-| `qa`        | Read, Glob, Grep, Bash                             | `default`        |
-| `scribe`    | Read, Glob, Grep, Edit, Write                      | `acceptEdits`    |
+| Role               | Agent CLI | Tools                                            | Permission mode |
+|--------------------|-----------|--------------------------------------------------|------------------|
+| `architect`        | claude    | Read, Glob, Grep, WebFetch, WebSearch, TodoWrite | `plan`           |
+| `backend`          | claude    | + Edit, Write, Bash                              | `acceptEdits`    |
+| `reviewer`         | claude    | Read, Glob, Grep, Bash                           | `default`        |
+| `qa`               | claude    | Read, Glob, Grep, Bash                           | `default`        |
+| `scribe`           | claude    | Read, Glob, Grep, Edit, Write                    | `acceptEdits`    |
+| `serious-reviewer` | **codex** | Read, Glob, Grep, Bash                           | `default`        |
 
 System-prompt templates live under `roles/`. Each role inherits the claw-code "4-constraint scaffolding" (delegated task / only tools / no questions / concise result).
+
+### Mixing agent CLIs
+
+caucus supports two backends per role: `claude` (default) and `codex`. The
+embedded `serious-reviewer` role runs on Codex as an *adversarial second
+opinion* — use it when a Claude reviewer stalls, rubber-stamps, or you want a
+different model to argue. Add a Codex-backed role to your `~/.caucus/roles.toml`
+or `<repo>/.caucus/roles.toml`:
+
+```toml
+[roles.serious-architect]
+description = "Adversarial second-opinion architect on codex."
+allowed_tools = ["Read", "Glob", "Grep", "WebSearch"]
+permission_mode = "default"
+system_prompt_template = "roles/serious-reviewer.md"
+agent_cli = "codex"
+model = "gpt-5.1-codex"
+```
+
+Sub-agents always get `--dangerously-skip-permissions` (claude) or
+`--dangerously-bypass-approvals-and-sandbox` (codex) by default — the role's
+`allowed_tools` is the real safety boundary, and inline permission prompts
+inside a tmux pane just freeze the agent. Opt out per-session with
+`caucus session new --require-permissions` or `caucus execute start
+--require-permissions`.
 
 ## Architecture
 

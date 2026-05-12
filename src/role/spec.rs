@@ -39,6 +39,29 @@ impl PermissionMode {
     }
 }
 
+/// Which agent CLI runs in the pane for a given role.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentCli {
+    /// `claude` (Claude Code). Default.
+    #[default]
+    Claude,
+    /// `codex` (OpenAI Codex CLI). Useful as a "serious reviewer" when
+    /// Claude gets stuck — see README "Mixing agent CLIs" section.
+    Codex,
+}
+
+impl AgentCli {
+    /// Binary name to invoke. Stays stable; both binaries are expected on
+    /// `PATH`.
+    pub fn binary(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+}
+
 /// Static specification for a role.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleSpec {
@@ -54,6 +77,10 @@ pub struct RoleSpec {
     /// Useful for cost control: e.g. `architect = sonnet`, `backend = opus`.
     #[serde(default)]
     pub model: Option<String>,
+    /// Which agent CLI to spawn for this role. Defaults to Claude. Set to
+    /// `codex` for roles where you want OpenAI Codex as a second opinion.
+    #[serde(default)]
+    pub agent_cli: AgentCli,
 }
 
 impl RoleSpec {
@@ -85,6 +112,7 @@ mod tests {
             permission_mode: mode,
             system_prompt_template: PathBuf::from(format!("roles/{name}.md")),
             model: None,
+            agent_cli: AgentCli::Claude,
         }
     }
 

@@ -65,6 +65,7 @@ mod tests {
             permission_mode: PermissionMode::Default,
             system_prompt_template: PathBuf::from(format!("roles/{name}.md")),
             model: None,
+            agent_cli: crate::role::spec::AgentCli::Claude,
         }
     }
 

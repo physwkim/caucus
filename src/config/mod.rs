@@ -70,6 +70,7 @@ impl RegistryBuilder {
 /// the override stack so that `caucus` always knows about `architect`,
 /// `backend`, `reviewer`, `qa`, `scribe` even with no config files present.
 pub fn embedded_defaults() -> Vec<RoleSpec> {
+    use crate::role::spec::AgentCli;
     fn role(name: &str, desc: &str, mode: PermissionMode, tools: &[&str]) -> RoleSpec {
         RoleSpec {
             name: name.into(),
@@ -78,9 +79,10 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             permission_mode: mode,
             system_prompt_template: PathBuf::from(format!("roles/{name}.md")),
             model: None,
+            agent_cli: AgentCli::Claude,
         }
     }
-    vec![
+    let claude_roles = [
         role(
             "architect",
             "Designs the approach, decomposes tasks, no code edits.",
@@ -111,7 +113,22 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             PermissionMode::AcceptEdits,
             &["Read", "Glob", "Grep", "Edit", "Write"],
         ),
-    ]
+    ];
+
+    // serious-reviewer runs on codex instead of claude — used as an
+    // adversarial second opinion when Claude review stalls or rubber-stamps.
+    let mut codex_reviewer = role(
+        "serious-reviewer",
+        "Adversarial second-opinion reviewer running on codex.",
+        PermissionMode::Default,
+        &["Read", "Glob", "Grep", "Bash"],
+    );
+    codex_reviewer.agent_cli = AgentCli::Codex;
+
+    let mut out = Vec::with_capacity(claude_roles.len() + 1);
+    out.extend(claude_roles);
+    out.push(codex_reviewer);
+    out
 }
 
 /// Convenience: build a `RolesConfig` from a slice of specs (so the embedded
@@ -129,6 +146,7 @@ impl From<Vec<RoleSpec>> for RolesConfig {
                     permission_mode: s.permission_mode,
                     system_prompt_template: s.system_prompt_template,
                     model: s.model,
+                    agent_cli: s.agent_cli,
                 },
             );
         }
@@ -142,12 +160,27 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn embedded_defaults_contain_all_five_roles() {
+    fn embedded_defaults_contain_all_six_roles() {
         let names: Vec<_> = embedded_defaults().into_iter().map(|s| s.name).collect();
         assert_eq!(
             names,
-            vec!["architect", "backend", "reviewer", "qa", "scribe"]
+            vec![
+                "architect",
+                "backend",
+                "reviewer",
+                "qa",
+                "scribe",
+                "serious-reviewer",
+            ]
         );
+    }
+
+    #[test]
+    fn serious_reviewer_uses_codex() {
+        use crate::role::spec::AgentCli;
+        let specs = embedded_defaults();
+        let sr = specs.iter().find(|s| s.name == "serious-reviewer").unwrap();
+        assert_eq!(sr.agent_cli, AgentCli::Codex);
     }
 
     #[test]

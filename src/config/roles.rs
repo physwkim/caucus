@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::role::spec::{PermissionMode, RoleSpec};
+use crate::role::spec::{AgentCli, PermissionMode, RoleSpec};
 
 /// On-disk representation of a `roles.toml` file. One entry per role,
 /// keyed by role name (e.g. `[roles.reviewer]`).
@@ -36,6 +36,8 @@ pub struct RoleEntry {
     /// Optional per-role model override; mirrors `RoleSpec::model`.
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub agent_cli: AgentCli,
 }
 
 const fn default_permission_mode() -> PermissionMode {
@@ -87,6 +89,7 @@ impl RolesConfig {
                 permission_mode: entry.permission_mode,
                 system_prompt_template: entry.system_prompt_template,
                 model: entry.model,
+                agent_cli: entry.agent_cli,
             })
             .collect()
     }
