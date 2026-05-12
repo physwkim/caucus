@@ -90,6 +90,13 @@ pub enum SessionAction {
     Deadlock(SessionDeadlockArgs),
     /// Kill every pane, enqueue worktree cleanup, mark Abandoned.
     Kill(SessionKillArgs),
+    /// Render `<session>/transcript.md` from all rounds.
+    Transcript(SessionTranscriptArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SessionTranscriptArgs {
+    pub session_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -225,12 +232,29 @@ pub struct AgentArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentAction {
+    /// List agents in a session, optionally filtered by kind.
+    List(AgentListArgs),
     /// Dump the manifest JSON for one agent.
     Show(AgentShowArgs),
     /// Send a raw line to the agent's pane (escape-quoted).
     Send(AgentSendArgs),
     /// Kill the agent's pane and mark it Killed.
     Kill(AgentKillArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AgentListArgs {
+    pub session_id: String,
+    /// Filter by agent kind. Default: all.
+    #[arg(long, value_enum, default_value_t = AgentKindFilter::All)]
+    pub kind: AgentKindFilter,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum AgentKindFilter {
+    All,
+    Meeting,
+    Execute,
 }
 
 #[derive(Debug, Args)]

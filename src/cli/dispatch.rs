@@ -664,7 +664,86 @@ fn lookup_execute_agent(session: &Session, role: &str) -> Result<AgentId> {
     Err(anyhow!("no execute agent for role {role}"))
 }
 
+pub fn session_transcript(
+    repo: &Path,
+    format: OutputFormat,
+    args: SessionTranscriptArgs,
+) -> Result<()> {
+    let id = parse_session_id(&args.session_id)?;
+    let session = read_session(repo, id)?;
+    let last = session.current_round.max(1);
+    let path = crate::round::transcript::assemble(
+        &session.session_root,
+        last,
+        &session.roles,
+        &session.topic,
+    )?;
+    emit(
+        format,
+        &serde_json::json!({
+            "session_id": id.to_string(),
+            "transcript_path": path,
+            "rounds": last,
+        }),
+        || format!("transcript written to {}", path.display()),
+    );
+    Ok(())
+}
+
 // ---- agent ---------------------------------------------------------------
+
+pub fn agent_list(repo: &Path, format: OutputFormat, args: AgentListArgs) -> Result<()> {
+    let id = parse_session_id(&args.session_id)?;
+    let session = read_session(repo, id)?;
+    let mut entries = Vec::new();
+    for (role, agent_id) in &session.agents {
+        let Ok(manifest) = crate::agent::manifest::read_json(&session.session_root, *agent_id)
+        else {
+            continue;
+        };
+        let keep = match args.kind {
+            AgentKindFilter::All => true,
+            AgentKindFilter::Meeting => {
+                matches!(manifest.kind, crate::agent::manifest::AgentKind::Meeting)
+            }
+            AgentKindFilter::Execute => {
+                matches!(manifest.kind, crate::agent::manifest::AgentKind::Execute)
+            }
+        };
+        if !keep {
+            continue;
+        }
+        entries.push(serde_json::json!({
+            "role": role,
+            "agent_id": agent_id.to_string(),
+            "kind": manifest.kind,
+            "status": manifest.status,
+            "derived_state": manifest.derived_state,
+            "tmux_pane_id": manifest.tmux_pane_id,
+            "worktree_path": manifest.worktree_path,
+        }));
+    }
+    emit(format, &entries, || {
+        if entries.is_empty() {
+            "no agents".into()
+        } else {
+            entries
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{:<10} {} kind={} state={}",
+                        e["role"].as_str().unwrap_or(""),
+                        e["agent_id"].as_str().unwrap_or(""),
+                        e["kind"],
+                        e["derived_state"],
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    });
+    Ok(())
+}
 
 pub fn agent_show(repo: &Path, format: OutputFormat, args: AgentShowArgs) -> Result<()> {
     let session_id = parse_session_id(&args.session)?;
@@ -957,6 +1036,7 @@ pub async fn dispatch(cli: Cli) -> Result<u8> {
             SessionAction::Converge(args) => session_converge(&repo, format, args)?,
             SessionAction::Deadlock(args) => session_deadlock(&repo, format, args)?,
             SessionAction::Kill(args) => session_kill(&repo, format, args).await?,
+            SessionAction::Transcript(args) => session_transcript(&repo, format, args)?,
         },
         Command::Round(RoundArgs { action }) => match action {
             RoundAction::Start(args) => round_start(&repo, format, args).await?,
@@ -970,6 +1050,7 @@ pub async fn dispatch(cli: Cli) -> Result<u8> {
             ExecuteAction::Abandon(args) => execute_abandon(&repo, format, args).await?,
         },
         Command::Agent(AgentArgs { action }) => match action {
+            AgentAction::List(args) => agent_list(&repo, format, args)?,
             AgentAction::Show(args) => agent_show(&repo, format, args)?,
             AgentAction::Send(args) => agent_send(&repo, args).await?,
             AgentAction::Kill(args) => agent_kill(&repo, format, args).await?,
