@@ -5,6 +5,9 @@ Cargo.lock.bak
 # caucus runtime state — never tracked
 .caucus/
 
+# Claude Code per-project state — never tracked
+.claude/
+
 # editor / OS
 .DS_Store
 .idea/
