@@ -83,6 +83,7 @@ caucus init
 caucus doctor
 caucus session    new | list | show | converge | deadlock | kill | transcript | is-terminal
 caucus round      start | status | next
+caucus ceo        enable | disable | status | show
 caucus execute    start | status | finish | abandon
 caucus agent      show | send | kill
 caucus role       list | show
@@ -91,6 +92,29 @@ caucus watch      <session-id>       # foreground stdout event stream for the CE
 ```
 
 Every command accepts `--format json | text` (text is default) and `--repo <path>` (defaults to CWD). Exit codes follow `docs/design.md` §10.1 — `0` success, `2` user error, `3` environment error, `4` state corruption.
+
+### CEO mode (live toggle)
+
+A plain `claude` session has no idea it's supposed to act as the caucus CEO —
+it'll happily read the repo's source files and try to "understand the
+codebase" instead of spawning role panes. To toggle the CEO discipline
+*inside* an already-running Claude Code session, install the slash commands:
+
+```bash
+caucus ceo enable
+# writes .claude/commands/{caucus-ceo.md, caucus-ceo-off.md}
+```
+
+Then in your Claude session, type `/caucus-ceo` to activate CEO rules
+("don't read files, spawn the meeting, …") and `/caucus-ceo-off` to suspend
+them. No restart needed — the slash command body becomes a user turn that
+sets the rules from that point forward.
+
+```bash
+caucus ceo status     # is it installed?
+caucus ceo disable    # remove the slash command files
+caucus ceo show       # print the activation prompt verbatim
+```
 
 ### Self-terminating polling loops
 

@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+pub mod ceo_brief;
 pub mod commands;
 pub mod dispatch;
 pub mod exit;

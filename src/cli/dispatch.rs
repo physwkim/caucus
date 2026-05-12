@@ -225,6 +225,15 @@ pub async fn session_new(repo: &Path, format: OutputFormat, args: SessionNewArgs
         session.register_agent(role_name, outcome.manifest.agent_id);
     }
 
+    // Re-balance the window after all role panes are spawned. Otherwise the
+    // last role ends up in a 12.5% slice because each split-window halves
+    // the current pane. `tiled` produces a 2D grid for 3+ panes; for 2 it
+    // splits evenly. Includes the CEO's own pane in the layout — that's
+    // typically what the operator wants (everything visible at once).
+    tmux.rebalance_window_for_panes(session.agents.len() + 1, None)
+        .await
+        .ok();
+
     write_session(&session)?;
 
     let json = serde_json::json!({
@@ -1247,6 +1256,69 @@ pub async fn dispatch(cli: Cli) -> Result<u8> {
             SentinelAction::Write(args) => sentinel_write(&repo, format, args)?,
         },
         Command::Watch(args) => watch(&repo, args).await?,
+        Command::Ceo(CeoArgs { action }) => ceo(&repo, format, action)?,
     }
     Ok(exit::OK)
+}
+
+fn ceo(repo: &Path, format: OutputFormat, action: CeoAction) -> Result<()> {
+    match action {
+        CeoAction::Enable => {
+            let report = crate::cli::ceo_brief::enable(repo)?;
+            emit(
+                format,
+                &serde_json::json!({
+                    "commands_dir": report.commands_dir,
+                    "on_path": report.on_path,
+                    "off_path": report.off_path,
+                    "action": format!("{:?}", report.action),
+                    "enabled": report.enabled,
+                }),
+                || {
+                    format!(
+                        "CEO slash commands installed in {} ({:?}).\n\
+                         In your Claude Code session type `/caucus-ceo` to activate, \
+                         `/caucus-ceo-off` to deactivate. No restart needed.",
+                        report.commands_dir.display(),
+                        report.action
+                    )
+                },
+            );
+        }
+        CeoAction::Disable => {
+            let report = crate::cli::ceo_brief::disable(repo)?;
+            emit(
+                format,
+                &serde_json::json!({
+                    "commands_dir": report.commands_dir,
+                    "on_path": report.on_path,
+                    "off_path": report.off_path,
+                    "action": format!("{:?}", report.action),
+                    "enabled": report.enabled,
+                }),
+                || {
+                    format!(
+                        "CEO slash commands removed from {} ({:?}). \
+                         Already-running sessions keep whichever mode you last toggled.",
+                        report.commands_dir.display(),
+                        report.action
+                    )
+                },
+            );
+        }
+        CeoAction::Status => {
+            let on = crate::cli::ceo_brief::status(repo)?;
+            emit(format, &serde_json::json!({"enabled": on}), || {
+                if on {
+                    "CEO slash commands are installed (`/caucus-ceo` / `/caucus-ceo-off`)".into()
+                } else {
+                    "CEO slash commands are NOT installed — run `caucus ceo enable`".into()
+                }
+            });
+        }
+        CeoAction::Show => {
+            print!("{}", crate::cli::ceo_brief::CEO_ON_BODY);
+        }
+    }
+    Ok(())
 }

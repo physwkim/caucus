@@ -57,6 +57,27 @@ pub enum Command {
 
     /// Foreground watcher: stream events for one session to stdout.
     Watch(WatchArgs),
+
+    /// Toggle the CAUCUS CEO orientation block in `<repo>/CLAUDE.md`.
+    Ceo(CeoArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CeoArgs {
+    #[command(subcommand)]
+    pub action: CeoAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CeoAction {
+    /// Add (or refresh) the CEO block in this repo's CLAUDE.md.
+    Enable,
+    /// Remove the CEO block from CLAUDE.md (preserves the rest of the file).
+    Disable,
+    /// Report whether the CEO block is currently installed.
+    Status,
+    /// Print the CEO orientation prompt to stdout. No side effects.
+    Show,
 }
 
 #[derive(Debug, Args)]

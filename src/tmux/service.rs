@@ -165,6 +165,44 @@ impl TmuxService {
         Ok(())
     }
 
+    /// `tmux select-layout LAYOUT` — re-balance every pane in the current
+    /// window (or in the target window if `target` is set). The standard
+    /// preset names accepted are `even-horizontal`, `even-vertical`,
+    /// `main-horizontal`, `main-vertical`, and `tiled` (a 2D grid). After
+    /// `caucus session new --roles a,b,c,d` the four role panes end up at
+    /// 50% / 25% / 12.5% / 12.5% widths because each `split-window`
+    /// halves the current pane; calling this with `tiled` afterwards
+    /// produces an evenly-distributed grid that scales with the window.
+    pub async fn select_layout(&self, layout: &str, target: Option<&str>) -> Result<(), TmuxError> {
+        let mut args = vec!["select-layout".to_string()];
+        if let Some(t) = target {
+            args.push("-t".into());
+            args.push(t.into());
+        }
+        args.push(layout.into());
+        let _ = self.run(args).await?;
+        Ok(())
+    }
+
+    /// Pick a sensible balanced layout for `pane_count` panes in one window.
+    /// Used by `caucus session new` so role panes don't end up in geometric
+    /// halves. The contract:
+    /// - 1 pane → no-op (nothing to balance).
+    /// - 2 panes → `even-horizontal`.
+    /// - 3+ panes → `tiled`.
+    pub async fn rebalance_window_for_panes(
+        &self,
+        pane_count: usize,
+        target: Option<&str>,
+    ) -> Result<(), TmuxError> {
+        let layout = match pane_count {
+            0 | 1 => return Ok(()),
+            2 => "even-horizontal",
+            _ => "tiled",
+        };
+        self.select_layout(layout, target).await
+    }
+
     /// `tmux select-pane -t PANE -T TITLE`.
     pub async fn set_pane_title(&self, pane: &str, title: &str) -> Result<(), TmuxError> {
         let _ = self
