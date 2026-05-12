@@ -80,6 +80,11 @@ pub struct AutoArgs {
     /// `--roles architect,backend,reviewer`).
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub roles: Option<Vec<String>>,
+    /// Path to a markdown file used verbatim as the round-1 agenda. When
+    /// omitted, caucus synthesizes an agenda from the task and the picked
+    /// roles via `claude --print`.
+    #[arg(long)]
+    pub agenda_file: Option<PathBuf>,
     /// Meeting agenda timeout (seconds). caucus waits up to this long for
     /// every meeting agent's first sentinel before giving up. Default 1800.
     #[arg(long, default_value_t = 1800)]

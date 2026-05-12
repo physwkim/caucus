@@ -110,10 +110,17 @@ tolerance). Pin the roster explicitly to skip the synthesis call:
 caucus auto "<task>" --roles architect,backend,reviewer
 ```
 
-The agenda, decision, and pipeline shape are still hard-coded in this
-version (architect → backend → reviewer mapping, `--continue-meeting`
-+ `--retry-on-block 1`); later versions will replace each with their
-own synthesis step.
+**Agenda body.** When `--agenda-file` is omitted, caucus also synthesizes
+the round-1 agenda from the task + picked roles via `claude --print`.
+Pin the agenda by writing it to a file and pointing the flag at it:
+
+```bash
+caucus auto "<task>" --agenda-file /tmp/agenda.md
+```
+
+The decision (== task text verbatim) and pipeline shape are still
+hard-coded in this version; convergence judgment, adaptive retry
+budget, and optional merge-on-approve are next.
 
 Requires `caucus init --install-hook` to have run in the repo first
 (otherwise no Stop hook → no sentinels → `auto` would block forever on

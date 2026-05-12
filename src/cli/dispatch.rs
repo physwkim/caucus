@@ -2248,10 +2248,38 @@ pub async fn auto(repo: &Path, format: OutputFormat, args: AutoArgs) -> Result<(
         || format!("auto: session {session_id} created"),
     );
 
+    let agenda_source: &'static str;
+    let agenda_body = match args.agenda_file.as_ref() {
+        Some(path) => {
+            agenda_source = "file";
+            std::fs::read_to_string(path).map_err(|e| {
+                anyhow!("auto: failed to read --agenda-file {}: {e}", path.display())
+            })?
+        }
+        None => {
+            agenda_source = "synthesized";
+            synthesize_agenda(&args.task, &roles, args.model.as_deref()).await?
+        }
+    };
     let agenda_path = session_root.join("auto-agenda.md");
-    std::fs::write(&agenda_path, compose_auto_agenda(&args.task, &roles))?;
+    std::fs::write(&agenda_path, &agenda_body)?;
     let task_copy_path = session_root.join("auto-task.md");
     std::fs::write(&task_copy_path, &args.task)?;
+    emit(
+        format,
+        &serde_json::json!({
+            "auto_step": "agenda_composed",
+            "agenda_path": agenda_path,
+            "source": agenda_source,
+            "bytes": agenda_body.len(),
+        }),
+        || {
+            format!(
+                "auto: agenda ({agenda_source}) at {}",
+                agenda_path.display()
+            )
+        },
+    );
 
     let lead = roles.iter().find(|r| r.as_str() == "architect").cloned();
     let round_args = RoundStartArgs {
@@ -2315,42 +2343,35 @@ pub async fn auto(repo: &Path, format: OutputFormat, args: AutoArgs) -> Result<(
     Ok(())
 }
 
-fn compose_auto_agenda(task: &str, roles: &[String]) -> String {
-    let mut s = String::new();
-    s.push_str("# Round 1 — automated meeting (caucus auto)\n\n");
-    s.push_str("## Task\n\n");
-    s.push_str(task.trim());
-    s.push_str("\n\n## Your job\n\n");
-    for r in roles {
-        match r.as_str() {
-            "architect" => s.push_str(
-                "- **architect**: produce a concrete plan. Specific file paths, \
-                 concrete changes, no hedging. Don't write code.\n",
-            ),
-            "backend" => s.push_str(
-                "- **backend**: read the task; flag concerns or ambiguities you'd \
-                 hit during implementation. Suggest your approach. Don't write \
-                 code yet.\n",
-            ),
-            "reviewer" => s.push_str(
-                "- **reviewer**: identify what \"approved\" looks like and what \
-                 regressions to watch for.\n",
-            ),
-            other => s.push_str(&format!("- **{other}**: contribute per your role.\n")),
-        }
+/// Shell out to `claude --print` once. Single owner of every auto-mode
+/// synthesis call: builds the command, captures stdout, surfaces stderr on
+/// non-zero exit. `purpose` is what we tell the user in error messages
+/// (`role synthesis`, `agenda synthesis`, ...) so failures point at the
+/// specific decision point that broke.
+async fn claude_print(prompt: &str, model: Option<&str>, purpose: &str) -> Result<String> {
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.arg("--print").arg(prompt);
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
     }
-    s.push_str(
-        "\nEach role: write your response to your `response.md` and stop. \
-         Markdown OK.\n",
-    );
-    s
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| anyhow!("auto: `claude --print` for {purpose} failed to launch: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "auto: `claude --print` for {purpose} exited non-zero ({}). stderr: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Shell out to `claude --print` with a router prompt and the registry's
-/// role list, then parse the response into a role roster. The router is
-/// deliberately strict: it must pick from the registry's actual names so
-/// the rest of the auto pipeline can hand them to `session new` and
-/// `execute pipeline` without surprise.
+/// Synthesize a role roster from the task text. Strict: must pick from the
+/// registry's actual names so downstream `session new` / `execute pipeline`
+/// don't surprise us with an unknown role.
 async fn synthesize_roles(repo: &Path, task: &str, model: Option<&str>) -> Result<Vec<String>> {
     let registry = build_registry(repo)?;
     let available: Vec<String> = registry.names().map(|s| s.to_string()).collect();
@@ -2377,26 +2398,40 @@ async fn synthesize_roles(repo: &Path, task: &str, model: Option<&str>) -> Resul
             .join("\n"),
         task = task.trim()
     );
-    let mut cmd = tokio::process::Command::new("claude");
-    cmd.arg("--print").arg(&prompt);
-    if let Some(m) = model {
-        cmd.arg("--model").arg(m);
-    }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| anyhow!("auto: `claude --print` for role synthesis failed: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = claude_print(&prompt, model, "role synthesis").await?;
+    parse_role_list(&stdout, &available)
+        .map_err(|e| anyhow!("{e}\nRe-run with `--roles <...>` to skip synthesis."))
+}
+
+/// Synthesize a round-1 agenda body from the task and the picked roles.
+/// Unlike role synthesis, the body is free-form markdown — we only check
+/// that it is non-empty.
+async fn synthesize_agenda(task: &str, roles: &[String], model: Option<&str>) -> Result<String> {
+    let prompt = format!(
+        "You are composing a round-1 meeting agenda for caucus, an agent \
+         orchestrator. Every role's agent will receive this agenda \
+         simultaneously and respond from their role's angle.\n\n\
+         Compose a SHORT (under 300 words) markdown agenda that:\n\
+         1. States the task in one or two sentences.\n\
+         2. Lists what each role should produce (one bullet per role).\n\
+         3. Reminds every role to write their response to `response.md` \
+            and stop.\n\n\
+         Roles in the meeting: {roles}\n\n\
+         Output ONLY the markdown agenda. No preamble, no explanation, no \
+         code fences.\n\n\
+         Task:\n{task}",
+        roles = roles.join(", "),
+        task = task.trim()
+    );
+    let stdout = claude_print(&prompt, model, "agenda synthesis").await?;
+    let body = stdout.trim().to_string();
+    if body.is_empty() {
         return Err(anyhow!(
-            "auto: `claude --print` exited non-zero ({}). stderr: {}\n\
-             Re-run with `--roles <...>` to skip synthesis.",
-            output.status,
-            stderr.trim()
+            "auto: claude returned an empty agenda body. \
+             Re-run with `--agenda-file <path>` to skip synthesis."
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_role_list(&stdout, &available)
+    Ok(body)
 }
 
 /// Robust parser for `claude --print` output. Tokenises on any
@@ -2506,26 +2541,6 @@ mod auto_tests {
             err.to_string().contains("implementer"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn agenda_embeds_task_text_and_canonical_role_blurbs() {
-        let body = compose_auto_agenda(
-            "fix the foo bug in bar.rs",
-            &v(&["architect", "backend", "reviewer"]),
-        );
-        assert!(body.contains("fix the foo bug in bar.rs"));
-        assert!(body.contains("**architect**"));
-        assert!(body.contains("**backend**"));
-        assert!(body.contains("**reviewer**"));
-        assert!(body.contains("response.md"));
-    }
-
-    #[test]
-    fn agenda_falls_back_to_generic_blurb_for_unknown_roles() {
-        let body = compose_auto_agenda("do thing", &v(&["scribe"]));
-        assert!(body.contains("**scribe**"));
-        assert!(body.contains("contribute per your role"));
     }
 
     #[test]
