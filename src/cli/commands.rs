@@ -116,6 +116,14 @@ pub struct AutoArgs {
     /// Optional base ref for the pipeline worktree.
     #[arg(long)]
     pub base_ref: Option<String>,
+    /// When the pipeline returns `approved`, immediately
+    /// `git merge --no-ff --no-edit <worktree-branch>` into the repo's
+    /// current branch. Off by default — caucus deliberately leaves the
+    /// merge decision to a human. Refuses to merge if the repo is in
+    /// detached HEAD or if the merge conflicts; in that case the merge
+    /// state is left for you to resolve / abort.
+    #[arg(long)]
+    pub merge_on_approve: bool,
 }
 
 #[derive(Debug, Args)]

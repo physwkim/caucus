@@ -130,7 +130,13 @@ retries this task probably needs (0 = trivial, 3 = very complex).
 Pass an explicit integer (e.g. `--retry-on-block 0` or
 `--retry-on-block 2`) to skip the synthesis.
 
-Optional merge-on-approve is the only remaining v2 decision point.
+**Merge on approve.** Pass `--merge-on-approve` to opt in to an
+automatic `git merge --no-ff --no-edit <worktree-branch>` into the
+repo's current branch when the pipeline returns `approved`. Off by
+default — without the flag, caucus prints the branch name and
+leaves the merge for you. Refuses to merge from a detached HEAD;
+on conflict, leaves the merge state in place and surfaces an error
+(no `git merge --abort` performed silently).
 
 Requires `caucus init --install-hook` to have run in the repo first
 (otherwise no Stop hook → no sentinels → `auto` would block forever on

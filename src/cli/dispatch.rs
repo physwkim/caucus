@@ -1299,7 +1299,7 @@ pub async fn execute_pipeline(
     repo: &Path,
     format: OutputFormat,
     args: ExecutePipelineCliArgs,
-) -> Result<()> {
+) -> Result<crate::execute::PipelineOutcome> {
     let id = parse_session_id(&args.session_id)?;
     let mut session = read_session(repo, id)?;
     if matches!(session.state, SessionState::MeetingConverged) {
@@ -1444,7 +1444,7 @@ pub async fn execute_pipeline(
             )
         },
     );
-    Ok(())
+    Ok(outcome)
 }
 
 /// Find the most recent Meeting-kind agent for `role` in this session.
@@ -2102,7 +2102,9 @@ pub async fn dispatch(cli: Cli) -> Result<u8> {
         },
         Command::Execute(ExecuteArgs { action }) => match action {
             ExecuteAction::Start(args) => execute_start(&repo, format, args).await?,
-            ExecuteAction::Pipeline(args) => execute_pipeline(&repo, format, args).await?,
+            ExecuteAction::Pipeline(args) => {
+                execute_pipeline(&repo, format, args).await?;
+            }
             ExecuteAction::Status(args) => execute_status(&repo, format, args)?,
             ExecuteAction::Finish(args) => execute_finish(&repo, format, args).await?,
             ExecuteAction::Abandon(args) => execute_abandon(&repo, format, args).await?,
@@ -2382,23 +2384,96 @@ pub async fn auto(repo: &Path, format: OutputFormat, args: AutoArgs) -> Result<(
         placement: args.placement,
         continue_meeting: true,
     };
-    execute_pipeline(repo, format, pipeline_args).await?;
+    let pipeline_outcome = execute_pipeline(repo, format, pipeline_args).await?;
+
+    // --merge-on-approve: opt-in. Only acts on `Approved`; everything else
+    // (NoReviewer, Blocked, StepFailed) preserves the existing "human
+    // decides" behaviour with a clear surface in the auto/complete payload.
+    let merge_report = if args.merge_on_approve
+        && matches!(
+            pipeline_outcome.status,
+            crate::execute::PipelineStatus::Approved
+        ) {
+        match merge_branch_into_head(repo, &pipeline_outcome.worktree_branch).await {
+            Ok(into) => serde_json::json!({
+                "attempted": true,
+                "merged": true,
+                "into_branch": into,
+                "from_branch": pipeline_outcome.worktree_branch,
+            }),
+            Err(err) => serde_json::json!({
+                "attempted": true,
+                "merged": false,
+                "from_branch": pipeline_outcome.worktree_branch,
+                "error": err.to_string(),
+            }),
+        }
+    } else {
+        serde_json::json!({ "attempted": false })
+    };
 
     emit(
         format,
         &serde_json::json!({
             "auto": "complete",
             "session_id": session_id.to_string(),
+            "pipeline_status": pipeline_outcome.status,
+            "worktree_branch": pipeline_outcome.worktree_branch,
+            "merge": merge_report,
             "next_action":
-                "auto run done. Read the final pipeline status emitted above. If \
-                 `approved`, merge the worktree branch (caucus deliberately does NOT \
-                 auto-merge). If `blocked` or `step_failed`, open the session and \
-                 either re-pipeline with more retry budget, escalate to a human, or \
-                 `caucus execute abandon` the worktree.",
+                "auto run done. Read the final pipeline status above. If \
+                 `approved` and you did NOT pass --merge-on-approve, merge the \
+                 worktree branch yourself. If `blocked` or `step_failed`, open \
+                 the session and either re-pipeline with more retry budget, \
+                 escalate to a human, or `caucus execute abandon`.",
         }),
         || format!("auto run complete for session {session_id}"),
     );
     Ok(())
+}
+
+/// Run `git merge --no-ff --no-edit <branch>` in the repo. Returns the
+/// name of the branch we merged INTO so callers can log it. Refuses to
+/// merge from a detached HEAD; on conflict, returns an error and leaves
+/// the merge state in place for the user to resolve / abort.
+async fn merge_branch_into_head(repo: &Path, branch: &str) -> Result<String> {
+    let repo_str = repo.to_string_lossy();
+    let head_out = tokio::process::Command::new("git")
+        .args(["-C", &repo_str, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .await
+        .map_err(|e| anyhow!("auto: git rev-parse failed to launch: {e}"))?;
+    if !head_out.status.success() {
+        return Err(anyhow!(
+            "auto: `git rev-parse --abbrev-ref HEAD` exited non-zero: {}",
+            String::from_utf8_lossy(&head_out.stderr).trim()
+        ));
+    }
+    let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+    if head == "HEAD" || head.is_empty() {
+        return Err(anyhow!(
+            "auto --merge-on-approve: repo at {} is in detached HEAD; \
+             refusing to merge. Check out a branch first.",
+            repo.display()
+        ));
+    }
+    let merge_out = tokio::process::Command::new("git")
+        .args(["-C", &repo_str, "merge", "--no-ff", "--no-edit", branch])
+        .output()
+        .await
+        .map_err(|e| anyhow!("auto: git merge failed to launch: {e}"))?;
+    if !merge_out.status.success() {
+        return Err(anyhow!(
+            "auto --merge-on-approve: `git merge --no-ff --no-edit {branch}` \
+             exited non-zero. stderr: {}\n\
+             The merge state is left in place at {}. Run `git -C {} merge --abort` \
+             to back out, or resolve conflicts and commit yourself.",
+            String::from_utf8_lossy(&merge_out.stderr).trim(),
+            repo.display(),
+            repo.display()
+        ));
+    }
+    Ok(head)
 }
 
 /// Shell out to `claude --print` once. Single owner of every auto-mode
