@@ -7,3 +7,4 @@ pub mod derive_state;
 pub mod lane_event;
 pub mod manifest;
 pub mod provenance;
+pub mod spawn;
