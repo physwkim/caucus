@@ -2346,13 +2346,35 @@ pub async fn auto(repo: &Path, format: OutputFormat, args: AutoArgs) -> Result<(
     session_converge(repo, format, converge_args)?;
 
     let (plan_role, impl_role, review_role) = pick_pipeline_roles(&roles)?;
+
+    let retry_source: &'static str;
+    let retry_on_block = match args.retry_on_block {
+        Some(n) => {
+            retry_source = "explicit";
+            n
+        }
+        None => {
+            retry_source = "synthesized";
+            synthesize_retry_budget(&args.task, args.model.as_deref()).await?
+        }
+    };
+    emit(
+        format,
+        &serde_json::json!({
+            "auto_step": "retry_budget_picked",
+            "retry_on_block": retry_on_block,
+            "source": retry_source,
+        }),
+        || format!("auto: retry_on_block ({retry_source}) = {retry_on_block}"),
+    );
+
     let pipeline_args = ExecutePipelineCliArgs {
         session_id: session_id.to_string(),
         task_file: session_root.join("decision.md"),
         plan: plan_role,
         implement: impl_role,
         review: review_role,
-        retry_on_block: args.retry_on_block,
+        retry_on_block,
         step_timeout_secs: args.step_timeout_secs,
         base_ref: args.base_ref,
         model: args.model,
@@ -2521,6 +2543,58 @@ async fn synthesize_decision(
 /// `(role, body)` pairs in the same order as `roles`. Missing files error
 /// (round_wait should have already gated on non-empty responses; a missing
 /// file at this point is a state-corruption bug, not a quiet skip).
+/// Ask claude how many in-pipeline retries make sense for this task. The
+/// pipeline's own `--retry-on-block N` triggers when the reviewer flags
+/// BLOCK; each retry re-plans → re-implements with the review findings
+/// folded in. We bound the synthesis to [0, 3] so a runaway estimate
+/// can't burn through a worktree's worth of agent runs.
+async fn synthesize_retry_budget(task: &str, model: Option<&str>) -> Result<u32> {
+    let prompt = format!(
+        "Predict how many implementation retry attempts make sense before \
+         declaring a caucus task too hard. A retry happens when the reviewer \
+         flags the implementer's code BLOCK; the next retry re-plans and \
+         re-implements with the review findings folded in.\n\n\
+         Output ONLY a single integer between 0 and 3, no other text.\n\
+         - 0: trivial change (mechanical refactor, doc-only fix).\n\
+         - 1: standard task (one bug fix, one feature, moderate complexity).\n\
+         - 2: complex (multi-file feature, subtle invariants, design choices).\n\
+         - 3: very complex (cross-crate change, performance work, race conditions).\n\n\
+         Task:\n{task}",
+        task = task.trim()
+    );
+    let stdout = claude_print(&prompt, model, "retry-budget synthesis").await?;
+    parse_retry_budget(&stdout)
+        .map_err(|e| anyhow!("{e}\nRe-run with `--retry-on-block <0..=3>` to skip synthesis."))
+}
+
+/// Extract the first integer in [0, 3] from the model's response. Tolerates
+/// prose framing ("I think 2 attempts is right") and trailing newlines.
+fn parse_retry_budget(stdout: &str) -> Result<u32> {
+    let mut current = String::new();
+    for c in stdout.chars() {
+        if c.is_ascii_digit() {
+            current.push(c);
+        } else if !current.is_empty() {
+            if let Ok(n) = current.parse::<u32>() {
+                if n <= 3 {
+                    return Ok(n);
+                }
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        if let Ok(n) = current.parse::<u32>() {
+            if n <= 3 {
+                return Ok(n);
+            }
+        }
+    }
+    Err(anyhow!(
+        "auto: claude returned no integer in [0, 3]. Got: {stdout:?}"
+    ))
+}
+
 fn read_round_responses(
     session_root: &Path,
     round: u32,
@@ -2719,6 +2793,47 @@ mod auto_tests {
         assert_eq!(got[1].0, "architect");
         assert_eq!(got[1].1, "plan: do X");
         assert_eq!(got[2].0, "reviewer");
+    }
+
+    #[test]
+    fn parse_retry_budget_bare_integer() {
+        assert_eq!(parse_retry_budget("1").unwrap(), 1);
+        assert_eq!(parse_retry_budget("0").unwrap(), 0);
+        assert_eq!(parse_retry_budget("3").unwrap(), 3);
+    }
+
+    #[test]
+    fn parse_retry_budget_handles_trailing_whitespace() {
+        assert_eq!(parse_retry_budget("2\n").unwrap(), 2);
+        assert_eq!(parse_retry_budget("  1  \n").unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_retry_budget_extracts_from_prose() {
+        // Models occasionally hedge despite "ONLY an integer" instructions.
+        assert_eq!(
+            parse_retry_budget("I think 2 attempts is right").unwrap(),
+            2
+        );
+        assert_eq!(parse_retry_budget("Estimated retries: 1").unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_retry_budget_skips_out_of_range_integers() {
+        // 7 is out of range, then "2" is the first valid hit.
+        assert_eq!(parse_retry_budget("7 is too many, try 2").unwrap(), 2);
+    }
+
+    #[test]
+    fn parse_retry_budget_rejects_no_digits() {
+        let err = parse_retry_budget("no clue").unwrap_err();
+        assert!(err.to_string().contains("no integer in [0, 3]"));
+    }
+
+    #[test]
+    fn parse_retry_budget_rejects_only_out_of_range_digits() {
+        let err = parse_retry_budget("9, 8, 7").unwrap_err();
+        assert!(err.to_string().contains("no integer in [0, 3]"));
     }
 
     #[test]

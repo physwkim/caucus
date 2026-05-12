@@ -122,12 +122,15 @@ caucus auto "<task>" --agenda-file /tmp/agenda.md
 `decision.md` from the task + every role's `response.md` via a third
 `claude --print` call, then hands it to `session converge` and from
 there to the pipeline. Pass `--decision-file <path>` to skip this
-step and supply your own decision verbatim. v2c only loops round 1
-once — "should we run another round?" judgment is a later commit.
+step and supply your own decision verbatim.
 
-The pipeline shape (plan/impl/review mapping + `--continue-meeting`
-+ `--retry-on-block 1`) is still hard-coded; adaptive retry budget
-and optional merge-on-approve are next.
+**Retry budget.** When `--retry-on-block` is omitted, caucus shells
+out to `claude --print` once more to estimate how many in-pipeline
+retries this task probably needs (0 = trivial, 3 = very complex).
+Pass an explicit integer (e.g. `--retry-on-block 0` or
+`--retry-on-block 2`) to skip the synthesis.
+
+Optional merge-on-approve is the only remaining v2 decision point.
 
 Requires `caucus init --install-hook` to have run in the repo first
 (otherwise no Stop hook → no sentinels → `auto` would block forever on

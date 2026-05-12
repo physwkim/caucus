@@ -98,9 +98,12 @@ pub struct AutoArgs {
     /// Per-pipeline-step sentinel timeout (seconds). Default 1800.
     #[arg(long, default_value_t = 1800)]
     pub step_timeout_secs: u64,
-    /// Retry budget for the reviewer's BLOCK verdict. Default 1.
-    #[arg(long, default_value_t = 1)]
-    pub retry_on_block: u32,
+    /// Retry budget for the reviewer's BLOCK verdict. When omitted,
+    /// caucus shells out to `claude --print` to pick a value between 0
+    /// and 3 from the task description. Pass an explicit integer to
+    /// skip the synthesis call.
+    #[arg(long)]
+    pub retry_on_block: Option<u32>,
     /// Pane placement. Default `window` — auto runs are unattended, so
     /// per-role tabs read more cleanly than split panes when you come
     /// back to inspect.
