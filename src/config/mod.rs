@@ -9,9 +9,6 @@
 //! See `docs/design.md` §6.
 
 pub mod roles;
-pub mod settings;
-
-pub use settings::{Settings, SettingsError, TeammateMode};
 
 use std::path::{Path, PathBuf};
 

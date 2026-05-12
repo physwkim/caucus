@@ -8,7 +8,7 @@
 | # | 결정 |
 |---|---|
 | 1 | 이름: `caucus`. 경로: `~/codes/caucus`. crates.io 미등록 확인. |
-| 2 | `teammateMode` 기본 = `tmux`. v0는 tmux 모드만 구현. `in-process`, `auto`는 v1+. |
+| 2 | 실행 모델 = **tmux 전용**. agent는 항상 별도 tmux pane의 `claude` CLI 프로세스. in-process / auto 같은 모드는 채택하지 않음 (§13 non-goals). |
 | 3 | CEO = 사용자의 메인 claude 세션. CEO가 caucus CLI를 shell로 호출. |
 | 4 | Sentinel 포맷 = `.caucus/<session_id>/agents/<agent_id>.sentinel.json`, fields: `{agent_id, ts, kind: stop \| tool_blocked \| error, last_message, exit_state}`. Claude `Stop` hook이 작성. |
 | 5 | 회의 단계 = read-only (worktree 없음). 실행 단계 = worktree per agent. |
@@ -397,7 +397,7 @@ caucus/
     │   ├── manager.rs       (생성)
     │   └── cleanup.rs       (직렬 큐 + depth-desc 정렬, tokio::mpsc consumer)
     ├── agent/
-    │   ├── spawn.rs         (teammateMode에 따라 디스패치. v0는 tmux::spawn 호출)
+    │   ├── spawn.rs         (RoleSpec → 새 tmux pane + 새 AgentManifest)
     │   ├── manifest.rs      (AgentManifest 영속화: .json + .md 페어)
     │   ├── lane_event.rs    (LaneEvent enum + append)
     │   ├── derive_state.rs  (4-tuple + pane_hint → DerivedState)
@@ -643,40 +643,40 @@ CEO → (kodex MCP):
 
 ---
 
-## 13. v0 스코프 vs deferred
+## 13. 스코프와 non-goals
 
-### v0 (MVP)
-- `caucus init`, `caucus doctor`
-- `caucus session new/list/show/kill`
+### v0 안에 들어 있는 것
+- `caucus init` (+ `--install-hook`), `caucus doctor`
+- `caucus session new/list/show/converge/deadlock/kill/transcript`
+- `caucus session deadlock --escalate | --explore` 정책 분기
 - `caucus round start/status/next`
-- `caucus session converge/deadlock`
 - `caucus execute start/status/finish/abandon`
-- `caucus agent show/send/kill`
-- `caucus sentinel write` + watcher
-- `caucus watch` foreground event stream
-- tmux 모드만 (`teammateMode = "tmux"`)
-- AgentManifest + LaneEvent + 8-state derived_state
-- worktree per execute-phase agent
-- Role: architect / backend / reviewer / qa / scribe (5종, 전부 prompt template 작성)
-- 기본 합의 정책: CEO 결단
+- `caucus agent list/show/send/kill`
+- `caucus role list/show`
+- `caucus sentinel write` + notify 기반 watcher
+- `caucus watch` 포그라운드 이벤트 스트림 (heartbeat + SIGINT + SIGUSR2)
+- AgentManifest + LaneEvent + 8-state derived_state + commit_provenance
+- 회의 단계 read-only / 실행 단계 worktree per role
+- 5종 role (architect / backend / reviewer / qa / scribe) + role 별 `model` override
+- 합의 정책: CEO 결단
 
-### v1+ (deferred)
-- `teammateMode = "in-process"` — claw-code 스타일 std::thread spawn
-- `teammateMode = "auto"` — 휴리스틱 (역할별, 작업 규모별)
-- `--explore-on-disagree` — 옵션별 worktree 비교 (dmux multi-select 정신)
-- `--escalate-on-disagree` — Discord/Slack 알림 (clawhip 정신)
-- LLM judge 합의 (CEO 외 별도 judge agent)
-- TUI (ratatui)
-- claude `Stop` hook 자동 설치 (현재는 `caucus doctor`가 명령 출력만)
-- 멀티 session 동시 (현재 v0도 가능은 하지만 격리 검증 미흡)
-- Notion / kodex MCP 어댑터 (별도 레포 또는 plugin)
-- Web view (외부 관찰자용)
-- 멀티 model — Opus(CEO) + Sonnet(agent) 같은 분담
+### Non-goals (v1, v2 어디서도 안 만듦)
+- **in-process 실행 모델.** caucus는 tmux 전용. 다른 형태로 agent를 띄우는 모드(같은 프로세스의 worker thread, fork, container 등)는 채택하지 않음. 격리·관찰성·기존 dmux 호환성을 위해 OS 프로세스 + 별도 pane이라는 단일 모델만 유지.
+- **`teammateMode` 같은 실행 모델 선택기.** 모드가 하나뿐이라서 선택지 자체가 불필요.
+- **LLM judge 합의.** 합의 판단은 CEO Claude가 자기 컨텍스트에서 직접 함. 별도 judge agent가 들어오면 가짜 자율성이 생기고 결과 추적이 흐려짐.
+- **TUI (ratatui 등).** caucus는 CEO Claude가 호출하는 인프라 CLI. 사람 손으로 직접 조작하는 도구가 필요하면 `dmux`가 그 자리를 차지하고 있음.
+- **자체 swarm/agent marketplace.** 98개 agent / 자기학습 swarm 같은 표면은 의도적으로 안 만듦.
 
-### 명시적 비 목표
-- **caucus는 Claude Code의 대체가 아님**. agent 한 명을 위한 도구가 아니라 여러 agent의 협업.
-- **caucus는 dmux의 대체가 아님**. dmux의 "사람이 멀티 agent 운영" 모델이 필요하면 dmux 그대로 씀.
-- **caucus는 ruflo의 대체가 아님**. 98 agent, 자기학습 swarm 같은 거대 표면 안 만듦.
+### 차후 확장 후보 (caucus가 직접 안 만들고 별도 레포 / plugin으로 갈 수 있는 항목)
+- claude `Stop` hook 자동 설치는 이미 `caucus init --install-hook`으로 제공됨.
+- `--escalate-on-deadlock` Discord/Slack webhook 어댑터 (현재 `escalated.signal` 파일을 외부 watcher가 읽도록 위임).
+- Notion / kodex MCP 어댑터 — CEO가 자기 MCP로 처리하면 되므로 caucus 코어에 추가하지 않음.
+- 외부 관찰자용 web view — 별도 컨슈머가 `.caucus/` 디렉터리를 직접 읽으면 충분.
+
+### caucus가 명시적으로 *아닌* 것
+- **Claude Code의 대체가 아님.** agent 한 명을 위한 도구가 아니라 여러 agent의 협업.
+- **dmux의 대체가 아님.** dmux의 "사람이 멀티 agent 운영" 모델이 필요하면 dmux 그대로 씀.
+- **ruflo의 대체가 아님.** 거대 swarm 플랫폼이 필요하면 ruflo로 가는 게 맞음.
 
 ---
 

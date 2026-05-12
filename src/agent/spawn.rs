@@ -1,7 +1,6 @@
 //! Agent spawn: build the `claude` command line from a [`RoleSpec`], spawn a
-//! tmux pane to run it, and persist the agent manifest. Only the `tmux`
-//! teammate mode is implemented in v0; `in-process` and `auto` fall back to
-//! tmux for now (see `docs/design.md` §13 deferred).
+//! tmux pane to run it, and persist the agent manifest. tmux is the only
+//! supported execution model in caucus — see `docs/design.md` §14 (non-goals).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

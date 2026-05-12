@@ -39,12 +39,9 @@ Requirements:
 From any git repository where you want to run a meeting:
 
 ```bash
-# 1. Bootstrap .caucus/ and the sentinel hook script.
-caucus init
-
-# 2. Install the Claude Stop hook in ~/.claude/settings.json once. The
-#    `caucus init` output prints the exact JSON snippet — paste it under
-#    "hooks": { "Stop": [...] }.
+# 1. Bootstrap .caucus/ and the sentinel hook script, and merge the
+#    Claude Stop hook into ~/.claude/settings.json (with .bak backup).
+caucus init --install-hook
 
 # 3. Health check.
 caucus doctor
