@@ -43,6 +43,12 @@ pub struct SpawnRequest<'a> {
     /// is in env, not on the command line, so an idle pane can be reused
     /// across rounds.
     pub initial_prompt_path: Option<PathBuf>,
+    /// If true, the spawned agent CLI gets the "skip every permission
+    /// prompt" flag (`claude --dangerously-skip-permissions`). The role's
+    /// own `allowed_tools` allowlist is the actual safety boundary; this
+    /// only suppresses the interactive confirmations that block agents
+    /// inside a tmux pane.
+    pub skip_permissions: bool,
 }
 
 /// Final result of a successful spawn.
@@ -77,6 +83,7 @@ pub fn render_command_line(
     response_path: &Path,
     initial_prompt_path: Option<&Path>,
     model: &str,
+    skip_permissions: bool,
 ) -> String {
     // The agent reads the response_path from its env, but we also pass it
     // as part of the first user message so Claude doesn't have to peek at
@@ -93,6 +100,9 @@ pub fn render_command_line(
     if !allowed.is_empty() {
         cmd.push_str(" --allowed-tools ");
         cmd.push_str(&shell_quote(&allowed));
+    }
+    if skip_permissions {
+        cmd.push_str(" --dangerously-skip-permissions");
     }
 
     if let Some(prompt_file) = initial_prompt_path {
@@ -138,6 +148,7 @@ pub async fn spawn(tmux: &TmuxService, req: SpawnRequest<'_>) -> Result<SpawnOut
         &req.response_path,
         req.initial_prompt_path.as_deref(),
         &model,
+        req.skip_permissions,
     );
 
     // Manifest first, so the manifest path exists by the time the pane
@@ -227,6 +238,7 @@ mod tests {
             Path::new("/r.md"),
             None,
             DEFAULT_MODEL, // request-level
+            false,
         );
         // render_command_line itself takes a model argument; the precedence
         // is resolved in spawn() before this call. Sanity: our request-level
@@ -244,6 +256,7 @@ mod tests {
             Path::new("/repo/.caucus/s/round-1/response-reviewer.md"),
             None,
             DEFAULT_MODEL,
+            false,
         );
         assert!(cmd.contains(&format!("--model {DEFAULT_MODEL}")));
         assert!(cmd.contains("--permission-mode default"));
@@ -251,6 +264,7 @@ mod tests {
         assert!(cmd.contains("--allowed-tools 'Glob,Grep,Read'"));
         // No initial prompt → no --print arg.
         assert!(!cmd.contains("--print"));
+        assert!(!cmd.contains("--dangerously-skip-permissions"));
     }
 
     #[test]
@@ -265,6 +279,7 @@ mod tests {
             &response,
             Some(&prompt),
             DEFAULT_MODEL,
+            false,
         );
         assert!(cmd.contains("--print"));
         assert!(cmd.contains("/p/agenda.md"));
@@ -282,7 +297,23 @@ mod tests {
             Path::new("/r.md"),
             None,
             "claude-opus-4-7",
+            false,
         );
         assert!(!cmd.contains("--allowed-tools"));
+    }
+
+    #[test]
+    fn skip_permissions_appends_dangerous_flag() {
+        let role = reviewer_spec();
+        let cmd = render_command_line(
+            &role,
+            Path::new("/repo"),
+            Path::new("/sys.md"),
+            Path::new("/r.md"),
+            None,
+            DEFAULT_MODEL,
+            true,
+        );
+        assert!(cmd.contains("--dangerously-skip-permissions"));
     }
 }

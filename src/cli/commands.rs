@@ -113,6 +113,12 @@ pub struct SessionNewArgs {
     /// Optional model id (forwarded to each spawned `claude`).
     #[arg(long)]
     pub model: Option<String>,
+    /// Opt back into the agent CLI's permission prompts. Default behaviour
+    /// is to pass `--dangerously-skip-permissions` to every sub-agent on the
+    /// assumption that the role's `allowed_tools` list is the real safety
+    /// boundary — interactive prompts only freeze the pane.
+    #[arg(long)]
+    pub require_permissions: bool,
 }
 
 #[derive(Debug, Args)]
@@ -220,6 +226,10 @@ pub struct ExecuteStartCliArgs {
     pub base_ref: Option<String>,
     #[arg(long)]
     pub model: Option<String>,
+    /// Opt back into the agent CLI's permission prompts (see
+    /// `caucus session new --require-permissions`).
+    #[arg(long)]
+    pub require_permissions: bool,
 }
 
 #[derive(Debug, Args)]

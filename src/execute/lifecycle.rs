@@ -64,6 +64,9 @@ pub struct ExecuteStartRequest<'a> {
     pub base_ref: Option<String>,
     /// Optional sentinel hook path forwarded into spawn().
     pub sentinel_hook_path: Option<PathBuf>,
+    /// Pass `--dangerously-skip-permissions` to the spawned agent CLI. Default
+    /// `true` from the CLI (opt out via `--require-permissions`).
+    pub skip_permissions: bool,
 }
 
 /// Files materialised under `<session_root>/execute/<role>/`.
@@ -148,6 +151,7 @@ pub async fn start(
             model: req.model,
             title: req.title,
             initial_prompt_path: Some(layout.task_path()),
+            skip_permissions: req.skip_permissions,
         },
     )
     .await?;

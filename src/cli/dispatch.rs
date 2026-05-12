@@ -216,6 +216,7 @@ pub async fn session_new(repo: &Path, format: OutputFormat, args: SessionNewArgs
                 model: args.model.clone(),
                 title: Some(role.name.clone()),
                 initial_prompt_path: None,
+                skip_permissions: !args.require_permissions,
             },
         )
         .await?;
@@ -457,6 +458,7 @@ async fn session_deadlock_explore(
                 title: Some(format!("{role_name}-explore")),
                 base_ref: args.base_ref.clone(),
                 sentinel_hook_path: Some(repo.join(".caucus").join("bin").join("sentinel-stop")),
+                skip_permissions: true,
             },
         )
         .await?;
@@ -669,6 +671,7 @@ pub async fn execute_start(
             title: Some(format!("{}-execute", args.role)),
             base_ref: args.base_ref,
             sentinel_hook_path: Some(repo.join(".caucus").join("bin").join("sentinel-stop")),
+            skip_permissions: !args.require_permissions,
         },
     )
     .await?;
