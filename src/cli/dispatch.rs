@@ -2206,13 +2206,29 @@ pub async fn auto(repo: &Path, format: OutputFormat, args: AutoArgs) -> Result<(
             repo.display()
         ));
     }
-    if args.roles.is_empty() {
-        return Err(anyhow!("--roles cannot be empty"));
-    }
+    let roles_source = if args.roles.is_some() {
+        "explicit"
+    } else {
+        "synthesized"
+    };
+    let roles = match args.roles.clone() {
+        Some(rs) if !rs.is_empty() => rs,
+        Some(_) => return Err(anyhow!("--roles passed but empty")),
+        None => synthesize_roles(repo, &args.task, args.model.as_deref()).await?,
+    };
+    emit(
+        format,
+        &serde_json::json!({
+            "auto_step": "roles_picked",
+            "roles": roles,
+            "source": roles_source,
+        }),
+        || format!("auto: roles ({roles_source}) = {roles:?}"),
+    );
 
     let session_args = SessionNewArgs {
         topic: args.task.clone(),
-        roles: args.roles.clone(),
+        roles: roles.clone(),
         max_rounds: 5,
         model: args.model.clone(),
         require_permissions: false,
@@ -2227,21 +2243,17 @@ pub async fn auto(repo: &Path, format: OutputFormat, args: AutoArgs) -> Result<(
         &serde_json::json!({
             "auto_step": "session_new",
             "session_id": session_id.to_string(),
-            "roles": args.roles,
+            "roles": roles,
         }),
         || format!("auto: session {session_id} created"),
     );
 
     let agenda_path = session_root.join("auto-agenda.md");
-    std::fs::write(&agenda_path, compose_auto_agenda(&args.task, &args.roles))?;
+    std::fs::write(&agenda_path, compose_auto_agenda(&args.task, &roles))?;
     let task_copy_path = session_root.join("auto-task.md");
     std::fs::write(&task_copy_path, &args.task)?;
 
-    let lead = args
-        .roles
-        .iter()
-        .find(|r| r.as_str() == "architect")
-        .cloned();
+    let lead = roles.iter().find(|r| r.as_str() == "architect").cloned();
     let round_args = RoundStartArgs {
         session_id: session_id.to_string(),
         agenda_file: agenda_path,
@@ -2269,7 +2281,7 @@ pub async fn auto(repo: &Path, format: OutputFormat, args: AutoArgs) -> Result<(
     };
     session_converge(repo, format, converge_args)?;
 
-    let (plan_role, impl_role, review_role) = pick_pipeline_roles(&args.roles)?;
+    let (plan_role, impl_role, review_role) = pick_pipeline_roles(&roles)?;
     let pipeline_args = ExecutePipelineCliArgs {
         session_id: session_id.to_string(),
         task_file: session_root.join("decision.md"),
@@ -2332,6 +2344,90 @@ fn compose_auto_agenda(task: &str, roles: &[String]) -> String {
          Markdown OK.\n",
     );
     s
+}
+
+/// Shell out to `claude --print` with a router prompt and the registry's
+/// role list, then parse the response into a role roster. The router is
+/// deliberately strict: it must pick from the registry's actual names so
+/// the rest of the auto pipeline can hand them to `session new` and
+/// `execute pipeline` without surprise.
+async fn synthesize_roles(repo: &Path, task: &str, model: Option<&str>) -> Result<Vec<String>> {
+    let registry = build_registry(repo)?;
+    let available: Vec<String> = registry.names().map(|s| s.to_string()).collect();
+    if available.is_empty() {
+        return Err(anyhow!(
+            "auto: role registry is empty; no roles to synthesize from"
+        ));
+    }
+    let prompt = format!(
+        "You are a router for caucus, an agent orchestrator. Pick 1-5 roles \
+         from this exact list for the task below.\n\n\
+         Available roles:\n{available}\n\n\
+         Always include at least one role that writes code (typically \
+         `backend`) and at least one role that reviews (typically `reviewer`). \
+         When the task is design-heavy or ambiguous, include `architect`. \
+         Add `qa` only if the task explicitly involves test coverage.\n\n\
+         Output ONLY a comma-separated list of role names from the list \
+         above, no other text, no markdown.\n\n\
+         Task:\n{task}",
+        available = available
+            .iter()
+            .map(|n| format!("- {n}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        task = task.trim()
+    );
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.arg("--print").arg(&prompt);
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    }
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| anyhow!("auto: `claude --print` for role synthesis failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "auto: `claude --print` exited non-zero ({}). stderr: {}\n\
+             Re-run with `--roles <...>` to skip synthesis.",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_role_list(&stdout, &available)
+}
+
+/// Robust parser for `claude --print` output. Tokenises on any
+/// non-identifier character, lower-cases, and keeps tokens that match an
+/// available role name (preserving order, deduped). Tolerates bullet
+/// lists, prose framing, and trailing newlines that the model sometimes
+/// emits despite "no other text" instructions.
+fn parse_role_list(stdout: &str, available: &[String]) -> Result<Vec<String>> {
+    let lowered: Vec<String> = available.iter().map(|a| a.to_lowercase()).collect();
+    let s_lower = stdout.to_lowercase();
+    let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tok in s_lower.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some(i) = lowered.iter().position(|l| l == tok) {
+            let canonical = available[i].clone();
+            if seen.insert(canonical.clone()) {
+                found.push(canonical);
+            }
+        }
+    }
+    if found.is_empty() {
+        return Err(anyhow!(
+            "auto: claude returned no recognisable role names. \
+             Available: {available:?}. Got: {stdout:?}. \
+             Re-run with `--roles <...>` to skip synthesis."
+        ));
+    }
+    Ok(found)
 }
 
 /// Map the meeting roster onto the plan / implement / review slots that
@@ -2430,5 +2526,51 @@ mod auto_tests {
         let body = compose_auto_agenda("do thing", &v(&["scribe"]));
         assert!(body.contains("**scribe**"));
         assert!(body.contains("contribute per your role"));
+    }
+
+    #[test]
+    fn parse_role_list_accepts_canonical_comma_form() {
+        let avail = v(&["architect", "backend", "reviewer", "qa", "scribe"]);
+        let got = parse_role_list("architect, backend, reviewer", &avail).unwrap();
+        assert_eq!(got, v(&["architect", "backend", "reviewer"]));
+    }
+
+    #[test]
+    fn parse_role_list_ignores_prose_around_bullet_list() {
+        let avail = v(&["architect", "backend", "reviewer", "qa", "scribe"]);
+        let raw = "Here are the picks:\n\n\
+                   - architect\n- backend\n- reviewer\n\n\
+                   Feel free to add more if needed.\n";
+        let got = parse_role_list(raw, &avail).unwrap();
+        assert_eq!(got, v(&["architect", "backend", "reviewer"]));
+    }
+
+    #[test]
+    fn parse_role_list_dedupes_while_preserving_first_occurrence_order() {
+        let avail = v(&["architect", "backend", "reviewer"]);
+        let got = parse_role_list("backend, architect, backend, reviewer", &avail).unwrap();
+        assert_eq!(got, v(&["backend", "architect", "reviewer"]));
+    }
+
+    #[test]
+    fn parse_role_list_is_case_insensitive() {
+        let avail = v(&["architect", "backend", "reviewer"]);
+        let got = parse_role_list("Architect, BACKEND, Reviewer", &avail).unwrap();
+        assert_eq!(got, v(&["architect", "backend", "reviewer"]));
+    }
+
+    #[test]
+    fn parse_role_list_rejects_no_recognised_names() {
+        let avail = v(&["architect", "backend", "reviewer"]);
+        let err = parse_role_list("frontend, security, ops", &avail).unwrap_err();
+        assert!(err.to_string().contains("no recognisable role names"));
+    }
+
+    #[test]
+    fn parse_role_list_filters_out_unknown_alongside_known() {
+        let avail = v(&["architect", "backend", "reviewer"]);
+        // Unknown names are silently dropped; known names are kept.
+        let got = parse_role_list("architect, security, backend, reviewer", &avail).unwrap();
+        assert_eq!(got, v(&["architect", "backend", "reviewer"]));
     }
 }

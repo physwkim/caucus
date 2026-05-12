@@ -92,18 +92,28 @@ above. `/caucus-ceo-off` releases the role when you're done.
 ### Hands-off mode (`caucus auto`)
 
 `caucus auto "<task>"` runs the entire spine — `session new` → round →
-converge → pipeline — with no human in the loop. v1 hard-codes the
-agenda template, the decision (== your task text), and the pipeline
-shape (architect → backend → reviewer with `--continue-meeting` and
-`--retry-on-block 1`); later versions will replace each decision with
-an LLM synthesis step.
+converge → pipeline — with no human in the loop.
 
 ```bash
 caucus auto "fix the foo bug in bar.rs; add a regression test"
-# emits JSON for every stage as it runs (session_new, round_start,
-# round_wait, session_converge, execute_pipeline) and a final
-# {"auto":"complete", ...} line.
+# emits JSON for every stage as it runs (roles_picked, session_new,
+# round_start, round_wait, session_converge, execute_pipeline) and a
+# final {"auto":"complete", ...} line.
 ```
+
+**Role selection.** When `--roles` is omitted, caucus shells out to
+`claude --print` with your task text and the role registry, and parses
+the response into a roster (canonical-name matching with prose
+tolerance). Pin the roster explicitly to skip the synthesis call:
+
+```bash
+caucus auto "<task>" --roles architect,backend,reviewer
+```
+
+The agenda, decision, and pipeline shape are still hard-coded in this
+version (architect → backend → reviewer mapping, `--continue-meeting`
++ `--retry-on-block 1`); later versions will replace each with their
+own synthesis step.
 
 Requires `caucus init --install-hook` to have run in the repo first
 (otherwise no Stop hook → no sentinels → `auto` would block forever on

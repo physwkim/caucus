@@ -73,17 +73,13 @@ pub struct AutoArgs {
     /// the agenda (meeting input) and the decision (pipeline input). Later
     /// versions will let an LLM rewrite each.
     pub task: String,
-    /// Comma-separated role names. v1 default
-    /// `architect,backend,reviewer` is hard-coded to match the pipeline
-    /// shape (plan / impl / review). Later versions will pick from the
-    /// task text.
-    #[arg(
-        long,
-        value_delimiter = ',',
-        num_args = 1..,
-        default_value = "architect,backend,reviewer"
-    )]
-    pub roles: Vec<String>,
+    /// Comma-separated role names. When omitted, caucus shells out to
+    /// `claude --print` with the task text and the registry's role list,
+    /// then parses the response into a role roster. Pass this flag
+    /// explicitly to skip synthesis and pin the roster (e.g.
+    /// `--roles architect,backend,reviewer`).
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub roles: Option<Vec<String>>,
     /// Meeting agenda timeout (seconds). caucus waits up to this long for
     /// every meeting agent's first sentinel before giving up. Default 1800.
     #[arg(long, default_value_t = 1800)]
