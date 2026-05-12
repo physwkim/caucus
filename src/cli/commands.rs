@@ -92,10 +92,18 @@ pub enum SessionAction {
     Kill(SessionKillArgs),
     /// Render `<session>/transcript.md` from all rounds.
     Transcript(SessionTranscriptArgs),
+    /// Exit 0 if the session is in a terminal state (Merged | Abandoned),
+    /// 1 if still active. Cheap polling-gate for CEO wakeup loops.
+    IsTerminal(SessionIsTerminalArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct SessionTranscriptArgs {
+    pub session_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionIsTerminalArgs {
     pub session_id: String,
 }
 

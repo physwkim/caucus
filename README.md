@@ -81,7 +81,7 @@ caucus execute finish <session-id> --role backend   # captures commit_provenance
 ```
 caucus init
 caucus doctor
-caucus session    new | list | show | converge | deadlock | kill
+caucus session    new | list | show | converge | deadlock | kill | transcript | is-terminal
 caucus round      start | status | next
 caucus execute    start | status | finish | abandon
 caucus agent      show | send | kill
@@ -91,6 +91,21 @@ caucus watch      <session-id>       # foreground stdout event stream for the CE
 ```
 
 Every command accepts `--format json | text` (text is default) and `--repo <path>` (defaults to CWD). Exit codes follow `docs/design.md` §10.1 — `0` success, `2` user error, `3` environment error, `4` state corruption.
+
+### Self-terminating polling loops
+
+`caucus session is-terminal <id>` is a cheap exit gate for CEO wakeup loops:
+exit `0` if the session is in `Merged`, `Abandoned`, or missing-on-disk; exit
+`1` if still active. Use it as the first line of any scheduled wakeup prompt
+so an abandoned/merged session stops polling itself:
+
+```bash
+if caucus session is-terminal "$SID"; then exit 0; fi
+# … otherwise poll round status, decide next step …
+```
+
+With `--format json` it also prints `{session_id, state, terminal, kind}` so
+the CEO can see the underlying state in the same call.
 
 ## Roles
 

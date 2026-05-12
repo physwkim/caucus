@@ -804,6 +804,49 @@ fn lookup_execute_agent(session: &Session, role: &str) -> Result<AgentId> {
     Err(anyhow!("no execute agent for role {role}"))
 }
 
+/// Exit-code gate for CEO polling loops. Returns 0 when the session is in a
+/// terminal state, 1 when it's still active. With `--format json`, also
+/// prints `{session_id, state, terminal}` to stdout so the CEO can read both
+/// the bit and the underlying state in one call. With `--format text`
+/// (default), stdout is silent — only the exit code matters.
+pub fn session_is_terminal(
+    repo: &Path,
+    format: OutputFormat,
+    args: SessionIsTerminalArgs,
+) -> Result<u8> {
+    use crate::session::record::SessionRecordError;
+    let id = parse_session_id(&args.session_id)?;
+    let (state, terminal, kind) = match read_session(repo, id) {
+        Ok(s) => {
+            let t = s.state.is_terminal();
+            (Some(s.state), t, if t { "terminal" } else { "active" })
+        }
+        // ENOENT on the session.json → session was never created or was
+        // already cleaned up. From a polling perspective that's strictly
+        // *more* terminal than `Abandoned`; report exit 0 so wakeup loops
+        // self-stop instead of treating "gone" the same as "active" (1).
+        Err(SessionRecordError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            (None, true, "missing")
+        }
+        Err(other) => return Err(other.into()),
+    };
+    if matches!(format, OutputFormat::Json) {
+        emit(
+            format,
+            &serde_json::json!({
+                "session_id": id.to_string(),
+                "state": state,
+                "terminal": terminal,
+                "kind": kind,
+            }),
+            String::new,
+        );
+    }
+    Ok(if terminal { 0 } else { 1 })
+}
+
 pub fn session_transcript(
     repo: &Path,
     format: OutputFormat,
@@ -1177,6 +1220,7 @@ pub async fn dispatch(cli: Cli) -> Result<u8> {
             SessionAction::Deadlock(args) => session_deadlock(&repo, format, args).await?,
             SessionAction::Kill(args) => session_kill(&repo, format, args).await?,
             SessionAction::Transcript(args) => session_transcript(&repo, format, args)?,
+            SessionAction::IsTerminal(args) => return session_is_terminal(&repo, format, args),
         },
         Command::Round(RoundArgs { action }) => match action {
             RoundAction::Start(args) => round_start(&repo, format, args).await?,
