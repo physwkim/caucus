@@ -281,12 +281,47 @@ pub struct ExecuteArgs {
 pub enum ExecuteAction {
     /// Spawn an execute-phase agent for one role in a new worktree.
     Start(ExecuteStartCliArgs),
+    /// Plan → implement → review pipeline over a shared worktree.
+    Pipeline(ExecutePipelineCliArgs),
     /// Per-role execute status (worktree path, derived_state).
     Status(ExecuteStatusArgs),
     /// Mark the agent finished; capture commit_provenance; queue cleanup.
     Finish(ExecuteFinishArgs),
     /// Mark the agent abandoned; queue worktree cleanup.
     Abandon(ExecuteAbandonArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ExecutePipelineCliArgs {
+    pub session_id: String,
+    /// Markdown file the first step consumes as `task.md`.
+    #[arg(long)]
+    pub task_file: PathBuf,
+    /// Optional planner role — runs first, its `response.md` becomes the
+    /// implementer's task. Omit to feed `--task-file` straight to the
+    /// implementer.
+    #[arg(long)]
+    pub plan: Option<String>,
+    /// Implementer role — required. Writes code in the shared worktree.
+    #[arg(long)]
+    pub implement: String,
+    /// Optional reviewer role — runs after implement and decides
+    /// `APPROVE` vs `BLOCK`.
+    #[arg(long)]
+    pub review: Option<String>,
+    /// Retry budget: when the reviewer says BLOCK, regenerate plan → impl
+    /// up to N more times before declaring `Blocked`. Default 0 = no retry.
+    #[arg(long, default_value_t = 0)]
+    pub retry_on_block: u32,
+    /// Per-step sentinel timeout in seconds.
+    #[arg(long, default_value_t = 1800)]
+    pub step_timeout_secs: u64,
+    #[arg(long)]
+    pub base_ref: Option<String>,
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub require_permissions: bool,
 }
 
 #[derive(Debug, Args)]

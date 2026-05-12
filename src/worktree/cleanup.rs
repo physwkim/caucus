@@ -271,6 +271,7 @@ mod integration {
             role: "backend".into(),
             branch: None,
             base_ref: None,
+            name_override: None,
         };
         let handle = create(&req).await.unwrap();
         assert!(handle.path.exists(), "worktree dir should exist");

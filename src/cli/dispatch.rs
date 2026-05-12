@@ -831,6 +831,86 @@ pub async fn execute_abandon(
     Ok(())
 }
 
+pub async fn execute_pipeline(
+    repo: &Path,
+    format: OutputFormat,
+    args: ExecutePipelineCliArgs,
+) -> Result<()> {
+    let id = parse_session_id(&args.session_id)?;
+    let mut session = read_session(repo, id)?;
+    if matches!(session.state, SessionState::MeetingConverged) {
+        session.transition(SessionState::Executing)?;
+    }
+    let registry = build_registry(repo)?;
+    let tmux = TmuxService::new();
+
+    let repo_path = repo.to_path_buf();
+    let resolver: Box<dyn Fn(&Path) -> std::path::PathBuf> =
+        Box::new(move |template| resolve_role_template(&repo_path, template));
+
+    let outcome = crate::execute::pipeline_run(
+        &tmux,
+        crate::execute::PipelineRequest {
+            session_id: session.id,
+            repo_root: repo.to_path_buf(),
+            session_root: session.session_root.clone(),
+            registry: &registry,
+            role_template_resolver: &resolver,
+            plan_role: args.plan.as_deref(),
+            implement_role: &args.implement,
+            review_role: args.review.as_deref(),
+            task_source: args.task_file,
+            model: args.model,
+            base_ref: args.base_ref,
+            sentinel_hook_path: Some(repo.join(".caucus").join("bin").join("sentinel-stop")),
+            skip_permissions: !args.require_permissions,
+            retry_on_block: args.retry_on_block,
+            step_timeout: std::time::Duration::from_secs(args.step_timeout_secs),
+        },
+    )
+    .await
+    .map_err(|err| anyhow!("pipeline failed: {err}"))?;
+
+    // Register every spawned agent under the session so `session show` /
+    // `agent list` continue to surface them.
+    for step in [
+        outcome.plan.as_ref(),
+        outcome.implement.as_ref(),
+        outcome.review.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        session.register_agent(&step.role, step.agent_id);
+    }
+    write_session(&session)?;
+
+    emit(
+        format,
+        &serde_json::json!({
+            "session_id": id.to_string(),
+            "pipeline_number": outcome.pipeline_number,
+            "worktree_path": outcome.worktree_path,
+            "worktree_branch": outcome.worktree_branch,
+            "status": outcome.status,
+            "attempts": outcome.attempts,
+            "plan": outcome.plan,
+            "implement": outcome.implement,
+            "review": outcome.review,
+        }),
+        || {
+            format!(
+                "pipeline #{} done — status={:?}, attempts={}, worktree={}",
+                outcome.pipeline_number,
+                outcome.status,
+                outcome.attempts,
+                outcome.worktree_path.display()
+            )
+        },
+    );
+    Ok(())
+}
+
 /// Find the most recent Meeting-kind agent for `role` in this session.
 /// Used by `caucus execute start --continue-meeting`.
 fn lookup_meeting_agent(session: &Session, role: &str) -> Result<AgentId> {
@@ -1477,6 +1557,7 @@ pub async fn dispatch(cli: Cli) -> Result<u8> {
         },
         Command::Execute(ExecuteArgs { action }) => match action {
             ExecuteAction::Start(args) => execute_start(&repo, format, args).await?,
+            ExecuteAction::Pipeline(args) => execute_pipeline(&repo, format, args).await?,
             ExecuteAction::Status(args) => execute_status(&repo, format, args)?,
             ExecuteAction::Finish(args) => execute_finish(&repo, format, args).await?,
             ExecuteAction::Abandon(args) => execute_abandon(&repo, format, args).await?,

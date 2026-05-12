@@ -7,8 +7,12 @@
 //! whole flow. Requires `tmux`, `git`, and the caucus binary built by
 //! cargo (the test resolves it via `CARGO_BIN_EXE_caucus`).
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -66,24 +70,36 @@ fn happy_path_init_doctor_session_round_converge() {
     );
     assert!(repo.join(".caucus/bin/sentinel-stop").exists());
 
-    // 2. doctor — every binary on PATH, all green.
+    // 2. doctor — JSON parses and includes every expected probe. We do
+    // *not* assert "all green": the "hook registered" probe inspects the
+    // user's real ~/.claude/settings.json against this temp repo's hook
+    // path, and that's expected to be missing in a fresh test env. The
+    // important guarantee is that doctor surfaces a structured report
+    // with every named check.
     let out = run_caucus(repo, &["--format", "json", "doctor"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("doctor JSON parses");
-    let checks = report["checks"].as_array().unwrap();
-    let unhealthy: Vec<_> = checks
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("doctor JSON parses (err={err}): {stdout}"));
+    let probe_names: Vec<&str> = report["checks"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter(|c| !c["ok"].as_bool().unwrap())
+        .map(|c| c["name"].as_str().unwrap())
         .collect();
-    assert!(
-        unhealthy.is_empty(),
-        "doctor reports failures: {unhealthy:?}"
-    );
+    for expected in [
+        "tmux",
+        "git",
+        "claude",
+        ".caucus dir",
+        "sentinel hook",
+        "hook registered",
+        "roles",
+    ] {
+        assert!(
+            probe_names.contains(&expected),
+            "doctor missing check {expected}: {probe_names:?}"
+        );
+    }
 
     // 3. role list — the embedded defaults round-trip through the registry.
     let out = run_caucus(repo, &["--format", "json", "role", "list"]);
@@ -205,6 +221,319 @@ fn round_status_json_has_last_event_ts() {
     );
     // current_pane_hint should serialise as null (default None).
     assert!(role0["current_pane_hint"].is_null());
+}
+
+// ----------------------------------------------------------------------
+// `caucus watch` subprocess harness — drives the stdout JSON stream and
+// asserts on synthesised event kinds (`round_progress`, `round_complete`,
+// `pane_hint`, `pane_gone`). The harness bypasses `session new` (which
+// spawns claude + tmux) by writing session.json + manifest files
+// directly with the caucus library types.
+
+/// Holds a spawned `caucus watch` subprocess and a channel of stdout
+/// lines. Dropping the struct SIGKILLs the child.
+struct WatchProc {
+    child: Child,
+    rx: Receiver<String>,
+    _stdout_thread: JoinHandle<()>,
+    _stderr_thread: JoinHandle<()>,
+}
+
+impl WatchProc {
+    fn spawn(repo: &Path, session_id: &str) -> Self {
+        let mut child = Command::new(caucus_bin())
+            .arg("--repo")
+            .arg(repo)
+            .args(["watch", session_id])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn caucus watch");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
+        let (tx, rx) = channel::<String>();
+        let stdout_thread = std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        // Drain stderr so the kernel pipe buffer never blocks the child.
+        // We don't assert on stderr — `note()` and tracing output go here.
+        let stderr_thread = std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for _line in reader.lines().map_while(Result::ok) {}
+        });
+
+        Self {
+            child,
+            rx,
+            _stdout_thread: stdout_thread,
+            _stderr_thread: stderr_thread,
+        }
+    }
+
+    /// Block until a stdout JSON line with `kind == expected` arrives or
+    /// `timeout` elapses (in which case it panics with the collected
+    /// lines for debugging). Lines whose `kind` differs are discarded
+    /// (returned via `seen` for callers that need them).
+    fn wait_for_kind(&self, expected: &str, timeout: Duration) -> serde_json::Value {
+        let (v, _seen) = self.wait_for_kind_collecting(expected, timeout);
+        v
+    }
+
+    fn wait_for_kind_collecting(
+        &self,
+        expected: &str,
+        timeout: Duration,
+    ) -> (serde_json::Value, Vec<String>) {
+        let deadline = Instant::now() + timeout;
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "timed out waiting for kind={expected}; saw {} line(s):\n{}",
+                    seen.len(),
+                    seen.join("\n")
+                );
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(line) => {
+                    seen.push(line.clone());
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                        && v["kind"].as_str() == Some(expected)
+                    {
+                        return (v, seen);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!(
+                        "timed out waiting for kind={expected}; saw {} line(s):\n{}",
+                        seen.len(),
+                        seen.join("\n")
+                    );
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!(
+                        "watch child closed stdout before emitting kind={expected}; \
+                         saw {} line(s):\n{}",
+                        seen.len(),
+                        seen.join("\n")
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drain stdout for `window` and return every line received. Used to
+    /// check for *absence* of follow-up events after a known one.
+    fn drain_for(&self, window: Duration) -> Vec<String> {
+        let deadline = Instant::now() + window;
+        let mut out = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return out;
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(line) => out.push(line),
+                Err(_) => return out,
+            }
+        }
+    }
+}
+
+impl Drop for WatchProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Build a session record + per-role manifests on disk so `caucus watch`
+/// has something to read without going through `session new`. No tmux
+/// panes are stamped — manifests carry `tmux_pane_id == None`, so the
+/// watch loop's poller fan-in spawns zero pollers (matches the headless
+/// CI environment).
+///
+/// If `write_response_files` is true, every role gets a non-empty
+/// `round-01/response-<role>.md` written, so `all_responses_complete`
+/// will flip true after the first sentinel arrives.
+fn build_meeting_session(
+    repo: &Path,
+    roles: &[&str],
+    write_response_files: bool,
+) -> (
+    caucus::session::id::SessionId,
+    PathBuf,
+    Vec<(String, caucus::session::id::AgentId)>,
+) {
+    use caucus::agent::manifest::{AgentKind, AgentManifest, write_json};
+    use caucus::session::record::{Session, write_session};
+    use caucus::session::state::SessionState;
+
+    std::fs::create_dir_all(repo.join(".caucus").join("sessions")).unwrap();
+    let role_names: Vec<String> = roles.iter().map(|r| (*r).to_string()).collect();
+    let mut session = Session::new(repo.to_path_buf(), "test".into(), role_names.clone(), 1);
+    session.transition(SessionState::MeetingInProgress).unwrap();
+    session.advance_round().unwrap();
+    std::fs::create_dir_all(session.session_root.join("agents")).unwrap();
+    std::fs::create_dir_all(session.session_root.join("round-01")).unwrap();
+
+    let mut registered = Vec::new();
+    for role in roles {
+        let manifest = AgentManifest::new(
+            session.id,
+            (*role).to_string(),
+            (*role).to_string(),
+            AgentKind::Meeting,
+            None,
+        );
+        let agent_id = manifest.agent_id;
+        write_json(&manifest, &session.session_root).unwrap();
+        session.register_agent(role, agent_id);
+        registered.push(((*role).to_string(), agent_id));
+        if write_response_files {
+            let path = session
+                .session_root
+                .join("round-01")
+                .join(format!("response-{role}.md"));
+            std::fs::write(&path, "# response\nok\n").unwrap();
+        }
+    }
+    write_session(&session).unwrap();
+    let session_root = session.session_root.clone();
+    (session.id, session_root, registered)
+}
+
+#[test]
+fn watch_emits_round_progress_on_sentinel() {
+    use caucus::sentinel::writer::{Sentinel, SentinelKind, write_sentinel};
+
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().to_path_buf();
+    let (session_id, session_root, agents) =
+        build_meeting_session(&repo, &["reviewer", "qa"], false);
+
+    let watch = WatchProc::spawn(&repo, &session_id.to_string());
+    // Drain `started` so we know notify is listening before we write.
+    watch.wait_for_kind("started", Duration::from_secs(5));
+    // FSEvents on macOS may need a brief settle window after the
+    // watcher arms before it reliably reports new files. The watcher's
+    // own unit test (sentinel::watcher::tests::watcher_picks_up_write)
+    // uses a 2-second timeout for the same reason; we mirror that with
+    // 50 ms of slack before writing so the test is independent of the
+    // FSEvents coalescence latency floor.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let (_role, agent_id) = agents[0].clone();
+    let s = Sentinel::new(
+        session_id,
+        agent_id,
+        SentinelKind::Stop,
+        Some("done".into()),
+        None,
+    );
+    write_sentinel(&session_root, &s).unwrap();
+
+    let progress = watch.wait_for_kind("round_progress", Duration::from_secs(10));
+    assert_eq!(
+        progress["session_id"].as_str().unwrap(),
+        session_id.to_string()
+    );
+    assert_eq!(progress["round_number"].as_u64().unwrap(), 1);
+    assert_eq!(progress["total"].as_u64().unwrap(), 2);
+    // No response files were written → completed must still be 0.
+    assert_eq!(progress["completed"].as_u64().unwrap(), 0);
+    // `states` is an object keyed by derived_state name.
+    assert!(progress["states"].is_object());
+}
+
+#[test]
+fn watch_emits_round_complete_once() {
+    use caucus::sentinel::writer::{Sentinel, SentinelKind, write_sentinel};
+
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().to_path_buf();
+    // Single-role session with the response file pre-written: the first
+    // sentinel flips all_responses_complete → true.
+    let (session_id, session_root, agents) = build_meeting_session(&repo, &["scribe"], true);
+
+    let watch = WatchProc::spawn(&repo, &session_id.to_string());
+    watch.wait_for_kind("started", Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(50));
+
+    let (_role, agent_id) = agents[0].clone();
+    let first = Sentinel::new(
+        session_id,
+        agent_id,
+        SentinelKind::Stop,
+        Some("first".into()),
+        None,
+    );
+    write_sentinel(&session_root, &first).unwrap();
+
+    let complete = watch.wait_for_kind("round_complete", Duration::from_secs(10));
+    assert_eq!(complete["round_number"].as_u64().unwrap(), 1);
+    assert_eq!(
+        complete["session_id"].as_str().unwrap(),
+        session_id.to_string()
+    );
+
+    // Now write a second sentinel for the same agent. The watch loop
+    // re-runs round_status → emits another `round_progress`, but the
+    // `last_round_complete_emitted` latch must suppress a duplicate
+    // `round_complete`.
+    //
+    // 250 ms is well above FSEvents' coalescence floor (~30 ms) so the
+    // second rename surfaces as its own event rather than being merged
+    // with the first one.
+    std::thread::sleep(Duration::from_millis(250));
+    let second = Sentinel::new(
+        session_id,
+        agent_id,
+        SentinelKind::Stop,
+        Some("second".into()),
+        None,
+    );
+    write_sentinel(&session_root, &second).unwrap();
+
+    // Wait for the follow-up `round_progress` (proves the watch loop
+    // picked up the second sentinel) and capture every line up to it.
+    let (_progress2, lines_until_progress2) =
+        watch.wait_for_kind_collecting("round_progress", Duration::from_secs(10));
+    let duplicate_in_window: Vec<_> = lines_until_progress2
+        .iter()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["kind"].as_str() == Some("round_complete"))
+        .collect();
+    assert!(
+        duplicate_in_window.is_empty(),
+        "round_complete must not re-emit; saw {} duplicate(s) before second progress: {:#?}",
+        duplicate_in_window.len(),
+        duplicate_in_window
+    );
+
+    // Drain stdout for a further window and assert nothing else slipped
+    // through (e.g. a delayed `round_complete` after the second
+    // `round_progress`).
+    let trailing = watch.drain_for(Duration::from_millis(500));
+    let trailing_completes: Vec<_> = trailing
+        .iter()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["kind"].as_str() == Some("round_complete"))
+        .collect();
+    assert!(
+        trailing_completes.is_empty(),
+        "round_complete must not re-emit after second round_progress; \
+         saw {} duplicate(s): {:#?}",
+        trailing_completes.len(),
+        trailing_completes
+    );
 }
 
 #[test]

@@ -136,6 +136,46 @@ caucus ceo disable    # remove the slash command files
 caucus ceo show       # print the activation prompt verbatim
 ```
 
+### Plan → implement → review pipeline
+
+`caucus execute start` runs one role. The full architect → backend → reviewer
+loop the meeting design implies is exposed as a single subcommand:
+
+```bash
+caucus execute pipeline <session-id> \
+  --task-file /tmp/decision.md \
+  --plan architect \           # optional: refines task, output feeds impl
+  --implement backend \        # required: writes code in the shared worktree
+  --review reviewer \          # optional: APPROVE | BLOCK verdict on impl
+  --retry-on-block 1           # default 0 — no retry
+```
+
+All three steps share one worktree (`<repo>/.caucus/worktrees/<session>-pipeline-NN/`)
+and run sequentially: caucus waits for each role's sentinel before starting
+the next. The reviewer's response is scanned for `^Recommendation:\s*BLOCK`
+(case-insensitive, matches the format `roles/reviewer.md` already
+standardises); when present and `--retry-on-block` has budget left, caucus
+folds the review findings into a fresh task and re-runs plan → impl.
+
+Per-attempt artefacts:
+
+```
+<session_root>/pipeline-01/
+├── attempt-01/
+│   ├── plan/{task,system,response}.md
+│   ├── implement/{task,system,response}.md
+│   ├── review-brief.md
+│   └── review/{task,system,response}.md
+├── retry-01.md
+└── attempt-02/...
+```
+
+The pipeline emits a final JSON status — `approved`, `no_reviewer`,
+`blocked {attempts: N}`, or `step_failed {step}` — that the CEO can branch
+on. Codex-backed roles work the same way (with their own command shape);
+the `--continue-meeting` flag does *not* combine with pipeline (the chain
+spawns a fresh process per step by design).
+
 ### Carrying meeting context into the execute phase
 
 By default `caucus execute start` spawns a fresh `claude` process in a new

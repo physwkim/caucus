@@ -137,6 +137,7 @@ pub async fn start(
         role: req.role.name.clone(),
         branch: None,
         base_ref: req.base_ref.clone(),
+        name_override: None,
     })
     .await?;
 

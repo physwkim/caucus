@@ -20,6 +20,11 @@ pub struct WorktreeRequest {
     pub branch: Option<String>,
     /// Base ref for the new branch. `None` means current `HEAD`.
     pub base_ref: Option<String>,
+    /// Override the directory leaf name under `<repo>/.caucus/worktrees/`.
+    /// Useful for pipeline worktrees that are shared across roles
+    /// (e.g. `<session>-pipeline-01`). When `None`, defaults to the
+    /// `<session>-<role>` shape from `default_path`.
+    pub name_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,10 +54,11 @@ pub enum WorktreeError {
 
 impl WorktreeRequest {
     pub fn default_path(&self) -> PathBuf {
-        self.repo_root
-            .join(".caucus")
-            .join("worktrees")
-            .join(format!("{}-{}", self.session_id, self.role))
+        let leaf = self
+            .name_override
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", self.session_id, self.role));
+        self.repo_root.join(".caucus").join("worktrees").join(leaf)
     }
 
     pub fn default_branch(&self) -> String {
@@ -170,6 +176,7 @@ mod tests {
             role: "backend".into(),
             branch: None,
             base_ref: None,
+            name_override: None,
         };
         let p = req.default_path();
         assert_eq!(p.parent().unwrap(), Path::new("/repo/.caucus/worktrees"));
@@ -185,6 +192,7 @@ mod tests {
             role: "reviewer".into(),
             branch: None,
             base_ref: None,
+            name_override: None,
         };
         let b = req.default_branch();
         assert!(b.starts_with("caucus/"));
@@ -203,6 +211,7 @@ mod tests {
             role: "backend".into(),
             branch: Some("feature/x".into()),
             base_ref: None,
+            name_override: None,
         };
         assert_eq!(req.default_branch(), "feature/x");
     }
