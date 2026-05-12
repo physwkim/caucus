@@ -7,6 +7,7 @@ use clap::Parser;
 pub mod commands;
 pub mod dispatch;
 pub mod exit;
+pub mod hook_install;
 pub mod output;
 
 use commands::Cli;

@@ -72,15 +72,29 @@ pub fn init(repo: &Path, args: InitArgs) -> Result<()> {
     }
 
     note(&format!("caucus initialised at {}", caucus_dir.display()));
-    note("");
-    note("Next step — install the Claude Stop hook in ~/.claude/settings.json:");
-    note("");
-    note("  {\"hooks\":{\"Stop\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",");
-    note(&format!(
-        "    \"command\":\"{}\"}}]}}]}}",
-        hook_path.display()
-    ));
-    note("");
+
+    if args.install_hook {
+        let report = crate::cli::hook_install::install_stop_hook(&hook_path)?;
+        note(&format!(
+            "claude settings updated ({:?}) at {}",
+            report.action,
+            report.settings_path.display()
+        ));
+        if let Some(bak) = &report.backup_path {
+            note(&format!("backup written to {}", bak.display()));
+        }
+    } else {
+        note("");
+        note("Next step — install the Claude Stop hook in ~/.claude/settings.json:");
+        note("");
+        note("  {\"hooks\":{\"Stop\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",");
+        note(&format!(
+            "    \"command\":\"{}\"}}]}}]}}",
+            hook_path.display()
+        ));
+        note("");
+        note("Re-run `caucus init --install-hook` to do this automatically.");
+    }
     note("Add `.caucus/` to your .gitignore. caucus state should never be tracked.");
     Ok(())
 }

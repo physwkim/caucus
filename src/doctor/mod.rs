@@ -34,9 +34,80 @@ pub fn run(repo: &Path) -> DoctorReport {
         probe_binary("claude", &["--version"]),
         probe_caucus_dir(repo),
         probe_hook_script(repo),
+        probe_hook_registered(repo),
         probe_roles(repo),
     ];
     DoctorReport { checks }
+}
+
+fn probe_hook_registered(repo: &Path) -> CheckResult {
+    let Some(home) = std::env::var_os("HOME") else {
+        return CheckResult {
+            name: "hook registered".into(),
+            ok: false,
+            detail: "HOME not set".into(),
+        };
+    };
+    let path = std::path::PathBuf::from(home)
+        .join(".claude")
+        .join("settings.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(err) => {
+            return CheckResult {
+                name: "hook registered".into(),
+                ok: false,
+                detail: format!(
+                    "{} unreadable: {err} — run `caucus init --install-hook`",
+                    path.display()
+                ),
+            };
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(err) => {
+            return CheckResult {
+                name: "hook registered".into(),
+                ok: false,
+                detail: format!("{} parse failed: {err}", path.display()),
+            };
+        }
+    };
+    let needle = repo
+        .join(".caucus")
+        .join("bin")
+        .join("sentinel-stop")
+        .display()
+        .to_string();
+    let stops = value
+        .pointer("/hooks/Stop")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let found = stops.iter().any(|block| {
+        block
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .map(|hooks| {
+                hooks
+                    .iter()
+                    .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(needle.as_str()))
+            })
+            .unwrap_or(false)
+    });
+    CheckResult {
+        name: "hook registered".into(),
+        ok: found,
+        detail: if found {
+            format!("Stop hook at {needle} present in {}", path.display())
+        } else {
+            format!(
+                "{} has no Stop hook pointing at {needle} — run `caucus init --install-hook`",
+                path.display()
+            )
+        },
+    }
 }
 
 fn probe_binary(name: &str, args: &[&str]) -> CheckResult {

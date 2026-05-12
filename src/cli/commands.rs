@@ -64,6 +64,10 @@ pub struct InitArgs {
     /// Overwrite existing `.caucus/bin/sentinel-stop` if present.
     #[arg(long)]
     pub force: bool,
+    /// Also merge the Stop hook into `~/.claude/settings.json` (with a
+    /// timestamped `.bak` backup if the file already exists).
+    #[arg(long)]
+    pub install_hook: bool,
 }
 
 #[derive(Debug, Args)]
