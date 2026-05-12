@@ -836,36 +836,96 @@ pub async fn watch(repo: &Path, args: WatchArgs) -> Result<()> {
     std::fs::create_dir_all(&agents_dir)?;
     let (watcher, mut rx) = crate::sentinel::watch(&agents_dir)?;
     let _w = watcher;
+
+    let started_at = chrono::Utc::now();
+    let startup = serde_json::json!({
+        "kind": "started",
+        "session_id": id.to_string(),
+        "agents_dir": agents_dir,
+        "ts": started_at,
+    });
+    println!("{startup}");
     note(&format!(
         "watching {} (Ctrl-C to stop)",
         agents_dir.display()
     ));
-    while let Some(event) = rx.recv().await {
-        match event {
-            crate::sentinel::WatchEvent::Sentinel { path, sentinel } => {
+
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await; // immediate tick is consumed silently.
+
+    let mut usr2 = crate::notify::Usr2Stream::new().ok();
+    let usr2_label = if usr2.is_some() { "yes" } else { "no" };
+    tracing::debug!(usr2 = usr2_label, "watch loop ready");
+
+    loop {
+        let usr2_recv = async {
+            match usr2.as_mut() {
+                Some(s) => s.recv().await,
+                None => std::future::pending::<Option<()>>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                let line = serde_json::json!({"kind": "stopped", "reason": "sigint"});
+                println!("{line}");
+                return Ok(());
+            }
+            _ = heartbeat.tick() => {
                 let line = serde_json::json!({
-                    "kind": "sentinel",
-                    "path": path,
-                    "agent_id": sentinel.agent_id.to_string(),
-                    "sentinel_kind": sentinel.kind,
-                    "ts": sentinel.ts,
+                    "kind": "heartbeat",
+                    "session_id": id.to_string(),
+                    "ts": chrono::Utc::now(),
                 });
-                println!("{}", line);
-                if let Ok(_manifest) =
-                    crate::round::record_sentinel(&session.session_root, &sentinel)
-                {
-                    // Manifest updated; nothing else to do here.
+                println!("{line}");
+            }
+            _ = usr2_recv => {
+                let line = serde_json::json!({
+                    "kind": "wake",
+                    "source": "sigusr2",
+                    "ts": chrono::Utc::now(),
+                });
+                println!("{line}");
+            }
+            event = rx.recv() => {
+                match event {
+                    None => {
+                        // Watcher torn down; exit cleanly.
+                        let line = serde_json::json!({"kind": "stopped", "reason": "watcher_closed"});
+                        println!("{line}");
+                        return Ok(());
+                    }
+                    Some(crate::sentinel::WatchEvent::Sentinel { path, sentinel }) => {
+                        let line = serde_json::json!({
+                            "kind": "sentinel",
+                            "path": path,
+                            "agent_id": sentinel.agent_id.to_string(),
+                            "sentinel_kind": sentinel.kind,
+                            "ts": sentinel.ts,
+                        });
+                        println!("{line}");
+                        let _ = crate::round::record_sentinel(&session.session_root, &sentinel);
+                    }
+                    Some(crate::sentinel::WatchEvent::ParseDeferred { path, reason }) => {
+                        let line = serde_json::json!({
+                            "kind": "parse_deferred",
+                            "path": path,
+                            "reason": reason,
+                        });
+                        println!("{line}");
+                    }
+                    Some(crate::sentinel::WatchEvent::WatcherError { message }) => {
+                        let line = serde_json::json!({
+                            "kind": "watcher_error",
+                            "message": message,
+                        });
+                        println!("{line}");
+                    }
                 }
-            }
-            crate::sentinel::WatchEvent::ParseDeferred { path, reason } => {
-                note(&format!("parse deferred {}: {reason}", path.display()));
-            }
-            crate::sentinel::WatchEvent::WatcherError { message } => {
-                note(&format!("watcher error: {message}"));
             }
         }
     }
-    Ok(())
 }
 
 // ---- top-level dispatch --------------------------------------------------
