@@ -185,11 +185,11 @@ impl TmuxService {
     }
 
     /// Pick a sensible balanced layout for `pane_count` panes in one window.
-    /// Used by `caucus session new` so role panes don't end up in geometric
-    /// halves. The contract:
+    /// Used by `caucus session new` / `execute start` / `session relayout`
+    /// so role panes don't end up in geometric halves. Contract:
     /// - 1 pane → no-op (nothing to balance).
     /// - 2 panes → `even-horizontal`.
-    /// - 3+ panes → `tiled`.
+    /// - 3+ panes → `tiled` (2D grid; uses both row and column splits).
     pub async fn rebalance_window_for_panes(
         &self,
         pane_count: usize,
@@ -201,6 +201,20 @@ impl TmuxService {
             _ => "tiled",
         };
         self.select_layout(layout, target).await
+    }
+
+    /// Apply an explicit layout name (caller-chosen). Honours the `auto`
+    /// path via `rebalance_window_for_panes` when `explicit` is None.
+    pub async fn apply_layout(
+        &self,
+        explicit: Option<&str>,
+        pane_count: usize,
+        target: Option<&str>,
+    ) -> Result<(), TmuxError> {
+        match explicit {
+            Some(name) => self.select_layout(name, target).await,
+            None => self.rebalance_window_for_panes(pane_count, target).await,
+        }
     }
 
     /// `tmux select-pane -t PANE -T TITLE`.

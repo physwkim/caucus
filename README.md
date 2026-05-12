@@ -81,7 +81,7 @@ caucus execute finish <session-id> --role backend   # captures commit_provenance
 ```
 caucus init
 caucus doctor
-caucus session    new | list | show | converge | deadlock | kill | transcript | is-terminal
+caucus session    new | list | show | converge | deadlock | kill | transcript | is-terminal | relayout
 caucus round      start | status | next
 caucus ceo        enable | disable | status | show
 caucus execute    start | status | finish | abandon
@@ -92,6 +92,26 @@ caucus watch      <session-id>       # foreground stdout event stream for the CE
 ```
 
 Every command accepts `--format json | text` (text is default) and `--repo <path>` (defaults to CWD). Exit codes follow `docs/design.md` §10.1 — `0` success, `2` user error, `3` environment error, `4` state corruption.
+
+### Pane layout
+
+`caucus session new` and `caucus execute start` accept `--layout` with one of:
+
+```
+auto              # default: even-horizontal for 2 panes, tiled for 3+
+tiled             # 2D grid (uses both horizontal and vertical splits)
+even-horizontal   # side-by-side
+even-vertical     # stacked
+main-horizontal   # one large pane on top, others tiled below
+main-vertical     # one large pane on left, others stacked right
+```
+
+After a terminal resize or manual rearrangement, re-balance without
+respawning anything:
+
+```bash
+caucus session relayout <session-id> --layout tiled
+```
 
 ### CEO mode (live toggle)
 

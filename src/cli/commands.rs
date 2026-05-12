@@ -116,6 +116,20 @@ pub enum SessionAction {
     /// Exit 0 if the session is in a terminal state (Merged | Abandoned),
     /// 1 if still active. Cheap polling-gate for CEO wakeup loops.
     IsTerminal(SessionIsTerminalArgs),
+    /// Re-balance pane layout for an existing session (no spawn). Useful
+    /// after a terminal resize or after the operator manually rearranges.
+    Relayout(SessionRelayoutArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SessionRelayoutArgs {
+    /// Session id — only needed for log/metadata, not for the tmux call
+    /// (the layout applies to the current window).
+    pub session_id: String,
+    /// Layout preset. Default `auto` picks even-horizontal for 2 panes,
+    /// tiled for 3+.
+    #[arg(long, value_enum, default_value_t = LayoutPreset::Auto)]
+    pub layout: LayoutPreset,
 }
 
 #[derive(Debug, Args)]
@@ -148,6 +162,37 @@ pub struct SessionNewArgs {
     /// boundary — interactive prompts only freeze the pane.
     #[arg(long)]
     pub require_permissions: bool,
+    /// Pane layout applied after all role panes are spawned. Default `auto`
+    /// picks `even-horizontal` for 2 panes and `tiled` for 3+.
+    #[arg(long, value_enum, default_value_t = LayoutPreset::Auto)]
+    pub layout: LayoutPreset,
+}
+
+/// tmux `select-layout` presets caucus surfaces to operators. `Auto` lets
+/// caucus pick based on pane count (even-horizontal for 2, tiled for 3+).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
+pub enum LayoutPreset {
+    Auto,
+    Tiled,
+    EvenHorizontal,
+    EvenVertical,
+    MainHorizontal,
+    MainVertical,
+}
+
+impl LayoutPreset {
+    /// Resolve to the literal tmux layout name. `Auto` is resolved
+    /// elsewhere (it depends on pane count).
+    pub fn as_tmux_name(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Tiled => Some("tiled"),
+            Self::EvenHorizontal => Some("even-horizontal"),
+            Self::EvenVertical => Some("even-vertical"),
+            Self::MainHorizontal => Some("main-horizontal"),
+            Self::MainVertical => Some("main-vertical"),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -259,6 +304,9 @@ pub struct ExecuteStartCliArgs {
     /// `caucus session new --require-permissions`).
     #[arg(long)]
     pub require_permissions: bool,
+    /// Pane layout applied after the execute pane is spawned. Default `auto`.
+    #[arg(long, value_enum, default_value_t = LayoutPreset::Auto)]
+    pub layout: LayoutPreset,
 }
 
 #[derive(Debug, Args)]

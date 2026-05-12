@@ -227,10 +227,10 @@ pub async fn session_new(repo: &Path, format: OutputFormat, args: SessionNewArgs
 
     // Re-balance the window after all role panes are spawned. Otherwise the
     // last role ends up in a 12.5% slice because each split-window halves
-    // the current pane. `tiled` produces a 2D grid for 3+ panes; for 2 it
-    // splits evenly. Includes the CEO's own pane in the layout — that's
-    // typically what the operator wants (everything visible at once).
-    tmux.rebalance_window_for_panes(session.agents.len() + 1, None)
+    // the current pane. `--layout` (default `auto`) picks even-horizontal
+    // for 2 panes and tiled for 3+ panes (a 2D grid that uses both row and
+    // column splits). Includes the CEO's own pane in the count.
+    tmux.apply_layout(args.layout.as_tmux_name(), session.agents.len() + 1, None)
         .await
         .ok();
 
@@ -685,6 +685,11 @@ pub async fn execute_start(
     )
     .await?;
     session.register_agent(&args.role, outcome.agent.agent_id);
+    // Rebalance like session_new — execute panes accumulate too.
+    let total_panes = session.agents.len() + 1;
+    tmux.apply_layout(args.layout.as_tmux_name(), total_panes, None)
+        .await
+        .ok();
     write_session(&session)?;
     emit(
         format,
@@ -854,6 +859,39 @@ pub fn session_is_terminal(
         );
     }
     Ok(if terminal { 0 } else { 1 })
+}
+
+pub async fn session_relayout(
+    repo: &Path,
+    format: OutputFormat,
+    args: SessionRelayoutArgs,
+) -> Result<()> {
+    let id = parse_session_id(&args.session_id)?;
+    let session = read_session(repo, id)?;
+    let tmux = TmuxService::new();
+    // Count live role panes + the operator's pane. The session manifest
+    // is the source of truth for active agents; if any have been killed,
+    // their tmux_pane_id is still recorded but `pane_exists` would say no.
+    // For layout purposes we count manifests — the worst case is a
+    // slightly over-counted layout, which tmux just absorbs.
+    let pane_count = session.agents.len() + 1;
+    tmux.apply_layout(args.layout.as_tmux_name(), pane_count, None)
+        .await?;
+    emit(
+        format,
+        &serde_json::json!({
+            "session_id": id.to_string(),
+            "layout": args.layout.as_tmux_name().unwrap_or("auto"),
+            "pane_count": pane_count,
+        }),
+        || {
+            format!(
+                "relayout applied ({:?}, {pane_count} panes counted)",
+                args.layout
+            )
+        },
+    );
+    Ok(())
 }
 
 pub fn session_transcript(
@@ -1230,6 +1268,7 @@ pub async fn dispatch(cli: Cli) -> Result<u8> {
             SessionAction::Kill(args) => session_kill(&repo, format, args).await?,
             SessionAction::Transcript(args) => session_transcript(&repo, format, args)?,
             SessionAction::IsTerminal(args) => return session_is_terminal(&repo, format, args),
+            SessionAction::Relayout(args) => session_relayout(&repo, format, args).await?,
         },
         Command::Round(RoundArgs { action }) => match action {
             RoundAction::Start(args) => round_start(&repo, format, args).await?,
