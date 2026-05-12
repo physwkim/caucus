@@ -101,13 +101,21 @@ pub fn init(repo: &Path, args: InitArgs) -> Result<()> {
 
 fn hook_script() -> &'static str {
     r#"#!/bin/sh
-# caucus Stop hook. Invoked by Claude Code when a turn ends in a pane spawned
-# by `caucus`. CAUCUS_SESSION_ID and CAUCUS_AGENT_ID are injected into the
-# pane's env at spawn time. The hook receives the full hook payload on stdin;
-# we forward it verbatim as `--raw` if you teach caucus to record it.
+# caucus Stop hook. Installed globally in ~/.claude/settings.json, so the
+# Claude Code harness fires it for EVERY claude session — not just caucus
+# panes. When the pane wasn't spawned by caucus the env vars below are
+# unset; we exit 0 silently in that case so the user doesn't see a
+# spurious "Stop hook error" on every unrelated session.
+#
+# When CAUCUS_SESSION_ID + CAUCUS_AGENT_ID are present (caucus spawned this
+# pane via tmux split-window with `-e`), we forward the Stop event to
+# `caucus sentinel write`. Stdin carries the full hook payload from
+# Claude Code (including the agent's claude session_id); caucus reads it
+# via read_stdin_json() and stores it on the sentinel.
 set -e
-: "${CAUCUS_SESSION_ID:?CAUCUS_SESSION_ID not set — this pane was not spawned by caucus}"
-: "${CAUCUS_AGENT_ID:?CAUCUS_AGENT_ID not set}"
+if [ -z "$CAUCUS_SESSION_ID" ] || [ -z "$CAUCUS_AGENT_ID" ]; then
+  exit 0
+fi
 exec caucus sentinel write \
   --session "$CAUCUS_SESSION_ID" \
   --agent "$CAUCUS_AGENT_ID" \
