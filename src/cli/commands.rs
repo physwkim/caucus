@@ -400,6 +400,16 @@ pub struct ExecutePipelineCliArgs {
     /// Where the pipeline's role panes live. Default `split`.
     #[arg(long, value_enum, default_value_t = PlacementMode::Split)]
     pub placement: PlacementMode,
+    /// Resume each step's meeting-phase claude session in the shared
+    /// worktree (plan ← meeting architect, impl ← meeting backend,
+    /// review ← meeting reviewer). Cuts the "fresh context per step"
+    /// cost — see `caucus execute start --continue-meeting` for the
+    /// single-role version. Kills the corresponding meeting panes before
+    /// spawning the pipeline's first step; on retry, kills the previous
+    /// attempt's panes before re-resuming. Requires every pipeline role
+    /// to have a meeting agent with a captured claude_session_id.
+    #[arg(long)]
+    pub continue_meeting: bool,
 }
 
 #[derive(Debug, Args)]

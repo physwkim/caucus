@@ -244,9 +244,7 @@ Per-attempt artefacts:
 
 The pipeline emits a final JSON status — `approved`, `no_reviewer`,
 `blocked {attempts: N}`, or `step_failed {step}` — that the CEO can branch
-on. Codex-backed roles work the same way (with their own command shape);
-the `--continue-meeting` flag does *not* combine with pipeline (the chain
-spawns a fresh process per step by design).
+on. Codex-backed roles work the same way (with their own command shape).
 
 ### Carrying meeting context into the execute phase
 
@@ -269,11 +267,29 @@ resumes of the same session id), and spawns the execute pane via
 `claude --resume <session-id>` in the worktree. The conversation history
 carries forward — no re-loading the spec discussion.
 
+The same flag is available on `caucus execute pipeline`:
+
+```bash
+caucus execute pipeline <session-id> \
+  --task-file /tmp/decision.md \
+  --plan architect --implement backend --review reviewer \
+  --continue-meeting
+```
+
+Each step resumes its own role's meeting session (plan → architect,
+impl → backend, review → reviewer). caucus validates every pipeline role
+has a captured `claude_session_id` and kills all three meeting panes
+before the first step. With `--retry-on-block`, the previous attempt's
+panes are also killed between attempts so the same session ids can be
+re-resumed for the retry.
+
 Trade-offs to know about:
 
 - **Context window growth**: long meetings + code reading after resume
   can hit the auto-compaction threshold. If the meeting was tight, this
-  is a win; if it sprawled, fresh-context might be cheaper.
+  is a win; if it sprawled, fresh-context might be cheaper. Pipeline
+  amplifies this — each role's resumed session keeps growing across
+  retries.
 - **No going back**: the meeting pane is killed. The transcript is still
   on disk (`.caucus/sessions/<id>/round-NN/response-*.md`) — that's the
   durable copy.
@@ -281,8 +297,9 @@ Trade-offs to know about:
   same way, so `--continue-meeting` on a Codex-backed role falls back to
   a fresh process.
 
-Requires at least one Stop hook to have fired for the meeting agent
-(otherwise caucus has no session id to resume).
+Requires at least one Stop hook to have fired for each meeting agent
+caucus will resume (otherwise it has no session id and errors before
+spawning anything).
 
 ### Self-terminating polling loops
 

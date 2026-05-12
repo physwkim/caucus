@@ -1300,6 +1300,43 @@ pub async fn execute_pipeline(
     let resolver: Box<dyn Fn(&Path) -> std::path::PathBuf> =
         Box::new(move |template| resolve_role_template(&repo_path, template));
 
+    // --continue-meeting: collect per-role claude session ids from each
+    // pipeline role's meeting agent and kill those panes so the pipeline's
+    // first step can resume the session without conflict. Validated
+    // up-front — any missing meeting agent or unrecorded session_id is a
+    // user error before the pipeline burns any state.
+    let mut resume_by_role: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    if args.continue_meeting {
+        let mut pipeline_roles: Vec<&str> = Vec::new();
+        if let Some(plan) = args.plan.as_deref() {
+            pipeline_roles.push(plan);
+        }
+        pipeline_roles.push(args.implement.as_str());
+        if let Some(review) = args.review.as_deref() {
+            pipeline_roles.push(review);
+        }
+        for role in pipeline_roles {
+            if resume_by_role.contains_key(role) {
+                continue;
+            }
+            let meeting_agent_id = lookup_meeting_agent(&session, role)?;
+            let manifest =
+                crate::agent::manifest::read_json(&session.session_root, meeting_agent_id)?;
+            let sid = manifest.claude_session_id.clone().ok_or_else(|| {
+                anyhow!(
+                    "meeting agent for role {role} ({meeting_agent_id}) has no captured \
+                     claude_session_id — wait until at least one Stop hook has fired \
+                     (run a round) before retrying with --continue-meeting"
+                )
+            })?;
+            if let Some(pane) = manifest.tmux_pane_id.clone() {
+                let _ = tmux.kill_pane(&pane).await;
+            }
+            resume_by_role.insert(role.to_string(), sid);
+        }
+    }
+
     let outcome = crate::execute::pipeline_run(
         &tmux,
         crate::execute::PipelineRequest {
@@ -1319,6 +1356,7 @@ pub async fn execute_pipeline(
             retry_on_block: args.retry_on_block,
             step_timeout: std::time::Duration::from_secs(args.step_timeout_secs),
             placement: args.placement.to_tmux(),
+            resume_by_role,
         },
     )
     .await

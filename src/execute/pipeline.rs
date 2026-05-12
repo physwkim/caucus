@@ -82,6 +82,12 @@ pub struct StepOutcome {
     pub derived_state: DerivedState,
     pub sentinel_kind: String,
     pub commit_provenance: Option<LaneCommitProvenance>,
+    /// tmux pane id of the spawned execute-phase agent. Used by the
+    /// `--continue-meeting` retry path to kill the previous attempt's pane
+    /// before re-resuming the same claude session id. `None` if the spawn
+    /// completed without a recorded pane (defensive — shouldn't happen).
+    #[serde(default)]
+    pub tmux_pane_id: Option<String>,
 }
 
 /// Terminal status of a pipeline run.
@@ -122,6 +128,12 @@ pub struct PipelineRequest<'a> {
     pub retry_on_block: u32,
     pub step_timeout: Duration,
     pub placement: crate::tmux::Placement,
+    /// Per-role claude `--resume` session ids. When a step's role appears in
+    /// this map, the step's spawn passes `resume_session_id = Some(...)`
+    /// instead of starting a fresh `claude` process. Populated by the CLI
+    /// from each role's meeting-agent manifest when `--continue-meeting`
+    /// is set. Empty map = fresh-context behaviour (unchanged).
+    pub resume_by_role: std::collections::BTreeMap<String, String>,
 }
 
 /// Final result of a pipeline run.
@@ -218,9 +230,19 @@ pub async fn run(
     // Reassigned each iteration; carry-forward isn't part of the contract,
     // but the variable's existence keeps the outcome assembly readable.
     let mut last_plan: Option<StepOutcome>;
+    // Pane ids spawned by the previous attempt — killed at the top of the
+    // next attempt under `--continue-meeting` so the same claude session
+    // id can be re-resumed in a fresh pane. Empty without resume mode.
+    let mut previous_attempt_panes: Vec<String> = Vec::new();
 
     loop {
         attempts += 1;
+        if attempts > 1 && !req.resume_by_role.is_empty() {
+            for pane in previous_attempt_panes.drain(..) {
+                let _ = tmux.kill_pane(&pane).await;
+            }
+        }
+        let mut current_attempt_panes: Vec<String> = Vec::new();
 
         // ---- Plan step (optional) -----------------------------------
         let plan_outcome = if let Some(role) = plan_spec.as_ref() {
@@ -243,10 +265,14 @@ pub async fn run(
                     attempt: attempts,
                     pipeline_number,
                     placement: req.placement,
+                    resume_session_id: req.resume_by_role.get(&role.name).cloned(),
                 },
                 req.step_timeout,
             )
             .await?;
+            if let Some(pane) = outcome.tmux_pane_id.as_ref() {
+                current_attempt_panes.push(pane.clone());
+            }
             if outcome.sentinel_kind != "stop" {
                 return Ok(PipelineOutcome {
                     pipeline_number,
@@ -288,10 +314,14 @@ pub async fn run(
                 attempt: attempts,
                 pipeline_number,
                 placement: req.placement,
+                resume_session_id: req.resume_by_role.get(&impl_spec.name).cloned(),
             },
             req.step_timeout,
         )
         .await?;
+        if let Some(pane) = implement_outcome.tmux_pane_id.as_ref() {
+            current_attempt_panes.push(pane.clone());
+        }
         last_implement = Some(implement_outcome.clone());
         if implement_outcome.sentinel_kind != "stop" {
             return Ok(PipelineOutcome {
@@ -337,15 +367,20 @@ pub async fn run(
                     attempt: attempts,
                     pipeline_number,
                     placement: req.placement,
+                    resume_session_id: req.resume_by_role.get(&role.name).cloned(),
                 },
                 req.step_timeout,
             )
             .await?;
+            if let Some(pane) = outcome.tmux_pane_id.as_ref() {
+                current_attempt_panes.push(pane.clone());
+            }
             Some(outcome)
         } else {
             None
         };
         last_review = review_outcome.clone();
+        previous_attempt_panes = current_attempt_panes;
 
         // ---- Decide ----------------------------------------------------
         let Some(review) = review_outcome.as_ref() else {
@@ -429,6 +464,10 @@ struct StepArgs<'a> {
     attempt: u32,
     pipeline_number: u32,
     placement: crate::tmux::Placement,
+    /// When `Some`, the step's spawn passes `claude --resume <id>` instead
+    /// of a fresh process. Populated from `PipelineRequest::resume_by_role`
+    /// for the step's role.
+    resume_session_id: Option<String>,
 }
 
 async fn run_step(
@@ -485,13 +524,14 @@ async fn run_step(
             initial_prompt_path: Some(task_dst),
             skip_permissions: args.skip_permissions,
             placement: args.placement,
-            resume_session_id: None,
+            resume_session_id: args.resume_session_id.clone(),
         },
     )
     .await
     .map_err(|e| PipelineError::Other(anyhow!("spawn {:?}: {e}", args.kind)))?;
 
     let agent_id = outcome.manifest.agent_id;
+    let tmux_pane_id = outcome.manifest.tmux_pane_id.clone();
     let sentinel = await_sentinel_for(rx, agent_id, timeout).await?;
     let manifest = crate::round::record_sentinel(args.session_root, &sentinel)
         .map_err(|e| PipelineError::Other(anyhow!("record sentinel: {e}")))?;
@@ -537,6 +577,7 @@ async fn run_step(
         derived_state: manifest.derived_state,
         sentinel_kind: format!("{:?}", sentinel.kind).to_lowercase(),
         commit_provenance,
+        tmux_pane_id,
     })
 }
 
