@@ -5,9 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::agent::derive_state::{DerivedState, PaneScreenHint};
 use crate::agent::manifest::{AgentManifest, ManifestError, write_json};
 use crate::sentinel::{Sentinel, read_sentinel};
 use crate::session::id::AgentId;
@@ -102,7 +104,11 @@ pub struct RoleStatus {
     pub agent_id: AgentId,
     pub sentinel_present: bool,
     pub response_bytes: Option<u64>,
-    pub derived_state: crate::agent::derive_state::DerivedState,
+    pub derived_state: DerivedState,
+    #[serde(default)]
+    pub last_event_ts: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub current_pane_hint: Option<PaneScreenHint>,
 }
 
 /// Aggregate over a single round.
@@ -125,24 +131,28 @@ pub fn round_status(
         let response_path = layout.response_path(role);
         let response_bytes = std::fs::metadata(&response_path).map(|m| m.len()).ok();
         let response_non_empty = response_bytes.unwrap_or(0) > 0;
-        let manifest = AgentManifest::json_path(&layout.session_root, *agent_id);
-        let derived_state = read_manifest(&manifest)
+        let manifest_path = AgentManifest::json_path(&layout.session_root, *agent_id);
+        let manifest = read_manifest(&manifest_path).ok();
+        let derived_state = manifest
+            .as_ref()
             .map(|m| m.derived_state)
-            .unwrap_or(crate::agent::derive_state::DerivedState::Working);
+            .unwrap_or(DerivedState::Working);
+        let last_event_ts = manifest
+            .as_ref()
+            .and_then(|m| m.lane_events.last().map(|e| e.ts()));
+        let current_pane_hint = manifest.as_ref().and_then(|m| m.current_pane_hint);
         roles.push(RoleStatus {
             role: role.clone(),
             agent_id: *agent_id,
             sentinel_present: sentinel.is_some(),
             response_bytes,
-            derived_state: if response_non_empty
-                && matches!(
-                    derived_state,
-                    crate::agent::derive_state::DerivedState::Working
-                ) {
-                crate::agent::derive_state::DerivedState::FinishedCleanable
+            derived_state: if response_non_empty && matches!(derived_state, DerivedState::Working) {
+                DerivedState::FinishedCleanable
             } else {
                 derived_state
             },
+            last_event_ts,
+            current_pane_hint,
         });
     }
     let all_responses_complete = roles.iter().all(|r| r.response_bytes.unwrap_or(0) > 0);
@@ -174,6 +184,17 @@ pub fn record_sentinel(
         ts: sentinel.ts,
         sentinel_kind: format!("{:?}", sentinel.kind).to_lowercase(),
     });
+    // Capture the Claude session id from the first hook payload that carries
+    // one. It's stable across rounds for the same `claude` process, so we
+    // only set it once and never overwrite. `caucus execute start
+    // --continue-meeting` reads this to invoke `claude --resume <id>`.
+    if manifest.claude_session_id.is_none() {
+        if let Some(payload) = sentinel.raw_hook_payload.as_ref() {
+            if let Some(sid) = payload.get("session_id").and_then(|v| v.as_str()) {
+                manifest.claude_session_id = Some(sid.to_string());
+            }
+        }
+    }
     let (raw, error) = match sentinel.kind {
         SentinelKind::Stop => (RawStatus::Completed, None),
         SentinelKind::ToolBlocked => (
@@ -216,6 +237,74 @@ pub fn record_sentinel(
         });
     }
 
+    write_json(&manifest, session_root)?;
+    Ok(manifest)
+}
+
+/// Record a pane-screen-hint transition on one agent's manifest.
+///
+/// The single owner for the `current_pane_hint` field — both this helper
+/// and [`record_pane_gone`] are the only sites that mutate it (audit:
+/// `rg -n "manifest\.current_pane_hint\s*=" src/`). Routes through
+/// [`write_json`], honouring invariant I-2.
+///
+/// Returns `Ok(true)` if the hint changed (write occurred), `Ok(false)`
+/// on a dedup hit (no write).
+pub fn record_pane_hint(
+    session_root: &Path,
+    agent_id: AgentId,
+    current: Option<PaneScreenHint>,
+) -> Result<bool, RoundError> {
+    use crate::agent::derive_state::derive;
+    use crate::agent::lane_event::LaneEvent;
+    use crate::agent::manifest::read_json;
+
+    let mut manifest = read_json(session_root, agent_id)?;
+    let previous = manifest.current_pane_hint;
+    if previous == current {
+        return Ok(false);
+    }
+    let now = chrono::Utc::now();
+    manifest.lane_events.push(LaneEvent::PaneHintChanged {
+        ts: now,
+        previous,
+        current,
+    });
+    manifest.current_pane_hint = current;
+    let response_non_empty = manifest
+        .lane_events
+        .iter()
+        .any(|ev| matches!(ev, LaneEvent::ResponseFileWritten { bytes, .. } if *bytes > 0));
+    manifest.derived_state = derive(
+        manifest.status,
+        response_non_empty,
+        manifest.error.as_deref(),
+        current,
+    );
+    write_json(&manifest, session_root)?;
+    Ok(true)
+}
+
+/// Record that the pane backing one agent has gone (poller's
+/// `capture_pane` failed). Sets `derived_state` to
+/// [`DerivedState::InterruptedTransport`] (architect D4); the regular
+/// `derive()` path is not used because the pane-loss signal is not
+/// reflected in `RawStatus`.
+pub fn record_pane_gone(
+    session_root: &Path,
+    agent_id: AgentId,
+    pane: String,
+) -> Result<AgentManifest, RoundError> {
+    use crate::agent::lane_event::LaneEvent;
+    use crate::agent::manifest::read_json;
+
+    let mut manifest = read_json(session_root, agent_id)?;
+    let now = chrono::Utc::now();
+    manifest
+        .lane_events
+        .push(LaneEvent::PaneGone { ts: now, pane });
+    manifest.current_pane_hint = None;
+    manifest.derived_state = DerivedState::InterruptedTransport;
     write_json(&manifest, session_root)?;
     Ok(manifest)
 }
@@ -357,6 +446,151 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, LaneEvent::Finished { .. }))
         );
+    }
+
+    #[test]
+    fn record_pane_hint_updates_derived_state() {
+        let tmp = TempDir::new().unwrap();
+        let session_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(session_root.join("agents")).unwrap();
+
+        let manifest = AgentManifest::new(
+            SessionId::new(),
+            "backend".into(),
+            "backend".into(),
+            AgentKind::Meeting,
+            None,
+        );
+        let agent_id = manifest.agent_id;
+        write_json(&manifest, &session_root).unwrap();
+
+        let changed = record_pane_hint(
+            &session_root,
+            agent_id,
+            Some(PaneScreenHint::PermissionPromptVisible),
+        )
+        .unwrap();
+        assert!(changed);
+        let updated = crate::agent::manifest::read_json(&session_root, agent_id).unwrap();
+        assert_eq!(
+            updated.current_pane_hint,
+            Some(PaneScreenHint::PermissionPromptVisible)
+        );
+        assert!(matches!(
+            updated.derived_state,
+            DerivedState::BlockedPermissionPrompt
+        ));
+        assert_eq!(
+            updated
+                .lane_events
+                .iter()
+                .filter(|e| matches!(e, LaneEvent::PaneHintChanged { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn record_pane_hint_dedups_when_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let session_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(session_root.join("agents")).unwrap();
+
+        let manifest = AgentManifest::new(
+            SessionId::new(),
+            "qa".into(),
+            "qa".into(),
+            AgentKind::Meeting,
+            None,
+        );
+        let agent_id = manifest.agent_id;
+        write_json(&manifest, &session_root).unwrap();
+
+        let first = record_pane_hint(
+            &session_root,
+            agent_id,
+            Some(PaneScreenHint::EscToInterruptVisible),
+        )
+        .unwrap();
+        assert!(first, "first call must write");
+        let second = record_pane_hint(
+            &session_root,
+            agent_id,
+            Some(PaneScreenHint::EscToInterruptVisible),
+        )
+        .unwrap();
+        assert!(!second, "same hint must dedup");
+
+        let updated = crate::agent::manifest::read_json(&session_root, agent_id).unwrap();
+        // Only one PaneHintChanged event should be present.
+        let hint_events = updated
+            .lane_events
+            .iter()
+            .filter(|e| matches!(e, LaneEvent::PaneHintChanged { .. }))
+            .count();
+        assert_eq!(hint_events, 1);
+    }
+
+    #[test]
+    fn record_pane_gone_sets_interrupted_transport() {
+        let tmp = TempDir::new().unwrap();
+        let session_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(session_root.join("agents")).unwrap();
+
+        let manifest = AgentManifest::new(
+            SessionId::new(),
+            "reviewer".into(),
+            "reviewer".into(),
+            AgentKind::Meeting,
+            None,
+        );
+        let agent_id = manifest.agent_id;
+        write_json(&manifest, &session_root).unwrap();
+
+        let updated = record_pane_gone(&session_root, agent_id, "%42".into()).unwrap();
+        // status must not be flipped — pane-loss is not a status transition.
+        assert!(matches!(updated.status, RawStatus::Running));
+        assert!(matches!(
+            updated.derived_state,
+            DerivedState::InterruptedTransport
+        ));
+        assert_eq!(updated.current_pane_hint, None);
+        assert!(
+            updated
+                .lane_events
+                .iter()
+                .any(|e| matches!(e, LaneEvent::PaneGone { .. }))
+        );
+    }
+
+    #[test]
+    fn round_status_includes_last_event_ts() {
+        let tmp = TempDir::new().unwrap();
+        let session_root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(session_root.join("round-01")).unwrap();
+        std::fs::create_dir_all(session_root.join("agents")).unwrap();
+
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            "scribe".into(),
+            "scribe".into(),
+            AgentKind::Meeting,
+            None,
+        );
+        let known_ts = chrono::DateTime::parse_from_rfc3339("2026-05-12T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        manifest.lane_events.push(LaneEvent::ResponseFileWritten {
+            ts: known_ts,
+            path: PathBuf::from("/tmp/r.md"),
+            bytes: 7,
+        });
+        let agent_id = manifest.agent_id;
+        write_json(&manifest, &session_root).unwrap();
+
+        let layout = RoundLayout::new(session_root, 1);
+        let status = round_status(&layout, &[("scribe".into(), agent_id)]).unwrap();
+        assert_eq!(status.roles[0].last_event_ts, Some(known_ts));
     }
 
     #[test]

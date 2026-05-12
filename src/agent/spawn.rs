@@ -49,6 +49,12 @@ pub struct SpawnRequest<'a> {
     /// only suppresses the interactive confirmations that block agents
     /// inside a tmux pane.
     pub skip_permissions: bool,
+    /// If `Some(session_id)`, spawn the agent CLI with `--resume <id>` so
+    /// it inherits the conversation context of an earlier session (typically
+    /// the meeting-phase agent). System prompt + allowed-tools are *not*
+    /// re-passed — the resumed session already has them. Only valid for
+    /// `AgentCli::Claude` (codex doesn't expose `--resume` the same way).
+    pub resume_session_id: Option<String>,
 }
 
 /// Final result of a successful spawn.
@@ -80,6 +86,8 @@ pub const DEFAULT_MODEL: &str = "claude-opus-4-7";
 /// Dispatches on `role.agent_cli`: Claude and Codex have different flag
 /// surfaces so we keep them in two named helpers. The only shared output is
 /// the bootstrap user message — both agents accept a positional prompt.
+#[allow(clippy::too_many_arguments)] // Eight knobs is the actual surface;
+// bundling into a config struct would just move the knob count around.
 pub fn render_command_line(
     role: &RoleSpec,
     cwd: &Path,
@@ -88,6 +96,7 @@ pub fn render_command_line(
     initial_prompt_path: Option<&Path>,
     model: &str,
     skip_permissions: bool,
+    resume_session_id: Option<&str>,
 ) -> String {
     match role.agent_cli {
         crate::role::spec::AgentCli::Claude => render_claude_command(
@@ -97,19 +106,26 @@ pub fn render_command_line(
             initial_prompt_path,
             model,
             skip_permissions,
+            resume_session_id,
         ),
-        crate::role::spec::AgentCli::Codex => render_codex_command(
-            role,
-            cwd,
-            system_prompt_path,
-            response_path,
-            initial_prompt_path,
-            model,
-            skip_permissions,
-        ),
+        crate::role::spec::AgentCli::Codex => {
+            // codex --resume opens a session picker by default and doesn't
+            // accept a session-id as a flag, so --continue-meeting is
+            // Claude-only for now. Fall through to the fresh-spawn path.
+            render_codex_command(
+                role,
+                cwd,
+                system_prompt_path,
+                response_path,
+                initial_prompt_path,
+                model,
+                skip_permissions,
+            )
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_claude_command(
     role: &RoleSpec,
     system_prompt_path: &Path,
@@ -117,7 +133,23 @@ fn render_claude_command(
     initial_prompt_path: Option<&Path>,
     model: &str,
     skip_permissions: bool,
+    resume_session_id: Option<&str>,
 ) -> String {
+    if let Some(sid) = resume_session_id {
+        // Resume path: model / permission-mode / system prompt / allowed-tools
+        // are all carried over from the original session. We only ensure the
+        // permission-bypass flag stays on (the original session likely had
+        // it; harmless to re-pass).
+        let mut cmd = format!("claude --resume {sid}");
+        if skip_permissions {
+            cmd.push_str(" --dangerously-skip-permissions");
+        }
+        // Bootstrap delivered post-spawn via `send_text` because `--print`
+        // would make claude exit after one response. See `spawn()` below.
+        let _ = (response_path, initial_prompt_path);
+        return cmd;
+    }
+
     let allowed = role.allowed_tools_csv();
     let mut cmd = format!(
         "claude --model {model} --permission-mode {mode} --append-system-prompt @{prompt}",
@@ -227,6 +259,7 @@ pub async fn spawn(tmux: &TmuxService, req: SpawnRequest<'_>) -> Result<SpawnOut
         req.initial_prompt_path.as_deref(),
         &model,
         req.skip_permissions,
+        req.resume_session_id.as_deref(),
     );
 
     // Manifest first, so the manifest path exists by the time the pane
@@ -238,6 +271,10 @@ pub async fn spawn(tmux: &TmuxService, req: SpawnRequest<'_>) -> Result<SpawnOut
         req.kind,
         Some(model.clone()),
     );
+    // Carry the inherited claude session id forward so subsequent sentinel
+    // ingests can't accidentally treat the resumed pane as a fresh agent
+    // when reconciling session ids.
+    manifest.claude_session_id = req.resume_session_id.clone();
     manifest.worktree_path = match req.kind {
         AgentKind::Execute => Some(req.cwd.clone()),
         AgentKind::Meeting => None,
@@ -273,8 +310,25 @@ pub async fn spawn(tmux: &TmuxService, req: SpawnRequest<'_>) -> Result<SpawnOut
         })
         .await?;
 
-    manifest.tmux_pane_id = Some(pane_id);
+    manifest.tmux_pane_id = Some(pane_id.clone());
     write_json(&manifest, &req.session_root)?;
+
+    // Resume-mode bootstrap: `--print` would make claude exit, so we omit it
+    // from the command line for resumed sessions and instead paste the task
+    // message after the TUI has started. A short wait lets `claude --resume`
+    // load the prior transcript before we start typing.
+    if req.resume_session_id.is_some() {
+        if let Some(prompt_file) = req.initial_prompt_path.as_deref() {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let body = format!(
+                "Read {prompt} and write your reply to {response}. \
+                 Finish with a one-line summary.",
+                prompt = prompt_file.display(),
+                response = req.response_path.display(),
+            );
+            tmux.send_text(&pane_id, &body, true).await?;
+        }
+    }
 
     Ok(SpawnOutcome {
         manifest,
@@ -318,6 +372,7 @@ mod tests {
             None,
             DEFAULT_MODEL, // request-level
             false,
+            None,
         );
         // render_command_line itself takes a model argument; the precedence
         // is resolved in spawn() before this call. Sanity: our request-level
@@ -336,6 +391,7 @@ mod tests {
             None,
             DEFAULT_MODEL,
             false,
+            None,
         );
         assert!(cmd.contains(&format!("--model {DEFAULT_MODEL}")));
         assert!(cmd.contains("--permission-mode default"));
@@ -359,6 +415,7 @@ mod tests {
             Some(&prompt),
             DEFAULT_MODEL,
             false,
+            None,
         );
         assert!(cmd.contains("--print"));
         assert!(cmd.contains("/p/agenda.md"));
@@ -377,6 +434,7 @@ mod tests {
             None,
             "claude-opus-4-7",
             false,
+            None,
         );
         assert!(!cmd.contains("--allowed-tools"));
     }
@@ -392,6 +450,7 @@ mod tests {
             None,
             DEFAULT_MODEL,
             true,
+            None,
         );
         assert!(cmd.contains("--dangerously-skip-permissions"));
     }
@@ -408,6 +467,7 @@ mod tests {
             None,
             "gpt-5.1-codex",
             true,
+            None,
         );
         assert!(cmd.starts_with("codex"));
         assert!(cmd.contains("--model gpt-5.1-codex"));
@@ -431,8 +491,31 @@ mod tests {
             None,
             "gpt-5.1-codex",
             false,
+            None,
         );
         assert!(cmd.contains("--sandbox read-only"));
         assert!(!cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn resume_session_id_uses_claude_resume_form() {
+        let role = reviewer_spec();
+        let cmd = render_command_line(
+            &role,
+            Path::new("/repo"),
+            Path::new("/sys.md"),
+            Path::new("/r.md"),
+            Some(Path::new("/p/task.md")),
+            DEFAULT_MODEL,
+            true,
+            Some("abc-123-session-id"),
+        );
+        assert!(cmd.starts_with("claude --resume abc-123-session-id"));
+        assert!(cmd.contains("--dangerously-skip-permissions"));
+        // Resume path: no system prompt, no allowed-tools, no --print
+        // (bootstrap is paste-buffered after spawn).
+        assert!(!cmd.contains("--append-system-prompt"));
+        assert!(!cmd.contains("--allowed-tools"));
+        assert!(!cmd.contains("--print"));
     }
 }

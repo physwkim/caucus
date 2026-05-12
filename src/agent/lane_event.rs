@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::derive_state::PaneScreenHint;
 use super::provenance::LaneCommitProvenance;
 
 /// Failure-class taxonomy for blockers, used by the orchestrator to choose a
@@ -75,6 +76,15 @@ pub enum LaneEvent {
         ts: DateTime<Utc>,
         path: PathBuf,
     },
+    PaneHintChanged {
+        ts: DateTime<Utc>,
+        previous: Option<PaneScreenHint>,
+        current: Option<PaneScreenHint>,
+    },
+    PaneGone {
+        ts: DateTime<Utc>,
+        pane: String,
+    },
 }
 
 impl LaneEvent {
@@ -100,7 +110,9 @@ impl LaneEvent {
             | Self::Finished { ts, .. }
             | Self::CommitCreated { ts, .. }
             | Self::WorktreeCreated { ts, .. }
-            | Self::WorktreeRemoved { ts, .. } => *ts,
+            | Self::WorktreeRemoved { ts, .. }
+            | Self::PaneHintChanged { ts, .. }
+            | Self::PaneGone { ts, .. } => *ts,
         }
     }
 }
@@ -180,5 +192,31 @@ mod tests {
         let back: LaneEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(ev, back);
         assert!(s.contains("\"kind\":\"finished\""));
+    }
+
+    #[test]
+    fn pane_hint_changed_serde_roundtrip() {
+        let ev = LaneEvent::PaneHintChanged {
+            ts: Utc::now(),
+            previous: None,
+            current: Some(PaneScreenHint::PermissionPromptVisible),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: LaneEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back);
+        assert!(s.contains("\"kind\":\"pane_hint_changed\""));
+        assert!(s.contains("permission_prompt_visible"));
+    }
+
+    #[test]
+    fn pane_gone_serde_roundtrip() {
+        let ev = LaneEvent::PaneGone {
+            ts: Utc::now(),
+            pane: "%42".into(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: LaneEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(ev, back);
+        assert!(s.contains("\"kind\":\"pane_gone\""));
     }
 }

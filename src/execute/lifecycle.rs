@@ -67,6 +67,9 @@ pub struct ExecuteStartRequest<'a> {
     /// Pass `--dangerously-skip-permissions` to the spawned agent CLI. Default
     /// `true` from the CLI (opt out via `--require-permissions`).
     pub skip_permissions: bool,
+    /// If Some, spawn the agent as `claude --resume <session_id>` so the
+    /// execute-phase pane inherits the meeting-phase conversation.
+    pub resume_session_id: Option<String>,
 }
 
 /// Files materialised under `<session_root>/execute/<role>/`.
@@ -152,6 +155,7 @@ pub async fn start(
             title: req.title,
             initial_prompt_path: Some(layout.task_path()),
             skip_permissions: req.skip_permissions,
+            resume_session_id: req.resume_session_id,
         },
     )
     .await?;

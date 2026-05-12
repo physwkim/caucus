@@ -136,6 +136,78 @@ fn caucus_help_lists_every_top_level_subcommand() {
 }
 
 #[test]
+fn round_status_json_has_last_event_ts() {
+    // Bypass `session new` (which spawns claude) by writing the session
+    // record + manifest directly on disk, then drive `caucus round status
+    // --format json` and check the new field is present.
+    use caucus::agent::lane_event::LaneEvent;
+    use caucus::agent::manifest::{AgentKind, AgentManifest, write_json};
+    use caucus::session::record::{Session, write_session};
+    use caucus::session::state::SessionState;
+
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().to_path_buf();
+    std::fs::create_dir_all(repo.join(".caucus").join("sessions")).unwrap();
+
+    let mut session = Session::new(repo.clone(), "topic".into(), vec!["scribe".into()], 1);
+    session.transition(SessionState::MeetingInProgress).unwrap();
+    session.advance_round().unwrap();
+    std::fs::create_dir_all(session.session_root.join("agents")).unwrap();
+    std::fs::create_dir_all(session.session_root.join("round-01")).unwrap();
+
+    let mut manifest = AgentManifest::new(
+        session.id,
+        "scribe".into(),
+        "scribe".into(),
+        AgentKind::Meeting,
+        None,
+    );
+    let known_ts = chrono::DateTime::parse_from_rfc3339("2026-05-12T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    manifest.lane_events.push(LaneEvent::ResponseFileWritten {
+        ts: known_ts,
+        path: session
+            .session_root
+            .join("round-01")
+            .join("response-scribe.md"),
+        bytes: 7,
+    });
+    let agent_id = manifest.agent_id;
+    write_json(&manifest, &session.session_root).unwrap();
+    session.register_agent("scribe", agent_id);
+    write_session(&session).unwrap();
+
+    let out = run_caucus(
+        &repo,
+        &[
+            "--format",
+            "json",
+            "round",
+            "status",
+            &session.id.to_string(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "round status failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let role0 = &parsed["roles"][0];
+    assert_eq!(role0["role"].as_str().unwrap(), "scribe");
+    let ts = role0["last_event_ts"]
+        .as_str()
+        .expect("last_event_ts present");
+    assert!(
+        ts.starts_with("2026-05-12T10:00:00"),
+        "unexpected last_event_ts: {ts}"
+    );
+    // current_pane_hint should serialise as null (default None).
+    assert!(role0["current_pane_hint"].is_null());
+}
+
+#[test]
 fn caucus_role_list_text_format_is_human_readable() {
     let tmp = TempDir::new().unwrap();
     let out = run_caucus(tmp.path(), &["role", "list"]);

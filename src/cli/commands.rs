@@ -307,6 +307,14 @@ pub struct ExecuteStartCliArgs {
     /// Pane layout applied after the execute pane is spawned. Default `auto`.
     #[arg(long, value_enum, default_value_t = LayoutPreset::Auto)]
     pub layout: LayoutPreset,
+    /// Resume the meeting-phase agent's Claude session in the new worktree
+    /// instead of starting a fresh one. Kills the meeting pane (claude
+    /// refuses two concurrent resumes of the same session id). Requires the
+    /// meeting agent to have produced at least one sentinel so caucus
+    /// captured its claude session id. Claude-only — codex roles ignore
+    /// this flag and always start a fresh process.
+    #[arg(long)]
+    pub continue_meeting: bool,
 }
 
 #[derive(Debug, Args)]

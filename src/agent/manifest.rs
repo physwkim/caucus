@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::session::id::{AgentId, SessionId};
 
-use super::derive_state::{DerivedState, RawStatus};
+use super::derive_state::{DerivedState, PaneScreenHint, RawStatus};
 use super::lane_event::{LaneEvent, LaneEventBlocker};
 
 /// What kind of pane backs this agent.
@@ -45,6 +45,15 @@ pub struct AgentManifest {
     pub current_blocker: Option<LaneEventBlocker>,
     pub derived_state: DerivedState,
     pub error: Option<String>,
+    #[serde(default)]
+    pub current_pane_hint: Option<PaneScreenHint>,
+    /// Claude Code session id extracted from the first Stop hook payload.
+    /// Populated by `crate::round::record_sentinel`. Used by
+    /// `caucus execute start --continue-meeting` to invoke
+    /// `claude --resume <id>` in the new worktree so the execute-phase
+    /// agent inherits the meeting-phase conversation context.
+    #[serde(default)]
+    pub claude_session_id: Option<String>,
 }
 
 impl AgentManifest {
@@ -75,6 +84,8 @@ impl AgentManifest {
             current_blocker: None,
             derived_state: DerivedState::Working,
             error: None,
+            current_pane_hint: None,
+            claude_session_id: None,
         }
     }
 
@@ -134,6 +145,9 @@ fn render_md(m: &AgentManifest) -> String {
     let _ = writeln!(s, "- kind: {:?}", m.kind);
     let _ = writeln!(s, "- status: {:?}", m.status);
     let _ = writeln!(s, "- derived_state: {:?}", m.derived_state);
+    if let Some(hint) = m.current_pane_hint {
+        let _ = writeln!(s, "- pane_hint: {hint:?}");
+    }
     if let Some(model) = &m.model {
         let _ = writeln!(s, "- model: {model}");
     }
@@ -188,6 +202,12 @@ fn event_label(ev: &LaneEvent) -> String {
         LaneEvent::WorktreeRemoved { path, .. } => {
             format!("worktree_removed ({})", path.display())
         }
+        LaneEvent::PaneHintChanged {
+            previous, current, ..
+        } => {
+            format!("pane_hint_changed ({previous:?} → {current:?})")
+        }
+        LaneEvent::PaneGone { pane, .. } => format!("pane_gone ({pane})"),
     }
 }
 
@@ -216,6 +236,53 @@ mod tests {
         let md =
             std::fs::read_to_string(AgentManifest::md_path(tmp.path(), manifest.agent_id)).unwrap();
         assert!(md.contains("role: reviewer"));
+    }
+
+    #[test]
+    fn manifest_persists_current_pane_hint() {
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            "backend".into(),
+            "backend".into(),
+            AgentKind::Meeting,
+            None,
+        );
+        manifest.current_pane_hint = Some(PaneScreenHint::PermissionPromptVisible);
+        write_json(&manifest, tmp.path()).unwrap();
+        let back = read_json(tmp.path(), manifest.agent_id).unwrap();
+        assert_eq!(
+            back.current_pane_hint,
+            Some(PaneScreenHint::PermissionPromptVisible)
+        );
+    }
+
+    #[test]
+    fn manifest_reads_pre_v0_2_json() {
+        // A pre-existing manifest JSON written before `current_pane_hint`
+        // existed must still parse, with the new field defaulted to None.
+        let json = serde_json::json!({
+            "agent_id": crate::session::id::AgentId::new(),
+            "session_id": SessionId::new(),
+            "role": "qa",
+            "agent_name": "qa-r1",
+            "kind": "meeting",
+            "tmux_pane_id": null,
+            "worktree_path": null,
+            "model": null,
+            "status": "running",
+            "created_at": "2026-05-01T00:00:00Z",
+            "started_at": "2026-05-01T00:00:00Z",
+            "completed_at": null,
+            "lane_events": [],
+            "current_blocker": null,
+            "derived_state": "working",
+            "error": null,
+            // NOTE: no current_pane_hint field — emulates old on-disk format.
+        });
+        let parsed: AgentManifest =
+            serde_json::from_value(json).expect("backward-compat parse failed");
+        assert_eq!(parsed.current_pane_hint, None);
     }
 
     #[test]

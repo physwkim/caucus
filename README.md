@@ -136,6 +136,42 @@ caucus ceo disable    # remove the slash command files
 caucus ceo show       # print the activation prompt verbatim
 ```
 
+### Carrying meeting context into the execute phase
+
+By default `caucus execute start` spawns a fresh `claude` process in a new
+worktree with only `decision.md` as input. The meeting-phase backend's
+contextual memory of the spec discussion is lost — the operator pays a
+re-load cost for every implementation pass.
+
+`--continue-meeting` resumes the same Claude session inside the new
+worktree:
+
+```bash
+caucus execute start <session-id> --role backend \
+  --task-file /tmp/decision.md --continue-meeting
+```
+
+caucus reads the meeting agent's `claude_session_id` (captured from the
+Stop hook payload), kills the meeting pane (Claude refuses concurrent
+resumes of the same session id), and spawns the execute pane via
+`claude --resume <session-id>` in the worktree. The conversation history
+carries forward — no re-loading the spec discussion.
+
+Trade-offs to know about:
+
+- **Context window growth**: long meetings + code reading after resume
+  can hit the auto-compaction threshold. If the meeting was tight, this
+  is a win; if it sprawled, fresh-context might be cheaper.
+- **No going back**: the meeting pane is killed. The transcript is still
+  on disk (`.caucus/sessions/<id>/round-NN/response-*.md`) — that's the
+  durable copy.
+- **Codex roles**: ignored. The Codex CLI doesn't expose `--resume` the
+  same way, so `--continue-meeting` on a Codex-backed role falls back to
+  a fresh process.
+
+Requires at least one Stop hook to have fired for the meeting agent
+(otherwise caucus has no session id to resume).
+
 ### Self-terminating polling loops
 
 `caucus session is-terminal <id>` is a cheap exit gate for CEO wakeup loops:

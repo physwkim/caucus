@@ -6,16 +6,25 @@
 //! This module is **read-only** with respect to sentinel files (Invariant I-5
 //! in `docs/design.md` §12). Writes go through `super::writer`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use super::writer::{Sentinel, SentinelError};
+use crate::agent::derive_state::PaneScreenHint;
+use crate::session::id::AgentId;
 
 /// One event surfaced to the orchestrator.
+///
+/// `Sentinel` / `ParseDeferred` / `WatcherError` are emitted by the
+/// filesystem watcher callback. The remaining variants are *synthesised*
+/// by the `caucus watch` loop in `cli/dispatch.rs` so that the stdout
+/// JSON serialiser can match a single enum.
 #[derive(Debug)]
 pub enum WatchEvent {
     /// A sentinel JSON was successfully read.
@@ -26,6 +35,36 @@ pub enum WatchEvent {
     ParseDeferred { path: PathBuf, reason: String },
     /// The underlying watcher itself errored. Watcher is still alive.
     WatcherError { message: String },
+    /// Pane-screen classification changed for one agent.
+    PaneHint {
+        role: String,
+        agent_id: AgentId,
+        pane: String,
+        previous: Option<PaneScreenHint>,
+        current: Option<PaneScreenHint>,
+        ts: DateTime<Utc>,
+    },
+    /// The poller could not capture the pane any more (pane killed).
+    PaneGone {
+        role: String,
+        agent_id: AgentId,
+        pane: String,
+        ts: DateTime<Utc>,
+    },
+    /// Round response-collection progress snapshot.
+    RoundProgress {
+        round_number: u32,
+        completed: u32,
+        total: u32,
+        states: BTreeMap<String, u32>,
+        ts: DateTime<Utc>,
+    },
+    /// All roles' response files for the current round are non-empty.
+    /// Emitted exactly once per round per `caucus watch` process.
+    RoundComplete {
+        round_number: u32,
+        ts: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -159,6 +198,7 @@ mod tests {
                 );
             }
             WatchEvent::WatcherError { message } => panic!("watcher errored: {message}"),
+            other => panic!("unexpected synthesised event in watcher test: {other:?}"),
         }
     }
 

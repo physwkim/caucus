@@ -217,6 +217,7 @@ pub async fn session_new(repo: &Path, format: OutputFormat, args: SessionNewArgs
                 title: Some(role.name.clone()),
                 initial_prompt_path: None,
                 skip_permissions: !args.require_permissions,
+                resume_session_id: None,
             },
         )
         .await?;
@@ -468,6 +469,7 @@ async fn session_deadlock_explore(
                 base_ref: args.base_ref.clone(),
                 sentinel_hook_path: Some(repo.join(".caucus").join("bin").join("sentinel-stop")),
                 skip_permissions: true,
+                resume_session_id: None,
             },
         )
         .await?;
@@ -667,6 +669,30 @@ pub async fn execute_start(
     let role = registry.get(&args.role).map_err(|err| anyhow!("{err}"))?;
     let role_template = resolve_role_template(repo, &role.system_prompt_template);
     let tmux = TmuxService::new();
+
+    // --continue-meeting: look up the meeting-phase agent for this role,
+    // read its captured claude_session_id, kill its pane (claude refuses to
+    // resume a live session from a second process), and pass the id into
+    // the spawn so the execute agent inherits the meeting transcript.
+    let resume_session_id = if args.continue_meeting {
+        let meeting_agent_id = lookup_meeting_agent(&session, &args.role)?;
+        let meeting_manifest =
+            crate::agent::manifest::read_json(&session.session_root, meeting_agent_id)?;
+        let sid = meeting_manifest.claude_session_id.clone().ok_or_else(|| {
+            anyhow!(
+                "meeting agent {meeting_agent_id} has no captured claude_session_id — \
+                     wait until at least one Stop hook has fired (run a round) before retrying \
+                     with --continue-meeting"
+            )
+        })?;
+        if let Some(pane) = meeting_manifest.tmux_pane_id.clone() {
+            let _ = tmux.kill_pane(&pane).await;
+        }
+        Some(sid)
+    } else {
+        None
+    };
+
     let outcome = crate::execute::start(
         &tmux,
         crate::execute::ExecuteStartRequest {
@@ -681,6 +707,7 @@ pub async fn execute_start(
             base_ref: args.base_ref,
             sentinel_hook_path: Some(repo.join(".caucus").join("bin").join("sentinel-stop")),
             skip_permissions: !args.require_permissions,
+            resume_session_id,
         },
     )
     .await?;
@@ -802,6 +829,24 @@ pub async fn execute_abandon(
         || format!("execute {agent_id} abandoned"),
     );
     Ok(())
+}
+
+/// Find the most recent Meeting-kind agent for `role` in this session.
+/// Used by `caucus execute start --continue-meeting`.
+fn lookup_meeting_agent(session: &Session, role: &str) -> Result<AgentId> {
+    for (r, id) in session.agents.iter().rev() {
+        if r != role {
+            continue;
+        }
+        if let Ok(m) = crate::agent::manifest::read_json(&session.session_root, *id) {
+            if matches!(m.kind, crate::agent::manifest::AgentKind::Meeting) {
+                return Ok(*id);
+            }
+        }
+    }
+    Err(anyhow!(
+        "no meeting-phase agent for role {role} in this session"
+    ))
 }
 
 fn lookup_execute_agent(session: &Session, role: &str) -> Result<AgentId> {
@@ -1173,6 +1218,50 @@ pub async fn watch(repo: &Path, args: WatchArgs) -> Result<()> {
         agents_dir.display()
     ));
 
+    // Pane-hint poller fan-in. The reverse index (pane_id → (role,
+    // agent_id)) is built once at startup; pane assignments do not change
+    // during a session (manifest.tmux_pane_id is stamped at spawn).
+    let tmux = TmuxService::new();
+    let (hint_tx, mut hint_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        String,
+        AgentId,
+        String,
+        crate::status::HintUpdate,
+    )>();
+    let mut pane_index: std::collections::HashMap<String, (String, AgentId)> =
+        std::collections::HashMap::new();
+    for (role, agent_id) in &session.agents {
+        let manifest = match crate::agent::manifest::read_json(&session.session_root, *agent_id) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let Some(pane) = manifest.tmux_pane_id.clone() else {
+            continue;
+        };
+        pane_index.insert(pane.clone(), (role.clone(), *agent_id));
+        let mut poller_rx = crate::status::spawn_poller(
+            tmux.clone(),
+            pane.clone(),
+            std::time::Duration::from_secs(2),
+            30,
+        );
+        let role = role.clone();
+        let agent_id = *agent_id;
+        let pane_for_task = pane.clone();
+        let hint_tx = hint_tx.clone();
+        tokio::spawn(async move {
+            while let Some(update) = poller_rx.recv().await {
+                if hint_tx
+                    .send((role.clone(), agent_id, pane_for_task.clone(), update))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+    drop(hint_tx); // close the channel once all forwarder tasks drop their clone
+
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     heartbeat.tick().await; // immediate tick is consumed silently.
@@ -1180,6 +1269,8 @@ pub async fn watch(repo: &Path, args: WatchArgs) -> Result<()> {
     let mut usr2 = crate::notify::Usr2Stream::new().ok();
     let usr2_label = if usr2.is_some() { "yes" } else { "no" };
     tracing::debug!(usr2 = usr2_label, "watch loop ready");
+
+    let mut last_round_complete_emitted: Option<u32> = None;
 
     loop {
         let usr2_recv = async {
@@ -1229,6 +1320,7 @@ pub async fn watch(repo: &Path, args: WatchArgs) -> Result<()> {
                         });
                         println!("{line}");
                         let _ = crate::round::record_sentinel(&session.session_root, &sentinel);
+                        emit_round_progress(repo, id, &mut last_round_complete_emitted);
                     }
                     Some(crate::sentinel::WatchEvent::ParseDeferred { path, reason }) => {
                         let line = serde_json::json!({
@@ -1245,9 +1337,117 @@ pub async fn watch(repo: &Path, args: WatchArgs) -> Result<()> {
                         });
                         println!("{line}");
                     }
+                    Some(other) => {
+                        // Watcher does not synthesise pane_hint/pane_gone/
+                        // round_progress/round_complete — those originate
+                        // from the watch loop itself. Defensive: ignore.
+                        tracing::debug!(?other, "unexpected synthesised event on watcher rx");
+                    }
                 }
             }
+            hint = hint_rx.recv() => {
+                let Some((role, agent_id, pane, update)) = hint else {
+                    // All poller forwarders dropped; nothing more to do
+                    // on this channel — keep looping for sentinels.
+                    continue;
+                };
+                let ts = chrono::Utc::now();
+                if update.current.is_none() {
+                    let line = serde_json::json!({
+                        "kind": "pane_gone",
+                        "role": role,
+                        "agent_id": agent_id.to_string(),
+                        "pane": pane,
+                        "ts": ts,
+                    });
+                    println!("{line}");
+                    let _ = crate::round::record_pane_gone(
+                        &session.session_root,
+                        agent_id,
+                        pane.clone(),
+                    );
+                } else {
+                    let line = serde_json::json!({
+                        "kind": "pane_hint",
+                        "role": role,
+                        "agent_id": agent_id.to_string(),
+                        "pane": pane,
+                        "previous": update.previous,
+                        "current": update.current,
+                        "ts": ts,
+                    });
+                    println!("{line}");
+                    let _ = crate::round::record_pane_hint(
+                        &session.session_root,
+                        agent_id,
+                        update.current,
+                    );
+                }
+                emit_round_progress(repo, id, &mut last_round_complete_emitted);
+            }
         }
+    }
+}
+
+/// Compute the current round's response-collection snapshot and emit a
+/// `round_progress` JSON line on stdout. On the first false→true
+/// transition of `all_responses_complete` for a given round number,
+/// additionally emit a `round_complete` line (idempotency latched by
+/// `last_emitted`).
+fn emit_round_progress(repo: &Path, session_id: SessionId, last_emitted: &mut Option<u32>) {
+    let session = match read_session(repo, session_id) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::debug!(%err, "watch: read_session failed during emit_round_progress");
+            return;
+        }
+    };
+    if session.current_round == 0 {
+        return;
+    }
+    let layout =
+        crate::round::RoundLayout::new(session.session_root.clone(), session.current_round);
+    let status = match crate::round::round_status(&layout, &session.agents) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::debug!(%err, "watch: round_status failed");
+            return;
+        }
+    };
+    let total = status.roles.len() as u32;
+    let completed = status
+        .roles
+        .iter()
+        .filter(|r| r.response_bytes.unwrap_or(0) > 0)
+        .count() as u32;
+    let mut states: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for r in &status.roles {
+        let key = serde_json::to_value(r.derived_state)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        *states.entry(key).or_insert(0) += 1;
+    }
+    let now = chrono::Utc::now();
+    let progress = serde_json::json!({
+        "kind": "round_progress",
+        "session_id": session_id.to_string(),
+        "round_number": status.round_number,
+        "completed": completed,
+        "total": total,
+        "states": states,
+        "ts": now,
+    });
+    println!("{progress}");
+    if status.all_responses_complete && *last_emitted != Some(status.round_number) {
+        let complete = serde_json::json!({
+            "kind": "round_complete",
+            "session_id": session_id.to_string(),
+            "round_number": status.round_number,
+            "ts": now,
+        });
+        println!("{complete}");
+        *last_emitted = Some(status.round_number);
     }
 }
 
