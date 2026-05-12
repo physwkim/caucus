@@ -302,6 +302,16 @@ pub struct RoundStartArgs {
     /// Path to the round's agenda markdown.
     #[arg(long)]
     pub agenda_file: PathBuf,
+    /// Architect-led round: nudge this role first, wait for its sentinel,
+    /// then write a follower brief that quotes its response and nudges
+    /// the other roles. Without this flag every role gets the same agenda
+    /// in parallel.
+    #[arg(long)]
+    pub lead: Option<String>,
+    /// Sentinel timeout (seconds) for the lead. Only meaningful with
+    /// `--lead`. Default 1800 (30 min).
+    #[arg(long, default_value_t = 1800)]
+    pub lead_timeout_secs: u64,
 }
 
 #[derive(Debug, Args)]
@@ -314,6 +324,12 @@ pub struct RoundNextArgs {
     pub session_id: String,
     #[arg(long)]
     pub agenda_file: PathBuf,
+    /// See `caucus round start --lead`.
+    #[arg(long)]
+    pub lead: Option<String>,
+    /// See `caucus round start --lead-timeout-secs`.
+    #[arg(long, default_value_t = 1800)]
+    pub lead_timeout_secs: u64,
 }
 
 #[derive(Debug, Args)]

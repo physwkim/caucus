@@ -106,6 +106,45 @@ caucus watch      <session-id>       # foreground stdout event stream for the CE
 
 Every command accepts `--format json | text` (text is default) and `--repo <path>` (defaults to CWD). Exit codes follow `docs/design.md` §10.1 — `0` success, `2` user error, `3` environment error, `4` state corruption.
 
+### Architect-led rounds (`--lead`)
+
+The default round flow nudges every role's pane with the same agenda in
+parallel. That makes every role's first response a parallel "first
+impression" — fine for round 1 of a brainstorm, but it under-uses the
+architect role: the architect's design output ends up as one of several
+opinions instead of the starting position the other roles react to.
+
+`--lead <role>` forces a sequential structure within the round:
+
+```bash
+caucus round start <session-id> --agenda-file /tmp/agenda.md \
+  --lead architect
+```
+
+1. caucus nudges only the lead role's pane with the agenda.
+2. caucus waits for the lead's Stop hook sentinel (timeout
+   `--lead-timeout-secs`, default 1800).
+3. When the lead's `response-<lead>.md` is non-empty, caucus writes a
+   `follower-brief-<role>.md` per other role under
+   `<session_root>/round-NN/`. The brief quotes the lead's response path,
+   re-states the original agenda, and frames each follower's job as "react
+   from your role's angle — don't rewrite the lead's response".
+4. caucus nudges every follower pane in parallel with that brief.
+
+Trade-offs:
+
+- Round latency roughly doubles (sequential lead + parallel followers vs
+  fully parallel) but each follower's response is genuinely "what does
+  this role think of the lead's proposal" rather than "what does this
+  role think of the agenda".
+- If the lead's response file is empty when the sentinel arrives, caucus
+  aborts the round before nudging followers — no point asking three roles
+  to react to nothing.
+- `--lead-timeout-secs` should cover the lead's longest reasonable
+  response time; default 30 min is generous for most meetings.
+
+`--lead` is also accepted by `caucus round next`.
+
 ### Pane placement: split vs window
 
 By default caucus splits the current tmux window into one pane per role.

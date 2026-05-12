@@ -318,16 +318,91 @@ pub async fn nudge_role(
     layout: &RoundLayout,
     role: &str,
 ) -> Result<(), RoundError> {
-    let agenda = layout.agenda_path();
-    let response = layout.response_path(role);
+    nudge_pane_with_brief(
+        tmux,
+        pane_id,
+        &layout.agenda_path(),
+        &layout.response_path(role),
+    )
+    .await
+}
+
+/// Lower-level form of [`nudge_role`]: deliver an explicit brief path +
+/// response path to a pane. Used by the architect-led round flow where
+/// followers receive a brief that quotes the lead's response rather than
+/// the round's shared agenda.
+pub async fn nudge_pane_with_brief(
+    tmux: &TmuxService,
+    pane_id: &str,
+    brief_path: &Path,
+    response_path: &Path,
+) -> Result<(), RoundError> {
     let message = format!(
-        "Read {agenda} and write your reply to {response}. \
+        "Read {brief} and write your reply to {response}. \
          Finish with a one-line summary.",
-        agenda = agenda.display(),
-        response = response.display(),
+        brief = brief_path.display(),
+        response = response_path.display(),
     );
     tmux.send_text(pane_id, &message, true).await?;
     Ok(())
+}
+
+/// Write the follower brief for one role in an architect-led round. The
+/// brief quotes the lead's response and frames the follower's job as
+/// "react from your role's angle" rather than starting from scratch.
+/// Returns the path the brief was saved to (under
+/// `round-NN/follower-brief-<role>.md`) so the CEO can audit it later.
+pub fn write_follower_brief(
+    layout: &RoundLayout,
+    follower_role: &str,
+    lead_role: &str,
+) -> Result<PathBuf, RoundError> {
+    let dir = layout.round_dir();
+    std::fs::create_dir_all(&dir).map_err(|source| RoundError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    let path = dir.join(format!("follower-brief-{follower_role}.md"));
+    let body = compose_follower_brief(layout, follower_role, lead_role);
+    std::fs::write(&path, body).map_err(|source| RoundError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
+}
+
+/// Pure formatter — easier to unit-test than the file writer.
+pub fn compose_follower_brief(
+    layout: &RoundLayout,
+    follower_role: &str,
+    lead_role: &str,
+) -> String {
+    let lead_response = layout.response_path(lead_role);
+    let agenda = layout.agenda_path();
+    format!(
+        "# Round {n} follower brief — {follower}\n\n\
+         The lead role (**{lead}**) just submitted their take on this round's \
+         agenda. Read their response **first** before anything else:\n\n\
+         - {lead_response}\n\n\
+         The original agenda is at:\n\n\
+         - {agenda}\n\n\
+         Your job, as the **{follower}** role: react to the lead's proposal \
+         from your role's angle. Specifically:\n\n\
+         - Confirm, sharpen, or push back on the lead's recommendation. Cite \
+           specific bullets / paragraphs from the lead response — don't just \
+           rewrite it in your own words.\n\
+         - Surface concrete failure modes / risks / costs the lead missed \
+           from your perspective.\n\
+         - If you disagree with the lead's recommendation, say so explicitly \
+           and name your alternative.\n\
+         - Keep your response tight (≤ 1 screen). The CEO synthesises across \
+           all follower responses; brevity helps.\n",
+        n = layout.round_number,
+        follower = follower_role,
+        lead = lead_role,
+        lead_response = lead_response.display(),
+        agenda = agenda.display(),
+    )
 }
 
 #[cfg(test)]
@@ -339,6 +414,32 @@ mod tests {
     use crate::sentinel::writer::{Sentinel, SentinelKind, write_sentinel};
     use crate::session::id::SessionId;
     use tempfile::TempDir;
+
+    #[test]
+    fn follower_brief_quotes_lead_response_path() {
+        let tmp = TempDir::new().unwrap();
+        let layout = RoundLayout::new(tmp.path().to_path_buf(), 2);
+        let brief = compose_follower_brief(&layout, "backend", "architect");
+        // Must reference both files by absolute path.
+        assert!(brief.contains(layout.response_path("architect").to_string_lossy().as_ref()));
+        assert!(brief.contains(layout.agenda_path().to_string_lossy().as_ref()));
+        // Must name both roles by ID so a reader knows who they are.
+        assert!(brief.contains("**architect**"));
+        assert!(brief.contains("**backend**"));
+        // Must instruct the follower NOT to rewrite the lead's response.
+        assert!(brief.contains("don't just rewrite"));
+    }
+
+    #[test]
+    fn write_follower_brief_persists_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let layout = RoundLayout::new(tmp.path().to_path_buf(), 1);
+        let path = write_follower_brief(&layout, "reviewer", "architect").unwrap();
+        assert!(path.exists());
+        assert!(path.ends_with("follower-brief-reviewer.md"));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("Round 1 follower brief — reviewer"));
+    }
 
     #[test]
     fn layout_paths_match_design() {

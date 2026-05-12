@@ -631,35 +631,202 @@ pub async fn round_start(repo: &Path, format: OutputFormat, args: RoundStartArgs
     crate::round::prepare_round(&layout, &role_templates, &args.agenda_file)?;
 
     let tmux = TmuxService::new();
-    for (role, agent_id) in &session.agents {
-        let manifest = crate::agent::manifest::read_json(&session.session_root, *agent_id)?;
-        if let Some(pane) = manifest.tmux_pane_id.clone() {
-            crate::round::nudge_role(&tmux, &pane, &layout, role).await?;
+
+    // Validate --lead role belongs to this session before doing any tmux work.
+    if let Some(lead) = &args.lead {
+        if !session.agents.iter().any(|(role, _)| role == lead) {
+            return Err(anyhow!(
+                "--lead role `{lead}` is not in this session (available: {})",
+                session
+                    .roles
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
     }
 
-    write_session(&session)?;
-    emit(
-        format,
-        &serde_json::json!({
+    let payload = if let Some(lead_role) = args.lead.clone() {
+        // Architect-led flow: nudge lead first, wait for sentinel, then
+        // compose follower briefs and nudge the rest.
+        let lead_outcome = run_lead_phase(
+            &tmux,
+            &session,
+            &layout,
+            &lead_role,
+            std::time::Duration::from_secs(args.lead_timeout_secs),
+        )
+        .await?;
+
+        let mut followers = Vec::new();
+        for (role, agent_id) in &session.agents {
+            if role == &lead_role {
+                continue;
+            }
+            let manifest = crate::agent::manifest::read_json(&session.session_root, *agent_id)?;
+            let pane = match manifest.tmux_pane_id.clone() {
+                Some(p) => p,
+                None => continue,
+            };
+            let brief_path = crate::round::write_follower_brief(&layout, role, &lead_role)
+                .map_err(|err| anyhow!("write follower brief: {err}"))?;
+            crate::round::nudge_pane_with_brief(
+                &tmux,
+                &pane,
+                &brief_path,
+                &layout.response_path(role),
+            )
+            .await
+            .map_err(|err| anyhow!("nudge follower {role}: {err}"))?;
+            followers.push(serde_json::json!({
+                "role": role,
+                "agent_id": agent_id.to_string(),
+                "brief_path": brief_path,
+            }));
+        }
+
+        serde_json::json!({
             "session_id": id.to_string(),
             "round": round,
             "roles": session.roles,
+            "mode": "lead",
+            "lead": {
+                "role": lead_role,
+                "agent_id": lead_outcome.agent_id.to_string(),
+                "response_path": lead_outcome.response_path,
+            },
+            "followers": followers,
             "next_action": format!(
-                "Roles are working. Schedule a wakeup ~5 minutes out. On wake, FIRST run \
-                 `caucus session is-terminal {id}` — exit 0 means stop polling. Otherwise check \
-                 `caucus round status {id} --format json` and read response files when \
-                 `all_responses_complete` is true. Do NOT read project source files yourself.",
+                "Lead ({lead_role}) finished. Follower briefs are sent. Schedule a wakeup ~5 minutes out. \
+                 On wake: FIRST `caucus session is-terminal {id}` (exit 0 → stop). Then `caucus round \
+                 status {id} --format json` until `all_responses_complete` is true. Read each follower's \
+                 response.md to see how they reacted to the lead's proposal."
             ),
             "polling_hint": serde_json::json!({
                 "first_check": format!("caucus session is-terminal {id}"),
                 "status_check": format!("caucus round status {id} --format json"),
-                "ready_when": ".all_responses_complete == true"
+                "ready_when": ".all_responses_complete == true",
             }),
-        }),
-        || format!("round {round} started for session {id}"),
-    );
+        })
+    } else {
+        // Parallel flow: every role gets the same agenda at once.
+        for (role, agent_id) in &session.agents {
+            let manifest = crate::agent::manifest::read_json(&session.session_root, *agent_id)?;
+            if let Some(pane) = manifest.tmux_pane_id.clone() {
+                crate::round::nudge_role(&tmux, &pane, &layout, role).await?;
+            }
+        }
+        serde_json::json!({
+            "session_id": id.to_string(),
+            "round": round,
+            "roles": session.roles,
+            "mode": "parallel",
+            "next_action": format!(
+                "Roles are working. Schedule a wakeup ~5 minutes out. On wake, FIRST run \
+                 `caucus session is-terminal {id}` — exit 0 means stop polling. Otherwise check \
+                 `caucus round status {id} --format json` and read response files when \
+                 `all_responses_complete` is true. Do NOT read project source files yourself."
+            ),
+            "polling_hint": serde_json::json!({
+                "first_check": format!("caucus session is-terminal {id}"),
+                "status_check": format!("caucus round status {id} --format json"),
+                "ready_when": ".all_responses_complete == true",
+            }),
+        })
+    };
+
+    write_session(&session)?;
+    emit(format, &payload, || {
+        format!("round {round} started for session {id}")
+    });
     Ok(())
+}
+
+#[derive(Debug)]
+struct LeadOutcome {
+    agent_id: crate::session::id::AgentId,
+    response_path: PathBuf,
+}
+
+/// Nudge the lead role's pane with the standard round agenda, then await
+/// its Stop sentinel. Returns the lead's agent_id + response path once we've
+/// confirmed the response file is non-empty.
+async fn run_lead_phase(
+    tmux: &TmuxService,
+    session: &Session,
+    layout: &crate::round::RoundLayout,
+    lead_role: &str,
+    timeout: std::time::Duration,
+) -> Result<LeadOutcome> {
+    let (lead_agent_id, lead_pane) = session
+        .agents
+        .iter()
+        .find(|(r, _)| r == lead_role)
+        .map(|(_, id)| *id)
+        .and_then(|id| {
+            crate::agent::manifest::read_json(&session.session_root, id)
+                .ok()
+                .and_then(|m| m.tmux_pane_id.clone().map(|p| (id, p)))
+        })
+        .ok_or_else(|| anyhow!("lead role {lead_role} has no live tmux pane"))?;
+
+    let agents_dir = session.session_root.join("agents");
+    std::fs::create_dir_all(&agents_dir)
+        .with_context(|| format!("creating {} for sentinel watcher", agents_dir.display()))?;
+    let (watcher, mut rx) = crate::sentinel::watch(&agents_dir)
+        .map_err(|err| anyhow!("sentinel::watch failed: {err}"))?;
+    let _watcher_guard = watcher;
+
+    crate::round::nudge_role(tmux, &lead_pane, layout, lead_role)
+        .await
+        .map_err(|err| anyhow!("nudge lead {lead_role}: {err}"))?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!(
+                "lead {lead_role} did not produce a sentinel within {}s",
+                timeout.as_secs()
+            ));
+        }
+        let event = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "lead {lead_role} did not produce a sentinel within {}s",
+                    timeout.as_secs()
+                )
+            })?;
+        match event {
+            Some(crate::sentinel::WatchEvent::Sentinel { sentinel, .. })
+                if sentinel.agent_id == lead_agent_id =>
+            {
+                // Ingest the sentinel into the manifest so follow-up
+                // `round status` / `session show` reflect it.
+                let _ = crate::round::record_sentinel(&session.session_root, &sentinel);
+                break;
+            }
+            Some(_) => continue,
+            None => return Err(anyhow!("sentinel watcher closed before lead responded")),
+        }
+    }
+
+    let response_path = layout.response_path(lead_role);
+    let response_size = std::fs::metadata(&response_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if response_size == 0 {
+        return Err(anyhow!(
+            "lead {lead_role} produced an empty response at {} — aborting before nudging followers",
+            response_path.display()
+        ));
+    }
+    Ok(LeadOutcome {
+        agent_id: lead_agent_id,
+        response_path,
+    })
 }
 
 pub fn round_status(repo: &Path, format: OutputFormat, args: RoundStatusArgs) -> Result<()> {
@@ -719,6 +886,8 @@ pub async fn round_next(repo: &Path, format: OutputFormat, args: RoundNextArgs) 
         RoundStartArgs {
             session_id: args.session_id,
             agenda_file: args.agenda_file,
+            lead: args.lead,
+            lead_timeout_secs: args.lead_timeout_secs,
         },
     )
     .await
