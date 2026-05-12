@@ -33,6 +33,9 @@ pub struct RoleEntry {
     #[serde(default = "default_permission_mode")]
     pub permission_mode: PermissionMode,
     pub system_prompt_template: PathBuf,
+    /// Optional per-role model override; mirrors `RoleSpec::model`.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 const fn default_permission_mode() -> PermissionMode {
@@ -83,6 +86,7 @@ impl RolesConfig {
                 allowed_tools: entry.allowed_tools.into_iter().collect(),
                 permission_mode: entry.permission_mode,
                 system_prompt_template: entry.system_prompt_template,
+                model: entry.model,
             })
             .collect()
     }

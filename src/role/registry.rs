@@ -64,6 +64,7 @@ mod tests {
             allowed_tools: [tool.to_string()].into_iter().collect(),
             permission_mode: PermissionMode::Default,
             system_prompt_template: PathBuf::from(format!("roles/{name}.md")),
+            model: None,
         }
     }
 

@@ -9,6 +9,9 @@
 //! See `docs/design.md` §6.
 
 pub mod roles;
+pub mod settings;
+
+pub use settings::{Settings, SettingsError, TeammateMode};
 
 use std::path::{Path, PathBuf};
 
@@ -77,6 +80,7 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             allowed_tools: tools.iter().map(|t| (*t).to_string()).collect(),
             permission_mode: mode,
             system_prompt_template: PathBuf::from(format!("roles/{name}.md")),
+            model: None,
         }
     }
     vec![
@@ -127,6 +131,7 @@ impl From<Vec<RoleSpec>> for RolesConfig {
                     allowed_tools: s.allowed_tools.into_iter().collect(),
                     permission_mode: s.permission_mode,
                     system_prompt_template: s.system_prompt_template,
+                    model: s.model,
                 },
             );
         }

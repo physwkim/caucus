@@ -49,6 +49,11 @@ pub struct RoleSpec {
     /// Path (relative to the caucus install / repo root) of the system-prompt
     /// markdown file for this role. Resolved at spawn time.
     pub system_prompt_template: PathBuf,
+    /// Optional model override for this role. If `None`, the spawning code
+    /// uses the request-level model (or [`crate::agent::spawn::DEFAULT_MODEL`]).
+    /// Useful for cost control: e.g. `architect = sonnet`, `backend = opus`.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl RoleSpec {
@@ -79,6 +84,7 @@ mod tests {
             allowed_tools: tools.iter().map(|t| (*t).to_string()).collect(),
             permission_mode: mode,
             system_prompt_template: PathBuf::from(format!("roles/{name}.md")),
+            model: None,
         }
     }
 
