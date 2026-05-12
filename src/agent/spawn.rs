@@ -55,6 +55,9 @@ pub struct SpawnRequest<'a> {
     /// re-passed — the resumed session already has them. Only valid for
     /// `AgentCli::Claude` (codex doesn't expose `--resume` the same way).
     pub resume_session_id: Option<String>,
+    /// How to lay out the agent's pane: as a split of the current window
+    /// or as its own new tmux window (tab). Defaults to split.
+    pub placement: crate::tmux::Placement,
 }
 
 /// Final result of a successful spawn.
@@ -307,6 +310,7 @@ pub async fn spawn(tmux: &TmuxService, req: SpawnRequest<'_>) -> Result<SpawnOut
             vertical: false,
             env,
             title: Some(req.title.clone().unwrap_or_else(|| req.role.name.clone())),
+            placement: req.placement,
         })
         .await?;
 

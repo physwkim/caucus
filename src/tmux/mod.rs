@@ -5,4 +5,4 @@
 pub mod escape;
 pub mod service;
 
-pub use service::{SpawnPaneOptions, TmuxConfig, TmuxError, TmuxService};
+pub use service::{Placement, SpawnPaneOptions, TmuxConfig, TmuxError, TmuxService};

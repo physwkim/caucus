@@ -121,6 +121,7 @@ pub struct PipelineRequest<'a> {
     pub skip_permissions: bool,
     pub retry_on_block: u32,
     pub step_timeout: Duration,
+    pub placement: crate::tmux::Placement,
 }
 
 /// Final result of a pipeline run.
@@ -241,6 +242,7 @@ pub async fn run(
                     sentinel_hook: req.sentinel_hook_path.clone(),
                     attempt: attempts,
                     pipeline_number,
+                    placement: req.placement,
                 },
                 req.step_timeout,
             )
@@ -285,6 +287,7 @@ pub async fn run(
                 sentinel_hook: req.sentinel_hook_path.clone(),
                 attempt: attempts,
                 pipeline_number,
+                placement: req.placement,
             },
             req.step_timeout,
         )
@@ -333,6 +336,7 @@ pub async fn run(
                     sentinel_hook: req.sentinel_hook_path.clone(),
                     attempt: attempts,
                     pipeline_number,
+                    placement: req.placement,
                 },
                 req.step_timeout,
             )
@@ -424,6 +428,7 @@ struct StepArgs<'a> {
     sentinel_hook: Option<PathBuf>,
     attempt: u32,
     pipeline_number: u32,
+    placement: crate::tmux::Placement,
 }
 
 async fn run_step(
@@ -479,6 +484,7 @@ async fn run_step(
             )),
             initial_prompt_path: Some(task_dst),
             skip_permissions: args.skip_permissions,
+            placement: args.placement,
             resume_session_id: None,
         },
     )

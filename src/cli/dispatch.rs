@@ -226,6 +226,7 @@ pub async fn session_new(repo: &Path, format: OutputFormat, args: SessionNewArgs
                 initial_prompt_path: None,
                 skip_permissions: !args.require_permissions,
                 resume_session_id: None,
+                placement: args.placement.to_tmux(),
             },
         )
         .await?;
@@ -234,14 +235,16 @@ pub async fn session_new(repo: &Path, format: OutputFormat, args: SessionNewArgs
         session.register_agent(role_name, outcome.manifest.agent_id);
     }
 
-    // Re-balance the window after all role panes are spawned. Otherwise the
-    // last role ends up in a 12.5% slice because each split-window halves
-    // the current pane. `--layout` (default `auto`) picks even-horizontal
-    // for 2 panes and tiled for 3+ panes (a 2D grid that uses both row and
-    // column splits). Includes the CEO's own pane in the count.
-    tmux.apply_layout(args.layout.as_tmux_name(), session.agents.len() + 1, None)
-        .await
-        .ok();
+    // Re-balance the window after all role panes are spawned — but only
+    // when placement=split. With `placement=window` each role has its
+    // own tab with a single pane, so there's nothing for select-layout
+    // to balance and calling it would just resize the CEO's lone pane
+    // unhelpfully.
+    if !args.placement.is_single_pane_per_window() {
+        tmux.apply_layout(args.layout.as_tmux_name(), session.agents.len() + 1, None)
+            .await
+            .ok();
+    }
 
     write_session(&session)?;
 
@@ -478,6 +481,7 @@ async fn session_deadlock_explore(
                 sentinel_hook_path: Some(repo.join(".caucus").join("bin").join("sentinel-stop")),
                 skip_permissions: true,
                 resume_session_id: None,
+                placement: crate::tmux::Placement::SplitCurrent,
             },
         )
         .await?;
@@ -716,15 +720,18 @@ pub async fn execute_start(
             sentinel_hook_path: Some(repo.join(".caucus").join("bin").join("sentinel-stop")),
             skip_permissions: !args.require_permissions,
             resume_session_id,
+            placement: args.placement.to_tmux(),
         },
     )
     .await?;
     session.register_agent(&args.role, outcome.agent.agent_id);
-    // Rebalance like session_new — execute panes accumulate too.
-    let total_panes = session.agents.len() + 1;
-    tmux.apply_layout(args.layout.as_tmux_name(), total_panes, None)
-        .await
-        .ok();
+    // Rebalance like session_new — but only when split-placement is in use.
+    if !args.placement.is_single_pane_per_window() {
+        let total_panes = session.agents.len() + 1;
+        tmux.apply_layout(args.layout.as_tmux_name(), total_panes, None)
+            .await
+            .ok();
+    }
     write_session(&session)?;
     emit(
         format,
@@ -874,6 +881,7 @@ pub async fn execute_pipeline(
             skip_permissions: !args.require_permissions,
             retry_on_block: args.retry_on_block,
             step_timeout: std::time::Duration::from_secs(args.step_timeout_secs),
+            placement: args.placement.to_tmux(),
         },
     )
     .await

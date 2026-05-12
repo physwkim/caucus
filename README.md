@@ -93,7 +93,27 @@ caucus watch      <session-id>       # foreground stdout event stream for the CE
 
 Every command accepts `--format json | text` (text is default) and `--repo <path>` (defaults to CWD). Exit codes follow `docs/design.md` §10.1 — `0` success, `2` user error, `3` environment error, `4` state corruption.
 
-### Pane layout
+### Pane placement: split vs window
+
+By default caucus splits the current tmux window into one pane per role.
+That gives an at-a-glance overview but cramps quickly past three or four
+roles. The `--placement window` alternative gives each role its own tmux
+window (tab) — full-width, visually isolated, switchable with the standard
+tmux prefix-n / prefix-p:
+
+```bash
+caucus session new --topic ... --roles architect,backend,reviewer \
+  --placement window
+# → one new tab per role: caucus-architect, caucus-backend, caucus-reviewer.
+#   the CEO's original window stays clean.
+```
+
+`--placement window` is honoured by `caucus session new`,
+`caucus execute start`, and `caucus execute pipeline`. The `--layout` flag
+is ignored under `--placement window` (each tab has a single pane, so
+there's nothing to balance).
+
+### Pane layout (`--placement split` only)
 
 `caucus session new` and `caucus execute start` accept `--layout` with one of:
 

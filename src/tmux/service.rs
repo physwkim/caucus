@@ -50,22 +50,41 @@ pub enum TmuxError {
     MissingPaneId { command: String },
 }
 
+/// How the new pane is created relative to the existing layout.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum Placement {
+    /// Split the current window's active pane (or `target_pane` if set).
+    /// This is the legacy default. Combine with a [`select_layout`] call
+    /// afterwards to balance widths.
+    #[default]
+    SplitCurrent,
+    /// Create a new tmux window (tab) containing this pane as its sole
+    /// occupant. `title` is used as the window name. Honour the existing
+    /// session; don't switch focus (`-d`).
+    NewWindow,
+}
+
 /// Options for [`TmuxService::spawn_pane`].
 #[derive(Debug, Clone, Default)]
 pub struct SpawnPaneOptions {
-    /// Target pane to split. `None` splits the current pane.
+    /// Target pane to split. Only meaningful when [`Placement::SplitCurrent`].
     pub target_pane: Option<String>,
     /// Working directory for the new pane.
     pub cwd: Option<PathBuf>,
     /// Shell command to run inside the new pane. If `None`, tmux spawns
     /// the user's default shell.
     pub command: Option<String>,
-    /// Vertical split if true, horizontal otherwise (default: horizontal).
+    /// Vertical split if true, horizontal otherwise. Only meaningful when
+    /// [`Placement::SplitCurrent`].
     pub vertical: bool,
     /// Environment variables to inject into the new pane's process.
     pub env: HashMap<String, String>,
-    /// Pane title (`select-pane -T`) applied after spawn.
+    /// Pane title (`select-pane -T`) applied after spawn. Also used as the
+    /// window name when [`Placement::NewWindow`].
     pub title: Option<String>,
+    /// How the new pane is created relative to the existing layout. Defaults
+    /// to [`Placement::SplitCurrent`] for backwards compatibility.
+    pub placement: Placement,
 }
 
 /// Typed wrapper over `tmux`.
@@ -83,10 +102,20 @@ impl TmuxService {
         Self { config }
     }
 
-    /// `tmux split-window -P -F '#{pane_id}' [opts] [command]` — captures
-    /// the new pane id from stdout. See `docs/dmux-analysis.md` §4.5: the
-    /// `-P -F '#{pane_id}'` combo is mandatory.
+    /// Dispatches on `opts.placement`. Returns the new pane's tmux id.
+    ///
+    /// - [`Placement::SplitCurrent`]: `tmux split-window -P -F '#{pane_id}'`
+    ///   (see `docs/dmux-analysis.md` §4.5 — the `-P -F` combo is mandatory).
+    /// - [`Placement::NewWindow`]: `tmux new-window -d -n <title> -P -F '#{pane_id}'`
+    ///   — `-d` so the new window doesn't steal focus from the CEO's pane.
     pub async fn spawn_pane(&self, opts: SpawnPaneOptions) -> Result<String, TmuxError> {
+        match opts.placement {
+            Placement::SplitCurrent => self.spawn_pane_split(opts).await,
+            Placement::NewWindow => self.spawn_pane_new_window(opts).await,
+        }
+    }
+
+    async fn spawn_pane_split(&self, opts: SpawnPaneOptions) -> Result<String, TmuxError> {
         let mut args: Vec<String> = vec![
             "split-window".into(),
             if opts.vertical {
@@ -115,19 +144,39 @@ impl TmuxService {
         }
 
         let out = self.run(args).await?;
-        let pane_id = out
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .map(str::trim)
-            .ok_or_else(|| TmuxError::MissingPaneId {
-                command: "split-window".into(),
-            })?
-            .to_string();
-
+        let pane_id = parse_pane_id(&out, "split-window")?;
         if let Some(title) = opts.title {
             self.set_pane_title(&pane_id, &title).await?;
         }
         Ok(pane_id)
+    }
+
+    async fn spawn_pane_new_window(&self, opts: SpawnPaneOptions) -> Result<String, TmuxError> {
+        let mut args: Vec<String> = vec![
+            "new-window".into(),
+            "-d".into(),
+            "-P".into(),
+            "-F".into(),
+            "#{pane_id}".into(),
+        ];
+        if let Some(name) = &opts.title {
+            args.push("-n".into());
+            args.push(name.clone());
+        }
+        if let Some(cwd) = &opts.cwd {
+            args.push("-c".into());
+            args.push(cwd.display().to_string());
+        }
+        for (k, v) in &opts.env {
+            args.push("-e".into());
+            args.push(format!("{k}={v}"));
+        }
+        if let Some(cmd) = &opts.command {
+            args.push(cmd.clone());
+        }
+
+        let out = self.run(args).await?;
+        parse_pane_id(&out, "new-window")
     }
 
     /// `tmux new-session -d -s NAME` — start a fresh detached session and
@@ -470,6 +519,16 @@ pub async fn detect_tmux(svc: &TmuxService) -> Result<String, TmuxError> {
     svc.run(vec!["-V".into()]).await
 }
 
+fn parse_pane_id(stdout: &str, command_label: &str) -> Result<String, TmuxError> {
+    stdout
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .ok_or_else(|| TmuxError::MissingPaneId {
+            command: command_label.into(),
+        })
+}
+
 /// Helper: pane id valid as a tmux `-t` argument? Returns false for blatant
 /// shell-injection attempts. (Not a security boundary — tmux itself rejects
 /// nonsense — just a sanity check before we shell out.)
@@ -524,6 +583,48 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let captured = svc.capture_pane(&panes_before[0], None, None).await?;
         assert!(captured.contains("caucus-marker"));
+
+        svc.kill_session(&session).await?;
+        Ok(())
+    }
+
+    /// `placement: NewWindow` opens a fresh tmux window. The returned pane
+    /// id refers to the new window's single pane, distinct from the pane
+    /// that was active when we spawned. We can also send_text to it and
+    /// observe the output.
+    #[tokio::test]
+    #[ignore = "requires tmux on PATH"]
+    async fn placement_new_window_creates_a_new_tab() -> Result<(), TmuxError> {
+        let svc = TmuxService::new();
+        let session = format!("caucus-window-{}", std::process::id());
+        svc.new_session(&session).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let initial_pane = svc
+            .list_pane_ids_in_session(&session)
+            .await?
+            .first()
+            .expect("session has at least one pane")
+            .clone();
+
+        let new_pane = svc
+            .spawn_pane(SpawnPaneOptions {
+                target_pane: Some(initial_pane.clone()),
+                title: Some("caucus-test-role".into()),
+                placement: Placement::NewWindow,
+                ..Default::default()
+            })
+            .await?;
+        assert_ne!(new_pane, initial_pane);
+
+        // Send a marker through the new pane to confirm it's a live shell.
+        svc.send_text(&new_pane, "echo caucus-window-ok", true)
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let captured = svc.capture_pane(&new_pane, None, None).await?;
+        assert!(
+            captured.contains("caucus-window-ok"),
+            "new-window pane did not echo back: {captured}"
+        );
 
         svc.kill_session(&session).await?;
         Ok(())

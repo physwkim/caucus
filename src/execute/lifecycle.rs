@@ -70,6 +70,8 @@ pub struct ExecuteStartRequest<'a> {
     /// If Some, spawn the agent as `claude --resume <session_id>` so the
     /// execute-phase pane inherits the meeting-phase conversation.
     pub resume_session_id: Option<String>,
+    /// Pane placement: split current window or open a new tmux window.
+    pub placement: crate::tmux::Placement,
 }
 
 /// Files materialised under `<session_root>/execute/<role>/`.
@@ -157,6 +159,7 @@ pub async fn start(
             initial_prompt_path: Some(layout.task_path()),
             skip_permissions: req.skip_permissions,
             resume_session_id: req.resume_session_id,
+            placement: req.placement,
         },
     )
     .await?;

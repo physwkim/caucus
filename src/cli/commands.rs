@@ -163,9 +163,43 @@ pub struct SessionNewArgs {
     #[arg(long)]
     pub require_permissions: bool,
     /// Pane layout applied after all role panes are spawned. Default `auto`
-    /// picks `even-horizontal` for 2 panes and `tiled` for 3+.
+    /// picks `even-horizontal` for 2 panes and `tiled` for 3+. Ignored when
+    /// `--placement window`.
     #[arg(long, value_enum, default_value_t = LayoutPreset::Auto)]
     pub layout: LayoutPreset,
+    /// Where each role's pane lives. `split` (default) shares the current
+    /// window; `window` opens a new tab per role.
+    #[arg(long, value_enum, default_value_t = PlacementMode::Split)]
+    pub placement: PlacementMode,
+}
+
+/// Where each role's pane lives in the tmux session.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, clap::ValueEnum)]
+pub enum PlacementMode {
+    /// `tmux split-window` in the current window. The window ends up with
+    /// one pane per role (default; existing behaviour).
+    #[default]
+    Split,
+    /// `tmux new-window` per role — each role gets its own tab, full
+    /// width. The current window stays clean. Recommended once role count
+    /// passes ~3.
+    Window,
+}
+
+impl PlacementMode {
+    /// Convert to the internal tmux placement enum.
+    pub fn to_tmux(self) -> crate::tmux::Placement {
+        match self {
+            Self::Split => crate::tmux::Placement::SplitCurrent,
+            Self::Window => crate::tmux::Placement::NewWindow,
+        }
+    }
+
+    /// Does the placement produce one pane per window (so `select-layout`
+    /// is irrelevant)?
+    pub fn is_single_pane_per_window(self) -> bool {
+        matches!(self, Self::Window)
+    }
 }
 
 /// tmux `select-layout` presets caucus surfaces to operators. `Auto` lets
@@ -322,6 +356,9 @@ pub struct ExecutePipelineCliArgs {
     pub model: Option<String>,
     #[arg(long)]
     pub require_permissions: bool,
+    /// Where the pipeline's role panes live. Default `split`.
+    #[arg(long, value_enum, default_value_t = PlacementMode::Split)]
+    pub placement: PlacementMode,
 }
 
 #[derive(Debug, Args)]
@@ -340,8 +377,12 @@ pub struct ExecuteStartCliArgs {
     #[arg(long)]
     pub require_permissions: bool,
     /// Pane layout applied after the execute pane is spawned. Default `auto`.
+    /// Ignored when `--placement window`.
     #[arg(long, value_enum, default_value_t = LayoutPreset::Auto)]
     pub layout: LayoutPreset,
+    /// Where the execute pane lives. Default `split` (same window).
+    #[arg(long, value_enum, default_value_t = PlacementMode::Split)]
+    pub placement: PlacementMode,
     /// Resume the meeting-phase agent's Claude session in the new worktree
     /// instead of starting a fresh one. Kills the meeting pane (claude
     /// refuses two concurrent resumes of the same session id). Requires the
