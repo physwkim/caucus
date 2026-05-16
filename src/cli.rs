@@ -55,6 +55,14 @@ pub enum Command {
     /// Inspect role definitions.
     #[command(subcommand)]
     Role(RoleCommand),
+    /// Stdio MCP server for the CEO panel — forwards the six caucus tools to
+    /// the main process over the control socket (`docs/design.md` §0 #4).
+    /// Spawned by the CEO's Claude Code instance, not by a human.
+    McpServe {
+        /// Path to the main caucus process's control socket.
+        #[arg(long)]
+        control_sock: PathBuf,
+    },
 }
 
 /// `caucus signal ...` — the turn-signal hook client.
@@ -129,7 +137,18 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Some(Command::Doctor) => run_doctor(),
         Some(Command::Signal(cmd)) => run_signal(cmd),
         Some(Command::Role(cmd)) => run_role(cmd),
+        Some(Command::McpServe { control_sock }) => run_mcp_serve(&control_sock),
     }
+}
+
+/// `caucus mcp-serve --control-sock <path>` — run the stdio MCP server.
+///
+/// Blocks serving JSON-RPC over stdio until `stdin` reaches EOF (the parent
+/// Claude Code instance closed the pipe). A control-socket I/O failure is a
+/// per-call error surfaced as an MCP tool error, not a process exit.
+fn run_mcp_serve(control_sock: &std::path::Path) -> Result<ExitCode> {
+    crate::mcp::serve::run(control_sock).context("run caucus mcp-serve")?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The git repository caucus operates on — the current working directory.
@@ -281,6 +300,23 @@ mod tests {
             cli.command,
             Some(Command::Signal(SignalCommand::Post { .. }))
         ));
+    }
+
+    #[test]
+    fn mcp_serve_parses_control_sock() {
+        let cli = Cli::try_parse_from([
+            "caucus",
+            "mcp-serve",
+            "--control-sock",
+            "/tmp/caucus-ctl.sock",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::McpServe { control_sock }) => {
+                assert_eq!(control_sock, PathBuf::from("/tmp/caucus-ctl.sock"));
+            }
+            other => panic!("expected McpServe, got {other:?}"),
+        }
     }
 
     #[test]

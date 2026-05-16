@@ -63,6 +63,10 @@ pub struct AgentManifest {
     pub(crate) current_blocker: Option<LaneEventBlocker>,
     pub(crate) derived_state: DerivedState,
     pub(crate) error: Option<String>,
+    /// The agent's final assistant message from its most recent turn signal
+    /// (`docs/design.md` §7.4, §8.5). Backs `read_panel(mode=last_message)`.
+    #[serde(default)]
+    pub(crate) last_message: Option<String>,
 }
 
 impl AgentManifest {
@@ -94,7 +98,14 @@ impl AgentManifest {
             current_blocker: None,
             derived_state: DerivedState::Working,
             error: None,
+            last_message: None,
         }
+    }
+
+    /// The agent's final message from its most recent turn signal, if any
+    /// (`docs/design.md` §7.4) — backs `read_panel(mode=last_message)`.
+    pub fn last_message(&self) -> Option<&str> {
+        self.last_message.as_deref()
     }
 
     /// Read-only view of the lane-event timeline.
@@ -144,6 +155,73 @@ pub(crate) fn write(
     if let Some(event) = event {
         manifest.lane_events.push(event);
     }
+    to_disk(manifest, session_root)
+}
+
+/// Record a turn-completion signal on the manifest (`docs/design.md` §7, §8.3).
+///
+/// Single owner of the `TurnCompleted` transition (Invariant I-2): appends a
+/// `TurnCompleted` lane event, stores the signal's `last_message`, recomputes
+/// `derived_state` via [`super::derive_state::derive_agent_state`], and
+/// persists the JSON + Markdown pair.
+///
+/// A non-`Stop` signal kind (`tool_blocked` / `error`) is recorded as a
+/// blocker so `derived_state` reflects it; a plain `Stop` clears any prior
+/// blocker and lands the agent in `Idle`.
+pub(crate) fn record_turn_completed(
+    manifest: &mut AgentManifest,
+    session_root: &Path,
+    signal: &crate::signal::TurnSignal,
+) -> Result<(), ManifestError> {
+    use super::lane_event::LaneFailureClass;
+    use crate::signal::TurnKind;
+
+    manifest
+        .lane_events
+        .push(LaneEvent::now(LaneEventKind::TurnCompleted));
+    manifest.last_message = signal.last_message.clone();
+
+    // A non-Stop turn signal carries a failure; map it onto a blocker so the
+    // derived state shows the agent as blocked/interrupted rather than idle.
+    manifest.current_blocker = match signal.kind {
+        TurnKind::Stop => None,
+        TurnKind::ToolBlocked => Some(LaneEventBlocker::new(
+            LaneFailureClass::PermissionPrompt,
+            "turn signal: tool_blocked",
+        )),
+        TurnKind::Error => Some(LaneEventBlocker::new(
+            LaneFailureClass::Transport,
+            "turn signal: error",
+        )),
+    };
+
+    manifest.derived_state = super::derive_state::derive_agent_state(
+        manifest.status.as_str(),
+        Some(signal),
+        manifest.error.as_deref(),
+        manifest.current_blocker.as_ref(),
+        None,
+    );
+    to_disk(manifest, session_root)
+}
+
+/// Mark an agent's process as exited (`docs/design.md` §8.3).
+///
+/// Single owner of the terminal `Exited` transition: flips `status` to
+/// `Exited`, stamps `exited_at`, recomputes `derived_state`, and persists.
+pub(crate) fn record_exited(
+    manifest: &mut AgentManifest,
+    session_root: &Path,
+) -> Result<(), ManifestError> {
+    manifest.status = AgentStatus::Exited;
+    manifest.exited_at = Some(Utc::now());
+    manifest.derived_state = super::derive_state::derive_agent_state(
+        manifest.status.as_str(),
+        None,
+        manifest.error.as_deref(),
+        manifest.current_blocker.as_ref(),
+        None,
+    );
     to_disk(manifest, session_root)
 }
 
@@ -251,6 +329,82 @@ mod tests {
         let md =
             std::fs::read_to_string(AgentManifest::md_path(tmp.path(), manifest.agent_id)).unwrap();
         assert!(md.contains("role: reviewer"));
+    }
+
+    #[test]
+    fn record_turn_completed_updates_state_and_message() {
+        use crate::signal::{TurnKind, TurnSignal};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        assert_eq!(manifest.derived_state(), DerivedState::Working);
+
+        let signal = TurnSignal::now(
+            manifest.session_id,
+            manifest.panel_id,
+            TurnKind::Stop,
+            Some("review done".into()),
+            serde_json::Value::Null,
+        );
+        record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
+
+        assert_eq!(manifest.derived_state(), DerivedState::Idle);
+        assert_eq!(manifest.last_message(), Some("review done"));
+        assert!(
+            manifest
+                .lane_events()
+                .iter()
+                .any(|e| matches!(e.kind, LaneEventKind::TurnCompleted))
+        );
+        // Persisted: a fresh read sees the same derived state.
+        let back = read(tmp.path(), manifest.agent_id).unwrap();
+        assert_eq!(back.derived_state(), DerivedState::Idle);
+    }
+
+    #[test]
+    fn record_turn_completed_error_kind_is_interrupted() {
+        use crate::signal::{TurnKind, TurnSignal};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            None,
+        );
+        let signal = TurnSignal::now(
+            manifest.session_id,
+            manifest.panel_id,
+            TurnKind::Error,
+            None,
+            serde_json::Value::Null,
+        );
+        record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
+        assert_eq!(manifest.derived_state(), DerivedState::InterruptedTransport);
+    }
+
+    #[test]
+    fn record_exited_is_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "qa",
+            "qa-1",
+            AgentCli::Claude,
+            None,
+        );
+        record_exited(&mut manifest, tmp.path()).unwrap();
+        assert_eq!(manifest.status(), AgentStatus::Exited);
+        assert_eq!(manifest.derived_state(), DerivedState::Exited);
+        assert!(manifest.exited_at.is_some());
     }
 
     #[test]

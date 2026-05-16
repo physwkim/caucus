@@ -38,6 +38,11 @@ pub struct SpawnRequest {
     /// boundary; this only suppresses interactive confirmations that would
     /// otherwise stall an agent inside a non-interactive panel.
     pub skip_permissions: bool,
+    /// Path to an MCP-config JSON to register with the backend CLI
+    /// (`docs/design.md` §0 #4). Set for the CEO panel so its Claude Code
+    /// instance loads the caucus MCP server; `None` for every other panel.
+    /// Honoured only by the `claude` backend (`--mcp-config`).
+    pub mcp_config_path: Option<PathBuf>,
 }
 
 impl Default for SpawnRequest {
@@ -59,6 +64,7 @@ impl Default for SpawnRequest {
             worktree_path: None,
             sock_path: None,
             skip_permissions: false,
+            mcp_config_path: None,
         }
     }
 }
@@ -104,7 +110,12 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
     let model = request.effective_model();
 
     let args: Vec<OsString> = match cli {
-        AgentCli::Claude => claude_args(&request.role, model.as_deref(), request.skip_permissions),
+        AgentCli::Claude => claude_args(
+            &request.role,
+            model.as_deref(),
+            request.skip_permissions,
+            request.mcp_config_path.as_deref(),
+        ),
         AgentCli::Codex => codex_args(&request.role, model.as_deref(), request.skip_permissions),
         AgentCli::Gemini => gemini_args(&request.role, model.as_deref(), request.skip_permissions),
     };
@@ -127,9 +138,15 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
     }
 }
 
-/// `claude` argv: `--model`, `--permission-mode`, `--allowedTools`, and
-/// optionally `--dangerously-skip-permissions`.
-fn claude_args(role: &RoleSpec, model: Option<&str>, skip_permissions: bool) -> Vec<OsString> {
+/// `claude` argv: `--model`, `--permission-mode`, `--allowedTools`, optionally
+/// `--dangerously-skip-permissions`, and `--mcp-config <path>` for the CEO
+/// panel (so its claude loads the caucus MCP server).
+fn claude_args(
+    role: &RoleSpec,
+    model: Option<&str>,
+    skip_permissions: bool,
+    mcp_config: Option<&std::path::Path>,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     if let Some(m) = model {
         args.push("--model".into());
@@ -144,6 +161,10 @@ fn claude_args(role: &RoleSpec, model: Option<&str>, skip_permissions: bool) -> 
     }
     if skip_permissions {
         args.push("--dangerously-skip-permissions".into());
+    }
+    if let Some(path) = mcp_config {
+        args.push("--mcp-config".into());
+        args.push(path.into());
     }
     args
 }
@@ -344,6 +365,33 @@ mod tests {
         let args = args_of(&cmd);
         assert!(args.windows(2).any(|w| w == ["--model", "flash"]));
         assert!(args.contains(&"--yolo".to_string()));
+    }
+
+    #[test]
+    fn claude_argv_includes_mcp_config_when_set() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "ceo-1".into(),
+            mcp_config_path: Some(PathBuf::from("/tmp/caucus/.mcp.json")),
+            ..SpawnRequest::default()
+        };
+        let cmd = build_command(&req, PanelId::new());
+        let args = args_of(&cmd);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--mcp-config", "/tmp/caucus/.mcp.json"])
+        );
+    }
+
+    #[test]
+    fn claude_argv_omits_mcp_config_by_default() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "backend-1".into(),
+            ..SpawnRequest::default()
+        };
+        let cmd = build_command(&req, PanelId::new());
+        assert!(!args_of(&cmd).contains(&"--mcp-config".to_string()));
     }
 
     #[test]

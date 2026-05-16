@@ -127,12 +127,17 @@ async fn handle_connection(stream: UnixStream, tx: mpsc::UnboundedSender<TurnSig
 /// Single owner of turn-signal ingestion (Invariant I-6).
 ///
 /// Parses one line of socket JSON into a [`TurnSignal`] and is the only path
-/// by which a turn signal reaches the rest of caucus (manifest append,
-/// derived-state recompute).
+/// by which a turn signal reaches the rest of caucus.
+///
+/// Ingestion is parse-only by design: applying the signal — appending a
+/// `TurnCompleted` lane event and recomputing `derived_state` — requires the
+/// per-panel [`crate::agent::AgentManifest`], whose single owner is the
+/// [`crate::session::Multiplexer`] (Invariant I-2). The server forwards the
+/// parsed signal; `Multiplexer::handle_signal` applies it through
+/// `agent::manifest::record_turn_completed`. Splitting it this way keeps the
+/// socket listener free of any manifest dependency.
 pub(crate) fn ingest(line: &str) -> Result<TurnSignal, SignalServerError> {
     let signal: TurnSignal = serde_json::from_str(line)?;
-    // TODO(phase 2): append a `TurnCompleted` LaneEvent to the panel manifest
-    // and recompute derived_state via `agent::derive_state`.
     Ok(signal)
 }
 

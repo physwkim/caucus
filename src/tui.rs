@@ -90,23 +90,24 @@ async fn run_loop(config: Config, session: Session, roles: &[String]) -> Result<
     terminal.clear().ok();
 
     let area = whole_screen(&terminal)?;
-    let (mut mux, mut signal_server) = Multiplexer::new(session, config, area)
+    let (mut mux, mut signal_server, mut control_server) = Multiplexer::new(session, config, area)
         .context("build multiplexer")?;
 
-    // TODO(mcp wave): start the CEO-control MCP server here. The CEO panel
-    // drives the other panels through `send_keys` / `spawn_role` / ... over
-    // MCP (`docs/design.md` §0 #4). `mcp::McpServer` is a stub until then;
-    // wire `McpServer::serve` against the live `Multiplexer` in that wave.
-
-    // The CEO panel always exists (`docs/design.md` §10). Treat the CEO as a
-    // role; fall back to `reviewer` if no `ceo` role is configured so the TUI
-    // still starts on a stock config.
+    // The CEO panel always exists (`docs/design.md` §10). The `ceo` role ships
+    // in the embedded defaults, so it is always present; fall back to
+    // `reviewer` only if a config override somehow removed it.
     let ceo_role = if mux.config.roles.contains("ceo") {
         "ceo"
     } else {
+        warn!("no `ceo` role configured — falling back to `reviewer` for the CEO panel");
         "reviewer"
     };
-    if let Err(err) = mux.spawn_panel(ceo_role, None, None, None) {
+    // The CEO panel gets the caucus MCP server wired in (`docs/design.md`
+    // §0 #4): `spawn_ceo_panel` writes `.mcp.json` and passes `--mcp-config`
+    // so the CEO's Claude Code instance can drive the other panels.
+    let caucus_bin = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("caucus"));
+    if let Err(err) = mux.spawn_ceo_panel(ceo_role, &caucus_bin) {
         bail!("failed to spawn the CEO panel: {err:#}");
     }
     for role in roles {
@@ -140,14 +141,18 @@ async fn run_loop(config: Config, session: Session, roles: &[String]) -> Result<
             mux.handle_signal(signal);
         }
 
-        // 3. PTY pump — drain every panel into its grid + capture, reap exits.
+        // 3. Control jobs — execute the CEO's queued MCP tool calls against
+        //    live panels on this same thread (Invariant I-5).
+        mux.drain_control(&mut control_server);
+
+        // 4. PTY pump — drain every panel into its grid + capture, reap exits.
         mux.pump_all();
 
         if mux.should_quit() {
             break;
         }
 
-        // 4. Redraw on the tick.
+        // 5. Redraw on the tick.
         if last_draw.elapsed() >= TICK {
             draw(&mut terminal, &mux)?;
             last_draw = Instant::now();

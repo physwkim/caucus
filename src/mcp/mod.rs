@@ -1,24 +1,46 @@
-//! caucus MCP server — the control interface caucus exposes to the CEO
+//! caucus MCP control plane — the interface caucus exposes to the CEO
 //! (`docs/design.md` §0 #4, §9).
 //!
-//! The CEO (a Claude Code agent in one panel) drives every other panel
-//! through these tools: `send_keys`, `ctrl_c`, `read_panel`, `spawn_role`,
+//! The CEO (a Claude Code agent in one panel) drives every other panel through
+//! six MCP tools: `send_keys`, `ctrl_c`, `read_panel`, `spawn_role`,
 //! `kill_panel`, `list_panels`.
 //!
-//! **Implementation note.** `rmcp` (the official Rust MCP SDK) resolves
-//! cleanly on crates.io (v1.7.0), but wiring its macro-driven server/transport
-//! surface is Phase 2 work and would not add value to a compiling skeleton.
-//! This module defines the tool surface as a plain [`McpToolSurface`] trait so
-//! parallel agents have a stable contract; the transport is stubbed.
-//
-// TODO: wire rmcp — add `rmcp` back to Cargo.toml and implement
-// `McpToolSurface` behind an `rmcp` `ServerHandler` in Phase 2.
+//! ## Architecture
+//!
+//! Two processes, two hops:
+//!
+//! 1. **`caucus mcp-serve`** ([`serve`]) — a thin stdio MCP server the CEO's
+//!    Claude Code instance spawns. It speaks JSON-RPC 2.0 over stdio
+//!    ([`jsonrpc`]) and forwards each tool call as a [`protocol::ControlRequest`]
+//!    over the *control socket* ([`control_client`]).
+//! 2. **The main `caucus` process** owns the control socket
+//!    ([`control_server`]); its accept task queues each request as a
+//!    [`control_server::ControlJob`] for the [`crate::session::Multiplexer`]
+//!    event loop, which executes it against live panels (Invariant I-5's
+//!    single-owner discipline) and answers through the job's oneshot.
+//!
+//! ## MCP transport: hand-rolled, not `rmcp`
+//!
+//! `rmcp` (1.7.0) resolves cleanly but its server surface is macro-driven and
+//! its transport runs an internal loop that resists deterministic unit
+//! testing. The MCP slice caucus needs is small — `initialize` / `tools/list`
+//! / `tools/call`, six tools — so [`jsonrpc`] implements exactly that, with a
+//! pure dispatch core. See that module's header for the rationale.
+
+pub mod control_client;
+pub mod control_server;
+pub mod jsonrpc;
+pub mod protocol;
+pub mod serve;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
+
+use jsonrpc::ToolDef;
 
 /// Which slice of a panel's captured output `read_panel` should return
 /// (`docs/design.md` §8.5).
@@ -36,7 +58,7 @@ pub enum ReadPanelMode {
 }
 
 /// One panel's status row, returned by `list_panels`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PanelSummary {
     pub panel_id: PanelId,
     pub role: String,
@@ -56,8 +78,9 @@ pub enum McpError {
 
 /// The tool surface caucus exposes to the CEO over MCP.
 ///
-/// Phase 2 implements this against the live panel registry and serves it via
-/// `rmcp`. Defining it as a trait now gives parallel agents a stable contract.
+/// Implemented by [`crate::session::Multiplexer`]: the live panel registry is
+/// the real backing store. The control-socket server routes each
+/// [`protocol::ControlRequest`] into one of these methods.
 pub trait McpToolSurface {
     /// Type keys into a panel's PTY (the live round mechanism, `docs/design.md`
     /// §4). When `enter` is set, a trailing newline is appended.
@@ -87,30 +110,106 @@ pub trait McpToolSurface {
     fn list_panels(&self) -> Vec<PanelSummary>;
 }
 
-/// Placeholder MCP server. Phase 2 replaces this with an `rmcp`-backed server
-/// bound to the live panel registry.
-pub struct McpServer {
-    // TODO(phase 2): hold a handle to the panel registry and the rmcp server.
-}
-
-impl McpServer {
-    /// Construct the (stub) MCP server.
-    pub fn new() -> Self {
-        Self {}
+/// The six MCP tools caucus exposes to the CEO (`docs/design.md` §0 #4).
+///
+/// One catalogue, shared by [`jsonrpc::McpDispatch`] (the `tools/list`
+/// response) and the control-socket request decoder ([`control_client`]).
+pub fn tool_catalogue() -> Vec<ToolDef> {
+    /// JSON-Schema for a required panel-id string argument.
+    fn panel_prop() -> Value {
+        json!({ "type": "string", "description": "Target panel id (a ULID)." })
     }
-
-    /// Serve MCP requests. Phase 2 wires the rmcp transport.
-    pub async fn serve(&self) -> Result<(), McpError> {
-        // TODO(phase 2): wire rmcp — bind the transport, register the six
-        // tools, dispatch into a `McpToolSurface`.
-        todo!("phase 2: wire rmcp MCP server")
-    }
-}
-
-impl Default for McpServer {
-    fn default() -> Self {
-        Self::new()
-    }
+    vec![
+        ToolDef {
+            name: "send_keys",
+            description: "Type text into a panel's terminal. With enter=true a \
+                          newline is appended — the live way to deliver a prompt \
+                          or a slash command (/compact, /clear) to that agent.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "panel": panel_prop(),
+                    "text": { "type": "string", "description": "Text to type." },
+                    "enter": {
+                        "type": "boolean",
+                        "description": "Append a newline (submit the line).",
+                        "default": false
+                    }
+                },
+                "required": ["panel", "text"]
+            }),
+        },
+        ToolDef {
+            name: "ctrl_c",
+            description: "Send Ctrl-C (interrupt) to a panel's terminal — stop a \
+                          runaway turn or cancel a prompt.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "panel": panel_prop() },
+                "required": ["panel"]
+            }),
+        },
+        ToolDef {
+            name: "read_panel",
+            description: "Read a panel's captured output. mode: 'screen' (visible \
+                          grid), 'scrollback' (full scrollback), 'since_last_turn' \
+                          (everything since the last prompt — the whole turn, no \
+                          racing the screen), 'last_message' (the agent's final \
+                          message from its turn signal).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "panel": panel_prop(),
+                    "mode": {
+                        "type": "string",
+                        "enum": ["screen", "scrollback", "since_last_turn", "last_message"],
+                        "description": "Which output slice to return."
+                    }
+                },
+                "required": ["panel", "mode"]
+            }),
+        },
+        ToolDef {
+            name: "spawn_role",
+            description: "Spawn a new panel running the given role. worktree=true \
+                          gives the new agent a dedicated git worktree as its cwd. \
+                          model and agent_cli override the role defaults.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role": { "type": "string", "description": "Role name (e.g. backend)." },
+                    "worktree": {
+                        "type": "boolean",
+                        "description": "Create a dedicated git worktree for the panel.",
+                        "default": false
+                    },
+                    "model": { "type": "string", "description": "Model override." },
+                    "agent_cli": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "gemini"],
+                        "description": "Backend CLI override."
+                    }
+                },
+                "required": ["role"]
+            }),
+        },
+        ToolDef {
+            name: "kill_panel",
+            description: "Kill a panel: terminate its agent process and enqueue \
+                          any worktree for cleanup.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "panel": panel_prop() },
+                "required": ["panel"]
+            }),
+        },
+        ToolDef {
+            name: "list_panels",
+            description: "List every live panel with its role and derived state \
+                          (working / idle / blocked_* / exited).",
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -123,5 +222,32 @@ mod tests {
             serde_json::to_string(&ReadPanelMode::SinceLastTurn).unwrap(),
             "\"since_last_turn\""
         );
+    }
+
+    #[test]
+    fn tool_catalogue_has_the_six_tools() {
+        let names: Vec<&str> = tool_catalogue().iter().map(|t| t.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "send_keys",
+                "ctrl_c",
+                "read_panel",
+                "spawn_role",
+                "kill_panel",
+                "list_panels",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_tool_has_an_object_schema() {
+        for tool in tool_catalogue() {
+            assert_eq!(
+                tool.input_schema["type"], "object",
+                "tool {} schema must be an object",
+                tool.name
+            );
+        }
     }
 }

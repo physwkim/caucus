@@ -60,9 +60,9 @@ impl Config {
     }
 }
 
-/// The six role specs shipped with caucus (`docs/design.md` §13). Bottom layer
-/// of the override stack, so caucus always knows the standard roles even with
-/// no config files present.
+/// The role specs shipped with caucus (`docs/design.md` §13). Bottom layer of
+/// the override stack, so caucus always knows the standard roles even with no
+/// config files present.
 pub fn embedded_defaults() -> Vec<RoleSpec> {
     fn role(
         name: &str,
@@ -83,6 +83,19 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
         }
     }
     vec![
+        role(
+            "ceo",
+            "Orchestrator. Talks to the user, drives the other panels via the \
+             caucus MCP tools (send_keys / read_panel / spawn_role / ...).",
+            "default",
+            // The CEO drives panels through caucus MCP tools, not in-session
+            // sub-agents — `Task` MUST NOT appear (Invariant I-7). It still
+            // reads and edits the repo to coordinate. The caucus MCP server is
+            // registered separately via `--mcp-config`, not the allowlist.
+            &["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite", "WebFetch", "WebSearch"],
+            AgentCli::Claude,
+            Some("opus"),
+        ),
         role(
             "architect",
             "Designs the approach, decomposes tasks, no code edits.",
@@ -163,11 +176,12 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn embedded_defaults_contain_six_roles() {
+    fn embedded_defaults_contain_the_standard_roles() {
         let names: Vec<_> = embedded_defaults().into_iter().map(|s| s.name).collect();
         assert_eq!(
             names,
             vec![
+                "ceo",
                 "architect",
                 "backend",
                 "reviewer",
@@ -176,6 +190,14 @@ mod tests {
                 "serious-reviewer",
             ]
         );
+    }
+
+    #[test]
+    fn ceo_role_is_claude_backed_and_has_no_task_tool() {
+        let specs = embedded_defaults();
+        let ceo = specs.iter().find(|s| s.name == "ceo").unwrap();
+        assert_eq!(ceo.agent_cli, AgentCli::Claude);
+        assert!(!ceo.allows_task(), "ceo role must not grant Task (Invariant I-7)");
     }
 
     #[test]
