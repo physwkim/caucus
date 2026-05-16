@@ -148,12 +148,35 @@ fn split(start: u16, total: u16, parts: usize) -> Vec<(u16, u16)> {
 
 /// Draw the full caucus screen: every panel's grid into its [`Layout`] slot,
 /// with a titled border and a focus highlight on `focused`.
+///
+/// After painting, the hardware cursor is parked at the focused panel's grid
+/// cursor. This is what makes the real terminal's cursor — and therefore IME
+/// pre-edit (composing CJK / Korean input) — track the focused agent's input
+/// position; without it the terminal composes pre-edit text at a stale spot
+/// and CJK input renders detached.
 pub fn draw(frame: &mut Frame, layout: &Layout, panels: &[Panel], focused: Option<PanelId>) {
     for (id, rect) in &layout.slots {
         let Some(panel) = panels.iter().find(|p| p.id == *id) else {
             continue;
         };
         draw_panel(frame, panel, *rect, focused == Some(*id));
+    }
+
+    // Park the hardware cursor at the focused panel's grid cursor. Grid
+    // columns map 1:1 to screen columns (a wide glyph occupies two grid
+    // columns and `grid_lines` renders it two columns wide), so the grid
+    // cursor column is also the screen column.
+    if let Some(fid) = focused
+        && let Some(rect) = layout.rect_of(fid)
+        && let Some(panel) = panels.iter().find(|p| p.id == fid)
+    {
+        let interior = rect.inner();
+        if interior.width > 0 && interior.height > 0 {
+            let (crow, ccol) = panel.grid().cursor();
+            let x = interior.x + (ccol as u16).min(interior.width - 1);
+            let y = interior.y + (crow as u16).min(interior.height - 1);
+            frame.set_cursor_position((x, y));
+        }
     }
 }
 

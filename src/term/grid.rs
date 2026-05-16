@@ -1722,4 +1722,19 @@ mod tests {
             g.row_text(0)
         );
     }
+
+    #[test]
+    fn korean_wide_chars_render_without_gaps() {
+        let mut g = Grid::new(40, 5);
+        g.advance("한글 입력".as_bytes());
+        assert_eq!(g.row_text(0).trim_end(), "한글 입력");
+        // Lead cell holds the glyph; the trailing cell is the '\0' marker.
+        assert_eq!(g.cell(0, 0).unwrap().ch, '한');
+        assert_eq!(g.cell(0, 1).unwrap().ch, '\0');
+        assert_eq!(g.cell(0, 2).unwrap().ch, '글');
+        assert_eq!(g.cell(0, 3).unwrap().ch, '\0');
+        assert_eq!(g.cell(0, 4).unwrap().ch, ' ');
+        assert_eq!(g.cell(0, 5).unwrap().ch, '입');
+        assert_eq!(g.cursor(), (0, 9));
+    }
 }
