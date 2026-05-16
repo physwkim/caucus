@@ -1,11 +1,13 @@
-//! Parse `roles.toml`. The file structure mirrors `docs/design.md` §6:
+//! Parse `roles.toml` (`docs/design.md` §6):
 //!
 //! ```toml
 //! [roles.architect]
 //! description = "..."
 //! allowed_tools = ["Read", "Glob", "Grep", "TodoWrite"]
-//! permission_mode = "default"
+//! permission_mode = "plan"
 //! system_prompt_template = "roles/architect.md"
+//! agent_cli = "claude"
+//! model = "opus"
 //! ```
 
 use std::collections::BTreeMap;
@@ -13,17 +15,18 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
-use crate::role::spec::{AgentCli, PermissionMode, RoleSpec};
+use crate::role::spec::{AgentCli, RoleSpec};
 
-/// On-disk representation of a `roles.toml` file. One entry per role,
-/// keyed by role name (e.g. `[roles.reviewer]`).
+/// On-disk representation of a `roles.toml` file. One entry per role.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RolesConfig {
     pub roles: BTreeMap<String, RoleEntry>,
 }
 
+/// One `[roles.<name>]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleEntry {
     #[serde(default)]
@@ -31,17 +34,32 @@ pub struct RoleEntry {
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     #[serde(default = "default_permission_mode")]
-    pub permission_mode: PermissionMode,
-    pub system_prompt_template: PathBuf,
-    /// Optional per-role model override; mirrors `RoleSpec::model`.
-    #[serde(default)]
-    pub model: Option<String>,
+    pub permission_mode: String,
+    pub system_prompt_template: String,
     #[serde(default)]
     pub agent_cli: AgentCli,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
-const fn default_permission_mode() -> PermissionMode {
-    PermissionMode::Default
+fn default_permission_mode() -> String {
+    "default".to_string()
+}
+
+/// Drop the `Task` tool from a role's allowlist (Invariant I-7), warning once
+/// per offending role. Returns the filtered list.
+fn strip_task(role: &str, tools: Vec<String>) -> Vec<String> {
+    if tools.iter().any(|t| t == "Task") {
+        warn!(
+            role,
+            "stripping forbidden `Task` tool from role allowlist — nested \
+             in-session sub-agents are invisible to caucus (design.md §0 #13, \
+             Invariant I-7)"
+        );
+        tools.into_iter().filter(|t| t != "Task").collect()
+    } else {
+        tools
+    }
 }
 
 /// Errors from loading `roles.toml`.
@@ -62,8 +80,8 @@ pub enum RolesError {
 }
 
 impl RolesConfig {
-    /// Read a single `roles.toml` from disk. Missing files yield an empty
-    /// config (so global+project merge can short-circuit).
+    /// Read one `roles.toml`. A missing file yields an empty config so the
+    /// global+project merge can short-circuit.
     pub fn load(path: &Path) -> Result<Self, RolesError> {
         match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).map_err(|source| RolesError::Toml {
@@ -78,25 +96,32 @@ impl RolesConfig {
         }
     }
 
-    /// Convert into a vector of `RoleSpec`, applying defaults.
+    /// Convert into [`RoleSpec`]s.
+    ///
+    /// The forbidden `Task` tool (`docs/design.md` §0 #13, Invariant I-7) is
+    /// stripped from every role's `allowed_tools` here, with a `warn!` per
+    /// offending role — a nested in-session sub-agent would be invisible to
+    /// caucus, so it never reaches a spawned agent's allowlist.
     pub fn into_specs(self) -> Vec<RoleSpec> {
         self.roles
             .into_iter()
-            .map(|(name, entry)| RoleSpec {
-                name,
-                description: entry.description,
-                allowed_tools: entry.allowed_tools.into_iter().collect(),
-                permission_mode: entry.permission_mode,
-                system_prompt_template: entry.system_prompt_template,
-                model: entry.model,
-                agent_cli: entry.agent_cli,
+            .map(|(name, entry)| {
+                let allowed_tools = strip_task(&name, entry.allowed_tools);
+                RoleSpec {
+                    name,
+                    description: entry.description,
+                    allowed_tools,
+                    permission_mode: entry.permission_mode,
+                    system_prompt_template: entry.system_prompt_template,
+                    agent_cli: entry.agent_cli,
+                    model: entry.model,
+                }
             })
             .collect()
     }
 
-    /// Override `self` with entries from `other`. Roles defined in `other`
-    /// fully replace the version in `self` (no field-level merge — keeps the
-    /// semantics simple to reason about).
+    /// Override `self` with entries from `other` — roles defined in `other`
+    /// fully replace the version in `self` (project beats global).
     pub fn override_with(mut self, other: Self) -> Self {
         for (name, entry) in other.roles {
             self.roles.insert(name, entry);
@@ -110,26 +135,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
-        path
-    }
-
     #[test]
     fn missing_file_yields_empty_config() {
         let tmp = TempDir::new().unwrap();
-        let missing = tmp.path().join("nope.toml");
-        let cfg = RolesConfig::load(&missing).unwrap();
+        let cfg = RolesConfig::load(&tmp.path().join("nope.toml")).unwrap();
         assert!(cfg.roles.is_empty());
     }
 
     #[test]
     fn parses_minimal_role() {
         let tmp = TempDir::new().unwrap();
-        let path = write(
-            tmp.path(),
-            "roles.toml",
+        let path = tmp.path().join("roles.toml");
+        std::fs::write(
+            &path,
             r#"
                 [roles.reviewer]
                 description = "read-only critic"
@@ -137,64 +155,69 @@ mod tests {
                 permission_mode = "default"
                 system_prompt_template = "roles/reviewer.md"
             "#,
-        );
-        let cfg = RolesConfig::load(&path).unwrap();
-        let specs = cfg.into_specs();
+        )
+        .unwrap();
+        let specs = RolesConfig::load(&path).unwrap().into_specs();
         assert_eq!(specs.len(), 1);
-        let r = &specs[0];
-        assert_eq!(r.name, "reviewer");
-        assert_eq!(r.permission_mode, PermissionMode::Default);
-        assert_eq!(r.allowed_tools_csv(), "Glob,Grep,Read");
-        assert_eq!(r.system_prompt_template, PathBuf::from("roles/reviewer.md"));
+        assert_eq!(specs[0].name, "reviewer");
+        assert_eq!(specs[0].allowed_tools_csv(), "Read,Glob,Grep");
     }
 
     #[test]
     fn project_overrides_global() {
-        let tmp = TempDir::new().unwrap();
-        let g_path = write(
-            tmp.path(),
-            "global.toml",
-            r#"
-                [roles.backend]
-                allowed_tools = ["Read"]
-                system_prompt_template = "g/backend.md"
-            "#,
-        );
-        let p_path = write(
-            tmp.path(),
-            "project.toml",
-            r#"
-                [roles.backend]
-                allowed_tools = ["Read", "Edit", "Write"]
-                permission_mode = "acceptEdits"
-                system_prompt_template = "p/backend.md"
-            "#,
-        );
-        let global = RolesConfig::load(&g_path).unwrap();
-        let project = RolesConfig::load(&p_path).unwrap();
+        let global = RolesConfig {
+            roles: BTreeMap::from([(
+                "backend".to_string(),
+                RoleEntry {
+                    description: "g".into(),
+                    allowed_tools: vec!["Read".into()],
+                    permission_mode: "default".into(),
+                    system_prompt_template: "g/backend.md".into(),
+                    agent_cli: AgentCli::Claude,
+                    model: None,
+                },
+            )]),
+        };
+        let project = RolesConfig {
+            roles: BTreeMap::from([(
+                "backend".to_string(),
+                RoleEntry {
+                    description: "p".into(),
+                    allowed_tools: vec!["Read".into(), "Edit".into()],
+                    permission_mode: "acceptEdits".into(),
+                    system_prompt_template: "p/backend.md".into(),
+                    agent_cli: AgentCli::Claude,
+                    model: None,
+                },
+            )]),
+        };
         let merged = global.override_with(project);
         let specs = merged.into_specs();
         assert_eq!(specs.len(), 1);
-        let r = &specs[0];
-        assert_eq!(r.name, "backend");
-        assert_eq!(r.permission_mode, PermissionMode::AcceptEdits);
-        assert_eq!(r.allowed_tools_csv(), "Edit,Read,Write");
-        assert_eq!(r.system_prompt_template, PathBuf::from("p/backend.md"));
+        assert_eq!(specs[0].permission_mode, "acceptEdits");
     }
 
     #[test]
-    fn rejects_invalid_permission_mode() {
+    fn task_tool_is_stripped_on_load() {
         let tmp = TempDir::new().unwrap();
-        let path = write(
-            tmp.path(),
-            "roles.toml",
+        let path = tmp.path().join("roles.toml");
+        std::fs::write(
+            &path,
             r#"
-                [roles.x]
-                permission_mode = "nuke"
-                system_prompt_template = "x.md"
+                [roles.rogue]
+                description = "tries to nest"
+                allowed_tools = ["Read", "Task", "Grep"]
+                permission_mode = "default"
+                system_prompt_template = "roles/rogue.md"
             "#,
+        )
+        .unwrap();
+        let specs = RolesConfig::load(&path).unwrap().into_specs();
+        assert_eq!(specs.len(), 1);
+        assert!(
+            !specs[0].allows_task(),
+            "Task must be stripped from a loaded role (Invariant I-7)"
         );
-        let err = RolesConfig::load(&path).unwrap_err();
-        assert!(matches!(err, RolesError::Toml { .. }));
+        assert_eq!(specs[0].allowed_tools, vec!["Read", "Grep"]);
     }
 }

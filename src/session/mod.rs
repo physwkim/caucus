@@ -1,8 +1,10 @@
-//! Session: a single topic of work. Owns the state machine; state transitions
-//! must go through `state::transition` (see `docs/design.md` Invariant I-1).
+//! Session: one caucus multiplexer instance — the set of panels convened
+//! around one topic. See `docs/design.md` §3.
 
 pub mod id;
-pub mod record;
+pub mod runtime;
 pub mod state;
 
-pub use record::{Session, SessionRecordError, list_sessions, read_session, write_session};
+pub use id::{AgentId, PanelId, SessionId};
+pub use runtime::Multiplexer;
+pub use state::{Session, SessionState};

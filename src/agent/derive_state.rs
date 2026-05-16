@@ -1,92 +1,121 @@
-//! 8-state derived view over `(status, response_file_present, error, blocker,
-//! pane_hint)`. Modelled on claw-code's `derive_agent_state` (see
-//! `docs/claw-code-analysis.md` §4.2), with one caucus-specific addition:
-//! `BlockedPermissionPrompt` for the tmux case where the spawned `claude`
-//! pane is stuck on a tool-permission y/n prompt.
+//! Derived agent state (`docs/design.md` §8.3, §8.4).
+//!
+//! A coarse-grained state surface the main worker inspects via `list_panels`, computed
+//! from `(status, last turn signal, error, blocker, grid hint)`. Recomputed on
+//! every turn-signal ingest and on grid changes.
 
 use serde::{Deserialize, Serialize};
 
-/// Coarse-grained state surface for the orchestrator. The CEO inspects this,
-/// not the raw `(status, error, blocker)` tuple.
+use super::lane_event::{LaneEventBlocker, LaneFailureClass};
+use crate::signal::TurnSignal;
+
+/// Coarse state surface for the main worker (`docs/design.md` §8.3).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DerivedState {
+    /// After `PromptDelivered`, before the next turn signal.
     Working,
-    FinishedCleanable,
-    FinishedPendingReport,
-    BlockedBackgroundJob,
-    BlockedMergeConflict,
+    /// Turn signal received — waiting for the next instruction.
+    Idle,
+    /// Grid shows a tool-permission `[y/n]` prompt. caucus never auto-answers.
     BlockedPermissionPrompt,
+    /// Grid shows a merge conflict.
+    BlockedMergeConflict,
+    /// Grid shows a stuck background job.
+    BlockedBackgroundJob,
+    /// MCP handshake degraded.
     DegradedMcp,
+    /// The transport to the agent was interrupted.
     InterruptedTransport,
-    TrulyIdle,
+    /// The agent process exited.
+    Exited,
 }
 
-/// Raw agent status, persisted in the manifest.
+/// Hint extracted from a panel's grid by the regex fallback in `term/`.
+/// `None` means caucus has no opinion. Used for backends without a
+/// turn-completion hook, and for blocked-state detection (`docs/design.md`
+/// §8.3).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RawStatus {
-    Running,
-    Completed,
-    Failed,
-}
-
-/// Hint extracted from the pane screen by the regex fallback in
-/// `crate::status::pane_hint`. `None` means we have no opinion.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PaneScreenHint {
-    EscToInterruptVisible,
+pub enum GridHint {
+    /// The agent is back at a bare input prompt (turn likely done).
+    PromptReady,
+    /// A `Allow this tool? [y/n]`-style permission prompt is visible.
     PermissionPromptVisible,
-    BareOpenPrompt,
+    /// A merge-conflict marker is visible.
+    MergeConflictVisible,
+    /// A long-running background job appears stuck.
+    BackgroundJobVisible,
 }
 
-/// Pure function: every input combination produces one `DerivedState`.
-/// Called on every sentinel ingest and every poller tick.
-pub fn derive(
-    status: RawStatus,
-    response_file_non_empty: bool,
+/// Pure function deriving the coarse state (`docs/design.md` §8.4).
+///
+/// `status` is the raw agent status string from the manifest
+/// (`live` / `exited` / `failed`). A visible blocking grid hint dominates;
+/// otherwise a received turn signal means `Idle`, and `live` with no signal
+/// means `Working`.
+pub fn derive_agent_state(
+    status: &str,
+    last_turn_signal: Option<&TurnSignal>,
     error: Option<&str>,
-    pane_hint: Option<PaneScreenHint>,
+    blocker: Option<&LaneEventBlocker>,
+    grid_hint: Option<&GridHint>,
 ) -> DerivedState {
-    if let Some(PaneScreenHint::PermissionPromptVisible) = pane_hint {
-        return DerivedState::BlockedPermissionPrompt;
+    // Classification precedence (`docs/design.md` §8.3):
+    //   1. `exited` status is terminal — overrides everything.
+    //   2. A live `error` string puts the agent in a transport-interrupted
+    //      state (the process is alive but its turn ended badly).
+    //   3. A recorded `blocker` maps onto its blocked/degraded variant.
+    //   4. A blocking grid hint (the heuristic fallback for backends without
+    //      a turn-completion hook) maps the same way — lower-confidence than
+    //      the hook-fed `blocker`, so it is weighed after it.
+    //   5. Otherwise: a received turn signal means `Idle`, a live agent with
+    //      no signal yet means `Working`.
+
+    // `exited` is terminal regardless of any pending blocker or hint.
+    if status == "exited" {
+        return DerivedState::Exited;
+    }
+
+    if error.is_some() {
+        return DerivedState::InterruptedTransport;
+    }
+
+    if let Some(blocker) = blocker {
+        return blocker_state(blocker.failure_class);
+    }
+
+    if let Some(hint) = grid_hint {
+        match hint {
+            GridHint::PermissionPromptVisible => return DerivedState::BlockedPermissionPrompt,
+            GridHint::MergeConflictVisible => return DerivedState::BlockedMergeConflict,
+            GridHint::BackgroundJobVisible => return DerivedState::BlockedBackgroundJob,
+            GridHint::PromptReady => {}
+        }
     }
 
     match status {
-        RawStatus::Running => DerivedState::Working,
-        RawStatus::Completed => {
-            if response_file_non_empty {
-                DerivedState::FinishedCleanable
-            } else {
-                DerivedState::FinishedPendingReport
-            }
-        }
-        RawStatus::Failed => classify_failure(error.unwrap_or_default()),
+        "failed" => DerivedState::InterruptedTransport,
+        _ if last_turn_signal.is_some() => DerivedState::Idle,
+        _ => DerivedState::Working,
     }
 }
 
-/// Classify a failure message string into a `DerivedState`. Matches
-/// claw-code's substring heuristics so error wording is interchangeable.
-pub fn classify_failure(error: &str) -> DerivedState {
-    let e = error.to_ascii_lowercase();
-    if e.contains("background") {
-        return DerivedState::BlockedBackgroundJob;
+/// Map a blocker's failure class onto a `DerivedState` variant
+/// (`docs/design.md` §8.3).
+fn blocker_state(class: LaneFailureClass) -> DerivedState {
+    match class {
+        LaneFailureClass::PermissionPrompt => DerivedState::BlockedPermissionPrompt,
+        LaneFailureClass::MergeConflict => DerivedState::BlockedMergeConflict,
+        LaneFailureClass::BackgroundJob => DerivedState::BlockedBackgroundJob,
+        LaneFailureClass::McpHandshake => DerivedState::DegradedMcp,
+        LaneFailureClass::Transport => DerivedState::InterruptedTransport,
+        // PromptDelivery / Unknown have no dedicated state surface; treat as
+        // transport-interrupted so the main worker still sees a non-Idle panel.
+        LaneFailureClass::PromptDelivery | LaneFailureClass::Unknown => {
+            DerivedState::InterruptedTransport
+        }
     }
-    if e.contains("merge conflict") || e.contains("cherry-pick") {
-        return DerivedState::BlockedMergeConflict;
-    }
-    if e.contains("mcp") {
-        return DerivedState::DegradedMcp;
-    }
-    if e.contains("transport")
-        || e.contains("broken pipe")
-        || e.contains("connection")
-        || e.contains("interrupted")
-    {
-        return DerivedState::InterruptedTransport;
-    }
-    DerivedState::TrulyIdle
 }
 
 #[cfg(test)]
@@ -94,75 +123,114 @@ mod tests {
     use super::*;
 
     #[test]
-    fn running_is_working() {
+    fn live_with_no_signal_is_working() {
         assert_eq!(
-            derive(RawStatus::Running, false, None, None),
+            derive_agent_state("live", None, None, None, None),
             DerivedState::Working
         );
     }
 
     #[test]
-    fn completed_with_report_is_cleanable() {
+    fn exited_status_is_exited() {
         assert_eq!(
-            derive(RawStatus::Completed, true, None, None),
-            DerivedState::FinishedCleanable
+            derive_agent_state("exited", None, None, None, None),
+            DerivedState::Exited
         );
     }
 
     #[test]
-    fn completed_without_report_is_pending() {
+    fn permission_prompt_hint_dominates() {
         assert_eq!(
-            derive(RawStatus::Completed, false, None, None),
-            DerivedState::FinishedPendingReport
-        );
-    }
-
-    #[test]
-    fn merge_conflict_classified() {
-        assert_eq!(
-            derive(
-                RawStatus::Failed,
-                false,
-                Some("merge conflict while rebasing"),
-                None
-            ),
-            DerivedState::BlockedMergeConflict
-        );
-    }
-
-    #[test]
-    fn mcp_handshake_classified() {
-        assert_eq!(
-            derive(
-                RawStatus::Failed,
-                false,
-                Some("mcp handshake timed out"),
-                None
-            ),
-            DerivedState::DegradedMcp
-        );
-    }
-
-    #[test]
-    fn permission_prompt_dominates_running() {
-        // Even if we still think the agent is running, a visible permission
-        // prompt is the more informative signal — surface it.
-        assert_eq!(
-            derive(
-                RawStatus::Running,
-                false,
+            derive_agent_state(
+                "live",
                 None,
-                Some(PaneScreenHint::PermissionPromptVisible)
+                None,
+                None,
+                Some(&GridHint::PermissionPromptVisible)
             ),
             DerivedState::BlockedPermissionPrompt
         );
     }
 
     #[test]
-    fn unknown_failure_falls_back_to_truly_idle() {
+    fn turn_signal_with_no_blocker_is_idle() {
+        let sig = TurnSignal::now(
+            crate::session::id::SessionId::new(),
+            crate::session::id::PanelId::new(),
+            crate::signal::TurnKind::Stop,
+            Some("done".into()),
+            serde_json::Value::Null,
+        );
         assert_eq!(
-            derive(RawStatus::Failed, false, Some("weird thing"), None),
-            DerivedState::TrulyIdle
+            derive_agent_state("live", Some(&sig), None, None, None),
+            DerivedState::Idle
+        );
+    }
+
+    #[test]
+    fn error_string_is_interrupted_transport() {
+        assert_eq!(
+            derive_agent_state("live", None, Some("pipe broke"), None, None),
+            DerivedState::InterruptedTransport
+        );
+    }
+
+    #[test]
+    fn blocker_maps_to_blocked_variant() {
+        let merge = LaneEventBlocker::new(LaneFailureClass::MergeConflict, "conflict in foo.rs");
+        assert_eq!(
+            derive_agent_state("live", None, None, Some(&merge), None),
+            DerivedState::BlockedMergeConflict
+        );
+        let mcp = LaneEventBlocker::new(LaneFailureClass::McpHandshake, "handshake failed");
+        assert_eq!(
+            derive_agent_state("live", None, None, Some(&mcp), None),
+            DerivedState::DegradedMcp
+        );
+        let perm = LaneEventBlocker::new(LaneFailureClass::PermissionPrompt, "y/n");
+        assert_eq!(
+            derive_agent_state("live", None, None, Some(&perm), None),
+            DerivedState::BlockedPermissionPrompt
+        );
+    }
+
+    #[test]
+    fn exited_dominates_blocker_and_hint() {
+        let blk = LaneEventBlocker::new(LaneFailureClass::PermissionPrompt, "y/n");
+        assert_eq!(
+            derive_agent_state(
+                "exited",
+                None,
+                Some("err"),
+                Some(&blk),
+                Some(&GridHint::PermissionPromptVisible),
+            ),
+            DerivedState::Exited
+        );
+    }
+
+    #[test]
+    fn blocker_outranks_grid_hint() {
+        // Hook-fed blocker (merge conflict) beats a lower-confidence grid
+        // hint (permission prompt).
+        let blk = LaneEventBlocker::new(LaneFailureClass::MergeConflict, "conflict");
+        assert_eq!(
+            derive_agent_state(
+                "live",
+                None,
+                None,
+                Some(&blk),
+                Some(&GridHint::PermissionPromptVisible),
+            ),
+            DerivedState::BlockedMergeConflict
+        );
+    }
+
+    #[test]
+    fn prompt_ready_hint_does_not_block() {
+        assert_eq!(
+            derive_agent_state("live", None, None, None, Some(&GridHint::PromptReady)),
+            DerivedState::Working
         );
     }
 }

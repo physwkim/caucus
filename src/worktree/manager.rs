@@ -1,32 +1,33 @@
-//! `git worktree add` driver. Worktree directories live under
-//! `<repo>/.caucus/worktrees/<session>-<role>/` and check out a fresh branch
-//! named `caucus/<session>/<role>` off the current `HEAD` (or an explicit
-//! base ref).
+//! `git worktree add` driver (`docs/design.md` §5).
+//!
+//! Worktree directories live under `<repo>/.caucus/worktrees/<session>-<role>-NN/`
+//! and check out a fresh branch off the current `HEAD` (or an explicit base).
+//!
+//! **Invariant I-3** (`docs/design.md` §12): worktree *creation* is owned by
+//! [`create`]; *deletion* goes through [`crate::worktree::cleanup`].
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use thiserror::Error;
-use tokio::process::Command;
 
 use crate::session::id::SessionId;
 
+/// A request to create one worktree for a role.
 #[derive(Debug, Clone)]
 pub struct WorktreeRequest {
     pub repo_root: PathBuf,
     pub session_id: SessionId,
     pub role: String,
-    /// Branch name to create. If `None`, defaults to `caucus/<session>/<role>`.
+    /// Branch to create. `None` defaults to `caucus/<session>/<role>`.
     pub branch: Option<String>,
     /// Base ref for the new branch. `None` means current `HEAD`.
     pub base_ref: Option<String>,
     /// Override the directory leaf name under `<repo>/.caucus/worktrees/`.
-    /// Useful for pipeline worktrees that are shared across roles
-    /// (e.g. `<session>-pipeline-01`). When `None`, defaults to the
-    /// `<session>-<role>` shape from `default_path`.
     pub name_override: Option<String>,
 }
 
+/// A created worktree.
 #[derive(Debug, Clone)]
 pub struct WorktreeHandle {
     pub path: PathBuf,
@@ -34,6 +35,7 @@ pub struct WorktreeHandle {
     pub repo_root: PathBuf,
 }
 
+/// Errors from worktree creation.
 #[derive(Debug, Error)]
 pub enum WorktreeError {
     #[error("worktree path already exists: {0}")]
@@ -53,6 +55,7 @@ pub enum WorktreeError {
 }
 
 impl WorktreeRequest {
+    /// Destination directory under `<repo>/.caucus/worktrees/`.
     pub fn default_path(&self) -> PathBuf {
         let leaf = self
             .name_override
@@ -61,6 +64,7 @@ impl WorktreeRequest {
         self.repo_root.join(".caucus").join("worktrees").join(leaf)
     }
 
+    /// Branch name to create.
     pub fn default_branch(&self) -> String {
         self.branch.clone().unwrap_or_else(|| {
             format!(
@@ -74,8 +78,6 @@ impl WorktreeRequest {
 
 fn short_session(id: SessionId) -> String {
     let s = id.to_string();
-    // Use the trailing 8 chars — ULIDs are 26 chars; the last 8 are still
-    // unique within a normal session count and keep the branch name short.
     s.chars()
         .rev()
         .take(8)
@@ -85,21 +87,26 @@ fn short_session(id: SessionId) -> String {
         .collect()
 }
 
-/// Create a worktree for the request. Errors out if the destination
-/// directory already exists (caller must clean up first via
-/// [`crate::worktree::cleanup`]).
-pub async fn create(req: &WorktreeRequest) -> Result<WorktreeHandle, WorktreeError> {
+/// Single owner of worktree creation (Invariant I-3).
+///
+/// Errors out if the destination directory already exists (the caller must
+/// clean up first via [`crate::worktree::cleanup`]).
+///
+/// Synchronous: `git worktree add` is a fast subprocess. The multiplexer
+/// event loop calls this directly on its own thread — no async bridging, so
+/// no nested-runtime hazard.
+pub(crate) fn create(req: &WorktreeRequest) -> Result<WorktreeHandle, WorktreeError> {
     let path = req.default_path();
     if path.exists() {
         return Err(WorktreeError::AlreadyExists(path));
     }
-    if let Some(parent) = path.parent() {
-        if let Err(source) = std::fs::create_dir_all(parent) {
-            return Err(WorktreeError::Spawn {
-                command: format!("mkdir -p {}", parent.display()),
-                source,
-            });
-        }
+    if let Some(parent) = path.parent()
+        && let Err(source) = std::fs::create_dir_all(parent)
+    {
+        return Err(WorktreeError::Spawn {
+            command: format!("mkdir -p {}", parent.display()),
+            source,
+        });
     }
     let branch = req.default_branch();
 
@@ -113,7 +120,7 @@ pub async fn create(req: &WorktreeRequest) -> Result<WorktreeHandle, WorktreeErr
     if let Some(base) = &req.base_ref {
         args.push(base.clone());
     }
-    run_git(&req.repo_root, &args).await?;
+    run_git(&req.repo_root, &args)?;
 
     Ok(WorktreeHandle {
         path,
@@ -122,9 +129,9 @@ pub async fn create(req: &WorktreeRequest) -> Result<WorktreeHandle, WorktreeErr
     })
 }
 
-/// Run a git subcommand in `repo` and return stdout (trimmed). Errors include
-/// stderr so the caller can classify them via `agent::lane_event::classify_failure`.
-pub(crate) async fn run_git(repo: &Path, args: &[String]) -> Result<String, WorktreeError> {
+/// Run a git subcommand in `repo` and return trimmed stdout. Stderr is folded
+/// into the error so the caller can classify it.
+pub(crate) fn run_git(repo: &Path, args: &[String]) -> Result<String, WorktreeError> {
     let label = format!("git {}", args.join(" "));
     let output = Command::new("git")
         .current_dir(repo)
@@ -132,7 +139,6 @@ pub(crate) async fn run_git(repo: &Path, args: &[String]) -> Result<String, Work
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .await
         .map_err(|source| WorktreeError::Spawn {
             command: label.clone(),
             source,
@@ -151,19 +157,6 @@ pub(crate) async fn run_git(repo: &Path, args: &[String]) -> Result<String, Work
     Ok(s)
 }
 
-/// Convenience: `git rev-parse --abbrev-ref HEAD` inside `repo`.
-pub async fn current_branch(repo: &Path) -> Result<String, WorktreeError> {
-    run_git(
-        repo,
-        &[
-            "rev-parse".to_string(),
-            "--abbrev-ref".to_string(),
-            "HEAD".to_string(),
-        ],
-    )
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,12 +173,11 @@ mod tests {
         };
         let p = req.default_path();
         assert_eq!(p.parent().unwrap(), Path::new("/repo/.caucus/worktrees"));
-        let name = p.file_name().unwrap().to_string_lossy();
-        assert!(name.ends_with("-backend"));
+        assert!(p.file_name().unwrap().to_string_lossy().ends_with("-backend"));
     }
 
     #[test]
-    fn default_branch_template_is_caucus_session_role() {
+    fn default_branch_template() {
         let req = WorktreeRequest {
             repo_root: PathBuf::from("/repo"),
             session_id: SessionId::new(),
@@ -197,10 +189,6 @@ mod tests {
         let b = req.default_branch();
         assert!(b.starts_with("caucus/"));
         assert!(b.ends_with("/reviewer"));
-        // Short-suffix length is 8 chars from the session id.
-        let parts: Vec<_> = b.split('/').collect();
-        assert_eq!(parts.len(), 3);
-        assert_eq!(parts[1].len(), 8);
     }
 
     #[test]

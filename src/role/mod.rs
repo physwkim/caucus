@@ -1,6 +1,8 @@
-//! Role typing. Each role is a name plus a tool allowlist, a permission mode,
-//! and a system-prompt template — the same structure claw-code uses for
-//! subagent types (see `docs/claw-code-analysis.md` §3).
+//! Role: architect / backend / reviewer etc. — a system prompt + tool
+//! allowlist + default `model`/`agent_cli`. See `docs/design.md` §6.
 
 pub mod registry;
 pub mod spec;
+
+pub use registry::{RoleRegistry, UnknownRole};
+pub use spec::{AgentCli, RoleSpec};

@@ -1,8 +1,8 @@
-//! Git worktree management. Removals go through a single serialised queue —
-//! see `docs/design.md` Invariant I-3.
+//! Worktree: per-role git worktrees for the execute phase. Creation
+//! (`manager`) and serialised cleanup (`cleanup`). See `docs/design.md` §5.
 
 pub mod cleanup;
 pub mod manager;
 
-pub use cleanup::{CleanupJob, CleanupQueue, CleanupSummary, QueueClosed};
-pub use manager::{WorktreeError, WorktreeHandle, WorktreeRequest, create, current_branch};
+pub use cleanup::{CleanupJob, CleanupQueue, CleanupSummary};
+pub use manager::{WorktreeError, WorktreeHandle, WorktreeRequest};
