@@ -648,6 +648,33 @@ impl Multiplexer {
             out.push_str(line.trim_end());
             out.push('\n');
         }
+        // Include the live viewport so `scrollback` is the complete retained
+        // buffer (history + current screen), not just the off-screen rows.
+        out.push_str(&Self::screen_text(panel));
+        out
+    }
+
+    /// Render a raw PTY byte capture — a whole turn, escape sequences and all —
+    /// into readable text by replaying it through a throwaway grid. Without
+    /// this, `read_panel(since_last_turn)` would hand the main worker an
+    /// escape-sequence soup instead of the turn's rendered output.
+    fn rendered_capture_text(bytes: &[u8], cols: usize) -> String {
+        let mut grid = crate::term::Grid::new(cols.max(20), 50);
+        grid.advance(bytes);
+        let mut out = String::new();
+        for row in grid.scrollback() {
+            let line: String = row.iter().filter(|c| c.ch != '\0').map(|c| c.ch).collect();
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        let (_, rows) = grid.size();
+        for r in 0..rows {
+            out.push_str(grid.row_text(r).trim_end());
+            out.push('\n');
+        }
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
         out
     }
 
@@ -720,10 +747,11 @@ impl McpToolSurface for Multiplexer {
             ReadPanelMode::Screen => Self::screen_text(p),
             ReadPanelMode::Scrollback => Self::scrollback_text(p),
             ReadPanelMode::SinceLastTurn => {
-                // Whole-turn capture (`docs/design.md` §8.5) — the main worker
-                // never races the screen because this is the captured turn output,
-                // not the live grid.
-                String::from_utf8_lossy(p.capture().since_last_turn()).into_owned()
+                // Whole-turn capture (`docs/design.md` §8.5), rendered to
+                // readable text — the main worker never races the screen and
+                // is never handed raw escape sequences.
+                let (cols, _) = p.grid().size();
+                Self::rendered_capture_text(p.capture().since_last_turn(), cols)
             }
             ReadPanelMode::LastMessage => self
                 .manifests
@@ -1051,5 +1079,20 @@ mod tests {
         }
 
         mux.shutdown();
+    }
+
+    #[test]
+    fn rendered_capture_strips_escape_sequences() {
+        // A raw turn capture: SGR colour, CR/LF, cursor moves — what a real
+        // agent emits. `read_panel(since_last_turn)` must hand the main
+        // worker readable text, never this escape soup.
+        let raw = b"\x1b[1;32mhello\x1b[0m\r\nfrom \x1b[31mcaucus\x1b[0m\x1b[K\r\n";
+        let text = Multiplexer::rendered_capture_text(raw, 80);
+        assert!(
+            !text.contains('\x1b'),
+            "escape sequences must be rendered away: {text:?}"
+        );
+        assert!(text.contains("hello"), "got: {text:?}");
+        assert!(text.contains("from caucus"), "got: {text:?}");
     }
 }
