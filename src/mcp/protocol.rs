@@ -33,6 +33,15 @@ pub enum ControlRequest {
         #[serde(default)]
         enter: bool,
     },
+    /// Type the same `text` into several panels' PTYs at once — a round's
+    /// fan-out. Equivalent to one [`ControlRequest::SendKeys`] per panel;
+    /// executed synchronously like `SendKeys`, not deferred.
+    Broadcast {
+        panels: Vec<PanelId>,
+        text: String,
+        #[serde(default)]
+        enter: bool,
+    },
     /// Send `Ctrl-C` (0x03) to a panel's PTY.
     CtrlC { panel: PanelId },
     /// Read a panel's captured output in `mode`.
@@ -104,6 +113,37 @@ mod tests {
         assert!(line.contains("\"op\":\"send_keys\""));
         let back: ControlRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn broadcast_round_trips() {
+        let req = ControlRequest::Broadcast {
+            panels: vec![PanelId::new(), PanelId::new()],
+            text: "the agenda".into(),
+            enter: true,
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"op\":\"broadcast\""));
+        let back: ControlRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn broadcast_enter_defaults_to_false() {
+        // `enter` defaults to false when omitted from the wire form.
+        let id = PanelId::new();
+        let req: ControlRequest = serde_json::from_str(&format!(
+            r#"{{"op":"broadcast","panels":["{id}"],"text":"hi"}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::Broadcast {
+                panels: vec![id],
+                text: "hi".into(),
+                enter: false,
+            }
+        );
     }
 
     #[test]

@@ -31,6 +31,19 @@ directly in this panel; you are the agent that gets the job done.
 - Ground yourself the same way: `recall_for_task` from kodex before you
   plan, and `learn` the decisions and patterns you settle while merging.
 
+# Running a round
+- A *round* is putting the same agenda to several sub-agents at once and
+  collecting all their answers before you move on.
+- `broadcast` the agenda to every panel in the round in one call — it is
+  the round's fan-out, equivalent to one `send_keys` per panel, so you
+  brief them all together instead of one at a time.
+- `wait_for_panels` on those same panel ids until they all settle, then
+  `read_panel(since_last_turn)` on each to collect what every sub-agent
+  produced this turn.
+- Synthesize the answers. To go another round — narrow the question,
+  hand back findings, push for consensus — `broadcast` the next agenda
+  to the same panels and repeat.
+
 # Hard rules
 - **Never use the `Task` tool.** Every sub-agent must be a visible caucus
   panel spawned with `spawn_role` (`docs/design.md` §0 #13). An invisible

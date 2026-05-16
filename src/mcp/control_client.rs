@@ -130,6 +130,33 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                 enter,
             })
         }
+        "broadcast" => {
+            let raw = args
+                .get("panels")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "missing array argument `panels`".to_string())?;
+            let panels = raw
+                .iter()
+                .map(|v| {
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| "`panels` entries must be panel-id strings".to_string())?;
+                    s.parse::<PanelId>()
+                        .map_err(|e| format!("invalid panel id `{s}`: {e}"))
+                })
+                .collect::<std::result::Result<Vec<PanelId>, String>>()?;
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing string argument `text`".to_string())?
+                .to_string();
+            let enter = args.get("enter").and_then(Value::as_bool).unwrap_or(false);
+            Ok(ControlRequest::Broadcast {
+                panels,
+                text,
+                enter,
+            })
+        }
         "ctrl_c" => Ok(ControlRequest::CtrlC {
             panel: panel(args)?,
         }),
@@ -263,6 +290,66 @@ mod tests {
                 enter: true,
             }
         );
+    }
+
+    #[test]
+    fn build_broadcast_request_with_enter() {
+        let a = PanelId::new();
+        let b = PanelId::new();
+        let req = build_request(
+            "broadcast",
+            &json!({"panels": [a.to_string(), b.to_string()], "text": "the agenda", "enter": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::Broadcast {
+                panels: vec![a, b],
+                text: "the agenda".into(),
+                enter: true,
+            }
+        );
+    }
+
+    #[test]
+    fn build_broadcast_request_defaults_enter() {
+        let a = PanelId::new();
+        let req = build_request(
+            "broadcast",
+            &json!({"panels": [a.to_string()], "text": "hi"}),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::Broadcast {
+                panels: vec![a],
+                text: "hi".into(),
+                enter: false,
+            }
+        );
+    }
+
+    #[test]
+    fn build_broadcast_requires_panels_array() {
+        let err = build_request("broadcast", &json!({"text": "hi"})).unwrap_err();
+        assert!(err.contains("missing array argument `panels`"));
+    }
+
+    #[test]
+    fn build_broadcast_requires_text() {
+        let a = PanelId::new();
+        let err = build_request("broadcast", &json!({"panels": [a.to_string()]})).unwrap_err();
+        assert!(err.contains("missing string argument `text`"));
+    }
+
+    #[test]
+    fn build_broadcast_rejects_bad_panel_id() {
+        let err = build_request(
+            "broadcast",
+            &json!({"panels": ["not-a-ulid"], "text": "hi"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid panel id"));
     }
 
     #[test]

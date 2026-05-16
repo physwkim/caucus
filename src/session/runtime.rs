@@ -737,6 +737,11 @@ impl Multiplexer {
                     Err(err) => ControlResponse::error(err),
                 }
             }
+            ControlRequest::Broadcast {
+                panels,
+                text,
+                enter,
+            } => self.broadcast(&panels, &text, enter),
             ControlRequest::CtrlC { panel } => match self.ctrl_c(panel) {
                 Ok(()) => ControlResponse::Ok,
                 Err(err) => ControlResponse::error(err),
@@ -820,12 +825,44 @@ impl Multiplexer {
     /// exists is omitted (it is gone — `list_panels` would not show it
     /// either); the main worker should treat a missing id as fully done.
     fn wait_response(&self, panels: &[PanelId]) -> ControlResponse {
+        ControlResponse::Panels {
+            panels: self.wait_response_summaries(panels),
+        }
+    }
+
+    /// Type the same `text` into every panel in `panels` — a round's fan-out
+    /// (`docs/design.md` §4). Each panel is driven exactly as the MCP
+    /// `send_keys` tool would drive it: the text is written, a `\r` appended
+    /// when `enter`, and on `enter` [`Multiplexer::note_prompt_delivered`]
+    /// opens a capture turn and flips the panel to `Working`.
+    ///
+    /// A panel id that does not exist (or whose write fails) is reported, not
+    /// fatal — the remaining panels still receive the text. The reply is
+    /// always [`ControlResponse::Panels`]: the post-broadcast [`PanelSummary`]
+    /// of each targeted id that exists, the same shape `list_panels` /
+    /// `wait_for_panels` return. A bad id is visible by its absence from that
+    /// list, so the main worker can tell which panels a typo missed while the
+    /// good ones still ran.
+    fn broadcast(&mut self, panels: &[PanelId], text: &str, enter: bool) -> ControlResponse {
+        for &panel in panels {
+            // Per-panel failures (no such panel, write error) are non-fatal:
+            // the other panels in the round still get the text.
+            let _ = self.send_keys(panel, text, enter);
+        }
+        ControlResponse::Panels {
+            panels: self.wait_response_summaries(panels),
+        }
+    }
+
+    /// The [`PanelSummary`] for each id in `panels` that still exists, in the
+    /// caller's order — missing ids are omitted (they were killed or the id
+    /// was bad).
+    fn wait_response_summaries(&self, panels: &[PanelId]) -> Vec<PanelSummary> {
         let all = self.list_panels();
-        let summaries = panels
+        panels
             .iter()
             .filter_map(|id| all.iter().find(|s| s.panel_id == *id).cloned())
-            .collect();
-        ControlResponse::Panels { panels: summaries }
+            .collect()
     }
 
     /// Register a `wait_for_panels` request. If the panels are already all
@@ -1554,6 +1591,56 @@ mod tests {
                 assert_eq!(panels[0].panel_id, panel);
             }
             other => panic!("expected a Panels reply, got {other:?}"),
+        }
+
+        mux.shutdown();
+    }
+
+    /// `execute_control(Broadcast{..})` fans the same text into every panel:
+    /// each real panel that exists is flipped to `Working` (with `enter`) and
+    /// appears in the `Panels` reply; a non-existent id is non-fatal and is
+    /// simply absent from the reply.
+    ///
+    /// Spawning a panel needs a real agent CLI; the test is skipped (not
+    /// failed) when none is on PATH, matching `tests/mcp_integration.rs`.
+    #[tokio::test]
+    async fn broadcast_control_request_fans_text_into_every_panel() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Ok(a) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        let b = mux.spawn_panel("reviewer", None, None, None).unwrap();
+        let ghost = PanelId::new();
+
+        let resp = mux.execute_control(ControlRequest::Broadcast {
+            // The ghost is interleaved between the two real ids — it must not
+            // stop `b` from receiving the text.
+            panels: vec![a, ghost, b],
+            text: "the agenda".into(),
+            enter: true,
+        });
+
+        match resp {
+            ControlResponse::Panels { panels } => {
+                // Only the two real panels come back; the ghost is omitted.
+                assert_eq!(panels.len(), 2, "ghost id must be reported by absence");
+                let ids: Vec<PanelId> = panels.iter().map(|s| s.panel_id).collect();
+                assert!(ids.contains(&a) && ids.contains(&b));
+                assert!(!ids.contains(&ghost));
+            }
+            other => panic!("expected Panels, got {other:?}"),
+        }
+
+        // `enter=true` opened a capture turn and flipped each real panel to
+        // `Working`; the ghost did nothing.
+        for id in [a, b] {
+            assert_eq!(
+                mux.panels().iter().find(|p| p.id == id).unwrap().state(),
+                PanelState::Working,
+            );
         }
 
         mux.shutdown();
