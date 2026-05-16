@@ -189,14 +189,17 @@ pub enum PanelError {
 
 /// Single owner of panel state transitions (Invariant I-5).
 ///
-/// Legal moves: `Spawning -> Working`, `Working <-> Idle`, `Working|Idle ->
-/// Blocked`, `Blocked -> Working`, and any state `-> Exited`.
+/// Legal moves: `Spawning -> Working | Idle` (a freshly-spawned agent goes to
+/// `Working` when a prompt is delivered, or to `Idle` once its CLI is up and
+/// awaiting one), `Working <-> Idle`, `Working|Idle -> Blocked`, `Blocked ->
+/// Working`, and any state `-> Exited`.
 pub(crate) fn transition(panel: &mut Panel, to: PanelState) -> Result<(), IllegalTransition> {
     use PanelState::*;
     let from = panel.state;
     let legal = matches!(
         (from, to),
         (Spawning, Working)
+            | (Spawning, Idle)
             | (Working, Idle)
             | (Idle, Working)
             | (Working, Blocked)
@@ -334,9 +337,19 @@ mod tests {
     }
 
     #[test]
-    fn spawning_to_idle_is_rejected() {
+    fn spawning_to_idle_is_legal() {
+        // A freshly-spawned agent whose CLI is up but has had no prompt yet
+        // settles into `Idle` (awaiting instruction), not stuck in `Spawning`.
         let mut p = cat_panel();
-        assert!(transition(&mut p, PanelState::Idle).is_err());
+        transition(&mut p, PanelState::Idle).unwrap();
+        assert_eq!(p.state(), PanelState::Idle);
+    }
+
+    #[test]
+    fn spawning_to_blocked_is_rejected() {
+        // `Spawning` may only advance to `Working` or `Idle`.
+        let mut p = cat_panel();
+        assert!(transition(&mut p, PanelState::Blocked).is_err());
     }
 
     #[test]

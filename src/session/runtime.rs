@@ -314,8 +314,19 @@ impl Multiplexer {
     pub fn pump_all(&mut self) {
         let mut exited = Vec::new();
         for panel in &mut self.panels {
-            if let Err(err) = panel.pump() {
-                warn!(panel = %panel.id, error = %err, "panel pump failed");
+            match panel.pump() {
+                Ok(n) => {
+                    // First output from a freshly-spawned agent: its CLI
+                    // process is alive and drawing its UI — it has left
+                    // `Spawning` and is now an idle agent awaiting its first
+                    // instruction.
+                    if n > 0 && panel.state() == PanelState::Spawning {
+                        let _ = lifecycle::transition(panel, PanelState::Idle);
+                    }
+                }
+                Err(err) => {
+                    warn!(panel = %panel.id, error = %err, "panel pump failed");
+                }
             }
             if panel.state() != PanelState::Exited && !panel.is_child_alive() {
                 exited.push(panel.id);
@@ -348,6 +359,12 @@ impl Multiplexer {
                     if let Err(err) = p.write_input(&bytes) {
                         warn!(panel = %panel, error = %err, "panel write failed");
                     }
+                }
+                // A submitted line (Enter) typed directly into a panel is a
+                // prompt delivered by the user — flip it to `Working`, the
+                // same as the MCP `send_keys` path.
+                if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
+                    self.note_prompt_delivered(panel);
                 }
             }
             InputAction::Caucus(cmd) => self.apply_command(cmd),
