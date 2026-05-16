@@ -32,7 +32,7 @@ fn area() -> Rect {
 
 /// `caucus mcp-serve` answers a JSON-RPC `tools/list` with the six tools.
 ///
-/// The binary is driven over stdio exactly as the CEO's Claude Code instance
+/// The binary is driven over stdio exactly as the main worker's Claude Code instance
 /// drives it; `initialize` and `tools/list` touch no control socket, so a
 /// throwaway socket path is fine.
 #[test]

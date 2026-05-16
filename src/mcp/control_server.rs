@@ -71,7 +71,7 @@ impl ControlServer {
         })
     }
 
-    /// Path the control socket is bound to — injected into the CEO panel's
+    /// Path the control socket is bound to — injected into the main worker panel's
     /// MCP config as `caucus mcp-serve --control-sock <path>`.
     pub fn sock_path(&self) -> &Path {
         &self.sock_path

@@ -52,8 +52,8 @@ pub struct Multiplexer {
     cleanup: CleanupQueue,
     /// Turn-signal socket path injected into spawned agents as `CAUCUS_SOCK`.
     sock_path: PathBuf,
-    /// Control socket path — the CEO panel's MCP server connects here
-    /// (`docs/design.md` §0 #4). Wired into the CEO panel's `.mcp.json`.
+    /// Control socket path — the main worker panel's MCP server connects here
+    /// (`docs/design.md` §0 #4). Wired into the main worker panel's `.mcp.json`.
     control_sock_path: PathBuf,
     /// Whole-screen area the layout tiles.
     area: Rect,
@@ -72,7 +72,7 @@ impl Multiplexer {
     ///
     /// Returns the multiplexer plus the two socket servers the event loop
     /// drains: the [`SignalServer`] (turn signals) and the [`ControlServer`]
-    /// (CEO MCP tool calls).
+    /// (main worker MCP tool calls).
     pub fn new(
         session: Session,
         config: Config,
@@ -112,7 +112,7 @@ impl Multiplexer {
         ))
     }
 
-    /// The MCP control socket path — wired into the CEO panel's `.mcp.json`.
+    /// The MCP control socket path — wired into the main worker panel's `.mcp.json`.
     pub fn control_sock_path(&self) -> &std::path::Path {
         &self.control_sock_path
     }
@@ -179,26 +179,27 @@ impl Multiplexer {
         self.spawn_panel_inner(role, agent_cli, model, worktree_path, None)
     }
 
-    /// Spawn the CEO panel (`docs/design.md` §0 #4, #10).
+    /// Spawn the main worker panel (`docs/design.md` §0 #4, #10).
     ///
     /// Writes the caucus MCP config (`.mcp.json`) into the session root and
-    /// registers it with the CEO's Claude Code instance via `--mcp-config`, so
-    /// the CEO can drive the other panels through the six caucus MCP tools.
-    /// `caucus_bin` is the absolute path of the running `caucus` binary so the
-    /// `mcp-serve` child is the exact same build.
-    pub fn spawn_ceo_panel(&mut self, role: &str, caucus_bin: &std::path::Path) -> Result<PanelId> {
+    /// registers it with the main worker's Claude Code instance via
+    /// `--mcp-config`, so the main worker can drive the sub-agent panels
+    /// through the six caucus MCP tools. `caucus_bin` is the absolute path of
+    /// the running `caucus` binary so the `mcp-serve` child is the exact same
+    /// build.
+    pub fn spawn_main_panel(&mut self, role: &str, caucus_bin: &std::path::Path) -> Result<PanelId> {
         let mcp_config = crate::mcp::serve::write_mcp_config(
             &self.session.root_dir,
             caucus_bin,
             &self.control_sock_path,
         )
-        .context("write CEO panel .mcp.json")?;
+        .context("write main worker panel .mcp.json")?;
         self.spawn_panel_inner(role, None, None, None, Some(mcp_config))
     }
 
     /// Shared spawn path for [`Multiplexer::spawn_panel`] and
-    /// [`Multiplexer::spawn_ceo_panel`]; `mcp_config_path` is set only for the
-    /// CEO panel.
+    /// [`Multiplexer::spawn_main_panel`]; `mcp_config_path` is set only for the
+    /// main worker panel.
     fn spawn_panel_inner(
         &mut self,
         role: &str,
@@ -448,7 +449,7 @@ impl Multiplexer {
     /// Called by the event loop for every [`ControlJob`] drained from the
     /// control socket — see [`Multiplexer::drain_control`]. Each variant maps
     /// onto one [`McpToolSurface`] method; failures become
-    /// [`ControlResponse::Error`] so the CEO sees the message in-band.
+    /// [`ControlResponse::Error`] so the main worker sees the message in-band.
     pub fn execute_control(&mut self, request: ControlRequest) -> ControlResponse {
         match request {
             ControlRequest::SendKeys { panel, text, enter } => {
@@ -490,8 +491,8 @@ impl Multiplexer {
 
     /// Drain every queued control job from `server`, execute it, and answer
     /// each through its oneshot reply. Called once per event-loop tick — the
-    /// single point at which CEO MCP tool calls touch live panels, on the same
-    /// thread that pumps PTYs (Invariant I-5).
+    /// single point at which main worker MCP tool calls touch live panels, on
+    /// the same thread that pumps PTYs (Invariant I-5).
     pub fn drain_control(&mut self, server: &mut ControlServer) {
         while let Ok(job) = server.jobs().try_recv() {
             let ControlJob { request, reply } = job;
@@ -510,7 +511,7 @@ impl Multiplexer {
             out.push_str(panel.grid().row_text(row).trim_end());
             out.push('\n');
         }
-        // Drop trailing blank lines so the CEO is not handed a wall of spaces.
+        // Drop trailing blank lines so the main worker is not handed a wall of spaces.
         while out.ends_with("\n\n") {
             out.pop();
         }
@@ -549,7 +550,7 @@ impl Multiplexer {
     }
 }
 
-/// The CEO's MCP tool surface, backed by the live panel registry
+/// The main worker's MCP tool surface, backed by the live panel registry
 /// (`docs/design.md` §0 #4). Every method runs on the multiplexer's own
 /// thread — control jobs are executed by [`Multiplexer::drain_control`] inside
 /// the event loop, never concurrently with `pump_all` (Invariant I-5).
@@ -597,8 +598,8 @@ impl McpToolSurface for Multiplexer {
             ReadPanelMode::Screen => Self::screen_text(p),
             ReadPanelMode::Scrollback => Self::scrollback_text(p),
             ReadPanelMode::SinceLastTurn => {
-                // Whole-turn capture (`docs/design.md` §8.5) — the CEO never
-                // races the screen because this is the captured turn output,
+                // Whole-turn capture (`docs/design.md` §8.5) — the main worker
+                // never races the screen because this is the captured turn output,
                 // not the live grid.
                 String::from_utf8_lossy(p.capture().since_last_turn()).into_owned()
             }

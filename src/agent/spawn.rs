@@ -19,12 +19,12 @@ pub struct SpawnRequest {
     pub session_id: SessionId,
     /// Role to instantiate.
     pub role: RoleSpec,
-    /// CEO-chosen agent name (e.g. `reviewer-r1`).
+    /// Main-worker-chosen agent name (e.g. `reviewer-r1`).
     pub agent_name: String,
-    /// CEO override for the backend CLI. `None` uses the role's `agent_cli`
-    /// (`docs/design.md` §0 #9).
+    /// Main worker override for the backend CLI. `None` uses the role's
+    /// `agent_cli` (`docs/design.md` §0 #9).
     pub agent_cli_override: Option<AgentCli>,
-    /// CEO override for the model. `None` uses the role's `model`.
+    /// Main worker override for the model. `None` uses the role's `model`.
     pub model_override: Option<String>,
     /// Worktree to use as cwd, if this is an execute-phase agent.
     pub worktree_path: Option<PathBuf>,
@@ -39,7 +39,7 @@ pub struct SpawnRequest {
     /// otherwise stall an agent inside a non-interactive panel.
     pub skip_permissions: bool,
     /// Path to an MCP-config JSON to register with the backend CLI
-    /// (`docs/design.md` §0 #4). Set for the CEO panel so its Claude Code
+    /// (`docs/design.md` §0 #4). Set for the main worker panel so its Claude Code
     /// instance loads the caucus MCP server; `None` for every other panel.
     /// Honoured only by the `claude` backend (`--mcp-config`).
     pub mcp_config_path: Option<PathBuf>,
@@ -139,8 +139,8 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
 }
 
 /// `claude` argv: `--model`, `--permission-mode`, `--allowedTools`, optionally
-/// `--dangerously-skip-permissions`, and `--mcp-config <path>` for the CEO
-/// panel (so its claude loads the caucus MCP server).
+/// `--dangerously-skip-permissions`, and `--mcp-config <path>` for the main
+/// worker panel (so its claude loads the caucus MCP server).
 fn claude_args(
     role: &RoleSpec,
     model: Option<&str>,
@@ -371,7 +371,7 @@ mod tests {
     fn claude_argv_includes_mcp_config_when_set() {
         let req = SpawnRequest {
             role: role(),
-            agent_name: "ceo-1".into(),
+            agent_name: "main-1".into(),
             mcp_config_path: Some(PathBuf::from("/tmp/caucus/.mcp.json")),
             ..SpawnRequest::default()
         };

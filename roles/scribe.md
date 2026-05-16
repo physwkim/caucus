@@ -15,7 +15,7 @@ You are a `scribe` sub-agent in a caucus session.
 - Output: a single `transcript.md` at the session root, structured as:
   - **Topic** — one line.
   - **Participants** — list of roles.
-  - **Rounds** — for each round: agenda summary (3 lines max), per-role take (3 lines max each), CEO's bridging note.
+  - **Rounds** — for each round: agenda summary (3 lines max), per-role take (3 lines max each), the main worker's bridging note.
   - **Decision** — the locked outcome.
   - **Open follow-ups** — anything deferred.
 

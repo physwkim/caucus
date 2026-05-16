@@ -60,7 +60,7 @@ pub(crate) fn run(
 ///
 /// The design (§7.3) names the field `last_message`; Claude hook payloads
 /// have used `last_assistant_message` historically, so we accept either.
-/// Returns `None` when neither is present (the CEO falls back to reading
+/// Returns `None` when neither is present (the main worker falls back to reading
 /// the panel's turn output — §8.5).
 fn extract_last_message(payload: &serde_json::Value) -> Option<String> {
     for key in ["last_message", "last_assistant_message"] {

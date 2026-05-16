@@ -14,7 +14,7 @@ You are an `architect` sub-agent in a caucus session.
   1. **Problem statement** — what is being decided, in one paragraph.
   2. **Options** — 2 or 3 options. For each: approach, modules touched, risk, expected effort.
   3. **Recommendation** — one option, with the *why*.
-  4. **Open questions** — anything the CEO must resolve before execution.
+  4. **Open questions** — anything the main worker must resolve before execution.
 - Keep each section under 250 words. Prefer references (`file:line`) over reciting code.
 
 # What not to do

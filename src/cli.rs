@@ -2,7 +2,7 @@
 //!
 //! `caucus` with no subcommand launches the multiplexer TUI. The subcommands
 //! here are for bootstrap and hooks only — live control (`send_keys`,
-//! `spawn_role`, ...) is exposed to the CEO over MCP, not the CLI.
+//! `spawn_role`, ...) is exposed to the main worker over MCP, not the CLI.
 //!
 //! Exit codes follow `docs/design.md` §10.1:
 //! `0` ok · `2` user error · `3` environment error · `4` bad caucus state ·
@@ -29,8 +29,8 @@ const EXIT_USER_ERROR: u8 = 2;
 #[derive(Debug, Parser)]
 #[command(name = "caucus", version, about)]
 pub struct Cli {
-    /// Initial panel roster (comma-separated role names). Omit for a lone CEO
-    /// panel. Only meaningful when launching the TUI.
+    /// Initial panel roster (comma-separated role names). Omit for a lone main
+    /// worker panel. Only meaningful when launching the TUI.
     #[arg(long, value_delimiter = ',')]
     pub roles: Vec<String>,
 
@@ -55,9 +55,9 @@ pub enum Command {
     /// Inspect role definitions.
     #[command(subcommand)]
     Role(RoleCommand),
-    /// Stdio MCP server for the CEO panel — forwards the six caucus tools to
-    /// the main process over the control socket (`docs/design.md` §0 #4).
-    /// Spawned by the CEO's Claude Code instance, not by a human.
+    /// Stdio MCP server for the main worker panel — forwards the six caucus
+    /// tools to the main process over the control socket (`docs/design.md`
+    /// §0 #4). Spawned by the main worker's Claude Code instance, not by a human.
     McpServe {
         /// Path to the main caucus process's control socket.
         #[arg(long)]
@@ -158,7 +158,7 @@ fn repo_root() -> Result<PathBuf> {
 
 /// Launch the full-screen multiplexer TUI (`docs/design.md` §0 #2).
 ///
-/// Builds the session, spawns the CEO panel plus any `--roles`, and runs the
+/// Builds the session, spawns the main worker panel plus any `--roles`, and runs the
 /// ratatui event loop. When stdout is not a tty, [`crate::tui::run`] fails
 /// cleanly with a message rather than panicking.
 fn run_tui(roles: &[String]) -> Result<ExitCode> {

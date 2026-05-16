@@ -98,7 +98,7 @@ pub struct ToolDef {
 ///
 /// A tool error is reported to the MCP client as a `tools/call` result with
 /// `isError: true` (the MCP convention) rather than a JSON-RPC error, so the
-/// CEO's model sees the failure text in-band.
+/// main worker's model sees the failure text in-band.
 pub enum ToolOutcome {
     /// Tool succeeded; the string is the textual result.
     Ok(String),

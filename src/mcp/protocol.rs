@@ -2,7 +2,7 @@
 //!
 //! The main `caucus` process opens a *control socket* — a unix-domain socket
 //! distinct from the turn-signal socket. The thin `caucus mcp-serve` process
-//! (spawned by the CEO's Claude Code instance) connects to it and forwards
+//! (spawned by the main worker's Claude Code instance) connects to it and forwards
 //! each MCP tool call as one [`ControlRequest`]; the main process executes it
 //! against the live [`crate::session::Multiplexer`] and writes back one
 //! [`ControlResponse`].
@@ -21,7 +21,7 @@ use super::{PanelSummary, ReadPanelMode};
 
 /// One control-socket request: an MCP tool call forwarded from `mcp-serve`.
 ///
-/// `snake_case` tag mirrors the MCP tool names exposed to the CEO so a wire
+/// `snake_case` tag mirrors the MCP tool names exposed to the main worker so a wire
 /// dump is self-describing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -38,7 +38,7 @@ pub enum ControlRequest {
     /// Read a panel's captured output in `mode`.
     ReadPanel { panel: PanelId, mode: ReadPanelMode },
     /// Spawn a new panel for `role`. `worktree` requests an execute-phase
-    /// worktree; `model` / `agent_cli` are CEO overrides.
+    /// worktree; `model` / `agent_cli` are main worker overrides.
     SpawnRole {
         role: String,
         #[serde(default)]

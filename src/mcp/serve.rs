@@ -1,13 +1,13 @@
 //! `caucus mcp-serve --control-sock <path>` — the thin stdio MCP server
 //! (`docs/design.md` §0 #4).
 //!
-//! This process is spawned by the CEO panel's Claude Code instance (caucus
+//! This process is spawned by the main worker panel's Claude Code instance (caucus
 //! writes an MCP config registering it — see [`crate::mcp::serve::mcp_config_json`]).
 //! It exposes the six caucus tools over stdio JSON-RPC and forwards each call
 //! to the main `caucus` process over the control socket.
 //!
 //! It owns no panels and no PTYs — all state lives in the main process. This
-//! keeps the CEO's MCP server crash-isolated from the multiplexer.
+//! keeps the main worker's MCP server crash-isolated from the multiplexer.
 
 use std::path::Path;
 
@@ -37,12 +37,12 @@ pub fn run(control_sock: &Path) -> Result<()> {
 }
 
 /// The MCP-config JSON registering the caucus MCP server for a Claude Code
-/// instance — written into the CEO panel's worktree/cwd as `.mcp.json`
+/// instance — written into the main worker panel's worktree/cwd as `.mcp.json`
 /// (`docs/design.md` §0 #4, #5).
 ///
 /// Claude Code reads `.mcp.json` from its cwd: it registers an MCP server
 /// `caucus` whose command is `caucus mcp-serve --control-sock <path>`, so the
-/// CEO's claude can call `send_keys` / `read_panel` / ... on the other panels.
+/// main worker's claude can call `send_keys` / `read_panel` / ... on the sub-agent panels.
 ///
 /// `caucus_bin` is the absolute path to the running `caucus` executable so the
 /// spawned server is the exact same build.
@@ -63,7 +63,7 @@ pub fn mcp_config_json(caucus_bin: &Path, control_sock: &Path) -> Value {
 
 /// Write the caucus MCP config to `<dir>/.mcp.json`, returning the file path.
 ///
-/// Called when caucus spawns the CEO panel: the CEO panel's claude picks the
+/// Called when caucus spawns the main worker panel: the main worker panel's claude picks the
 /// file up from its cwd and gains the caucus tool surface.
 pub fn write_mcp_config(dir: &Path, caucus_bin: &Path, control_sock: &Path) -> Result<std::path::PathBuf> {
     let path = dir.join(".mcp.json");

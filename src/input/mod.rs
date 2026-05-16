@@ -3,7 +3,7 @@
 //!
 //! caucus panels are fully bidirectional interactive terminals: the user can
 //! type into a focused panel directly (logins, OAuth device codes, ...), and
-//! the CEO can drive any panel via the MCP `send_keys` tool.
+//! the main worker can drive any panel via the MCP `send_keys` tool.
 //!
 //! # Keymap
 //!

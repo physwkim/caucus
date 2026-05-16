@@ -2,7 +2,7 @@
 //! See `docs/design.md` §0 #3, §9.
 //!
 //! Panels are dynamic (`docs/design.md` §0 #10): the layout reflows whenever
-//! the CEO spawns or kills a panel. Two pieces live here:
+//! the main worker spawns or kills a panel. Two pieces live here:
 //!
 //! * [`Layout::reflow`] — a pure tiling computation: given a screen area and
 //!   N panel ids, assign each a non-overlapping [`Rect`]. No ratatui types,

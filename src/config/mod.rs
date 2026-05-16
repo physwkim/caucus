@@ -3,7 +3,7 @@
 //!
 //! Layered lookup (later layers override earlier):
 //!
-//! 1. Embedded defaults (6 built-in roles) — see [`embedded_defaults`].
+//! 1. Embedded defaults (built-in roles) — see [`embedded_defaults`].
 //! 2. `~/.caucus/roles.toml` — user-global overrides.
 //! 3. `<repo>/.caucus/roles.toml` — project overrides (highest precedence).
 
@@ -84,17 +84,28 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
     }
     vec![
         role(
-            "ceo",
-            "Orchestrator. Talks to the user, drives the other panels via the \
-             caucus MCP tools (send_keys / read_panel / spawn_role / ...).",
+            "main",
+            "Main worker. Talks to the user, does small/sequential work itself, \
+             and for parallelizable work spawns sub-agent panels via the caucus \
+             MCP tools (spawn_role / send_keys / read_panel / ...).",
             "default",
-            // The CEO drives panels through caucus MCP tools, not in-session
-            // sub-agents — `Task` MUST NOT appear (Invariant I-7). It still
-            // reads and edits the repo to coordinate. The caucus MCP server is
-            // registered separately via `--mcp-config`, not the allowlist.
+            // The main worker delegates by spawning sub-agent panels through
+            // caucus MCP tools, not in-session sub-agents — `Task` MUST NOT
+            // appear (Invariant I-7). It also reads, edits, and runs bash to do
+            // simple work itself. The caucus MCP server is registered
+            // separately via `--mcp-config`, not the allowlist.
             &["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite", "WebFetch", "WebSearch"],
             AgentCli::Claude,
             Some("opus"),
+        ),
+        role(
+            "worker",
+            "Generic sub-agent. The default parallel worker spawned by the \
+             main worker (`docs/design.md` §0 #15). Full file edit + bash.",
+            "acceptEdits",
+            &["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite"],
+            AgentCli::Claude,
+            Some("sonnet"),
         ),
         role(
             "architect",
@@ -181,7 +192,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "ceo",
+                "main",
+                "worker",
                 "architect",
                 "backend",
                 "reviewer",
@@ -193,11 +205,22 @@ mod tests {
     }
 
     #[test]
-    fn ceo_role_is_claude_backed_and_has_no_task_tool() {
+    fn main_role_is_claude_backed_and_has_no_task_tool() {
         let specs = embedded_defaults();
-        let ceo = specs.iter().find(|s| s.name == "ceo").unwrap();
-        assert_eq!(ceo.agent_cli, AgentCli::Claude);
-        assert!(!ceo.allows_task(), "ceo role must not grant Task (Invariant I-7)");
+        let main = specs.iter().find(|s| s.name == "main").unwrap();
+        assert_eq!(main.agent_cli, AgentCli::Claude);
+        assert!(!main.allows_task(), "main role must not grant Task (Invariant I-7)");
+    }
+
+    #[test]
+    fn worker_role_is_claude_backed_and_has_no_task_tool() {
+        let specs = embedded_defaults();
+        let worker = specs.iter().find(|s| s.name == "worker").unwrap();
+        assert_eq!(worker.agent_cli, AgentCli::Claude);
+        assert!(
+            !worker.allows_task(),
+            "worker role must not grant Task (Invariant I-7)"
+        );
     }
 
     #[test]

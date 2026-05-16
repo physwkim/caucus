@@ -4,7 +4,7 @@
 //!
 //! 1. enter raw mode + the alternate screen behind a [`TerminalGuard`] that
 //!    restores the terminal on *any* exit path, including a panic;
-//! 2. build the [`Multiplexer`], spawn the CEO panel (+ any `--roles`);
+//! 2. build the [`Multiplexer`], spawn the main worker panel (+ any `--roles`);
 //! 3. loop: poll crossterm input → route via `input/`; drain each panel's PTY
 //!    via `panel pump`; ingest turn signals; redraw on a ~60 Hz tick;
 //! 4. on quit, kill every panel and restore the terminal.
@@ -60,8 +60,8 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Launch the multiplexer TUI in the git repo at `repo`, starting a CEO panel
-/// plus one panel per entry of `roles`.
+/// Launch the multiplexer TUI in the git repo at `repo`, starting a main
+/// worker panel plus one panel per entry of `roles`.
 ///
 /// Fails cleanly (no panic) when stdout is not a terminal.
 pub fn run(repo: &std::path::Path, roles: &[String]) -> Result<()> {
@@ -97,22 +97,23 @@ async fn run_loop(config: Config, session: Session, roles: &[String]) -> Result<
     let (mut mux, mut signal_server, mut control_server) = Multiplexer::new(session, config, area)
         .context("build multiplexer")?;
 
-    // The CEO panel always exists (`docs/design.md` §10). The `ceo` role ships
-    // in the embedded defaults, so it is always present; fall back to
-    // `reviewer` only if a config override somehow removed it.
-    let ceo_role = if mux.config.roles.contains("ceo") {
-        "ceo"
+    // The main worker panel always exists (`docs/design.md` §10). The `main`
+    // role ships in the embedded defaults, so it is always present; fall back
+    // to `reviewer` only if a config override somehow removed it.
+    let main_role = if mux.config.roles.contains("main") {
+        "main"
     } else {
-        warn!("no `ceo` role configured — falling back to `reviewer` for the CEO panel");
+        warn!("no `main` role configured — falling back to `reviewer` for the main worker panel");
         "reviewer"
     };
-    // The CEO panel gets the caucus MCP server wired in (`docs/design.md`
-    // §0 #4): `spawn_ceo_panel` writes `.mcp.json` and passes `--mcp-config`
-    // so the CEO's Claude Code instance can drive the other panels.
+    // The main worker panel gets the caucus MCP server wired in
+    // (`docs/design.md` §0 #4): `spawn_main_panel` writes `.mcp.json` and
+    // passes `--mcp-config` so the main worker's Claude Code instance can
+    // drive the sub-agent panels.
     let caucus_bin = std::env::current_exe()
         .unwrap_or_else(|_| std::path::PathBuf::from("caucus"));
-    if let Err(err) = mux.spawn_ceo_panel(ceo_role, &caucus_bin) {
-        bail!("failed to spawn the CEO panel: {err:#}");
+    if let Err(err) = mux.spawn_main_panel(main_role, &caucus_bin) {
+        bail!("failed to spawn the main worker panel: {err:#}");
     }
     for role in roles {
         if let Err(err) = mux.spawn_panel(role, None, None, None) {
@@ -145,7 +146,7 @@ async fn run_loop(config: Config, session: Session, roles: &[String]) -> Result<
             mux.handle_signal(signal);
         }
 
-        // 3. Control jobs — execute the CEO's queued MCP tool calls against
+        // 3. Control jobs — execute the main worker's queued MCP tool calls against
         //    live panels on this same thread (Invariant I-5).
         mux.drain_control(&mut control_server);
 

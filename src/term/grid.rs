@@ -1667,9 +1667,9 @@ mod tests {
     /// mid-frame, so every subsequent relative move was anchored at row 0 and
     /// the whole screen collapsed onto ~4 overlapping top rows.
     #[test]
-    fn live_ceo_replay_matches_tmux() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/live-ceo-startup.raw");
-        let bytes = std::fs::read(path).expect("live-ceo-startup.raw fixture present");
+    fn live_main_replay_matches_tmux() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/live-main-startup.raw");
+        let bytes = std::fs::read(path).expect("live-main-startup.raw fixture present");
         let mut g = Grid::new(150, 58);
         g.advance(&bytes);
 

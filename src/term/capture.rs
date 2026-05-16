@@ -1,9 +1,9 @@
 //! Turn-segmented output capture (`docs/design.md` §8.5).
 //!
-//! Panel PTY output scrolls fast; the CEO acts in discrete MCP calls, not
-//! live. caucus captures every byte a panel emits, segmented by turn boundary
-//! (`PromptDelivered` .. `TurnCompleted`), so `read_panel` can return a whole
-//! turn's output without the CEO racing the screen.
+//! Panel PTY output scrolls fast; the main worker acts in discrete MCP calls,
+//! not live. caucus captures every byte a panel emits, segmented by turn
+//! boundary (`PromptDelivered` .. `TurnCompleted`), so `read_panel` can return
+//! a whole turn's output without the main worker racing the screen.
 //!
 //! Memory ring + disk spill to
 //! `.caucus/sessions/<id>/panels/<panel_id>.log`.

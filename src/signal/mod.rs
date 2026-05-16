@@ -34,7 +34,7 @@ pub struct TurnSignal {
     pub ts: DateTime<Utc>,
     pub kind: TurnKind,
     /// The agent's final assistant message, lifted from the hook payload.
-    /// Lets the CEO judge most turns without scraping the terminal.
+    /// Lets the main worker judge most turns without scraping the terminal.
     pub last_message: Option<String>,
     /// The raw Claude hook payload, retained verbatim for diagnostics.
     pub raw_hook_payload: serde_json::Value,

@@ -43,7 +43,7 @@ impl LaneEventBlocker {
 pub enum LaneEventKind {
     /// Agent process started.
     Started,
-    /// The CEO delivered an agenda to the panel via `send_keys`.
+    /// The main worker delivered an agenda to the panel via `send_keys`.
     PromptDelivered,
     /// A `Stop`-hook turn signal was received for this panel.
     TurnCompleted,

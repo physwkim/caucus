@@ -1,16 +1,16 @@
-//! caucus MCP control plane — the interface caucus exposes to the CEO
+//! caucus MCP control plane — the interface caucus exposes to the main worker
 //! (`docs/design.md` §0 #4, §9).
 //!
-//! The CEO (a Claude Code agent in one panel) drives every other panel through
-//! six MCP tools: `send_keys`, `ctrl_c`, `read_panel`, `spawn_role`,
-//! `kill_panel`, `list_panels`.
+//! The main worker (a Claude Code agent in one panel) drives every sub-agent
+//! panel through six MCP tools: `send_keys`, `ctrl_c`, `read_panel`,
+//! `spawn_role`, `kill_panel`, `list_panels`.
 //!
 //! ## Architecture
 //!
 //! Two processes, two hops:
 //!
-//! 1. **`caucus mcp-serve`** ([`serve`]) — a thin stdio MCP server the CEO's
-//!    Claude Code instance spawns. It speaks JSON-RPC 2.0 over stdio
+//! 1. **`caucus mcp-serve`** ([`serve`]) — a thin stdio MCP server the main
+//!    worker's Claude Code instance spawns. It speaks JSON-RPC 2.0 over stdio
 //!    ([`jsonrpc`]) and forwards each tool call as a [`protocol::ControlRequest`]
 //!    over the *control socket* ([`control_client`]).
 //! 2. **The main `caucus` process** owns the control socket
@@ -76,7 +76,7 @@ pub enum McpError {
     Tool(String),
 }
 
-/// The tool surface caucus exposes to the CEO over MCP.
+/// The tool surface caucus exposes to the main worker over MCP.
 ///
 /// Implemented by [`crate::session::Multiplexer`]: the live panel registry is
 /// the real backing store. The control-socket server routes each
@@ -94,7 +94,7 @@ pub trait McpToolSurface {
     fn read_panel(&self, panel: PanelId, mode: ReadPanelMode) -> Result<String, McpError>;
 
     /// Spawn a new panel for `role`. `worktree` requests an execute-phase
-    /// worktree; `model`/`agent_cli` are CEO overrides (`docs/design.md` §5).
+    /// worktree; `model`/`agent_cli` are main worker overrides (`docs/design.md` §5).
     fn spawn_role(
         &mut self,
         role: &str,
@@ -110,7 +110,7 @@ pub trait McpToolSurface {
     fn list_panels(&self) -> Vec<PanelSummary>;
 }
 
-/// The six MCP tools caucus exposes to the CEO (`docs/design.md` §0 #4).
+/// The six MCP tools caucus exposes to the main worker (`docs/design.md` §0 #4).
 ///
 /// One catalogue, shared by [`jsonrpc::McpDispatch`] (the `tools/list`
 /// response) and the control-socket request decoder ([`control_client`]).

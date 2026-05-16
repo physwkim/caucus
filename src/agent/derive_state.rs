@@ -1,6 +1,6 @@
 //! Derived agent state (`docs/design.md` §8.3, §8.4).
 //!
-//! A coarse-grained state surface the CEO inspects via `list_panels`, computed
+//! A coarse-grained state surface the main worker inspects via `list_panels`, computed
 //! from `(status, last turn signal, error, blocker, grid hint)`. Recomputed on
 //! every turn-signal ingest and on grid changes.
 
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::lane_event::{LaneEventBlocker, LaneFailureClass};
 use crate::signal::TurnSignal;
 
-/// Coarse state surface for the CEO (`docs/design.md` §8.3).
+/// Coarse state surface for the main worker (`docs/design.md` §8.3).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DerivedState {
@@ -111,7 +111,7 @@ fn blocker_state(class: LaneFailureClass) -> DerivedState {
         LaneFailureClass::McpHandshake => DerivedState::DegradedMcp,
         LaneFailureClass::Transport => DerivedState::InterruptedTransport,
         // PromptDelivery / Unknown have no dedicated state surface; treat as
-        // transport-interrupted so the CEO still sees a non-Idle panel.
+        // transport-interrupted so the main worker still sees a non-Idle panel.
         LaneFailureClass::PromptDelivery | LaneFailureClass::Unknown => {
             DerivedState::InterruptedTransport
         }
