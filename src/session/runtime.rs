@@ -665,9 +665,9 @@ impl Multiplexer {
     /// (`docs/design.md` §5). Single owner of worktree creation is
     /// `worktree::manager::create` (Invariant I-3).
     ///
-    /// `spawn_role` runs synchronously inside the event loop; the async git
-    /// driver is bridged with `block_in_place` + `Handle::block_on` so the
-    /// multiplexer thread is not blocked off-runtime.
+    /// `worktree::manager::create` is synchronous (`git worktree add` is a
+    /// fast subprocess); the event loop calls it directly on its own thread —
+    /// no async bridging, so no nested-runtime panic.
     fn create_role_worktree(&self, role: &str) -> Result<PathBuf, McpError> {
         let req = WorktreeRequest {
             repo_root: self.session.repo_path.clone(),
@@ -684,11 +684,7 @@ impl Multiplexer {
                 self.role_counts.get(role).copied().unwrap_or(0) + 1,
             )),
         };
-        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            McpError::Tool("spawn_role(worktree): no tokio runtime".to_string())
-        })?;
-        let handle_result = tokio::task::block_in_place(|| handle.block_on(create_worktree(&req)));
-        match handle_result {
+        match create_worktree(&req) {
             Ok(wt) => Ok(wt.path),
             Err(err) => Err(McpError::Tool(format!("worktree create: {err}"))),
         }

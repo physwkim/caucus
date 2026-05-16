@@ -7,10 +7,9 @@
 //! [`create`]; *deletion* goes through [`crate::worktree::cleanup`].
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use thiserror::Error;
-use tokio::process::Command;
 
 use crate::session::id::SessionId;
 
@@ -92,7 +91,11 @@ fn short_session(id: SessionId) -> String {
 ///
 /// Errors out if the destination directory already exists (the caller must
 /// clean up first via [`crate::worktree::cleanup`]).
-pub(crate) async fn create(req: &WorktreeRequest) -> Result<WorktreeHandle, WorktreeError> {
+///
+/// Synchronous: `git worktree add` is a fast subprocess. The multiplexer
+/// event loop calls this directly on its own thread — no async bridging, so
+/// no nested-runtime hazard.
+pub(crate) fn create(req: &WorktreeRequest) -> Result<WorktreeHandle, WorktreeError> {
     let path = req.default_path();
     if path.exists() {
         return Err(WorktreeError::AlreadyExists(path));
@@ -117,7 +120,7 @@ pub(crate) async fn create(req: &WorktreeRequest) -> Result<WorktreeHandle, Work
     if let Some(base) = &req.base_ref {
         args.push(base.clone());
     }
-    run_git(&req.repo_root, &args).await?;
+    run_git(&req.repo_root, &args)?;
 
     Ok(WorktreeHandle {
         path,
@@ -128,7 +131,7 @@ pub(crate) async fn create(req: &WorktreeRequest) -> Result<WorktreeHandle, Work
 
 /// Run a git subcommand in `repo` and return trimmed stdout. Stderr is folded
 /// into the error so the caller can classify it.
-pub(crate) async fn run_git(repo: &Path, args: &[String]) -> Result<String, WorktreeError> {
+pub(crate) fn run_git(repo: &Path, args: &[String]) -> Result<String, WorktreeError> {
     let label = format!("git {}", args.join(" "));
     let output = Command::new("git")
         .current_dir(repo)
@@ -136,7 +139,6 @@ pub(crate) async fn run_git(repo: &Path, args: &[String]) -> Result<String, Work
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .await
         .map_err(|source| WorktreeError::Spawn {
             command: label.clone(),
             source,

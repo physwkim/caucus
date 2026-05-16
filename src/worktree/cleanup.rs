@@ -67,7 +67,7 @@ impl CleanupQueue {
 
 async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<CleanupJob>) {
     while let Some(job) = rx.recv().await {
-        let summary = run_one(&job).await;
+        let summary = run_one(&job);
         if let Some(reply) = job.done {
             let _ = reply.send(summary);
         }
@@ -76,7 +76,10 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<CleanupJob>) {
 }
 
 /// Run one cleanup job. Module-private — external code only [`CleanupQueue::enqueue`]s.
-async fn run_one(job: &CleanupJob) -> CleanupSummary {
+///
+/// Synchronous git calls; the consumer task awaits the next job, then runs
+/// this. The serial queue tolerates the brief block per job.
+fn run_one(job: &CleanupJob) -> CleanupSummary {
     let mut summary = CleanupSummary::default();
 
     // Deeper paths first; lex-descending on ties.
@@ -89,7 +92,7 @@ async fn run_one(job: &CleanupJob) -> CleanupSummary {
     });
 
     for path in paths {
-        match remove_worktree(&job.repo_root, &path).await {
+        match remove_worktree(&job.repo_root, &path) {
             Ok(()) => summary.removed_worktrees.push(path),
             Err(err) => {
                 let msg = err.to_string();
@@ -100,7 +103,7 @@ async fn run_one(job: &CleanupJob) -> CleanupSummary {
     }
 
     for branch in &job.branches_to_delete {
-        match delete_branch(&job.repo_root, branch).await {
+        match delete_branch(&job.repo_root, branch) {
             Ok(true) => summary.deleted_branches.push(branch.clone()),
             Ok(false) => {}
             Err(err) => {
@@ -114,7 +117,7 @@ async fn run_one(job: &CleanupJob) -> CleanupSummary {
     summary
 }
 
-async fn remove_worktree(repo: &Path, path: &Path) -> Result<(), WorktreeError> {
+fn remove_worktree(repo: &Path, path: &Path) -> Result<(), WorktreeError> {
     run_git(
         repo,
         &[
@@ -123,13 +126,12 @@ async fn remove_worktree(repo: &Path, path: &Path) -> Result<(), WorktreeError> 
             "--force".into(),
             path.display().to_string(),
         ],
-    )
-    .await?;
+    )?;
     Ok(())
 }
 
 /// `Ok(true)` if the branch existed and was deleted, `Ok(false)` if absent.
-async fn delete_branch(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
+fn delete_branch(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
     let exists = run_git(
         repo,
         &[
@@ -138,12 +140,11 @@ async fn delete_branch(repo: &Path, branch: &str) -> Result<bool, WorktreeError>
             "--quiet".into(),
             format!("refs/heads/{branch}"),
         ],
-    )
-    .await;
+    );
     if exists.is_err() {
         return Ok(false);
     }
-    run_git(repo, &["branch".into(), "-D".into(), branch.into()]).await?;
+    run_git(repo, &["branch".into(), "-D".into(), branch.into()])?;
     Ok(true)
 }
 
@@ -193,5 +194,61 @@ mod tests {
             .unwrap();
         let summary = rx.await.unwrap();
         assert!(summary.removed_worktrees.is_empty());
+    }
+
+    /// End-to-end execute-phase check: `manager::create` makes a real
+    /// `git worktree add`, and the cleanup queue removes it (worktree + branch)
+    /// — the worktree half of `spawn_role(worktree=true)` (`docs/design.md` §5).
+    #[tokio::test]
+    async fn create_then_cleanup_a_real_worktree() {
+        use crate::session::id::SessionId;
+        use crate::worktree::manager::{WorktreeRequest, create};
+
+        // Hermetic temp git repo with one commit so `worktree add` has a HEAD.
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .expect("run git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "caucus-test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        // Create the worktree (Invariant I-3 owner).
+        let req = WorktreeRequest {
+            repo_root: repo.path().to_path_buf(),
+            session_id: SessionId::new(),
+            role: "worker".into(),
+            branch: None,
+            base_ref: None,
+            name_override: Some("ts-worker-1".into()),
+        };
+        let handle = create(&req).expect("git worktree add");
+        assert!(handle.path.is_dir(), "worktree directory created");
+        assert!(
+            handle.path.join(".git").exists(),
+            "worktree .git marker present"
+        );
+
+        // Clean it up through the serial queue.
+        let (queue, _h) = CleanupQueue::spawn();
+        let (tx, rx) = oneshot::channel();
+        queue
+            .enqueue(CleanupJob {
+                repo_root: repo.path().to_path_buf(),
+                worktree_paths: vec![handle.path.clone()],
+                branches_to_delete: vec![handle.branch.clone()],
+                done: Some(tx),
+            })
+            .unwrap();
+        let summary = rx.await.unwrap();
+        assert_eq!(summary.removed_worktrees, vec![handle.path.clone()]);
+        assert!(summary.failed_worktrees.is_empty(), "no removal failures");
+        assert!(!handle.path.exists(), "worktree directory removed");
+        assert_eq!(summary.deleted_branches, vec![handle.branch]);
     }
 }
