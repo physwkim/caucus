@@ -2,9 +2,11 @@
 //! scan its final turn-signal message for the first 7–40 char hex token and
 //! pair it with the worktree's branch + path.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
+use tokio::process::Command;
 
 /// Provenance metadata recorded when an agent creates a commit in its
 /// worktree. Attached to a [`crate::agent::lane_event::LaneEventKind::CommitCreated`]
@@ -43,6 +45,41 @@ pub fn extract_commit_sha(text: &str) -> Option<String> {
     }
 }
 
+/// Scan a turn signal's `last_message` for the first SHA-like token and
+/// confirm it names a real commit object in `repo` via `git rev-parse`
+/// (`docs/design.md` §5).
+///
+/// Returns the *full 40-char* canonical SHA git resolved (so callers record
+/// the unambiguous id), or `None` when the message carries no SHA-like token,
+/// or the token does not resolve to a commit in `repo`. A `false`-positive
+/// hex run from prose (e.g. `deadbeef` in a sentence) simply fails to resolve
+/// and yields `None` rather than an error.
+pub async fn extract_verified_commit(repo: &Path, last_message: &str) -> Option<String> {
+    let candidate = extract_commit_sha(last_message)?;
+    verify_commit(repo, &candidate).await
+}
+
+/// Resolve `rev` against `repo` with `git rev-parse --verify <rev>^{commit}`.
+/// `Some(full_sha)` if it is a real commit, `None` otherwise (including when
+/// `git` itself is missing or `repo` is not a worktree).
+pub async fn verify_commit(repo: &Path, rev: &str) -> Option<String> {
+    // The `^{commit}` peel rejects tokens that resolve to a tree/blob/tag —
+    // only an actual commit object counts as provenance.
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +112,63 @@ mod tests {
         let got = extract_commit_sha(s).unwrap();
         assert_eq!(got.len(), 40);
         assert!(s.starts_with(&got));
+    }
+
+    /// Build a throwaway git repo with one commit; return `(dir, full_sha)`.
+    async fn repo_with_commit() -> (tempfile::TempDir, String) {
+        use std::process::Stdio;
+        use tokio::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let path = dir.path().to_path_buf();
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            async move {
+                let st = Command::new("git")
+                    .current_dir(&path)
+                    .args(&args)
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await
+                    .unwrap();
+                assert!(st.success(), "git {args:?} failed");
+            }
+        };
+        git(&["init", "-q"]).await;
+        std::fs::write(dir.path().join("f.txt"), "hi").unwrap();
+        git(&["add", "."]).await;
+        git(&["commit", "-q", "-m", "first"]).await;
+        let sha = verify_commit(dir.path(), "HEAD").await.unwrap();
+        (dir, sha)
+    }
+
+    #[tokio::test]
+    async fn verifies_a_real_commit() {
+        let (dir, sha) = repo_with_commit().await;
+        let msg = format!("Implemented feature. Commit {} on branch.", &sha[..12]);
+        let got = extract_verified_commit(dir.path(), &msg).await.unwrap();
+        assert_eq!(got, sha);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_bogus_sha() {
+        let (dir, _sha) = repo_with_commit().await;
+        // `deadbeef` is hex-shaped but not a commit in this repo.
+        let got = extract_verified_commit(dir.path(), "see deadbeef please").await;
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_sha_in_message_yields_none() {
+        let (dir, _sha) = repo_with_commit().await;
+        assert!(
+            extract_verified_commit(dir.path(), "nothing hex here")
+                .await
+                .is_none()
+        );
     }
 }

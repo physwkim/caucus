@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 use crate::role::spec::{AgentCli, RoleSpec};
 
@@ -43,6 +44,22 @@ pub struct RoleEntry {
 
 fn default_permission_mode() -> String {
     "default".to_string()
+}
+
+/// Drop the `Task` tool from a role's allowlist (Invariant I-7), warning once
+/// per offending role. Returns the filtered list.
+fn strip_task(role: &str, tools: Vec<String>) -> Vec<String> {
+    if tools.iter().any(|t| t == "Task") {
+        warn!(
+            role,
+            "stripping forbidden `Task` tool from role allowlist — nested \
+             in-session sub-agents are invisible to caucus (design.md §0 #13, \
+             Invariant I-7)"
+        );
+        tools.into_iter().filter(|t| t != "Task").collect()
+    } else {
+        tools
+    }
 }
 
 /// Errors from loading `roles.toml`.
@@ -80,17 +97,25 @@ impl RolesConfig {
     }
 
     /// Convert into [`RoleSpec`]s.
+    ///
+    /// The forbidden `Task` tool (`docs/design.md` §0 #13, Invariant I-7) is
+    /// stripped from every role's `allowed_tools` here, with a `warn!` per
+    /// offending role — a nested in-session sub-agent would be invisible to
+    /// caucus, so it never reaches a spawned agent's allowlist.
     pub fn into_specs(self) -> Vec<RoleSpec> {
         self.roles
             .into_iter()
-            .map(|(name, entry)| RoleSpec {
-                name,
-                description: entry.description,
-                allowed_tools: entry.allowed_tools,
-                permission_mode: entry.permission_mode,
-                system_prompt_template: entry.system_prompt_template,
-                agent_cli: entry.agent_cli,
-                model: entry.model,
+            .map(|(name, entry)| {
+                let allowed_tools = strip_task(&name, entry.allowed_tools);
+                RoleSpec {
+                    name,
+                    description: entry.description,
+                    allowed_tools,
+                    permission_mode: entry.permission_mode,
+                    system_prompt_template: entry.system_prompt_template,
+                    agent_cli: entry.agent_cli,
+                    model: entry.model,
+                }
             })
             .collect()
     }
@@ -170,5 +195,29 @@ mod tests {
         let specs = merged.into_specs();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].permission_mode, "acceptEdits");
+    }
+
+    #[test]
+    fn task_tool_is_stripped_on_load() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("roles.toml");
+        std::fs::write(
+            &path,
+            r#"
+                [roles.rogue]
+                description = "tries to nest"
+                allowed_tools = ["Read", "Task", "Grep"]
+                permission_mode = "default"
+                system_prompt_template = "roles/rogue.md"
+            "#,
+        )
+        .unwrap();
+        let specs = RolesConfig::load(&path).unwrap().into_specs();
+        assert_eq!(specs.len(), 1);
+        assert!(
+            !specs[0].allows_task(),
+            "Task must be stripped from a loaded role (Invariant I-7)"
+        );
+        assert_eq!(specs[0].allowed_tools, vec!["Read", "Grep"]);
     }
 }
