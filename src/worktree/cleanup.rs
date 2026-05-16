@@ -75,7 +75,18 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<CleanupJob>) {
     debug!("cleanup queue consumer shut down");
 }
 
-/// Run one cleanup job. Module-private — external code only [`CleanupQueue::enqueue`]s.
+/// Run one cleanup job synchronously, off the async queue.
+///
+/// The async [`CleanupQueue`] is the normal path, but on caucus shutdown the
+/// tokio runtime is dropped — and the queue's consumer task aborted — before
+/// it can drain. Shutdown therefore cleans worktrees through this blocking
+/// entry point instead, so they are not leaked on every exit.
+pub(crate) fn run_blocking(job: &CleanupJob) -> CleanupSummary {
+    run_one(job)
+}
+
+/// Run one cleanup job. Module-private — external code [`CleanupQueue::enqueue`]s
+/// or, on shutdown, calls [`run_blocking`].
 ///
 /// Synchronous git calls; the consumer task awaits the next job, then runs
 /// this. The serial queue tolerates the brief block per job.

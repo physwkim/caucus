@@ -684,12 +684,37 @@ impl Multiplexer {
     /// The `Active -> Closed` transition goes through `session::state::transition`
     /// (Invariant I-1, the single owner of session state).
     pub fn shutdown(&mut self) {
-        let ids: Vec<PanelId> = self.panels.iter().map(|p| p.id).collect();
-        for id in ids {
-            if let Err(err) = self.kill_panel(id) {
-                warn!(panel = %id, error = %err, "panel kill on shutdown failed");
+        // Kill every panel's PTY and collect its worktree. `kill_panel` is
+        // avoided here: it enqueues worktree cleanup onto the async queue,
+        // whose consumer task is aborted with the tokio runtime the instant
+        // the event loop returns — so the worktrees would never be removed.
+        let mut worktrees: Vec<PathBuf> = Vec::new();
+        for panel in &mut self.panels {
+            if let Err(err) = lifecycle::kill(panel) {
+                warn!(panel = %panel.id, error = %err, "panel kill on shutdown failed");
+            }
+            if let Some(wt) = panel.worktree_path.clone() {
+                worktrees.push(wt);
             }
         }
+        self.panels.clear();
+        self.manifests.clear();
+
+        // Clean the worktrees synchronously, before the runtime goes away.
+        // Branches are kept (`branches_to_delete` empty) — they hold the
+        // sub-agents' commits and merging is the user's call (`docs/design.md` §5).
+        if !worktrees.is_empty() {
+            let summary = crate::worktree::cleanup::run_blocking(&CleanupJob {
+                repo_root: self.session.repo_path.clone(),
+                worktree_paths: worktrees,
+                branches_to_delete: Vec::new(),
+                done: None,
+            });
+            for (path, msg) in &summary.failed_worktrees {
+                warn!(?path, %msg, "worktree cleanup on shutdown failed");
+            }
+        }
+
         if self.session.state() == crate::session::state::SessionState::Active {
             let _ = crate::session::state::transition(
                 &mut self.session,
@@ -1161,5 +1186,52 @@ mod tests {
         assert!(cleaned, "orphan worktree must be enqueued for cleanup");
 
         mux.shutdown();
+    }
+
+    /// `shutdown` must remove worktrees synchronously — the async cleanup
+    /// queue is aborted with the tokio runtime the instant the event loop
+    /// returns, so an enqueued cleanup would never run and the worktree would
+    /// leak on every caucus exit.
+    #[tokio::test]
+    async fn shutdown_cleans_up_worktrees_synchronously() {
+        let tmp = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(tmp.path())
+                .args(args)
+                .output()
+                .expect("run git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "caucus-test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        let mut mux = mux(&tmp);
+        let resp = mux.execute_control(ControlRequest::SpawnRole {
+            role: "worker".into(),
+            worktree: true,
+            model: None,
+            agent_cli: None,
+        });
+        let panel_id = match resp {
+            ControlResponse::Spawned { panel } => panel,
+            // No `claude` on PATH / spawn failed — cannot exercise shutdown
+            // worktree cleanup here; skip rather than fail spuriously.
+            _ => {
+                mux.shutdown();
+                return;
+            }
+        };
+        let wt = mux
+            .panels()
+            .iter()
+            .find(|p| p.id == panel_id)
+            .and_then(|p| p.worktree_path.clone())
+            .expect("worktree panel has a worktree path");
+        assert!(wt.is_dir(), "worktree directory created");
+
+        mux.shutdown();
+        assert!(!wt.exists(), "shutdown must remove the worktree, not leak it");
     }
 }
