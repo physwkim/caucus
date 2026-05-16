@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Sang Woo Kim"]
 license = "MIT"
-description = "Collaboration swarm orchestrator for Claude Code agents over tmux + git worktree"
+description = "A terminal multiplexer for teams of AI coding agents"
 repository = "https://github.com/physwkim/caucus"
 homepage = "https://github.com/physwkim/caucus"
 readme = "README.md"
-keywords = ["claude", "claude-code", "tmux", "agent", "orchestrator"]
+keywords = ["claude", "claude-code", "agent", "orchestrator"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.85"
 
@@ -24,17 +24,21 @@ path = "src/lib.rs"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
-notify = "8"
+crossterm = "0.29.0"
 once_cell = "1"
+portable-pty = "0.9.0"
+ratatui = "0.29.0"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "sync", "time", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "sync", "time", "fs", "io-util", "net"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = { version = "1", features = ["serde"] }
+unicode-width = "=0.2.0"
+vte = "0.15.0"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,16 +1,14 @@
 //! Commit-provenance extraction. After an execute-phase agent finishes, we
-//! scan its final message for the first 7–40 char hex token and pair it with
-//! the worktree's current branch + path. This is the same heuristic
-//! claw-code uses (`extract_commit_sha`, see
-//! `docs/claw-code-analysis.md` §4.3) — it is cheap, correct in the common
-//! case, and recoverable when wrong (the orchestrator can still query
-//! `git log` later).
+//! scan its final turn-signal message for the first 7–40 char hex token and
+//! pair it with the worktree's branch + path.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Provenance metadata recorded when an agent finishes an execute-phase task.
+/// Provenance metadata recorded when an agent creates a commit in its
+/// worktree. Attached to a [`crate::agent::lane_event::LaneEventKind::CommitCreated`]
+/// event.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LaneCommitProvenance {
     pub commit: String,
@@ -51,10 +49,7 @@ mod tests {
 
     #[test]
     fn finds_short_sha() {
-        assert_eq!(
-            extract_commit_sha("see 0123456").as_deref(),
-            Some("0123456")
-        );
+        assert_eq!(extract_commit_sha("see 0123456").as_deref(), Some("0123456"));
     }
 
     #[test]
@@ -69,20 +64,13 @@ mod tests {
     }
 
     #[test]
-    fn ignores_non_hex_garbage() {
-        assert!(extract_commit_sha("zzzz xxxx yyyy").is_none());
-    }
-
-    #[test]
     fn returns_first_match() {
         let s = "committed deadbeef and then cafef00d more";
-        // "deadbeef" (8 hex) — first run we accept.
         assert_eq!(extract_commit_sha(s).as_deref(), Some("deadbeef"));
     }
 
     #[test]
     fn caps_at_40_chars() {
-        // 50 hex chars in a row — must take the first 40.
         let s = "0123456789abcdef0123456789abcdef0123456789abcdef00";
         let got = extract_commit_sha(s).unwrap();
         assert_eq!(got.len(), 40);

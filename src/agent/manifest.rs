@@ -1,9 +1,10 @@
-//! `AgentManifest` — the single authoritative record per agent. Persisted as
-//! a JSON file plus a sibling Markdown view.
+//! `AgentManifest` — the single authoritative record per agent
+//! (`docs/design.md` §8.1). Persisted as a JSON file plus a sibling Markdown
+//! view.
 //!
-//! **Invariant I-2** (`docs/design.md` §12): all mutation goes through the
-//! `Mutator` returned by `AgentManifest::edit`. External code cannot mutate
-//! the manifest fields directly.
+//! **Invariant I-2** (`docs/design.md` §12): all manifest mutation — LaneEvent
+//! append or status change — goes through [`write`]. External code does not
+//! write the JSON directly.
 
 use std::path::{Path, PathBuf};
 
@@ -11,82 +12,104 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::session::id::{AgentId, SessionId};
+use crate::role::spec::AgentCli;
+use crate::session::id::{AgentId, PanelId, SessionId};
 
-use super::derive_state::{DerivedState, PaneScreenHint, RawStatus};
-use super::lane_event::{LaneEvent, LaneEventBlocker};
+use super::derive_state::DerivedState;
+use super::lane_event::{LaneEvent, LaneEventBlocker, LaneEventKind};
 
-/// What kind of pane backs this agent.
+/// Raw agent status, persisted in the manifest. Coarser than `DerivedState`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentKind {
-    /// Meeting-phase agent: read-only, no worktree.
-    Meeting,
-    /// Execute-phase agent: has its own worktree.
-    Execute,
+pub enum AgentStatus {
+    /// Spawned, process running.
+    Live,
+    /// Process exited cleanly.
+    Exited,
+    /// Process failed.
+    Failed,
 }
 
-/// Authoritative on-disk record for one agent.
+impl AgentStatus {
+    /// String form used by [`super::derive_state::derive_agent_state`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Exited => "exited",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Authoritative on-disk record for one agent (`docs/design.md` §8.1).
+///
+/// Fields are `pub(crate)` so only this module can mutate them; external code
+/// reads via the accessors and mutates only through [`write`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentManifest {
     pub agent_id: AgentId,
     pub session_id: SessionId,
     pub role: String,
     pub agent_name: String,
-    pub kind: AgentKind,
-    pub tmux_pane_id: Option<String>,
+    pub panel_id: PanelId,
+    pub agent_cli: AgentCli,
     pub worktree_path: Option<PathBuf>,
     pub model: Option<String>,
-    pub status: RawStatus,
+    pub(crate) status: AgentStatus,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub lane_events: Vec<LaneEvent>,
-    pub current_blocker: Option<LaneEventBlocker>,
-    pub derived_state: DerivedState,
-    pub error: Option<String>,
-    #[serde(default)]
-    pub current_pane_hint: Option<PaneScreenHint>,
-    /// Claude Code session id extracted from the first Stop hook payload.
-    /// Populated by `crate::round::record_sentinel`. Used by
-    /// `caucus execute start --continue-meeting` to invoke
-    /// `claude --resume <id>` in the new worktree so the execute-phase
-    /// agent inherits the meeting-phase conversation context.
-    #[serde(default)]
-    pub claude_session_id: Option<String>,
+    pub exited_at: Option<DateTime<Utc>>,
+    pub(crate) lane_events: Vec<LaneEvent>,
+    pub(crate) current_blocker: Option<LaneEventBlocker>,
+    pub(crate) derived_state: DerivedState,
+    pub(crate) error: Option<String>,
 }
 
 impl AgentManifest {
-    /// Allocate a fresh manifest in the `Running` / `Working` initial state.
-    /// The caller is responsible for persisting it via [`write_json`].
+    /// Allocate a fresh manifest in the `Live` / `Working` initial state.
+    /// Persist it via [`write`].
     pub fn new(
         session_id: SessionId,
-        role: String,
-        agent_name: String,
-        kind: AgentKind,
+        panel_id: PanelId,
+        role: impl Into<String>,
+        agent_name: impl Into<String>,
+        agent_cli: AgentCli,
         model: Option<String>,
     ) -> Self {
         let now = Utc::now();
         Self {
             agent_id: AgentId::new(),
             session_id,
-            role,
-            agent_name,
-            kind,
-            tmux_pane_id: None,
+            role: role.into(),
+            agent_name: agent_name.into(),
+            panel_id,
+            agent_cli,
             worktree_path: None,
             model,
-            status: RawStatus::Running,
+            status: AgentStatus::Live,
             created_at: now,
             started_at: Some(now),
-            completed_at: None,
+            exited_at: None,
             lane_events: vec![LaneEvent::started(now)],
             current_blocker: None,
             derived_state: DerivedState::Working,
             error: None,
-            current_pane_hint: None,
-            claude_session_id: None,
         }
+    }
+
+    /// Read-only view of the lane-event timeline.
+    pub fn lane_events(&self) -> &[LaneEvent] {
+        &self.lane_events
+    }
+
+    /// Current raw status.
+    pub fn status(&self) -> AgentStatus {
+        self.status
+    }
+
+    /// Current derived state.
+    pub fn derived_state(&self) -> DerivedState {
+        self.derived_state
     }
 
     /// JSON path under a session root: `<session_root>/agents/<id>.json`.
@@ -109,16 +132,30 @@ pub enum ManifestError {
     Json(#[from] serde_json::Error),
 }
 
-/// Atomic write: serialise to a sibling `*.tmp`, fsync, rename over the
-/// final path. The Markdown view is rewritten the same way.
-pub fn write_json(manifest: &AgentManifest, session_root: &Path) -> Result<(), ManifestError> {
+/// Single owner of manifest persistence (Invariant I-2).
+///
+/// Append a lane event then atomically rewrite the JSON + Markdown pair.
+/// All manifest mutation routes through here.
+pub(crate) fn write(
+    manifest: &mut AgentManifest,
+    session_root: &Path,
+    event: Option<LaneEvent>,
+) -> Result<(), ManifestError> {
+    if let Some(event) = event {
+        manifest.lane_events.push(event);
+    }
+    to_disk(manifest, session_root)
+}
+
+/// Atomic on-disk write of the JSON + Markdown pair. Module-private — callers
+/// go through [`write`].
+fn to_disk(manifest: &AgentManifest, session_root: &Path) -> Result<(), ManifestError> {
     let path = AgentManifest::json_path(session_root, manifest.agent_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(manifest)?;
-    std::fs::write(&tmp, &bytes)?;
+    std::fs::write(&tmp, serde_json::to_vec_pretty(manifest)?)?;
     std::fs::rename(&tmp, &path)?;
 
     let md_path = AgentManifest::md_path(session_root, manifest.agent_id);
@@ -129,9 +166,8 @@ pub fn write_json(manifest: &AgentManifest, session_root: &Path) -> Result<(), M
 }
 
 /// Read a manifest by id under a session root.
-pub fn read_json(session_root: &Path, agent_id: AgentId) -> Result<AgentManifest, ManifestError> {
-    let path = AgentManifest::json_path(session_root, agent_id);
-    let bytes = std::fs::read(path)?;
+pub fn read(session_root: &Path, agent_id: AgentId) -> Result<AgentManifest, ManifestError> {
+    let bytes = std::fs::read(AgentManifest::json_path(session_root, agent_id))?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
@@ -141,73 +177,52 @@ fn render_md(m: &AgentManifest) -> String {
     let _ = writeln!(s, "# agent {} ({})", m.agent_name, m.agent_id);
     let _ = writeln!(s);
     let _ = writeln!(s, "- session: {}", m.session_id);
+    let _ = writeln!(s, "- panel: {}", m.panel_id);
     let _ = writeln!(s, "- role: {}", m.role);
-    let _ = writeln!(s, "- kind: {:?}", m.kind);
+    let _ = writeln!(s, "- agent_cli: {:?}", m.agent_cli);
     let _ = writeln!(s, "- status: {:?}", m.status);
     let _ = writeln!(s, "- derived_state: {:?}", m.derived_state);
-    if let Some(hint) = m.current_pane_hint {
-        let _ = writeln!(s, "- pane_hint: {hint:?}");
-    }
     if let Some(model) = &m.model {
         let _ = writeln!(s, "- model: {model}");
-    }
-    if let Some(pane) = &m.tmux_pane_id {
-        let _ = writeln!(s, "- tmux pane: {pane}");
     }
     if let Some(wt) = &m.worktree_path {
         let _ = writeln!(s, "- worktree: {}", wt.display());
     }
     let _ = writeln!(s, "- created_at: {}", m.created_at);
-    if let Some(t) = m.completed_at {
-        let _ = writeln!(s, "- completed_at: {t}");
+    if let Some(t) = m.exited_at {
+        let _ = writeln!(s, "- exited_at: {t}");
     }
     if let Some(err) = &m.error {
-        let _ = writeln!(s);
-        let _ = writeln!(s, "## error\n\n{err}");
+        let _ = writeln!(s, "\n## error\n\n{err}");
     }
-    let _ = writeln!(s);
-    let _ = writeln!(s, "## lane events");
-    let _ = writeln!(s);
+    let _ = writeln!(s, "\n## lane events\n");
     for ev in &m.lane_events {
-        let _ = writeln!(s, "- {} — {}", ev.ts(), event_label(ev));
+        let _ = writeln!(s, "- {} — {}", ev.ts, event_label(&ev.kind));
     }
     s
 }
 
-fn event_label(ev: &LaneEvent) -> String {
-    match ev {
-        LaneEvent::Started { .. } => "started".into(),
-        LaneEvent::PromptDelivered { prompt_path, .. } => {
-            format!("prompt_delivered ({})", prompt_path.display())
-        }
-        LaneEvent::SentinelReceived { sentinel_kind, .. } => {
-            format!("sentinel_received ({sentinel_kind})")
-        }
-        LaneEvent::ResponseFileWritten { path, bytes, .. } => {
-            format!("response_written ({}, {bytes} bytes)", path.display())
-        }
-        LaneEvent::Blocked { blocker, .. } => {
+fn event_label(kind: &LaneEventKind) -> String {
+    match kind {
+        LaneEventKind::Started => "started".into(),
+        LaneEventKind::PromptDelivered => "prompt_delivered".into(),
+        LaneEventKind::TurnCompleted => "turn_completed".into(),
+        LaneEventKind::Blocked { blocker } => {
             format!("blocked ({:?}: {})", blocker.failure_class, blocker.detail)
         }
-        LaneEvent::Failed { blocker, .. } => {
+        LaneEventKind::Failed { blocker } => {
             format!("failed ({:?}: {})", blocker.failure_class, blocker.detail)
         }
-        LaneEvent::Finished { detail, .. } => format!("finished ({detail})"),
-        LaneEvent::CommitCreated { provenance, .. } => {
+        LaneEventKind::Finished { detail } => format!("finished ({detail})"),
+        LaneEventKind::CommitCreated { provenance } => {
             format!("commit_created ({})", provenance.commit)
         }
-        LaneEvent::WorktreeCreated { path, .. } => {
+        LaneEventKind::WorktreeCreated { path } => {
             format!("worktree_created ({})", path.display())
         }
-        LaneEvent::WorktreeRemoved { path, .. } => {
+        LaneEventKind::WorktreeRemoved { path } => {
             format!("worktree_removed ({})", path.display())
         }
-        LaneEvent::PaneHintChanged {
-            previous, current, ..
-        } => {
-            format!("pane_hint_changed ({previous:?} → {current:?})")
-        }
-        LaneEvent::PaneGone { pane, .. } => format!("pane_gone ({pane})"),
     }
 }
 
@@ -219,86 +234,44 @@ mod tests {
     #[test]
     fn write_read_roundtrip() {
         let tmp = TempDir::new().unwrap();
-        let manifest = AgentManifest::new(
+        let mut manifest = AgentManifest::new(
             SessionId::new(),
-            "reviewer".into(),
-            "reviewer-r1".into(),
-            AgentKind::Meeting,
-            Some("claude-opus-4-7".into()),
+            PanelId::new(),
+            "reviewer",
+            "reviewer-r1",
+            AgentCli::Claude,
+            Some("opus".into()),
         );
-        write_json(&manifest, tmp.path()).unwrap();
-        let back = read_json(tmp.path(), manifest.agent_id).unwrap();
+        write(&mut manifest, tmp.path(), None).unwrap();
+        let back = read(tmp.path(), manifest.agent_id).unwrap();
         assert_eq!(back.agent_id, manifest.agent_id);
         assert_eq!(back.role, "reviewer");
-        assert_eq!(back.lane_events.len(), 1);
+        assert_eq!(back.lane_events().len(), 1);
 
-        // Markdown sibling exists and mentions the role
         let md =
             std::fs::read_to_string(AgentManifest::md_path(tmp.path(), manifest.agent_id)).unwrap();
         assert!(md.contains("role: reviewer"));
     }
 
     #[test]
-    fn manifest_persists_current_pane_hint() {
+    fn write_appends_lane_event() {
         let tmp = TempDir::new().unwrap();
         let mut manifest = AgentManifest::new(
             SessionId::new(),
-            "backend".into(),
-            "backend".into(),
-            AgentKind::Meeting,
+            PanelId::new(),
+            "backend",
+            "backend",
+            AgentCli::Claude,
             None,
         );
-        manifest.current_pane_hint = Some(PaneScreenHint::PermissionPromptVisible);
-        write_json(&manifest, tmp.path()).unwrap();
-        let back = read_json(tmp.path(), manifest.agent_id).unwrap();
-        assert_eq!(
-            back.current_pane_hint,
-            Some(PaneScreenHint::PermissionPromptVisible)
-        );
-    }
-
-    #[test]
-    fn manifest_reads_pre_v0_2_json() {
-        // A pre-existing manifest JSON written before `current_pane_hint`
-        // existed must still parse, with the new field defaulted to None.
-        let json = serde_json::json!({
-            "agent_id": crate::session::id::AgentId::new(),
-            "session_id": SessionId::new(),
-            "role": "qa",
-            "agent_name": "qa-r1",
-            "kind": "meeting",
-            "tmux_pane_id": null,
-            "worktree_path": null,
-            "model": null,
-            "status": "running",
-            "created_at": "2026-05-01T00:00:00Z",
-            "started_at": "2026-05-01T00:00:00Z",
-            "completed_at": null,
-            "lane_events": [],
-            "current_blocker": null,
-            "derived_state": "working",
-            "error": null,
-            // NOTE: no current_pane_hint field — emulates old on-disk format.
-        });
-        let parsed: AgentManifest =
-            serde_json::from_value(json).expect("backward-compat parse failed");
-        assert_eq!(parsed.current_pane_hint, None);
-    }
-
-    #[test]
-    fn write_is_atomic_after_partial_failure_recovery() {
-        // The .tmp file should not be left behind on a successful write.
-        let tmp = TempDir::new().unwrap();
-        let m = AgentManifest::new(
-            SessionId::new(),
-            "qa".into(),
-            "qa".into(),
-            AgentKind::Meeting,
-            None,
-        );
-        write_json(&m, tmp.path()).unwrap();
-        let json = AgentManifest::json_path(tmp.path(), m.agent_id);
-        let leftover = json.with_extension("json.tmp");
-        assert!(!leftover.exists());
+        write(
+            &mut manifest,
+            tmp.path(),
+            Some(LaneEvent::now(LaneEventKind::TurnCompleted)),
+        )
+        .unwrap();
+        assert_eq!(manifest.lane_events().len(), 2);
+        let back = read(tmp.path(), manifest.agent_id).unwrap();
+        assert_eq!(back.lane_events().len(), 2);
     }
 }

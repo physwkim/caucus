@@ -1,92 +1,84 @@
-//! 8-state derived view over `(status, response_file_present, error, blocker,
-//! pane_hint)`. Modelled on claw-code's `derive_agent_state` (see
-//! `docs/claw-code-analysis.md` §4.2), with one caucus-specific addition:
-//! `BlockedPermissionPrompt` for the tmux case where the spawned `claude`
-//! pane is stuck on a tool-permission y/n prompt.
+//! Derived agent state (`docs/design.md` §8.3, §8.4).
+//!
+//! A coarse-grained state surface the CEO inspects via `list_panels`, computed
+//! from `(status, last turn signal, error, blocker, grid hint)`. Recomputed on
+//! every turn-signal ingest and on grid changes.
 
 use serde::{Deserialize, Serialize};
 
-/// Coarse-grained state surface for the orchestrator. The CEO inspects this,
-/// not the raw `(status, error, blocker)` tuple.
+use super::lane_event::LaneEventBlocker;
+use crate::signal::TurnSignal;
+
+/// Coarse state surface for the CEO (`docs/design.md` §8.3).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DerivedState {
+    /// After `PromptDelivered`, before the next turn signal.
     Working,
-    FinishedCleanable,
-    FinishedPendingReport,
-    BlockedBackgroundJob,
-    BlockedMergeConflict,
+    /// Turn signal received — waiting for the next instruction.
+    Idle,
+    /// Grid shows a tool-permission `[y/n]` prompt. caucus never auto-answers.
     BlockedPermissionPrompt,
+    /// Grid shows a merge conflict.
+    BlockedMergeConflict,
+    /// Grid shows a stuck background job.
+    BlockedBackgroundJob,
+    /// MCP handshake degraded.
     DegradedMcp,
+    /// The transport to the agent was interrupted.
     InterruptedTransport,
-    TrulyIdle,
+    /// The agent process exited.
+    Exited,
 }
 
-/// Raw agent status, persisted in the manifest.
+/// Hint extracted from a panel's grid by the regex fallback in `term/`.
+/// `None` means caucus has no opinion. Used for backends without a
+/// turn-completion hook, and for blocked-state detection (`docs/design.md`
+/// §8.3).
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RawStatus {
-    Running,
-    Completed,
-    Failed,
-}
-
-/// Hint extracted from the pane screen by the regex fallback in
-/// `crate::status::pane_hint`. `None` means we have no opinion.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PaneScreenHint {
-    EscToInterruptVisible,
+pub enum GridHint {
+    /// The agent is back at a bare input prompt (turn likely done).
+    PromptReady,
+    /// A `Allow this tool? [y/n]`-style permission prompt is visible.
     PermissionPromptVisible,
-    BareOpenPrompt,
+    /// A merge-conflict marker is visible.
+    MergeConflictVisible,
+    /// A long-running background job appears stuck.
+    BackgroundJobVisible,
 }
 
-/// Pure function: every input combination produces one `DerivedState`.
-/// Called on every sentinel ingest and every poller tick.
-pub fn derive(
-    status: RawStatus,
-    response_file_non_empty: bool,
+/// Pure function deriving the coarse state (`docs/design.md` §8.4).
+///
+/// `status` is the raw agent status string from the manifest
+/// (`live` / `exited` / `failed`). A visible blocking grid hint dominates;
+/// otherwise a received turn signal means `Idle`, and `live` with no signal
+/// means `Working`.
+pub fn derive_agent_state(
+    status: &str,
+    last_turn_signal: Option<&TurnSignal>,
     error: Option<&str>,
-    pane_hint: Option<PaneScreenHint>,
+    blocker: Option<&LaneEventBlocker>,
+    grid_hint: Option<&GridHint>,
 ) -> DerivedState {
-    if let Some(PaneScreenHint::PermissionPromptVisible) = pane_hint {
-        return DerivedState::BlockedPermissionPrompt;
+    // TODO(phase 2): full classification per §8.3 — fold `error` and
+    // `blocker` into the blocked variants, weigh hook vs grid heuristics.
+    let _ = (error, blocker);
+
+    if let Some(hint) = grid_hint {
+        match hint {
+            GridHint::PermissionPromptVisible => return DerivedState::BlockedPermissionPrompt,
+            GridHint::MergeConflictVisible => return DerivedState::BlockedMergeConflict,
+            GridHint::BackgroundJobVisible => return DerivedState::BlockedBackgroundJob,
+            GridHint::PromptReady => {}
+        }
     }
 
     match status {
-        RawStatus::Running => DerivedState::Working,
-        RawStatus::Completed => {
-            if response_file_non_empty {
-                DerivedState::FinishedCleanable
-            } else {
-                DerivedState::FinishedPendingReport
-            }
-        }
-        RawStatus::Failed => classify_failure(error.unwrap_or_default()),
+        "exited" => DerivedState::Exited,
+        _ if last_turn_signal.is_some() => DerivedState::Idle,
+        _ => DerivedState::Working,
     }
-}
-
-/// Classify a failure message string into a `DerivedState`. Matches
-/// claw-code's substring heuristics so error wording is interchangeable.
-pub fn classify_failure(error: &str) -> DerivedState {
-    let e = error.to_ascii_lowercase();
-    if e.contains("background") {
-        return DerivedState::BlockedBackgroundJob;
-    }
-    if e.contains("merge conflict") || e.contains("cherry-pick") {
-        return DerivedState::BlockedMergeConflict;
-    }
-    if e.contains("mcp") {
-        return DerivedState::DegradedMcp;
-    }
-    if e.contains("transport")
-        || e.contains("broken pipe")
-        || e.contains("connection")
-        || e.contains("interrupted")
-    {
-        return DerivedState::InterruptedTransport;
-    }
-    DerivedState::TrulyIdle
 }
 
 #[cfg(test)]
@@ -94,75 +86,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn running_is_working() {
+    fn live_with_no_signal_is_working() {
         assert_eq!(
-            derive(RawStatus::Running, false, None, None),
+            derive_agent_state("live", None, None, None, None),
             DerivedState::Working
         );
     }
 
     #[test]
-    fn completed_with_report_is_cleanable() {
+    fn exited_status_is_exited() {
         assert_eq!(
-            derive(RawStatus::Completed, true, None, None),
-            DerivedState::FinishedCleanable
+            derive_agent_state("exited", None, None, None, None),
+            DerivedState::Exited
         );
     }
 
     #[test]
-    fn completed_without_report_is_pending() {
+    fn permission_prompt_hint_dominates() {
         assert_eq!(
-            derive(RawStatus::Completed, false, None, None),
-            DerivedState::FinishedPendingReport
-        );
-    }
-
-    #[test]
-    fn merge_conflict_classified() {
-        assert_eq!(
-            derive(
-                RawStatus::Failed,
-                false,
-                Some("merge conflict while rebasing"),
-                None
-            ),
-            DerivedState::BlockedMergeConflict
-        );
-    }
-
-    #[test]
-    fn mcp_handshake_classified() {
-        assert_eq!(
-            derive(
-                RawStatus::Failed,
-                false,
-                Some("mcp handshake timed out"),
-                None
-            ),
-            DerivedState::DegradedMcp
-        );
-    }
-
-    #[test]
-    fn permission_prompt_dominates_running() {
-        // Even if we still think the agent is running, a visible permission
-        // prompt is the more informative signal — surface it.
-        assert_eq!(
-            derive(
-                RawStatus::Running,
-                false,
+            derive_agent_state(
+                "live",
                 None,
-                Some(PaneScreenHint::PermissionPromptVisible)
+                None,
+                None,
+                Some(&GridHint::PermissionPromptVisible)
             ),
             DerivedState::BlockedPermissionPrompt
-        );
-    }
-
-    #[test]
-    fn unknown_failure_falls_back_to_truly_idle() {
-        assert_eq!(
-            derive(RawStatus::Failed, false, Some("weird thing"), None),
-            DerivedState::TrulyIdle
         );
     }
 }

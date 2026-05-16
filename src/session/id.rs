@@ -1,5 +1,5 @@
-//! Identifier types. `ULID` for sessions and agents — lexicographic order ≈
-//! time order, no central counter, 26-char base32 representation.
+//! Identifier types. `ULID` for sessions, panels, and agents — lexicographic
+//! order ≈ time order, no central counter, 26-char base32 representation.
 
 use std::fmt;
 use std::str::FromStr;
@@ -44,6 +44,7 @@ macro_rules! ulid_newtype {
 }
 
 ulid_newtype!(SessionId);
+ulid_newtype!(PanelId);
 ulid_newtype!(AgentId);
 
 #[cfg(test)]
@@ -58,10 +59,10 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_agent_id_via_json() {
-        let id = AgentId::new();
+    fn roundtrip_panel_id_via_json() {
+        let id = PanelId::new();
         let s = serde_json::to_string(&id).unwrap();
-        let back: AgentId = serde_json::from_str(&s).unwrap();
+        let back: PanelId = serde_json::from_str(&s).unwrap();
         assert_eq!(id, back);
     }
 

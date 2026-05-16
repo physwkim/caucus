@@ -1,102 +1,69 @@
-//! Role specification: name, allowed tools, permission mode, prompt template
-//! location. Mirrors claw-code's per-type tool allowlist (see
-//! `docs/claw-code-analysis.md` §3).
-
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+//! Role specification: name, description, allowed tools, permission mode,
+//! prompt template, agent CLI, model. See `docs/design.md` §6.
 
 use serde::{Deserialize, Serialize};
 
-/// Claude CLI `--permission-mode` values that caucus knows about. The
-/// serde representation matches the exact strings the `claude` binary
-/// accepts, so a `roles.toml` value can be copy-pasted from `claude --help`.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-pub enum PermissionMode {
-    /// `--permission-mode default` — Claude asks before any write/bash.
-    #[serde(rename = "default")]
-    Default,
-    /// `--permission-mode acceptEdits` — write/edit are auto-approved.
-    /// Bash still prompts.
-    #[serde(rename = "acceptEdits")]
-    AcceptEdits,
-    /// `--permission-mode plan` — read-only planning mode.
-    #[serde(rename = "plan")]
-    Plan,
-    /// `--permission-mode bypassPermissions` — skip every prompt. Dangerous;
-    /// reserve for sandboxed roles.
-    #[serde(rename = "bypassPermissions")]
-    BypassPermissions,
-}
-
-impl PermissionMode {
-    pub fn as_cli_arg(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::AcceptEdits => "acceptEdits",
-            Self::Plan => "plan",
-            Self::BypassPermissions => "bypassPermissions",
-        }
-    }
-}
-
-/// Which agent CLI runs in the pane for a given role.
+/// Which agent CLI runs in the panel for a given role (`docs/design.md` §0 #9).
+/// Serialised lowercase so `roles.toml` reads `agent_cli = "claude"`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentCli {
-    /// `claude` (Claude Code). Default.
+    /// `claude` (Claude Code). Default when `agent_cli` is omitted.
     #[default]
     Claude,
-    /// `codex` (OpenAI Codex CLI). Useful as a "serious reviewer" when
-    /// Claude gets stuck — see README "Mixing agent CLIs" section.
+    /// `codex` (OpenAI Codex CLI). Useful as an adversarial second opinion.
     Codex,
+    /// `gemini` (Google Gemini CLI).
+    Gemini,
 }
 
 impl AgentCli {
-    /// Binary name to invoke. Stays stable; both binaries are expected on
-    /// `PATH`.
+    /// Binary name to invoke. Both/all binaries are expected on `PATH`.
     pub fn binary(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Gemini => "gemini",
         }
     }
 }
 
-/// Static specification for a role.
+/// Static specification for a role (`docs/design.md` §6 / §9).
+///
+/// `permission_mode` is kept as a free-form `String` matching the exact
+/// `--permission-mode` value the backend CLI accepts (e.g. `default`,
+/// `acceptEdits`, `plan`, `bypassPermissions`), so a `roles.toml` value can be
+/// copy-pasted straight from the CLI's help text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleSpec {
     pub name: String,
     pub description: String,
-    pub allowed_tools: BTreeSet<String>,
-    pub permission_mode: PermissionMode,
+    /// Tool allowlist. `Task` MUST NOT appear here (`docs/design.md` §0 #13,
+    /// Invariant I-7) — `caucus doctor` warns if it does.
+    pub allowed_tools: Vec<String>,
+    /// `--permission-mode` value passed to the backend CLI verbatim.
+    pub permission_mode: String,
     /// Path (relative to the caucus install / repo root) of the system-prompt
     /// markdown file for this role. Resolved at spawn time.
-    pub system_prompt_template: PathBuf,
-    /// Optional model override for this role. If `None`, the spawning code
-    /// uses the request-level model (or [`crate::agent::spawn::DEFAULT_MODEL`]).
-    /// Useful for cost control: e.g. `architect = sonnet`, `backend = opus`.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Which agent CLI to spawn for this role. Defaults to Claude. Set to
-    /// `codex` for roles where you want OpenAI Codex as a second opinion.
+    pub system_prompt_template: String,
+    /// Which agent CLI to spawn for this role. Defaults to Claude.
     #[serde(default)]
     pub agent_cli: AgentCli,
+    /// Optional model override. `None` means the CLI's own default tier.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl RoleSpec {
-    /// Render `--allowed-tools` as the comma-separated string Claude CLI
-    /// accepts.
+    /// Render `allowed_tools` as the comma-separated string the CLIs accept.
     pub fn allowed_tools_csv(&self) -> String {
-        let mut iter = self.allowed_tools.iter();
-        let mut s = match iter.next() {
-            Some(first) => first.clone(),
-            None => return String::new(),
-        };
-        for tool in iter {
-            s.push(',');
-            s.push_str(tool);
-        }
-        s
+        self.allowed_tools.join(",")
+    }
+
+    /// Whether this role's allowlist contains the forbidden `Task` tool
+    /// (Invariant I-7). `caucus doctor` surfaces this.
+    pub fn allows_task(&self) -> bool {
+        self.allowed_tools.iter().any(|t| t == "Task")
     }
 }
 
@@ -104,43 +71,32 @@ impl RoleSpec {
 mod tests {
     use super::*;
 
-    fn sample(name: &str, tools: &[&str], mode: PermissionMode) -> RoleSpec {
+    fn sample(name: &str, tools: &[&str]) -> RoleSpec {
         RoleSpec {
             name: name.into(),
             description: format!("test role {name}"),
             allowed_tools: tools.iter().map(|t| (*t).to_string()).collect(),
-            permission_mode: mode,
-            system_prompt_template: PathBuf::from(format!("roles/{name}.md")),
-            model: None,
+            permission_mode: "default".into(),
+            system_prompt_template: format!("roles/{name}.md"),
             agent_cli: AgentCli::Claude,
+            model: None,
         }
     }
 
     #[test]
-    fn csv_in_btree_order() {
-        let s = sample(
-            "reviewer",
-            &["Grep", "Glob", "Read"],
-            PermissionMode::Default,
-        );
-        // BTreeSet sorts alphabetically.
-        assert_eq!(s.allowed_tools_csv(), "Glob,Grep,Read");
+    fn csv_preserves_order() {
+        let s = sample("reviewer", &["Read", "Glob", "Grep"]);
+        assert_eq!(s.allowed_tools_csv(), "Read,Glob,Grep");
     }
 
     #[test]
-    fn empty_allowlist_yields_empty_csv() {
-        let s = sample("noop", &[], PermissionMode::Plan);
-        assert_eq!(s.allowed_tools_csv(), "");
+    fn detects_forbidden_task_tool() {
+        assert!(sample("x", &["Read", "Task"]).allows_task());
+        assert!(!sample("x", &["Read", "Grep"]).allows_task());
     }
 
     #[test]
-    fn permission_mode_cli_args() {
-        assert_eq!(PermissionMode::Default.as_cli_arg(), "default");
-        assert_eq!(PermissionMode::AcceptEdits.as_cli_arg(), "acceptEdits");
-        assert_eq!(PermissionMode::Plan.as_cli_arg(), "plan");
-        assert_eq!(
-            PermissionMode::BypassPermissions.as_cli_arg(),
-            "bypassPermissions"
-        );
+    fn agent_cli_serde_is_lowercase() {
+        assert_eq!(serde_json::to_string(&AgentCli::Gemini).unwrap(), "\"gemini\"");
     }
 }
