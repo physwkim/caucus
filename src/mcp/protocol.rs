@@ -191,10 +191,9 @@ mod tests {
     fn wait_for_panels_timeout_is_optional() {
         // `timeout_secs` defaults to None when omitted from the wire form.
         let id = PanelId::new();
-        let req: ControlRequest = serde_json::from_str(&format!(
-            r#"{{"op":"wait_for_panels","panels":["{id}"]}}"#
-        ))
-        .unwrap();
+        let req: ControlRequest =
+            serde_json::from_str(&format!(r#"{{"op":"wait_for_panels","panels":["{id}"]}}"#))
+                .unwrap();
         assert_eq!(
             req,
             ControlRequest::WaitForPanels {

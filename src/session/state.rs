@@ -99,10 +99,7 @@ pub struct IllegalTransition {
 ///
 /// The only legal transition is `Active -> Closed`. `Closed -> *` and the
 /// no-op `Active -> Active` are rejected.
-pub(crate) fn transition(
-    session: &mut Session,
-    to: SessionState,
-) -> Result<(), IllegalTransition> {
+pub(crate) fn transition(session: &mut Session, to: SessionState) -> Result<(), IllegalTransition> {
     let from = session.state;
     match (from, to) {
         (SessionState::Active, SessionState::Closed) => {

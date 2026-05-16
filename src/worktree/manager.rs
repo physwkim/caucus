@@ -211,7 +211,12 @@ mod tests {
         };
         let p = req.default_path();
         assert_eq!(p.parent().unwrap(), Path::new("/repo/.caucus/worktrees"));
-        assert!(p.file_name().unwrap().to_string_lossy().ends_with("-backend"));
+        assert!(
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-backend")
+        );
     }
 
     #[test]

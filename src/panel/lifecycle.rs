@@ -302,12 +302,7 @@ mod tests {
     fn cat_panel() -> Panel {
         use crate::pty::PtyCommand;
         let inner = rect().inner();
-        let pty = Pty::spawn(
-            &PtyCommand::new("/bin/cat"),
-            inner.width,
-            inner.height,
-        )
-        .unwrap();
+        let pty = Pty::spawn(&PtyCommand::new("/bin/cat"), inner.width, inner.height).unwrap();
         Panel {
             id: PanelId::new(),
             role: "reviewer".into(),

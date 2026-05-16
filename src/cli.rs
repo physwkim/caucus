@@ -302,18 +302,15 @@ fn run_sessions(format: OutputFormat) -> Result<ExitCode> {
     let records = crate::session::record::discover(&repo);
     match format {
         OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(&records)
-                .context("serialise session records")?;
+            let json =
+                serde_json::to_string_pretty(&records).context("serialise session records")?;
             println!("{json}");
         }
         OutputFormat::Text => {
             if records.is_empty() {
                 eprintln!("caucus: no resumable sessions under .caucus/sessions/");
             } else {
-                println!(
-                    "{:<28} {:<10} {:<8} TOPIC",
-                    "SESSION", "AGE", "PANELS"
-                );
+                println!("{:<28} {:<10} {:<8} TOPIC", "SESSION", "AGE", "PANELS");
                 let now = chrono::Utc::now();
                 for rec in &records {
                     println!(
@@ -372,8 +369,17 @@ mod tests {
     #[test]
     fn signal_post_parses() {
         let cli = Cli::try_parse_from([
-            "caucus", "signal", "post", "--sock", "/tmp/c.sock", "--session", "S", "--panel", "P",
-            "--kind", "stop",
+            "caucus",
+            "signal",
+            "post",
+            "--sock",
+            "/tmp/c.sock",
+            "--session",
+            "S",
+            "--panel",
+            "P",
+            "--kind",
+            "stop",
         ])
         .unwrap();
         assert!(matches!(

@@ -273,7 +273,11 @@ impl Multiplexer {
     /// through the six caucus MCP tools. `caucus_bin` is the absolute path of
     /// the running `caucus` binary so the `mcp-serve` child is the exact same
     /// build.
-    pub fn spawn_main_panel(&mut self, role: &str, caucus_bin: &std::path::Path) -> Result<PanelId> {
+    pub fn spawn_main_panel(
+        &mut self,
+        role: &str,
+        caucus_bin: &std::path::Path,
+    ) -> Result<PanelId> {
         let id = self.spawn_main_panel_resume(role, caucus_bin, None)?;
         self.persist_record();
         Ok(id)
@@ -351,9 +355,7 @@ impl Multiplexer {
                 let manifest = self.manifests.get(&panel.id);
                 PanelRecord {
                     role: panel.role.clone(),
-                    agent_cli: manifest
-                        .map(|m| m.agent_cli)
-                        .unwrap_or(AgentCli::Claude),
+                    agent_cli: manifest.map(|m| m.agent_cli).unwrap_or(AgentCli::Claude),
                     model: manifest.and_then(|m| m.model.clone()),
                     order_index: idx,
                     worktree_branch: self.worktree_branches.get(&panel.id).cloned(),
@@ -417,16 +419,10 @@ impl Multiplexer {
             .map_err(|e| anyhow::anyhow!("agent spawn: {e}"))?;
         ids.push(outcome.panel_id);
         let provisional = Layout::reflow(&ids, self.area, self.layout_mode);
-        let rect = provisional
-            .rect_of(outcome.panel_id)
-            .unwrap_or(self.area);
+        let rect = provisional.rect_of(outcome.panel_id).unwrap_or(self.area);
 
-        let mut panel = lifecycle::spawn(
-            &request,
-            outcome.panel_id,
-            outcome.manifest.agent_id,
-            rect,
-        )?;
+        let mut panel =
+            lifecycle::spawn(&request, outcome.panel_id, outcome.manifest.agent_id, rect)?;
         let panel_id = panel.id;
         // Turn-segmented capture spills to `<session>/panels/<panel>.log`
         // (`docs/design.md` §8.5).
@@ -812,12 +808,12 @@ impl Multiplexer {
     /// `Spawning`. A panel id that does not exist counts as settled (there is
     /// nothing left to wait for — it was killed or never spawned).
     fn wait_panels_settled(&self, panels: &[PanelId]) -> bool {
-        panels.iter().all(|id| {
-            match self.panels.iter().find(|p| p.id == *id) {
+        panels
+            .iter()
+            .all(|id| match self.panels.iter().find(|p| p.id == *id) {
                 Some(p) => !matches!(p.state(), PanelState::Working | PanelState::Spawning),
                 None => true,
-            }
-        })
+            })
     }
 
     /// Build the deferred reply for a satisfied/timed-out `wait_for_panels`:
@@ -1485,7 +1481,10 @@ mod tests {
         assert_eq!(mux.zoomed(), Some(panel));
 
         Multiplexer::kill_panel(&mut mux, panel).unwrap();
-        assert!(mux.zoomed().is_none(), "zoom must clear when its panel dies");
+        assert!(
+            mux.zoomed().is_none(),
+            "zoom must clear when its panel dies"
+        );
 
         mux.shutdown();
     }
@@ -1530,7 +1529,10 @@ mod tests {
         assert!(reply_rx.try_recv().is_err());
 
         mux.poll_pending_waits();
-        assert!(mux.pending_waits.is_empty(), "timed-out wait must be dropped");
+        assert!(
+            mux.pending_waits.is_empty(),
+            "timed-out wait must be dropped"
+        );
         match reply_rx.try_recv() {
             Ok(ControlResponse::Panels { .. }) => {}
             other => panic!("expected a Panels reply after timeout, got {other:?}"),
@@ -1561,7 +1563,11 @@ mod tests {
 
         let (reply_tx, mut reply_rx) = oneshot::channel();
         mux.register_wait(vec![panel], Some(600), reply_tx);
-        assert_eq!(mux.pending_waits.len(), 1, "wait must be stashed, not answered");
+        assert_eq!(
+            mux.pending_waits.len(),
+            1,
+            "wait must be stashed, not answered"
+        );
 
         // A poll while the panel is still working leaves the wait pending.
         mux.poll_pending_waits();
@@ -1758,6 +1764,9 @@ mod tests {
         assert!(wt.is_dir(), "worktree directory created");
 
         mux.shutdown();
-        assert!(!wt.exists(), "shutdown must remove the worktree, not leak it");
+        assert!(
+            !wt.exists(),
+            "shutdown must remove the worktree, not leak it"
+        );
     }
 }

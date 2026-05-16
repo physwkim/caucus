@@ -131,10 +131,7 @@ impl FocusRouter {
         // While the transcript overlay is open, a bare `Esc` hides it rather
         // than reaching the focused panel. Every other key still passes
         // through — the overlay is read-only and does not capture input.
-        if self.transcript_open
-            && key.code == KeyCode::Esc
-            && key.modifiers.is_empty()
-        {
+        if self.transcript_open && key.code == KeyCode::Esc && key.modifiers.is_empty() {
             return InputAction::Caucus(CaucusCommand::HideTranscript);
         }
         match self.focused {
@@ -159,24 +156,14 @@ impl FocusRouter {
             };
         }
         match key.code {
-            KeyCode::Char('n') | KeyCode::Right => {
-                InputAction::Caucus(CaucusCommand::FocusNext)
-            }
-            KeyCode::Char('p') | KeyCode::Left => {
-                InputAction::Caucus(CaucusCommand::FocusPrev)
-            }
+            KeyCode::Char('n') | KeyCode::Right => InputAction::Caucus(CaucusCommand::FocusNext),
+            KeyCode::Char('p') | KeyCode::Left => InputAction::Caucus(CaucusCommand::FocusPrev),
             KeyCode::Char('q') => InputAction::Caucus(CaucusCommand::Quit),
             KeyCode::Char('z') => InputAction::Caucus(CaucusCommand::ToggleZoom),
-            KeyCode::Char('<') => {
-                InputAction::Caucus(CaucusCommand::MovePanelEarlier)
-            }
-            KeyCode::Char('>') => {
-                InputAction::Caucus(CaucusCommand::MovePanelLater)
-            }
+            KeyCode::Char('<') => InputAction::Caucus(CaucusCommand::MovePanelEarlier),
+            KeyCode::Char('>') => InputAction::Caucus(CaucusCommand::MovePanelLater),
             KeyCode::Char(' ') => InputAction::Caucus(CaucusCommand::CycleLayout),
-            KeyCode::Char('t') => {
-                InputAction::Caucus(CaucusCommand::ToggleTranscript)
-            }
+            KeyCode::Char('t') => InputAction::Caucus(CaucusCommand::ToggleTranscript),
             // Any other key after the prefix: prefix consumed, nothing done.
             _ => InputAction::Ignore,
         }

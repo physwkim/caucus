@@ -57,8 +57,7 @@ pub struct InitOutcome {
 pub fn run(repo: &Path, install_hook: bool) -> Result<InitOutcome> {
     let caucus_dir = repo.join(".caucus");
     let bin_dir = caucus_dir.join("bin");
-    std::fs::create_dir_all(&bin_dir)
-        .with_context(|| format!("create {}", bin_dir.display()))?;
+    std::fs::create_dir_all(&bin_dir).with_context(|| format!("create {}", bin_dir.display()))?;
     std::fs::create_dir_all(caucus_dir.join("sessions"))?;
 
     let hook_script = bin_dir.join("turn-signal");
@@ -108,11 +107,8 @@ fn install_claude_hook(hook_script: &Path) -> Result<HookInstall> {
     let settings_path = claude_dir.join("settings.json");
 
     let mut settings: serde_json::Value = match std::fs::read_to_string(&settings_path) {
-        Ok(text) if !text.trim().is_empty() => {
-            serde_json::from_str(&text).with_context(|| {
-                format!("{} is not valid JSON", settings_path.display())
-            })?
-        }
+        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON", settings_path.display()))?,
         // Missing or empty: start from a fresh object.
         _ => serde_json::json!({}),
     };
@@ -165,9 +161,7 @@ fn merge_stop_hook(settings: &mut serde_json::Value, hook_command: &str) {
     let obj = settings
         .as_object_mut()
         .expect("settings root is a JSON object");
-    let hooks = obj
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
     let hooks_obj = hooks
         .as_object_mut()
         .expect("hooks is a JSON object after init");

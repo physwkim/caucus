@@ -65,7 +65,11 @@ pub fn mcp_config_json(caucus_bin: &Path, control_sock: &Path) -> Value {
 ///
 /// Called when caucus spawns the main worker panel: the main worker panel's claude picks the
 /// file up from its cwd and gains the caucus tool surface.
-pub fn write_mcp_config(dir: &Path, caucus_bin: &Path, control_sock: &Path) -> Result<std::path::PathBuf> {
+pub fn write_mcp_config(
+    dir: &Path,
+    caucus_bin: &Path,
+    control_sock: &Path,
+) -> Result<std::path::PathBuf> {
     let path = dir.join(".mcp.json");
     let body = serde_json::to_vec_pretty(&mcp_config_json(caucus_bin, control_sock))
         .context("serialise .mcp.json")?;
@@ -107,8 +111,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(path, dir.path().join(".mcp.json"));
-        let written: Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(written["mcpServers"]["caucus"].is_object());
     }
 }

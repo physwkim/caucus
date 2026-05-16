@@ -129,15 +129,19 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 fn setup(
     config: Config,
     session: Session,
-) -> Result<(Term, Multiplexer, crate::signal::server::SignalServer, crate::mcp::control_server::ControlServer)>
-{
+) -> Result<(
+    Term,
+    Multiplexer,
+    crate::signal::server::SignalServer,
+    crate::mcp::control_server::ControlServer,
+)> {
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("init ratatui terminal")?;
     terminal.clear().ok();
     // Panels tile the *body* — the whole screen minus the one-row status bar.
     let area = body_area(whole_screen(&terminal)?);
-    let (mux, signal_server, control_server) = Multiplexer::new(session, config, area)
-        .context("build multiplexer")?;
+    let (mux, signal_server, control_server) =
+        Multiplexer::new(session, config, area).context("build multiplexer")?;
     Ok((terminal, mux, signal_server, control_server))
 }
 
@@ -243,7 +247,14 @@ fn resume_worktree_path(
     panel: &crate::session::record::PanelRecord,
 ) -> std::path::PathBuf {
     let id = session_id.to_string();
-    let suffix: String = id.chars().rev().take(8).collect::<String>().chars().rev().collect();
+    let suffix: String = id
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     repo.join(".caucus").join("worktrees").join(format!(
         "{suffix}-{}-resume{}",
         panel.role, panel.order_index
@@ -351,12 +362,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mux: &Multiplexer) ->
             // The transcript overlay paints on top of the panels — draw-time
             // only; the panels keep pumping and input keeps routing.
             if mux.show_transcript() {
-                render::draw_transcript(
-                    frame,
-                    mux.panels(),
-                    mux.manifests(),
-                    mux.focused(),
-                );
+                render::draw_transcript(frame, mux.panels(), mux.manifests(), mux.focused());
             }
 
             let status = status_line(mux);
@@ -379,11 +385,7 @@ fn status_line(mux: &Multiplexer) -> String {
         .and_then(|id| mux.panels().iter().find(|p| p.id == id))
         .map(|p| format!("{} ({})", p.role, p.state_label()))
         .unwrap_or_else(|| "none".into());
-    let prefix = if mux.prefix_armed() {
-        "  [PREFIX]"
-    } else {
-        ""
-    };
+    let prefix = if mux.prefix_armed() { "  [PREFIX]" } else { "" };
     let zoom = if mux.zoomed().is_some() {
         "  [ZOOM]"
     } else {

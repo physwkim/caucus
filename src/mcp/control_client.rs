@@ -223,13 +223,13 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                         .map_err(|e| format!("invalid panel id `{s}`: {e}"))
                 })
                 .collect::<std::result::Result<Vec<PanelId>, String>>()?;
-            let timeout_secs = match args.get("timeout_secs") {
-                Some(v) => Some(
-                    v.as_u64()
-                        .ok_or_else(|| "`timeout_secs` must be a non-negative integer".to_string())?,
-                ),
-                None => None,
-            };
+            let timeout_secs =
+                match args.get("timeout_secs") {
+                    Some(v) => Some(v.as_u64().ok_or_else(|| {
+                        "`timeout_secs` must be a non-negative integer".to_string()
+                    })?),
+                    None => None,
+                };
             Ok(ControlRequest::WaitForPanels {
                 panels,
                 timeout_secs,
@@ -245,12 +245,10 @@ fn render_response(resp: ControlResponse) -> ToolOutcome {
         ControlResponse::Ok => ToolOutcome::Ok("ok".to_string()),
         ControlResponse::Panel { text } => ToolOutcome::Ok(text),
         ControlResponse::Spawned { panel } => ToolOutcome::Ok(panel.to_string()),
-        ControlResponse::Panels { panels } => {
-            match serde_json::to_string_pretty(&panels) {
-                Ok(text) => ToolOutcome::Ok(text),
-                Err(err) => ToolOutcome::Err(format!("serialise panel list: {err}")),
-            }
-        }
+        ControlResponse::Panels { panels } => match serde_json::to_string_pretty(&panels) {
+            Ok(text) => ToolOutcome::Ok(text),
+            Err(err) => ToolOutcome::Err(format!("serialise panel list: {err}")),
+        },
         ControlResponse::Error { message } => ToolOutcome::Err(message),
     }
 }
@@ -449,8 +447,7 @@ mod tests {
 
     #[test]
     fn build_wait_for_panels_rejects_bad_panel_id() {
-        let err = build_request("wait_for_panels", &json!({"panels": ["not-a-ulid"]}))
-            .unwrap_err();
+        let err = build_request("wait_for_panels", &json!({"panels": ["not-a-ulid"]})).unwrap_err();
         assert!(err.contains("invalid panel id"));
     }
 

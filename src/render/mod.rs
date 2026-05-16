@@ -66,9 +66,7 @@ impl From<Rect> for TuiRect {
 ///
 /// `Tiled` is the historical roughly-square auto-tile; the rest mirror the
 /// tmux layout names. The arrangement is cycled at runtime via `Ctrl-A Space`.
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LayoutMode {
     /// Roughly-square auto-tile: `cols = ceil(sqrt(n))` columns.
@@ -151,11 +149,7 @@ impl Layout {
             // not taken by an earlier panel — so the bottom row is never
             // ragged: it widens to fill `area`.
             let in_last_row = row == rows - 1;
-            let cells_in_row = if in_last_row {
-                n - row * cols
-            } else {
-                cols
-            };
+            let cells_in_row = if in_last_row { n - row * cols } else { cols };
             let col_b = if in_last_row && cells_in_row != cols {
                 split(area.x, area.width, cells_in_row)
             } else {
@@ -338,11 +332,7 @@ fn draw_panel(frame: &mut Frame, panel: &Panel, rect: Rect, focused: bool) {
         .border_style(border_style)
         .title(Span::styled(
             title,
-            Style::default().fg(if focused {
-                Color::Cyan
-            } else {
-                Color::Gray
-            }),
+            Style::default().fg(if focused { Color::Cyan } else { Color::Gray }),
         ));
 
     let lines = grid_lines(panel.grid(), &tui_rect);
@@ -473,10 +463,10 @@ impl TranscriptRow {
         let turns = manifest.map(turn_count).unwrap_or(0);
         // The worktree branch is the last path component of the worktree dir
         // (`worktree::manager::create` names the dir after the branch).
-        let branch = panel.worktree_path.as_ref().and_then(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        });
+        let branch = panel
+            .worktree_path
+            .as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
         let last_message = manifest
             .and_then(|m| m.last_message())
             .unwrap_or("")
@@ -607,10 +597,16 @@ pub fn draw_transcript(
     let title = format!(" caucus · transcript — {} panel(s) ", panels.len());
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .title(Span::styled(
             title,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
 
     // Interior: the popup minus its single-cell border.
@@ -628,16 +624,16 @@ pub fn draw_transcript(
         // panels to fit; otherwise every panel gets a row.
         let fits = inner_h;
         let (visible, overflow) = if panels.len() > fits && fits > 0 {
-            (fits.saturating_sub(1), panels.len() - fits.saturating_sub(1))
+            (
+                fits.saturating_sub(1),
+                panels.len() - fits.saturating_sub(1),
+            )
         } else {
             (panels.len(), 0)
         };
         for panel in panels.iter().take(visible) {
-            let row = TranscriptRow::build(
-                panel,
-                manifests.get(&panel.id),
-                focused == Some(panel.id),
-            );
+            let row =
+                TranscriptRow::build(panel, manifests.get(&panel.id), focused == Some(panel.id));
             lines.push(transcript_row_line(&row, inner_w));
         }
         if overflow > 0 {
@@ -882,10 +878,20 @@ mod tests {
 
     #[test]
     fn render_line_truncates_the_message_to_width() {
-        let r = row("backend", "this is a fairly long last message that will not fit");
+        let r = row(
+            "backend",
+            "this is a fairly long last message that will not fit",
+        );
         let line = r.render_line(50);
-        assert!(line.chars().count() <= 50, "got {} cols", line.chars().count());
-        assert!(line.ends_with('…'), "long message must be ellipsised: {line:?}");
+        assert!(
+            line.chars().count() <= 50,
+            "got {} cols",
+            line.chars().count()
+        );
+        assert!(
+            line.ends_with('…'),
+            "long message must be ellipsised: {line:?}"
+        );
         assert!(line.contains("backend"));
         assert!(line.contains("3 turn(s)"));
     }

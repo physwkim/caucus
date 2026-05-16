@@ -311,7 +311,10 @@ mod tests {
         let args = args_of(&cmd);
         assert!(args.windows(2).any(|w| w == ["--model", "opus"]));
         assert!(args.windows(2).any(|w| w == ["--permission-mode", "plan"]));
-        assert!(args.windows(2).any(|w| w == ["--allowedTools", "Read,Grep"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--allowedTools", "Read,Grep"])
+        );
         assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
@@ -324,9 +327,7 @@ mod tests {
             ..SpawnRequest::default()
         };
         let cmd = build_command(&req, PanelId::new());
-        assert!(
-            args_of(&cmd).contains(&"--dangerously-skip-permissions".to_string())
-        );
+        assert!(args_of(&cmd).contains(&"--dangerously-skip-permissions".to_string()));
     }
 
     #[test]
@@ -343,7 +344,10 @@ mod tests {
         let cmd = build_command(&req, PanelId::new());
         assert_eq!(cmd.program, OsString::from("codex"));
         let args = args_of(&cmd);
-        assert!(args.windows(2).any(|w| w == ["--sandbox", "workspace-write"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--sandbox", "workspace-write"])
+        );
         // No claude model id leaks into a codex invocation.
         assert!(!args.contains(&"--model".to_string()));
     }
@@ -509,7 +513,11 @@ mod tests {
         let outcome = spawn(&req).unwrap();
         assert_eq!(outcome.panel_id, outcome.manifest.panel_id);
         assert_eq!(
-            outcome.command.env.get("CAUCUS_PANEL_ID").map(String::as_str),
+            outcome
+                .command
+                .env
+                .get("CAUCUS_PANEL_ID")
+                .map(String::as_str),
             Some(outcome.panel_id.to_string().as_str())
         );
     }

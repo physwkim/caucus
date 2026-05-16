@@ -238,12 +238,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = Config::load(tmp.path()).unwrap();
         let report = run(&config);
-        assert!(
-            report
-                .checks
-                .iter()
-                .all(|c| !c.name.starts_with("role:"))
-        );
+        assert!(report.checks.iter().all(|c| !c.name.starts_with("role:")));
     }
 
     #[test]

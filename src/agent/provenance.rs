@@ -67,7 +67,12 @@ pub async fn verify_commit(repo: &Path, rev: &str) -> Option<String> {
     // only an actual commit object counts as provenance.
     let output = Command::new("git")
         .current_dir(repo)
-        .args(["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -86,7 +91,10 @@ mod tests {
 
     #[test]
     fn finds_short_sha() {
-        assert_eq!(extract_commit_sha("see 0123456").as_deref(), Some("0123456"));
+        assert_eq!(
+            extract_commit_sha("see 0123456").as_deref(),
+            Some("0123456")
+        );
     }
 
     #[test]
