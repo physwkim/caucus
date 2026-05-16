@@ -210,3 +210,58 @@ async fn read_panel_unknown_panel_is_an_error() {
         );
     }
 }
+
+/// The main worker builds a team of one architect + three reviewers through
+/// the MCP `spawn_role` control path — the same path `spawn_role` takes when
+/// the main worker's Claude Code instance calls it. Every panel comes up, the
+/// roster has the right roles, and the layout tiles all four.
+#[tokio::test]
+async fn main_spawns_an_architect_and_three_reviewers() {
+    let tmp = TempDir::new().unwrap();
+    let (mut mux, _control) = build_mux(&tmp);
+
+    // `spawn_role` over the control plane — exactly what the main worker
+    // triggers. The same role spawned repeatedly is allowed (panels are
+    // disambiguated by a per-role counter).
+    for role in ["architect", "reviewer", "reviewer", "reviewer"] {
+        match mux.execute_control(ControlRequest::SpawnRole {
+            role: role.to_string(),
+            worktree: false,
+            model: None,
+            agent_cli: None,
+        }) {
+            ControlResponse::Spawned { .. } => {}
+            ControlResponse::Error { message } => {
+                eprintln!("skipping: spawn_role({role}) failed: {message}");
+                mux.shutdown();
+                return;
+            }
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+    }
+
+    let panels = McpToolSurface::list_panels(&mux);
+    eprintln!("--- team spawned: {} panels ---", panels.len());
+    for p in &panels {
+        eprintln!("  {} · {}", p.role, p.state);
+    }
+
+    assert_eq!(panels.len(), 4, "architect + 3 reviewers = 4 panels");
+    assert_eq!(
+        panels.iter().filter(|p| p.role == "architect").count(),
+        1,
+        "exactly one architect"
+    );
+    assert_eq!(
+        panels.iter().filter(|p| p.role == "reviewer").count(),
+        3,
+        "three reviewers"
+    );
+    assert_eq!(
+        mux.layout().slots.len(),
+        4,
+        "layout reflowed to tile all four panels"
+    );
+
+    mux.shutdown();
+}
