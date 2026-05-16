@@ -14,6 +14,11 @@ use anyhow::{Context, Result};
 const TURN_SIGNAL_SCRIPT: &str = "#!/bin/sh\n\
 # caucus turn-signal hook. CAUCUS_* env is injected by caucus at panel spawn;\n\
 # the Claude hook payload is read from stdin by `caucus signal post`.\n\
+#\n\
+# The Stop hook is installed globally (~/.claude/settings.json), so it also\n\
+# fires in ordinary Claude Code sessions that are NOT caucus panels. There the\n\
+# CAUCUS_* env is unset — exit quietly so the hook is a harmless no-op.\n\
+[ -n \"$CAUCUS_SOCK\" ] || exit 0\n\
 exec caucus signal post \\\n\
   --sock    \"$CAUCUS_SOCK\" \\\n\
   --session \"$CAUCUS_SESSION_ID\" \\\n\
