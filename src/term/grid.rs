@@ -955,6 +955,18 @@ impl Perform for Grid {
             }
             return;
         }
+        // Non-standard private-marker sequences: a leading `<`, `>` or `=`
+        // byte (vte exposes it as the first intermediate) marks a CSI that is
+        // *not* a standard cell-affecting op. These cover the kitty keyboard
+        // protocol (`CSI < u`, `CSI > 1 u`), `XTMODKEYS` (`CSI > 4 m`),
+        // `XTVERSION` (`CSI > q`), DEC tertiary-DA (`CSI = c`) and similar
+        // terminal-capability negotiation. Dispatching them to the standard
+        // handlers is a bug: `CSI < u` would hit the SCO-restore (`u`) path
+        // and home the cursor, and `CSI > 4 ; 2 m` would be misread as SGR.
+        // They never change the scraped grid, so ignore them outright.
+        if matches!(intermediates.first(), Some(b'<' | b'>' | b'=')) {
+            return;
+        }
         let n = first_param(params, 1) as usize;
         let (cr, cc) = self.cursor;
         match action {
@@ -1619,6 +1631,95 @@ mod tests {
         assert!(
             !has_banner,
             "startup banner must have scrolled off / been overwritten:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn private_marker_csi_does_not_affect_grid() {
+        // The kitty-keyboard protocol (`CSI < u`, `CSI > 1 u`) and XTMODKEYS
+        // (`CSI > 4 m`) carry a `<`/`>`/`=` private marker. None touch the
+        // cell grid. Before the marker check they were mis-dispatched: `CSI
+        // < u` hit the SCO-restore path (homing the cursor) and `CSI > 4 m`
+        // was misread as SGR. They must now be inert.
+        let mut g = Grid::new(20, 5);
+        g.advance(b"\x1b[3;5HX"); // cursor lands at (2,5) after the glyph
+        let before = g.cursor();
+        g.advance(b"\x1b[<u\x1b[>1u\x1b[<1u"); // kitty keyboard push/pop/query
+        assert_eq!(g.cursor(), before, "kitty `CSI <|> u` must not move cursor");
+        g.advance(b"\x1b[>4;2m\x1b[>4mY"); // XTMODKEYS must not be read as SGR
+        let y = g.cell(before.0, before.1).unwrap();
+        assert_eq!(y.ch, 'Y');
+        assert_eq!(y.attrs, 0, "`CSI > 4 m` must not set SGR attrs");
+        assert_eq!(y.fg, 0);
+    }
+
+    /// Regression: a real `claude` (Claude Code v2.1.143) Ink-TUI byte stream
+    /// captured live through a 150x58 PTY — startup then quit. Claude renders
+    /// with relative cursor moves only (`CUU`/`CUD`/`CUF`, `CR`, `LF`, `EL`),
+    /// no absolute positioning and no alt-screen. The grid must reproduce
+    /// `tmux`'s rendering of the same bytes: the mascot banner on rows 0-2,
+    /// the input box (rules + prompt) on rows 4-6, and the quit/resume
+    /// messages on their own separate rows 7-11 — never collapsed or
+    /// overlapping.
+    ///
+    /// The corruption this guards against: `CSI < u` (kitty keyboard) was
+    /// mis-dispatched to the SCO cursor-restore handler, homing the cursor
+    /// mid-frame, so every subsequent relative move was anchored at row 0 and
+    /// the whole screen collapsed onto ~4 overlapping top rows.
+    #[test]
+    fn live_ceo_replay_matches_tmux() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/live-ceo-startup.raw");
+        let bytes = std::fs::read(path).expect("live-ceo-startup.raw fixture present");
+        let mut g = Grid::new(150, 58);
+        g.advance(&bytes);
+
+        // Expected non-blank rows, verified against `tmux` (-x 150 -y 58)
+        // rendering the identical byte stream. Each entry is (row, prefix):
+        // a prefix match keeps the test robust to trailing-blank padding and
+        // to the full-width rule's exact length.
+        let expect: &[(usize, &str)] = &[
+            (0, " ▐▛███▜▌   Claude Code v2.1.143"),
+            (1, "▝▜█████▛▘  Opus 4.7 with xhigh effort · Claude Max"),
+            (2, "  ▘▘ ▝▝    /Users/stevek"),
+            (4, "──────────────────────────────────────────"),
+            (5, "❯"),
+            (6, "──────────────────────────────────────────"),
+            (7, "  Press Ctrl-C again to exit"),
+            (9, "Resume this session with:"),
+            (10, "claude --resume ddfb5a48-a860-49db-885e-433eb5cb4872"),
+            (11, "^C"),
+        ];
+        for &(row, prefix) in expect {
+            let text = g.row_text(row);
+            assert!(
+                text.trim_end().starts_with(prefix.trim_end()),
+                "row {row} mismatch\n  expected prefix: {prefix:?}\n  got:             {:?}",
+                text.trim_end()
+            );
+        }
+        // Rows 4 and 6 are full-width rules of '─'.
+        for &row in &[4usize, 6] {
+            let text = g.row_text(row);
+            assert!(
+                text.trim_end().chars().all(|c| c == '─') && text.trim_end().chars().count() > 100,
+                "row {row} must be a full-width rule, got {:?}",
+                text.trim_end()
+            );
+        }
+        // Rows that must stay blank — proof nothing collapsed onto them.
+        for &row in &[3usize, 8, 12] {
+            assert!(
+                g.row_text(row).trim().is_empty(),
+                "row {row} must be blank, got {:?}",
+                g.row_text(row)
+            );
+        }
+        // The startup banner must NOT coexist on the same row as the quit
+        // footer — that overlap is the exact corruption being guarded.
+        assert!(
+            !g.row_text(0).contains("resume") && !g.row_text(0).contains("^C"),
+            "banner row 0 must not carry footer content: {:?}",
+            g.row_text(0)
         );
     }
 }
