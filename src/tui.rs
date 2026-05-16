@@ -89,7 +89,11 @@ async fn run_loop(config: Config, session: Session, roles: &[String]) -> Result<
         Terminal::new(CrosstermBackend::new(io::stdout())).context("init ratatui terminal")?;
     terminal.clear().ok();
 
-    let area = whole_screen(&terminal)?;
+    // Panels tile the *body* — the whole screen minus the one-row status bar
+    // at the bottom. Reserving it here (rather than only clipping at draw
+    // time) means the layout, every panel's PTY size, and the rendered area
+    // all agree, so a panel never overdraws the status row.
+    let area = body_area(whole_screen(&terminal)?);
     let (mut mux, mut signal_server, mut control_server) = Multiplexer::new(session, config, area)
         .context("build multiplexer")?;
 
@@ -125,12 +129,12 @@ async fn run_loop(config: Config, session: Session, roles: &[String]) -> Result<
                     mux.handle_key(key);
                 }
                 Event::Resize(w, h) => {
-                    let _ = mux.resize(Rect {
+                    let _ = mux.resize(body_area(Rect {
                         x: 0,
                         y: 0,
                         width: w,
                         height: h,
-                    });
+                    }));
                 }
                 _ => {}
             }
@@ -175,25 +179,30 @@ fn whole_screen(terminal: &Terminal<CrosstermBackend<Stdout>>) -> Result<Rect> {
     })
 }
 
+/// The panel-tiling area: the whole screen minus the one-row status bar at
+/// the bottom. Saturating, so a zero-height terminal yields a zero-height
+/// body rather than underflowing.
+fn body_area(screen: Rect) -> Rect {
+    Rect {
+        height: screen.height.saturating_sub(1),
+        ..screen
+    }
+}
+
 /// Draw one frame: every panel, plus a one-line status bar at the bottom.
 fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mux: &Multiplexer) -> Result<()> {
     terminal
         .draw(|frame| {
             let full = frame.area();
-            // Reserve the last row for the status bar.
-            let body = TuiRect {
-                height: full.height.saturating_sub(1),
-                ..full
-            };
+            // The last row is the status bar; the multiplexer's layout was
+            // already reflowed against the body (whole screen minus this
+            // row), so panels tile the body and never overdraw the status.
             let status_row = TuiRect {
                 y: full.y + full.height.saturating_sub(1),
                 height: 1,
                 ..full
             };
 
-            // Re-tile within the body area (the layout was computed against
-            // the full screen; draw clips to the body so the status bar is
-            // never overdrawn).
             render::draw(frame, mux.layout(), mux.panels(), mux.focused());
 
             let status = status_line(mux);
@@ -204,7 +213,6 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mux: &Multiplexer) ->
                 )),
                 status_row,
             );
-            let _ = body;
         })
         .context("draw frame")?;
     Ok(())

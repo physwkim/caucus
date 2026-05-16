@@ -121,6 +121,41 @@ pub struct Grid {
     title: Option<String>,
     /// Last hyperlink URI set via OSC 8 (stored, not rendered here).
     hyperlink: Option<String>,
+    /// Saved cursor state for `ESC 7` / `ESC 8` (DECSC/DECRC) and the
+    /// `CSI s` / `CSI u` SCO variant. `None` until the first save.
+    saved_cursor: Option<SavedCursor>,
+    /// Primary-screen snapshot taken when the panel switched to the alternate
+    /// screen (`CSI ?1049h` / `?1047h` / `?47h`). `Some` exactly while the alt
+    /// screen is active; restored verbatim on the matching reset.
+    alt_saved: Option<AltScreen>,
+}
+
+/// Cursor + pen state preserved by DECSC (`ESC 7`) / SCO save (`CSI s`).
+#[derive(Debug, Clone)]
+struct SavedCursor {
+    cursor: (usize, usize),
+    pen: Pen,
+    wrap_pending: bool,
+}
+
+/// Primary-screen state preserved across an alternate-screen switch.
+///
+/// The alternate screen is a *separate*, always-cleared buffer (xterm `?1049`).
+/// Entering it stashes the primary buffer here; the matching reset pops it
+/// back so the panel that was scraping (e.g. a shell with its banner) is
+/// restored exactly — no primary content bleeds through the alt screen, and no
+/// alt content survives the switch back.
+struct AltScreen {
+    viewport: Vec<Cell>,
+    cursor: (usize, usize),
+    pen: Pen,
+    scroll_top: usize,
+    scroll_bottom: usize,
+    wrap_pending: bool,
+    /// Cursor saved at switch time (`?1049` saves the cursor; `?47`/`?1047`
+    /// do not — but stashing it unconditionally is harmless and lets a single
+    /// restore path serve all three).
+    saved_cursor: Option<SavedCursor>,
 }
 
 impl Grid {
@@ -145,7 +180,15 @@ impl Grid {
             wrap_pending: false,
             title: None,
             hyperlink: None,
+            saved_cursor: None,
+            alt_saved: None,
         }
+    }
+
+    /// Whether the panel is currently on the alternate screen (`?1049h` and
+    /// friends). Diagnostic / test helper.
+    pub fn on_alt_screen(&self) -> bool {
+        self.alt_saved.is_some()
     }
 
     /// Viewport dimensions, `(cols, rows)`.
@@ -249,6 +292,31 @@ impl Grid {
         // Pad with blank rows if the viewport grew taller.
         while new_viewport.len() < cols * rows {
             new_viewport.push(Cell::default());
+        }
+
+        // Reflow the stashed primary buffer too when resizing on the alt
+        // screen, so leaving the alt screen restores a correctly-sized
+        // viewport rather than a truncate/pad approximation.
+        if let Some(alt) = self.alt_saved.as_mut() {
+            let alt_old: Vec<Vec<Cell>> = (0..self.rows)
+                .map(|r| alt.viewport[r * self.cols..(r + 1) * self.cols].to_vec())
+                .collect();
+            let alt_overflow = alt_old.len().saturating_sub(rows);
+            let mut alt_new = Vec::with_capacity(cols * rows);
+            for row in alt_old.iter().skip(alt_overflow) {
+                alt_new.extend(resize_row(row, cols));
+            }
+            while alt_new.len() < cols * rows {
+                alt_new.push(Cell::default());
+            }
+            alt.viewport = alt_new;
+            alt.cursor = (
+                alt.cursor.0.saturating_sub(alt_overflow).min(rows - 1),
+                alt.cursor.1.min(cols - 1),
+            );
+            alt.scroll_top = 0;
+            alt.scroll_bottom = rows - 1;
+            alt.wrap_pending = false;
         }
 
         self.cols = cols;
@@ -617,6 +685,134 @@ impl Grid {
         }
         self.wrap_pending = false;
     }
+
+    /// DECSC (`ESC 7`) / SCO save (`CSI s`): stash cursor + pen.
+    fn save_cursor(&mut self) {
+        self.saved_cursor = Some(SavedCursor {
+            cursor: self.cursor,
+            pen: self.pen.clone(),
+            wrap_pending: self.wrap_pending,
+        });
+    }
+
+    /// DECRC (`ESC 8`) / SCO restore (`CSI u`): restore cursor + pen.
+    ///
+    /// With no prior save the VT spec homes the cursor and resets the pen;
+    /// that matches xterm and keeps a stray restore from leaving the cursor
+    /// at an arbitrary spot.
+    fn restore_cursor(&mut self) {
+        match self.saved_cursor.take() {
+            Some(s) => {
+                self.cursor = (
+                    s.cursor.0.min(self.rows - 1),
+                    s.cursor.1.min(self.cols - 1),
+                );
+                self.pen = s.pen.clone();
+                self.wrap_pending = s.wrap_pending;
+                // Keep the save so a second restore re-applies it (xterm
+                // DECRC does not consume the saved state).
+                self.saved_cursor = Some(s);
+            }
+            None => {
+                self.cursor = (0, 0);
+                self.pen = Pen::default();
+                self.wrap_pending = false;
+            }
+        }
+    }
+
+    /// Enter the alternate screen (`CSI ?1049h` / `?1047h` / `?47h`).
+    ///
+    /// Stashes the primary buffer and switches to a freshly **cleared** alt
+    /// buffer — the root fix for banner bleed-through: a full-screen TUI's
+    /// startup banner lives on the primary screen, and without a real alt
+    /// buffer every alt-screen redraw was layered on top of it.
+    ///
+    /// The primary cursor/pen are always stashed in `AltScreen` and restored
+    /// on exit — `?1049` mandates it and doing so for `?47`/`?1047` too is
+    /// harmless for a scraped panel (a precise restore can only help).
+    fn enter_alt_screen(&mut self) {
+        if self.alt_saved.is_some() {
+            // Already on the alt screen — a redundant set is a no-op so the
+            // stashed primary buffer is never clobbered.
+            return;
+        }
+        self.alt_saved = Some(AltScreen {
+            viewport: std::mem::replace(
+                &mut self.viewport,
+                vec![Cell::default(); self.cols * self.rows],
+            ),
+            cursor: self.cursor,
+            pen: std::mem::take(&mut self.pen),
+            scroll_top: self.scroll_top,
+            scroll_bottom: self.scroll_bottom,
+            wrap_pending: self.wrap_pending,
+            saved_cursor: self.saved_cursor.take(),
+        });
+        // Fresh alt screen: cleared buffer, home cursor, full-screen region.
+        self.cursor = (0, 0);
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows - 1;
+        self.wrap_pending = false;
+    }
+
+    /// Leave the alternate screen (`CSI ?1049l` / `?1047l` / `?47l`).
+    ///
+    /// Restores the primary buffer verbatim; the alt buffer is discarded so
+    /// no alt content survives the switch back.
+    fn leave_alt_screen(&mut self) {
+        let Some(alt) = self.alt_saved.take() else {
+            // Not on the alt screen — nothing to restore.
+            return;
+        };
+        // The restored primary buffer may have been sized while on the alt
+        // screen; clamp it to the current dimensions so a resize that
+        // happened mid-alt cannot leave a mis-shaped viewport.
+        let want = self.cols * self.rows;
+        let mut viewport = alt.viewport;
+        if viewport.len() != want {
+            viewport.resize(want, Cell::default());
+        }
+        self.viewport = viewport;
+        self.cursor = (
+            alt.cursor.0.min(self.rows - 1),
+            alt.cursor.1.min(self.cols - 1),
+        );
+        self.pen = alt.pen;
+        self.scroll_top = alt.scroll_top.min(self.rows - 1);
+        self.scroll_bottom = alt.scroll_bottom.min(self.rows - 1);
+        if self.scroll_top >= self.scroll_bottom {
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows - 1;
+        }
+        self.wrap_pending = alt.wrap_pending;
+        self.saved_cursor = alt.saved_cursor;
+    }
+
+    /// Apply one DEC private mode set/reset (`CSI ? Pn h` / `l`).
+    ///
+    /// Only the modes that change cell state are acted on; cursor-visibility
+    /// (`?25`), bracketed paste (`?2004`), mouse modes, synchronized output
+    /// (`?2026`) etc. remain deliberately ignored — they do not affect the
+    /// scraped grid.
+    fn set_private_mode(&mut self, mode: u16, enable: bool) {
+        match mode {
+            // Alternate screen buffer. `?47` is the legacy bare switch;
+            // `?1047` clears the alt buffer on exit; `?1049` additionally
+            // saves/restores the cursor. caucus treats all three as a
+            // save-primary / cleared-alt / restore-primary pair — the
+            // distinctions only matter to applications that depend on alt
+            // content persisting, which a scraped panel never does.
+            47 | 1047 | 1049 => {
+                if enable {
+                    self.enter_alt_screen();
+                } else {
+                    self.leave_alt_screen();
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// First numeric parameter, defaulting to `default` when absent or zero-ish.
@@ -675,8 +871,13 @@ fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
 ///   (ignored), `NEL` via `\x85`.
 /// - `csi_dispatch` — `CUU/CUD/CUF/CUB`, `CNL/CPL`, `CHA`, `VPA`, `CUP/HVP`,
 ///   `ED/EL`, `IL/DL`, `ICH/DCH/ECH`, `SU/SD`, `SGR`, `DECSTBM`.
-/// - `esc_dispatch` — `IND`, `RI`, `NEL`, `RIS` (reset), charset designation
-///   (parsed and ignored — see partials).
+/// - `esc_dispatch` — `IND`, `RI`, `NEL`, `RIS` (reset), `DECSC`/`DECRC`
+///   (`ESC 7` / `ESC 8` cursor save/restore), charset designation (parsed
+///   and ignored — see partials).
+/// - `csi_dispatch` private modes — the alternate screen (`?1049` / `?1047`
+///   / `?47`) is fully implemented: enter stashes the primary buffer and
+///   switches to a cleared alt buffer, exit restores it. Cursor save/restore
+///   via `CSI s` / `CSI u` is implemented.
 /// - `osc_dispatch` — window title (OSC 0/2) and hyperlinks (OSC 8) stored on
 ///   the grid.
 ///
@@ -687,9 +888,10 @@ fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
 ///   prose, which is UTF-8, so box-drawing glyph substitution is unnecessary.
 /// - Combining marks / zero-width joiners are dropped rather than merged into
 ///   the base cell.
-/// - DEC private modes (`?25` cursor visibility, `?1049` alt-screen, `?2004`
-///   bracketed paste) are accepted and ignored — caucus never renders an alt
-///   screen for a scraped panel.
+/// - DEC private modes other than the alternate screen (`?25` cursor
+///   visibility, `?2004` bracketed paste, `?2026` synchronized output, mouse
+///   modes) are accepted and ignored — they do not affect the scraped cell
+///   grid. The alternate screen *is* honoured (see `csi_dispatch` above).
 /// - DCS strings (`hook`/`put`/`unhook`) are ignored.
 impl Perform for Grid {
     fn print(&mut self, c: char) {
@@ -739,8 +941,18 @@ impl Perform for Grid {
         _ignore: bool,
         action: char,
     ) {
-        // DEC private sequences (`CSI ? ...`) are accepted and ignored.
+        // DEC private sequences (`CSI ? Pn h` / `l`). Modes that change cell
+        // state — chiefly the alternate screen — are acted on; the rest are
+        // accepted and ignored (see [`Grid::set_private_mode`]).
         if intermediates.first() == Some(&b'?') {
+            if matches!(action, 'h' | 'l') {
+                let enable = action == 'h';
+                for p in params.iter() {
+                    for &mode in p {
+                        self.set_private_mode(mode, enable);
+                    }
+                }
+            }
             return;
         }
         let n = first_param(params, 1) as usize;
@@ -802,9 +1014,14 @@ impl Perform for Grid {
                     self.move_to(0, 0);
                 }
             }
+            // `CSI s` is SCO save (SCOSC) when it carries no explicit
+            // arguments; with two it is DECSLRM (set left/right margin),
+            // which caucus does not implement and so ignores.
+            's' if params.len() < 2 => self.save_cursor(),
+            'u' => self.restore_cursor(), // SCO restore (SCORC)
             _ => {
                 // CSI sequences not relevant to a scraped grid (DSR/DA query
-                // replies, cursor save/restore via 's'/'u', mode set/reset)
+                // replies, `CSI s` *with* params = DECSLRM left/right margin)
                 // are intentionally ignored.
             }
         }
@@ -817,6 +1034,8 @@ impl Perform for Grid {
             return;
         }
         match byte {
+            b'7' => self.save_cursor(),                     // DECSC
+            b'8' => self.restore_cursor(),                  // DECRC
             b'D' => self.line_feed(),                       // IND
             b'E' => {
                 // NEL — CR + LF.
@@ -843,6 +1062,8 @@ impl Perform for Grid {
                 self.wrap_pending = false;
                 self.title = None;
                 self.hyperlink = None;
+                self.saved_cursor = None;
+                self.alt_saved = None;
             }
             _ => {}
         }
@@ -1202,10 +1423,202 @@ mod tests {
     }
 
     #[test]
-    fn private_mode_sequences_ignored() {
+    fn cosmetic_private_modes_are_ignored() {
+        // `?25` (cursor visibility) and `?2004` (bracketed paste) do not
+        // affect the cell grid; they must not disturb glyph printing.
         let mut g = Grid::new(10, 3);
-        g.advance(b"\x1b[?25l\x1b[?1049hX");
-        // Sequences ignored; the 'X' still prints.
+        g.advance(b"\x1b[?25l\x1b[?2004hX");
         assert_eq!(at(&g, 0, 0), 'X');
+        assert!(!g.on_alt_screen());
+    }
+
+    // ----- alternate screen (banner bleed-through regression) --------------
+
+    #[test]
+    fn alt_screen_enter_clears_and_hides_primary() {
+        // Primary screen carries a "banner". Switching to the alt screen must
+        // present a *cleared* buffer — the banner must not bleed through.
+        let mut g = Grid::new(20, 4);
+        g.advance(b"BANNER ONE\r\nBANNER TWO\r\n");
+        g.advance(b"\x1b[?1049h"); // enter alt screen
+        assert!(g.on_alt_screen());
+        for r in 0..4 {
+            assert_eq!(
+                g.row_text(r).trim(),
+                "",
+                "alt screen row {r} must start blank"
+            );
+        }
+        // Conversation drawn on the alt screen stands alone — no banner under.
+        g.advance(b"CONVO ALPHA");
+        assert_eq!(g.row_text(0).trim_end(), "CONVO ALPHA");
+        assert!(!g.row_text(0).contains("BANNER"));
+    }
+
+    #[test]
+    fn alt_screen_exit_restores_primary_verbatim() {
+        let mut g = Grid::new(20, 4);
+        g.advance(b"BANNER ONE\r\nBANNER TWO");
+        g.advance(b"\x1b[?1049h"); // enter
+        g.advance(b"\x1b[2J\x1b[HCONVO ALPHA\r\nCONVO BETA");
+        g.advance(b"\x1b[?1049l"); // exit -> primary restored
+        assert!(!g.on_alt_screen());
+        assert_eq!(g.row_text(0).trim_end(), "BANNER ONE");
+        assert_eq!(g.row_text(1).trim_end(), "BANNER TWO");
+        // No alt-screen content survives the switch back.
+        assert!(!g.row_text(0).contains("CONVO"));
+        assert!(!g.row_text(1).contains("CONVO"));
+    }
+
+    #[test]
+    fn alt_screen_no_superimposition_after_redraws() {
+        // The reported corruption: a startup banner stays in the top rows
+        // while live output is drawn ON TOP. With a real alt buffer the two
+        // can never coexist. Craft banner -> alt enter -> several redraws.
+        let mut g = Grid::new(30, 6);
+        g.advance("\x1b[1;1HClaude Code v2.1.143\r\n".as_bytes());
+        g.advance(b"  mascot-art-line\r\n");
+        g.advance(b"\x1b[?1049h"); // full-screen TUI takes over
+        // Three redraw frames, each homing + erasing + reprinting.
+        for frame in ["frame-A", "frame-B", "frame-C"] {
+            g.advance(b"\x1b[H\x1b[2J");
+            g.advance(format!("live: {frame}").as_bytes());
+        }
+        // Only the last frame is visible; the banner is gone entirely.
+        assert_eq!(g.row_text(0).trim_end(), "live: frame-C");
+        for r in 0..6 {
+            let line = g.row_text(r);
+            assert!(
+                !line.contains("Claude Code") && !line.contains("mascot"),
+                "banner must not coexist with alt-screen content (row {r}: {line:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_screen_legacy_modes_47_and_1047() {
+        for mode in ["47", "1047"] {
+            let mut g = Grid::new(12, 3);
+            g.advance(b"primary");
+            g.advance(format!("\x1b[?{mode}h").as_bytes());
+            assert!(g.on_alt_screen(), "?{mode}h enters alt screen");
+            assert_eq!(g.row_text(0).trim(), "", "?{mode}h clears the buffer");
+            g.advance(format!("\x1b[?{mode}l").as_bytes());
+            assert!(!g.on_alt_screen());
+            assert_eq!(g.row_text(0).trim_end(), "primary");
+        }
+    }
+
+    #[test]
+    fn alt_screen_redundant_enter_keeps_primary_snapshot() {
+        // A second `?1049h` while already on the alt screen must not clobber
+        // the stashed primary buffer.
+        let mut g = Grid::new(12, 3);
+        g.advance(b"primary");
+        g.advance(b"\x1b[?1049h");
+        g.advance(b"alt-content");
+        g.advance(b"\x1b[?1049h"); // redundant
+        g.advance(b"\x1b[?1049l");
+        assert_eq!(g.row_text(0).trim_end(), "primary");
+    }
+
+    #[test]
+    fn alt_screen_resize_preserves_primary() {
+        // A resize while on the alt screen must not corrupt the stashed
+        // primary buffer it will be restored to.
+        let mut g = Grid::new(20, 4);
+        g.advance(b"BANNER ONE\r\nBANNER TWO");
+        g.advance(b"\x1b[?1049h");
+        g.advance(b"alt stuff");
+        g.resize(30, 6);
+        g.advance(b"\x1b[?1049l");
+        assert_eq!(g.size(), (30, 6));
+        assert_eq!(g.row_text(0).trim_end(), "BANNER ONE");
+        assert_eq!(g.row_text(1).trim_end(), "BANNER TWO");
+    }
+
+    // ----- cursor save / restore (DECSC/DECRC, SCOSC/SCORC) ----------------
+
+    #[test]
+    fn esc_7_8_saves_and_restores_cursor() {
+        let mut g = Grid::new(20, 4);
+        g.advance(b"line0\r\n");
+        g.advance(b"\x1b7"); // DECSC at (1,0)
+        g.advance(b"line1\r\nline2\r\n");
+        g.advance(b"\x1b8"); // DECRC -> back to (1,0)
+        g.advance(b"X");
+        assert_eq!(g.row_text(1).trim_end(), "Xine1");
+        assert_eq!(g.row_text(2).trim_end(), "line2");
+    }
+
+    #[test]
+    fn csi_s_u_saves_and_restores_cursor() {
+        let mut g = Grid::new(20, 4);
+        g.advance(b"\x1b[2;3H"); // (1,2)
+        g.advance(b"\x1b[s"); // SCOSC
+        g.advance(b"\x1b[4;6H"); // move away to (3,5)
+        g.advance(b"\x1b[u"); // SCORC -> back to (1,2)
+        g.advance(b"Z");
+        assert_eq!(at(&g, 1, 2), 'Z');
+    }
+
+    #[test]
+    fn cursor_save_preserves_pen() {
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[31m\x1b7"); // red pen, save
+        g.advance(b"\x1b[0m\x1b[2;1H"); // reset pen, move away
+        g.advance(b"\x1b8X"); // restore: pen should be red again
+        assert_eq!(g.cell(0, 0).unwrap().fg, 2, "restored pen is red");
+    }
+
+    #[test]
+    fn cursor_restore_without_save_homes() {
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[3;5H"); // (2,4)
+        g.advance(b"\x1b8"); // DECRC with no prior save
+        assert_eq!(g.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn cursor_save_survives_alt_screen_round_trip() {
+        // DECSC on the primary screen, an alt-screen excursion, then DECRC
+        // back on the primary must still restore the primary save point.
+        let mut g = Grid::new(20, 4);
+        g.advance(b"\x1b[2;3H\x1b7"); // save at (1,2) on primary
+        g.advance(b"\x1b[?1049h"); // alt screen
+        g.advance(b"\x1b[u"); // a restore inside alt must not see primary save
+        g.advance(b"alt");
+        g.advance(b"\x1b[?1049l"); // back to primary
+        g.advance(b"\x1b8Q"); // DECRC -> (1,2)
+        assert_eq!(at(&g, 1, 2), 'Q');
+    }
+
+    #[test]
+    fn claude_code_capture_replays_without_corruption() {
+        // A real `claude` (Claude Code v2.1.143) TUI byte stream captured
+        // through a PTY. Claude's Ink renderer redraws on the *primary*
+        // screen (no alt-screen), so this is a non-corruption baseline: the
+        // grid must contain the latest frame and must NOT show the startup
+        // banner ("Claude Code v2.1.143" mascot box) superimposed on the
+        // live conversation.
+        let bytes = std::fs::read("tests/fixtures/claude_code_tui.vt")
+            .expect("claude_code_tui.vt fixture present");
+        let mut g = Grid::new(80, 24);
+        g.advance(&bytes);
+
+        let screen: Vec<String> = (0..24).map(|r| g.row_text(r)).collect();
+        let joined = screen.join("\n");
+        // The captured session ends on the input prompt + status footer.
+        assert!(
+            joined.contains("for shortcuts"),
+            "final-frame footer present:\n{joined}"
+        );
+        // The mascot banner ("▐▛███▜▌") must not coexist with the live
+        // conversation footer — that pairing is exactly the corruption.
+        let has_banner = joined.contains("▐▛███▜▌") || joined.contains("v2.1.143");
+        assert!(
+            !has_banner,
+            "startup banner must have scrolled off / been overwritten:\n{joined}"
+        );
     }
 }
