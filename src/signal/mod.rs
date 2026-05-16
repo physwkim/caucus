@@ -4,6 +4,7 @@
 //! [`TurnSignal`] to the caucus unix-domain socket. caucus reads it live —
 //! no file sentinel, no polling.
 
+pub mod post;
 pub mod server;
 
 use chrono::{DateTime, Utc};

@@ -7,21 +7,56 @@
 //! **Invariant** (`docs/design.md` §9.1): the grid is mutated only by PTY
 //! bytes fed through [`Grid::advance`]. No module pokes cells directly.
 //!
-//! The real `Perform` implementation (~2-4k LOC, zellij `grid.rs` as a
-//! line-by-line reference) is Phase 2; this skeleton compiles a stub.
+//! Implemented against caucus's own [`Cell`] / [`Grid`] types, using
+//! `zellij-server/src/panes/grid.rs` as a semantic reference (design.md §0 #3).
+//! Scope of this implementation and the deliberate partials are documented at
+//! [`Perform for Grid`].
 
+use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
 
+/// SGR attribute bitflags packed into [`Cell::attrs`].
+pub mod attr {
+    /// Bold / increased intensity (SGR 1).
+    pub const BOLD: u8 = 1 << 0;
+    /// Dim / decreased intensity (SGR 2).
+    pub const DIM: u8 = 1 << 1;
+    /// Italic (SGR 3).
+    pub const ITALIC: u8 = 1 << 2;
+    /// Underline (SGR 4).
+    pub const UNDERLINE: u8 = 1 << 3;
+    /// Reverse video (SGR 7).
+    pub const REVERSE: u8 = 1 << 4;
+    /// Concealed / hidden (SGR 8).
+    pub const HIDDEN: u8 = 1 << 5;
+    /// Crossed-out / strikethrough (SGR 9).
+    pub const STRIKE: u8 = 1 << 6;
+}
+
 /// One terminal cell: a glyph plus its rendition attributes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Copy` is derived (additive to the skeleton) so row-shift operations can
+/// use `slice::copy_within`; all fields are themselves `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     /// The displayed character. Space for an empty cell.
+    ///
+    /// `'\0'` marks the *trailing half* of a wide (East-Asian) glyph: the
+    /// preceding cell holds the real character and occupies two columns.
     pub ch: char,
-    /// Packed SGR foreground colour index (0 = default). Phase 2 widens this.
+    /// Packed SGR foreground colour index (0 = default).
+    ///
+    /// Encoding: `0` default; `1..=8` the standard ANSI colours (SGR 30-37);
+    /// `9..=16` the bright variants (SGR 90-97); `17..=255` a direct 256-colour
+    /// palette index from `38;5;n` (truncated to a [`u8`]). True-colour
+    /// (`38;2;r;g;b`) is approximated to the nearest palette slot — see
+    /// [`Grid::apply_sgr`].
     pub fg: u8,
-    /// Packed SGR background colour index (0 = default).
+    /// Packed SGR background colour index (0 = default). Same encoding as
+    /// [`Cell::fg`].
     pub bg: u8,
-    /// Bold / underline / reverse etc., packed as a bitflag byte.
+    /// Bold / underline / reverse etc., packed as a bitflag byte — see
+    /// [`attr`].
     pub attrs: u8,
 }
 
@@ -34,6 +69,27 @@ impl Default for Cell {
             attrs: 0,
         }
     }
+}
+
+impl Cell {
+    /// A blank cell carrying the given rendition (used when erasing so that a
+    /// set background colour is preserved, matching xterm behaviour).
+    fn blank_with(pen: &Pen) -> Self {
+        Self {
+            ch: ' ',
+            fg: pen.fg,
+            bg: pen.bg,
+            attrs: pen.attrs,
+        }
+    }
+}
+
+/// Current graphic rendition ("pen") applied to freshly printed cells.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Pen {
+    fg: u8,
+    bg: u8,
+    attrs: u8,
 }
 
 /// A panel's parsed screen state: viewport cell matrix + bounded scrollback.
@@ -51,6 +107,20 @@ pub struct Grid {
     cursor: (usize, usize),
     /// vte escape-sequence parser. Drives [`Perform`] callbacks on this grid.
     parser: Parser,
+    /// Current graphic rendition for printed glyphs.
+    pen: Pen,
+    /// Scroll region, inclusive `(top, bottom)` row indices (DECSTBM). Defaults
+    /// to the whole viewport.
+    scroll_top: usize,
+    scroll_bottom: usize,
+    /// Deferred-wrap flag: set after printing into the last column so the next
+    /// glyph wraps. Matches the xterm "pending wrap" state and avoids eagerly
+    /// scrolling on a glyph that lands exactly on the right margin.
+    wrap_pending: bool,
+    /// Window title set via OSC 0/2 (stored, not rendered here).
+    title: Option<String>,
+    /// Last hyperlink URI set via OSC 8 (stored, not rendered here).
+    hyperlink: Option<String>,
 }
 
 impl Grid {
@@ -59,6 +129,8 @@ impl Grid {
 
     /// Build a blank grid sized `cols x rows`.
     pub fn new(cols: usize, rows: usize) -> Self {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
         Self {
             cols,
             rows,
@@ -67,6 +139,12 @@ impl Grid {
             scrollback_limit: Self::DEFAULT_SCROLLBACK,
             cursor: (0, 0),
             parser: Parser::new(),
+            pen: Pen::default(),
+            scroll_top: 0,
+            scroll_bottom: rows - 1,
+            wrap_pending: false,
+            title: None,
+            hyperlink: None,
         }
     }
 
@@ -99,6 +177,30 @@ impl Grid {
         self.scrollback.iter()
     }
 
+    /// Current window title (OSC 0/2), if the panel set one.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// Most recent hyperlink URI (OSC 8), if set.
+    pub fn hyperlink(&self) -> Option<&str> {
+        self.hyperlink.as_deref()
+    }
+
+    /// Collect a viewport row's characters into a `String` (test/diagnostic
+    /// helper). Trailing-half wide-glyph cells are skipped.
+    pub fn row_text(&self, row: usize) -> String {
+        if row >= self.rows {
+            return String::new();
+        }
+        let start = row * self.cols;
+        self.viewport[start..start + self.cols]
+            .iter()
+            .filter(|c| c.ch != '\0')
+            .map(|c| c.ch)
+            .collect()
+    }
+
     /// Feed a chunk of PTY output bytes through the vte parser.
     ///
     /// The only sanctioned way to mutate grid state.
@@ -110,49 +212,678 @@ impl Grid {
         self.parser = parser;
     }
 
-    /// Resize the viewport. Phase 2 reflows wrapped lines; the skeleton just
-    /// reallocates a blank matrix.
+    /// Resize the viewport.
+    ///
+    /// **Reflow policy** (deliberately simple — design.md §0 #3 leaves full
+    /// wrapped-line reflow to a later pass): the top-left content anchor is
+    /// preserved. Each existing viewport row is copied into the new matrix,
+    /// truncated when narrower and space-padded when wider. When the row count
+    /// shrinks, the rows scrolled off the *top* are pushed into scrollback so
+    /// no output is silently lost; when it grows, blank rows are appended at
+    /// the bottom. Hard-wrapped logical lines are **not** re-joined or
+    /// re-split — a line that wrapped at the old width keeps its old break.
     pub(crate) fn resize(&mut self, cols: usize, rows: usize) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        if cols == self.cols && rows == self.rows {
+            return;
+        }
+
+        // Existing rows as owned vectors.
+        let old_rows: Vec<Vec<Cell>> = (0..self.rows)
+            .map(|r| self.viewport[r * self.cols..(r + 1) * self.cols].to_vec())
+            .collect();
+
+        // If shrinking vertically, oldest rows spill into scrollback.
+        let overflow = old_rows.len().saturating_sub(rows);
+        for row in old_rows.iter().take(overflow) {
+            let mut row = resize_row(row, cols);
+            row.truncate(cols);
+            self.push_scrollback(row);
+        }
+
+        let mut new_viewport = Vec::with_capacity(cols * rows);
+        for row in old_rows.iter().skip(overflow) {
+            new_viewport.extend(resize_row(row, cols));
+        }
+        // Pad with blank rows if the viewport grew taller.
+        while new_viewport.len() < cols * rows {
+            new_viewport.push(Cell::default());
+        }
+
         self.cols = cols;
         self.rows = rows;
-        self.viewport = vec![Cell::default(); cols * rows];
-        self.cursor = (0, 0);
+        self.viewport = new_viewport;
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
+        self.wrap_pending = false;
+        // Clamp the cursor: it moves up by the same overflow it was pushed by.
+        let cur_row = self.cursor.0.saturating_sub(overflow).min(rows - 1);
+        let cur_col = self.cursor.1.min(cols - 1);
+        self.cursor = (cur_row, cur_col);
+    }
+
+    // ----- internal cell-state machine -------------------------------------
+
+    /// Index into `viewport` for `(row, col)`.
+    #[inline]
+    fn idx(&self, row: usize, col: usize) -> usize {
+        row * self.cols + col
+    }
+
+    /// Push a row off the top into the bounded scrollback ring.
+    fn push_scrollback(&mut self, row: Vec<Cell>) {
+        if self.scrollback_limit == 0 {
+            return;
+        }
+        if self.scrollback.len() == self.scrollback_limit {
+            self.scrollback.pop_front();
+        }
+        self.scrollback.push_back(row);
+    }
+
+    /// Scroll the scroll-region up by one line. The line leaving the top of
+    /// the region enters scrollback **only** when the region starts at row 0
+    /// (a full-screen scroll); a partial region scroll discards it, matching
+    /// xterm.
+    fn scroll_up(&mut self) {
+        let top = self.scroll_top;
+        let bottom = self.scroll_bottom;
+        if top >= bottom {
+            // Degenerate region: just blank the single line.
+            self.clear_row(top);
+            return;
+        }
+        let leaving: Vec<Cell> = self.viewport[self.idx(top, 0)..self.idx(top, 0) + self.cols]
+            .to_vec();
+        for r in top..bottom {
+            let (dst_lo, dst_hi) = (self.idx(r, 0), self.idx(r, 0) + self.cols);
+            let src_lo = self.idx(r + 1, 0);
+            self.viewport.copy_within(src_lo..src_lo + self.cols, dst_lo);
+            let _ = dst_hi;
+        }
+        self.clear_row(bottom);
+        if top == 0 {
+            self.push_scrollback(leaving);
+        }
+    }
+
+    /// Scroll the scroll-region down by one line (RI at the top margin).
+    fn scroll_down(&mut self) {
+        let top = self.scroll_top;
+        let bottom = self.scroll_bottom;
+        if top >= bottom {
+            self.clear_row(top);
+            return;
+        }
+        for r in (top + 1..=bottom).rev() {
+            let dst_lo = self.idx(r, 0);
+            let src_lo = self.idx(r - 1, 0);
+            self.viewport.copy_within(src_lo..src_lo + self.cols, dst_lo);
+        }
+        self.clear_row(top);
+    }
+
+    /// Blank an entire viewport row with the current pen's background.
+    fn clear_row(&mut self, row: usize) {
+        if row >= self.rows {
+            return;
+        }
+        let blank = Cell::blank_with(&self.pen);
+        let start = self.idx(row, 0);
+        for c in &mut self.viewport[start..start + self.cols] {
+            *c = blank.clone();
+        }
+    }
+
+    /// Advance the cursor one line down, scrolling the region when it would
+    /// pass the bottom margin.
+    fn line_feed(&mut self) {
+        if self.cursor.0 == self.scroll_bottom {
+            self.scroll_up();
+        } else if self.cursor.0 + 1 < self.rows {
+            self.cursor.0 += 1;
+        }
+        self.wrap_pending = false;
+    }
+
+    /// Write one glyph at the cursor, honouring a pending wrap and advancing.
+    fn put_glyph(&mut self, c: char) {
+        let width = c.width().unwrap_or(0);
+        if width == 0 {
+            // Combining / zero-width: drop it. (Full combining-mark merge into
+            // the previous cell is left to a later pass — documented partial.)
+            return;
+        }
+
+        // Resolve a deferred wrap from the previous glyph.
+        if self.wrap_pending {
+            self.cursor.1 = 0;
+            self.line_feed();
+        }
+
+        // A wide glyph that cannot fit before the right margin wraps first.
+        if width == 2 && self.cursor.1 + 1 >= self.cols {
+            // Pad the last column so nothing splits across the wrap.
+            let idx = self.idx(self.cursor.0, self.cursor.1);
+            self.viewport[idx] = Cell::blank_with(&self.pen);
+            self.cursor.1 = 0;
+            self.line_feed();
+        }
+
+        let (row, col) = self.cursor;
+        let idx = self.idx(row, col);
+        self.viewport[idx] = Cell {
+            ch: c,
+            fg: self.pen.fg,
+            bg: self.pen.bg,
+            attrs: self.pen.attrs,
+        };
+        if width == 2 && col + 1 < self.cols {
+            // Trailing half marker.
+            let trail = self.idx(row, col + 1);
+            self.viewport[trail] = Cell {
+                ch: '\0',
+                fg: self.pen.fg,
+                bg: self.pen.bg,
+                attrs: self.pen.attrs,
+            };
+        }
+
+        let advance = width.max(1);
+        if col + advance >= self.cols {
+            // Land on the right margin: defer the wrap until the next glyph.
+            self.cursor.1 = self.cols - 1;
+            self.wrap_pending = true;
+        } else {
+            self.cursor.1 = col + advance;
+        }
+    }
+
+    /// Clamp `(row, col)` into the viewport and store as the cursor.
+    fn move_to(&mut self, row: usize, col: usize) {
+        self.cursor = (row.min(self.rows - 1), col.min(self.cols - 1));
+        self.wrap_pending = false;
+    }
+
+    /// Apply one SGR parameter list to the pen.
+    fn apply_sgr(&mut self, params: &Params) {
+        if params.is_empty() {
+            self.pen = Pen::default();
+            return;
+        }
+        // Flatten into a single index stream so multi-arg colours
+        // (`38;5;n`, `38;2;r;g;b`) can be consumed across iterator items.
+        let flat: Vec<u16> = params.iter().flat_map(|p| p.iter().copied()).collect();
+        let mut i = 0;
+        while i < flat.len() {
+            let p = flat[i];
+            match p {
+                0 => self.pen = Pen::default(),
+                1 => self.pen.attrs |= attr::BOLD,
+                2 => self.pen.attrs |= attr::DIM,
+                3 => self.pen.attrs |= attr::ITALIC,
+                4 => self.pen.attrs |= attr::UNDERLINE,
+                7 => self.pen.attrs |= attr::REVERSE,
+                8 => self.pen.attrs |= attr::HIDDEN,
+                9 => self.pen.attrs |= attr::STRIKE,
+                21 | 22 => self.pen.attrs &= !(attr::BOLD | attr::DIM),
+                23 => self.pen.attrs &= !attr::ITALIC,
+                24 => self.pen.attrs &= !attr::UNDERLINE,
+                27 => self.pen.attrs &= !attr::REVERSE,
+                28 => self.pen.attrs &= !attr::HIDDEN,
+                29 => self.pen.attrs &= !attr::STRIKE,
+                30..=37 => self.pen.fg = (p - 30 + 1) as u8,
+                39 => self.pen.fg = 0,
+                40..=47 => self.pen.bg = (p - 40 + 1) as u8,
+                49 => self.pen.bg = 0,
+                90..=97 => self.pen.fg = (p - 90 + 9) as u8,
+                100..=107 => self.pen.bg = (p - 100 + 9) as u8,
+                38 | 48 => {
+                    let is_fg = p == 38;
+                    // `38;5;n` (256-colour) or `38;2;r;g;b` (true-colour).
+                    if let Some(&mode) = flat.get(i + 1) {
+                        match mode {
+                            5 => {
+                                let n = flat.get(i + 2).copied().unwrap_or(0);
+                                let v = (n.min(255)) as u8;
+                                if is_fg {
+                                    self.pen.fg = v;
+                                } else {
+                                    self.pen.bg = v;
+                                }
+                                i += 2;
+                            }
+                            2 => {
+                                let r = flat.get(i + 2).copied().unwrap_or(0);
+                                let g = flat.get(i + 3).copied().unwrap_or(0);
+                                let b = flat.get(i + 4).copied().unwrap_or(0);
+                                let v = rgb_to_256(r as u8, g as u8, b as u8);
+                                if is_fg {
+                                    self.pen.fg = v;
+                                } else {
+                                    self.pen.bg = v;
+                                }
+                                i += 4;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    /// Erase in display (ED). `mode`: 0 cursor..end, 1 start..cursor, 2 all,
+    /// 3 all + scrollback.
+    fn erase_display(&mut self, mode: u16) {
+        let blank = Cell::blank_with(&self.pen);
+        let (cr, cc) = self.cursor;
+        match mode {
+            0 => {
+                // Cursor to end of current row, then all rows below.
+                let start = self.idx(cr, cc);
+                let row_end = self.idx(cr, 0) + self.cols;
+                for c in &mut self.viewport[start..row_end] {
+                    *c = blank.clone();
+                }
+                let below = self.idx(cr + 1, 0).min(self.viewport.len());
+                for c in &mut self.viewport[below..] {
+                    *c = blank.clone();
+                }
+            }
+            1 => {
+                // Start of screen through cursor (inclusive).
+                let above = self.idx(cr, 0);
+                for c in &mut self.viewport[..above] {
+                    *c = blank.clone();
+                }
+                let end = self.idx(cr, cc) + 1;
+                for c in &mut self.viewport[above..end] {
+                    *c = blank.clone();
+                }
+            }
+            2 | 3 => {
+                for c in &mut self.viewport {
+                    *c = blank.clone();
+                }
+                if mode == 3 {
+                    self.scrollback.clear();
+                }
+            }
+            _ => {}
+        }
+        self.wrap_pending = false;
+    }
+
+    /// Erase in line (EL). `mode`: 0 cursor..end, 1 start..cursor, 2 whole row.
+    fn erase_line(&mut self, mode: u16) {
+        let blank = Cell::blank_with(&self.pen);
+        let (cr, cc) = self.cursor;
+        let row_start = self.idx(cr, 0);
+        let row_end = row_start + self.cols;
+        let range = match mode {
+            0 => self.idx(cr, cc)..row_end,
+            1 => row_start..self.idx(cr, cc) + 1,
+            2 => row_start..row_end,
+            _ => return,
+        };
+        for c in &mut self.viewport[range] {
+            *c = blank.clone();
+        }
+        self.wrap_pending = false;
+    }
+
+    /// Insert `n` blank lines at the cursor row (IL), pushing lower lines down
+    /// within the scroll region.
+    fn insert_lines(&mut self, n: usize) {
+        let cr = self.cursor.0;
+        if cr < self.scroll_top || cr > self.scroll_bottom {
+            return;
+        }
+        let n = n.min(self.scroll_bottom - cr + 1);
+        for _ in 0..n {
+            for r in (cr + 1..=self.scroll_bottom).rev() {
+                let dst = self.idx(r, 0);
+                let src = self.idx(r - 1, 0);
+                self.viewport.copy_within(src..src + self.cols, dst);
+            }
+            self.clear_row(cr);
+        }
+        self.wrap_pending = false;
+    }
+
+    /// Delete `n` lines at the cursor row (DL), pulling lower lines up within
+    /// the scroll region.
+    fn delete_lines(&mut self, n: usize) {
+        let cr = self.cursor.0;
+        if cr < self.scroll_top || cr > self.scroll_bottom {
+            return;
+        }
+        let n = n.min(self.scroll_bottom - cr + 1);
+        for _ in 0..n {
+            for r in cr..self.scroll_bottom {
+                let dst = self.idx(r, 0);
+                let src = self.idx(r + 1, 0);
+                self.viewport.copy_within(src..src + self.cols, dst);
+            }
+            self.clear_row(self.scroll_bottom);
+        }
+        self.wrap_pending = false;
+    }
+
+    /// Insert `n` blank cells at the cursor (ICH), shifting the rest of the
+    /// row right.
+    fn insert_chars(&mut self, n: usize) {
+        let (cr, cc) = self.cursor;
+        let n = n.min(self.cols - cc);
+        let row_start = self.idx(cr, 0);
+        let row_end = row_start + self.cols;
+        let cur = self.idx(cr, cc);
+        self.viewport.copy_within(cur..row_end - n, cur + n);
+        let blank = Cell::blank_with(&self.pen);
+        for c in &mut self.viewport[cur..cur + n] {
+            *c = blank.clone();
+        }
+        self.wrap_pending = false;
+    }
+
+    /// Delete `n` cells at the cursor (DCH), shifting the rest of the row
+    /// left and blanking the tail.
+    fn delete_chars(&mut self, n: usize) {
+        let (cr, cc) = self.cursor;
+        let n = n.min(self.cols - cc);
+        let row_start = self.idx(cr, 0);
+        let row_end = row_start + self.cols;
+        let cur = self.idx(cr, cc);
+        self.viewport.copy_within(cur + n..row_end, cur);
+        let blank = Cell::blank_with(&self.pen);
+        for c in &mut self.viewport[row_end - n..row_end] {
+            *c = blank.clone();
+        }
+        self.wrap_pending = false;
+    }
+
+    /// Erase `n` cells at the cursor in place (ECH) — no shift.
+    fn erase_chars(&mut self, n: usize) {
+        let (cr, cc) = self.cursor;
+        let n = n.min(self.cols - cc);
+        let cur = self.idx(cr, cc);
+        let blank = Cell::blank_with(&self.pen);
+        for c in &mut self.viewport[cur..cur + n] {
+            *c = blank.clone();
+        }
+        self.wrap_pending = false;
     }
 }
 
-/// Stub `vte::Perform` implementation. Compiles and accepts the full callback
-/// surface; the real cell mutations are Phase 2 (zellij `grid.rs` reference).
+/// First numeric parameter, defaulting to `default` when absent or zero-ish.
+fn first_param(params: &Params, default: u16) -> u16 {
+    match params.iter().next().and_then(|p| p.first().copied()) {
+        Some(0) | None => default,
+        Some(v) => v,
+    }
+}
+
+/// Resize one logical row to `cols` columns: truncate when narrower, pad with
+/// blank cells when wider.
+fn resize_row(row: &[Cell], cols: usize) -> Vec<Cell> {
+    let mut out: Vec<Cell> = row.iter().take(cols).cloned().collect();
+    out.resize(cols, Cell::default());
+    out
+}
+
+/// Map a 24-bit RGB triple to the closest xterm 256-colour palette index.
+///
+/// caucus's [`Cell`] colour fields are [`u8`] (skeleton constraint), so
+/// true-colour output is approximated rather than stored verbatim. The 6×6×6
+/// colour cube occupies indices 16..=231; pure greys snap to the 232..=255
+/// grey ramp.
+fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
+    // Grey ramp when the channels are near-equal.
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    if max.saturating_sub(min) < 8 {
+        if r < 8 {
+            return 16;
+        }
+        if r > 248 {
+            return 231;
+        }
+        return 232 + ((r as u16 - 8) * 24 / 247) as u8;
+    }
+    let q = |v: u8| -> u16 {
+        if v < 48 {
+            0
+        } else if v < 115 {
+            1
+        } else {
+            ((v as u16 - 35) / 40).min(5)
+        }
+    };
+    (16 + 36 * q(r) + 6 * q(g) + q(b)) as u8
+}
+
+/// `vte::Perform` implementation: the parsed-op → cell-state machine.
+///
+/// **Fully implemented**
+/// - `print` — glyph write, cursor advance, deferred right-margin wrap,
+///   scroll-on-overflow into bounded scrollback, wide (CJK) glyphs.
+/// - `execute` — `LF`/`VT`/`FF`, `CR`, `BS`, `HT` (8-col tab stops), `BEL`
+///   (ignored), `NEL` via `\x85`.
+/// - `csi_dispatch` — `CUU/CUD/CUF/CUB`, `CNL/CPL`, `CHA`, `VPA`, `CUP/HVP`,
+///   `ED/EL`, `IL/DL`, `ICH/DCH/ECH`, `SU/SD`, `SGR`, `DECSTBM`.
+/// - `esc_dispatch` — `IND`, `RI`, `NEL`, `RIS` (reset), charset designation
+///   (parsed and ignored — see partials).
+/// - `osc_dispatch` — window title (OSC 0/2) and hyperlinks (OSC 8) stored on
+///   the grid.
+///
+/// **Documented partials** (intentionally simplified for caucus's read-only
+/// scraping use; design.md §0 #3 scopes the grid to ~2-4k LOC):
+/// - Charset translation (DEC special graphics, G0/G1 shift-in/shift-out) is
+///   *not* applied — designations are parsed and discarded. caucus reads agent
+///   prose, which is UTF-8, so box-drawing glyph substitution is unnecessary.
+/// - Combining marks / zero-width joiners are dropped rather than merged into
+///   the base cell.
+/// - DEC private modes (`?25` cursor visibility, `?1049` alt-screen, `?2004`
+///   bracketed paste) are accepted and ignored — caucus never renders an alt
+///   screen for a scraped panel.
+/// - DCS strings (`hook`/`put`/`unhook`) are ignored.
 impl Perform for Grid {
-    fn print(&mut self, _c: char) {
-        // TODO(phase 2): write `_c` at the cursor, advance, wrap, scroll.
+    fn print(&mut self, c: char) {
+        self.put_glyph(c);
     }
 
-    fn execute(&mut self, _byte: u8) {
-        // TODO(phase 2): handle C0 controls (LF, CR, BS, HT, ...).
+    fn execute(&mut self, byte: u8) {
+        match byte {
+            0x08 => {
+                // BS — move left one column.
+                if self.wrap_pending {
+                    self.wrap_pending = false;
+                } else if self.cursor.1 > 0 {
+                    self.cursor.1 -= 1;
+                }
+            }
+            0x09 => {
+                // HT — next 8-column tab stop.
+                let next = ((self.cursor.1 / 8) + 1) * 8;
+                self.cursor.1 = next.min(self.cols - 1);
+                self.wrap_pending = false;
+            }
+            0x0A | 0x0B | 0x0C => {
+                // LF / VT / FF — line feed.
+                self.line_feed();
+            }
+            0x0D => {
+                // CR — column 0.
+                self.cursor.1 = 0;
+                self.wrap_pending = false;
+            }
+            0x85 => {
+                // NEL — newline (CR + LF).
+                self.cursor.1 = 0;
+                self.line_feed();
+            }
+            _ => {
+                // BEL (0x07) and other C0/C1 controls: nothing to render.
+            }
+        }
     }
 
     fn csi_dispatch(
         &mut self,
-        _params: &Params,
-        _intermediates: &[u8],
+        params: &Params,
+        intermediates: &[u8],
         _ignore: bool,
-        _action: char,
+        action: char,
     ) {
-        // TODO(phase 2): cursor moves, erase, SGR rendition, scroll regions.
+        // DEC private sequences (`CSI ? ...`) are accepted and ignored.
+        if intermediates.first() == Some(&b'?') {
+            return;
+        }
+        let n = first_param(params, 1) as usize;
+        let (cr, cc) = self.cursor;
+        match action {
+            'A' => self.move_to(cr.saturating_sub(n), cc), // CUU
+            'B' => self.move_to(cr + n, cc),               // CUD
+            'C' => self.move_to(cr, cc + n),               // CUF
+            'D' => self.move_to(cr, cc.saturating_sub(n)), // CUB
+            'E' => self.move_to(cr + n, 0),                // CNL
+            'F' => self.move_to(cr.saturating_sub(n), 0),  // CPL
+            'G' | '`' => self.move_to(cr, n.saturating_sub(1)), // CHA / HPA
+            'd' => self.move_to(n.saturating_sub(1), cc),  // VPA
+            'H' | 'f' => {
+                // CUP / HVP — both params 1-based, default 1.
+                let row = first_param(params, 1) as usize;
+                let col = params
+                    .iter()
+                    .nth(1)
+                    .and_then(|p| p.first().copied())
+                    .filter(|&v| v != 0)
+                    .unwrap_or(1) as usize;
+                self.move_to(row.saturating_sub(1), col.saturating_sub(1));
+            }
+            'J' => self.erase_display(first_param(params, 0)),
+            'K' => self.erase_line(first_param(params, 0)),
+            'L' => self.insert_lines(n),
+            'M' => self.delete_lines(n),
+            '@' => self.insert_chars(n),
+            'P' => self.delete_chars(n),
+            'X' => self.erase_chars(n),
+            'S' => {
+                for _ in 0..n {
+                    self.scroll_up();
+                }
+            }
+            'T' => {
+                for _ in 0..n {
+                    self.scroll_down();
+                }
+            }
+            'm' => self.apply_sgr(params),
+            'r' => {
+                // DECSTBM — set top/bottom scroll margins.
+                let top = first_param(params, 1) as usize;
+                let bottom = params
+                    .iter()
+                    .nth(1)
+                    .and_then(|p| p.first().copied())
+                    .filter(|&v| v != 0)
+                    .map(|v| v as usize)
+                    .unwrap_or(self.rows);
+                let top = top.saturating_sub(1).min(self.rows - 1);
+                let bottom = bottom.saturating_sub(1).min(self.rows - 1);
+                if top < bottom {
+                    self.scroll_top = top;
+                    self.scroll_bottom = bottom;
+                    // DECSTBM homes the cursor.
+                    self.move_to(0, 0);
+                }
+            }
+            _ => {
+                // CSI sequences not relevant to a scraped grid (DSR/DA query
+                // replies, cursor save/restore via 's'/'u', mode set/reset)
+                // are intentionally ignored.
+            }
+        }
     }
 
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {
-        // TODO(phase 2): index, reverse index, charset selection.
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        // Charset designation: `ESC ( B`, `ESC ) 0`, etc. Parsed and ignored
+        // (documented partial — caucus reads UTF-8 agent prose).
+        if matches!(intermediates.first(), Some(b'(' | b')' | b'*' | b'+')) {
+            return;
+        }
+        match byte {
+            b'D' => self.line_feed(),                       // IND
+            b'E' => {
+                // NEL — CR + LF.
+                self.cursor.1 = 0;
+                self.line_feed();
+            }
+            b'M' => {
+                // RI — reverse index.
+                if self.cursor.0 == self.scroll_top {
+                    self.scroll_down();
+                } else if self.cursor.0 > 0 {
+                    self.cursor.0 -= 1;
+                }
+                self.wrap_pending = false;
+            }
+            b'c' => {
+                // RIS — full reset.
+                self.viewport = vec![Cell::default(); self.cols * self.rows];
+                self.scrollback.clear();
+                self.cursor = (0, 0);
+                self.pen = Pen::default();
+                self.scroll_top = 0;
+                self.scroll_bottom = self.rows - 1;
+                self.wrap_pending = false;
+                self.title = None;
+                self.hyperlink = None;
+            }
+            _ => {}
+        }
     }
 
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {
-        // TODO(phase 2): title, hyperlinks, clipboard.
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        let Some(&code) = params.first() else {
+            return;
+        };
+        match code {
+            b"0" | b"2" => {
+                // Set window/icon title.
+                if let Some(&title) = params.get(1) {
+                    self.title = Some(String::from_utf8_lossy(title).into_owned());
+                }
+            }
+            b"8" => {
+                // Hyperlink: `OSC 8 ; params ; URI ST`. params[2] is the URI;
+                // an empty URI closes the link.
+                match params.get(2) {
+                    Some(uri) if !uri.is_empty() => {
+                        self.hyperlink = Some(String::from_utf8_lossy(uri).into_owned());
+                    }
+                    _ => self.hyperlink = None,
+                }
+            }
+            _ => {
+                // OSC 4 (palette), 52 (clipboard), 10/11 (default colours):
+                // not needed for a scraped grid.
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(g: &Grid, row: usize, col: usize) -> char {
+        g.cell(row, col).unwrap().ch
+    }
 
     #[test]
     fn new_grid_is_blank() {
@@ -174,5 +905,307 @@ mod tests {
         let mut g = Grid::new(80, 24);
         g.resize(100, 30);
         assert_eq!(g.size(), (100, 30));
+    }
+
+    #[test]
+    fn print_writes_glyphs_and_advances_cursor() {
+        let mut g = Grid::new(20, 5);
+        g.advance(b"abc");
+        assert_eq!(at(&g, 0, 0), 'a');
+        assert_eq!(at(&g, 0, 1), 'b');
+        assert_eq!(at(&g, 0, 2), 'c');
+        assert_eq!(g.cursor(), (0, 3));
+    }
+
+    #[test]
+    fn cr_lf_moves_cursor() {
+        let mut g = Grid::new(20, 5);
+        g.advance(b"ab\r\ncd");
+        assert_eq!(g.row_text(0), "ab".to_string() + &" ".repeat(18));
+        assert_eq!(at(&g, 1, 0), 'c');
+        assert_eq!(at(&g, 1, 1), 'd');
+        assert_eq!(g.cursor(), (1, 2));
+    }
+
+    #[test]
+    fn backspace_and_tab() {
+        let mut g = Grid::new(40, 3);
+        g.advance(b"abc\x08X");
+        // BS over 'c', overwrite with 'X'.
+        assert_eq!(at(&g, 0, 2), 'X');
+        let mut g2 = Grid::new(40, 3);
+        g2.advance(b"a\tb");
+        assert_eq!(g2.cursor().1, 9); // tab to col 8, then 'b' advances to 9.
+        assert_eq!(at(&g2, 0, 8), 'b');
+    }
+
+    #[test]
+    fn deferred_wrap_at_right_margin() {
+        let mut g = Grid::new(3, 3);
+        g.advance(b"abc");
+        // After printing into the last column, cursor parks there pending wrap.
+        assert_eq!(g.cursor(), (0, 2));
+        g.advance(b"d");
+        // Next glyph wraps to the new line.
+        assert_eq!(at(&g, 1, 0), 'd');
+        assert_eq!(g.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn scroll_pushes_top_row_into_scrollback() {
+        let mut g = Grid::new(10, 2);
+        g.advance(b"row0\r\nrow1\r\nrow2");
+        // 2-row viewport: row0 scrolled off, viewport now row1/row2.
+        assert_eq!(g.row_text(0).trim_end(), "row1");
+        assert_eq!(g.row_text(1).trim_end(), "row2");
+        let sb: Vec<_> = g.scrollback().collect();
+        assert_eq!(sb.len(), 1);
+        let text: String = sb[0].iter().map(|c| c.ch).collect();
+        assert_eq!(text.trim_end(), "row0");
+    }
+
+    #[test]
+    fn scrollback_ring_is_bounded() {
+        // 2-row viewport so a line feed at the bottom actually scrolls.
+        let mut g = Grid::new(4, 2);
+        g.scrollback_limit = 3;
+        for i in 0..10u8 {
+            g.advance(&[b'0' + i]);
+            g.advance(b"\r\n");
+        }
+        let sb: Vec<_> = g.scrollback().collect();
+        assert_eq!(sb.len(), 3, "ring capped at 3");
+        // Lines 0..=8 scroll off the top (each trailing \r\n past the first
+        // line feeds at the bottom margin). The ring keeps the last 3: 6,7,8.
+        let oldest: String = sb[0].iter().map(|c| c.ch).collect();
+        assert_eq!(oldest.trim_end(), "6");
+        let newest: String = sb[2].iter().map(|c| c.ch).collect();
+        assert_eq!(newest.trim_end(), "8");
+    }
+
+    #[test]
+    fn cup_positions_cursor_one_based() {
+        let mut g = Grid::new(20, 10);
+        g.advance(b"\x1b[3;5HX");
+        // Row 3, col 5 (1-based) -> (2,4).
+        assert_eq!(at(&g, 2, 4), 'X');
+    }
+
+    #[test]
+    fn cursor_moves_cuu_cud_cuf_cub() {
+        let mut g = Grid::new(20, 10);
+        g.advance(b"\x1b[5;5H");
+        g.advance(b"\x1b[2A"); // up 2
+        assert_eq!(g.cursor(), (2, 4));
+        g.advance(b"\x1b[3B"); // down 3
+        assert_eq!(g.cursor(), (5, 4));
+        g.advance(b"\x1b[2C"); // right 2
+        assert_eq!(g.cursor(), (5, 6));
+        g.advance(b"\x1b[4D"); // left 4
+        assert_eq!(g.cursor(), (5, 2));
+    }
+
+    #[test]
+    fn erase_line_modes() {
+        let mut g = Grid::new(10, 2);
+        g.advance(b"abcdefghij");
+        g.advance(b"\x1b[1;5H"); // cursor at col 4 ('e')
+        g.advance(b"\x1b[0K"); // erase cursor..end
+        assert_eq!(g.row_text(0).trim_end(), "abcd");
+
+        let mut g2 = Grid::new(10, 2);
+        g2.advance(b"abcdefghij\x1b[1;5H\x1b[1K"); // erase start..cursor
+        assert_eq!(g2.row_text(0), "     fghij");
+
+        let mut g3 = Grid::new(10, 2);
+        g3.advance(b"abcdefghij\x1b[2K"); // whole row
+        assert_eq!(g3.row_text(0).trim(), "");
+    }
+
+    #[test]
+    fn erase_display_modes() {
+        let mut g = Grid::new(5, 3);
+        g.advance(b"aaaaa\r\nbbbbb\r\nccccc");
+        g.advance(b"\x1b[2;3H"); // row 1, col 2
+        g.advance(b"\x1b[0J"); // cursor..end
+        assert_eq!(g.row_text(0).trim_end(), "aaaaa");
+        assert_eq!(g.row_text(1), "bb   ");
+        assert_eq!(g.row_text(2).trim(), "");
+
+        let mut g2 = Grid::new(5, 3);
+        g2.advance(b"aaaaa\r\nbbbbb\r\nccccc\x1b[2J");
+        for r in 0..3 {
+            assert_eq!(g2.row_text(r).trim(), "");
+        }
+    }
+
+    #[test]
+    fn sgr_parses_into_cell_attrs() {
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[1;4;31;42mX\x1b[0mY");
+        let x = g.cell(0, 0).unwrap();
+        assert_eq!(x.ch, 'X');
+        assert_ne!(x.attrs & attr::BOLD, 0);
+        assert_ne!(x.attrs & attr::UNDERLINE, 0);
+        assert_eq!(x.fg, 2); // red = 31 -> index 2
+        assert_eq!(x.bg, 3); // green bg = 42 -> index 3
+        let y = g.cell(0, 1).unwrap();
+        assert_eq!(y.ch, 'Y');
+        assert_eq!(y.attrs, 0);
+        assert_eq!(y.fg, 0);
+        assert_eq!(y.bg, 0);
+    }
+
+    #[test]
+    fn sgr_256_and_truecolor() {
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[38;5;200mA");
+        assert_eq!(g.cell(0, 0).unwrap().fg, 200);
+        g.advance(b"\x1b[48;2;255;255;255mB");
+        // Pure white truecolor snaps to 231 in the grey-ramp branch.
+        assert_eq!(g.cell(0, 1).unwrap().bg, 231);
+    }
+
+    #[test]
+    fn sgr_bright_colors() {
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[91mA"); // bright red
+        assert_eq!(g.cell(0, 0).unwrap().fg, 10); // 91-90+9
+    }
+
+    #[test]
+    fn wide_glyph_occupies_two_columns() {
+        let mut g = Grid::new(10, 2);
+        g.advance("한x".as_bytes());
+        assert_eq!(at(&g, 0, 0), '한');
+        assert_eq!(at(&g, 0, 1), '\0'); // trailing half
+        assert_eq!(at(&g, 0, 2), 'x');
+        assert_eq!(g.cursor(), (0, 3));
+    }
+
+    #[test]
+    fn scroll_region_decstbm() {
+        let mut g = Grid::new(5, 5);
+        // Restrict scrolling to rows 2..=4 (1-based).
+        g.advance(b"\x1b[2;4r");
+        // DECSTBM homes the cursor.
+        assert_eq!(g.cursor(), (0, 0));
+        g.advance(b"\x1b[2;1Hr1\r\n");
+        g.advance(b"r2\r\n");
+        g.advance(b"r3\r\n");
+        g.advance(b"r4");
+        // Region rows 1..=3; r1 was at row1, after scroll it should move up.
+        assert_eq!(g.row_text(0).trim(), ""); // row 0 untouched
+        assert_eq!(g.row_text(3).trim_end(), "r4");
+    }
+
+    #[test]
+    fn insert_and_delete_lines() {
+        let mut g = Grid::new(5, 4);
+        g.advance(b"aaaaa\r\nbbbbb\r\nccccc\r\nddddd");
+        g.advance(b"\x1b[2;1H\x1b[1L"); // insert 1 line at row 1
+        assert_eq!(g.row_text(0).trim_end(), "aaaaa");
+        assert_eq!(g.row_text(1).trim(), "");
+        assert_eq!(g.row_text(2).trim_end(), "bbbbb");
+
+        let mut g2 = Grid::new(5, 4);
+        g2.advance(b"aaaaa\r\nbbbbb\r\nccccc\r\nddddd");
+        g2.advance(b"\x1b[2;1H\x1b[1M"); // delete 1 line at row 1
+        assert_eq!(g2.row_text(1).trim_end(), "ccccc");
+        assert_eq!(g2.row_text(2).trim_end(), "ddddd");
+    }
+
+    #[test]
+    fn insert_delete_erase_chars() {
+        let mut g = Grid::new(10, 2);
+        g.advance(b"abcdef\x1b[1;1H\x1b[2@"); // insert 2 blanks at col 0
+        assert_eq!(g.row_text(0).trim_end(), "  abcdef");
+
+        let mut g2 = Grid::new(10, 2);
+        g2.advance(b"abcdef\x1b[1;1H\x1b[2P"); // delete 2 chars at col 0
+        assert_eq!(g2.row_text(0).trim_end(), "cdef");
+
+        let mut g3 = Grid::new(10, 2);
+        g3.advance(b"abcdef\x1b[1;3H\x1b[2X"); // erase 2 chars at col 2
+        assert_eq!(g3.row_text(0), "ab  ef    ");
+    }
+
+    #[test]
+    fn reverse_index_at_top_scrolls_down() {
+        let mut g = Grid::new(5, 3);
+        g.advance(b"r0\r\nr1\r\nr2");
+        g.advance(b"\x1b[1;1H"); // home
+        g.advance(b"\x1bM"); // RI at top
+        assert_eq!(g.row_text(0).trim(), ""); // blank inserted
+        assert_eq!(g.row_text(1).trim_end(), "r0");
+        assert_eq!(g.row_text(2).trim_end(), "r1");
+    }
+
+    #[test]
+    fn esc_index_and_nel() {
+        let mut g = Grid::new(10, 3);
+        g.advance(b"ab\x1bD"); // IND: down, keep column
+        assert_eq!(g.cursor(), (1, 2));
+        g.advance(b"\x1bE"); // NEL: down + col 0
+        assert_eq!(g.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn osc_title_and_hyperlink() {
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b]0;my title\x07");
+        assert_eq!(g.title(), Some("my title"));
+        g.advance(b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07");
+        // Link closed by the trailing empty OSC 8.
+        assert_eq!(g.hyperlink(), None);
+        assert_eq!(at(&g, 0, 0), 'l');
+    }
+
+    #[test]
+    fn ris_resets_grid() {
+        let mut g = Grid::new(10, 3);
+        g.advance(b"\x1b[31mhello\x1b]0;t\x07");
+        g.advance(b"\x1bc"); // RIS
+        assert_eq!(at(&g, 0, 0), ' ');
+        assert_eq!(g.cursor(), (0, 0));
+        assert_eq!(g.title(), None);
+        assert_eq!(g.cell(0, 0).unwrap().fg, 0);
+    }
+
+    #[test]
+    fn resize_preserves_content_and_spills_on_shrink() {
+        let mut g = Grid::new(10, 4);
+        g.advance(b"row0\r\nrow1\r\nrow2\r\nrow3");
+        g.resize(10, 2); // shrink to 2 rows
+        assert_eq!(g.size(), (10, 2));
+        // row0/row1 spilled into scrollback.
+        let sb: Vec<_> = g.scrollback().collect();
+        assert_eq!(sb.len(), 2);
+        assert_eq!(g.row_text(0).trim_end(), "row2");
+        assert_eq!(g.row_text(1).trim_end(), "row3");
+    }
+
+    #[test]
+    fn resize_wider_pads_blank() {
+        let mut g = Grid::new(5, 2);
+        g.advance(b"abc");
+        g.resize(10, 2);
+        assert_eq!(g.size(), (10, 2));
+        assert_eq!(g.row_text(0), "abc       ");
+    }
+
+    #[test]
+    fn erase_keeps_background_pen() {
+        let mut g = Grid::new(5, 2);
+        g.advance(b"\x1b[42m\x1b[2K"); // green bg, erase line
+        assert_eq!(g.cell(0, 0).unwrap().bg, 3); // green bg index
+    }
+
+    #[test]
+    fn private_mode_sequences_ignored() {
+        let mut g = Grid::new(10, 3);
+        g.advance(b"\x1b[?25l\x1b[?1049hX");
+        // Sequences ignored; the 'X' still prints.
+        assert_eq!(at(&g, 0, 0), 'X');
     }
 }
