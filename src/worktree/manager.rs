@@ -129,6 +129,44 @@ pub(crate) fn create(req: &WorktreeRequest) -> Result<WorktreeHandle, WorktreeEr
     })
 }
 
+/// Re-add a worktree on an **existing** branch — the resume path
+/// (`docs/design.md` §5). Unlike [`create`], this runs `git worktree add`
+/// *without* `-b`: the branch already exists (it persisted across the prior
+/// caucus shutdown, holding the agent's commits) and only its working
+/// directory needs recreating.
+///
+/// Errors out if `path` already exists. Synchronous, like [`create`].
+pub(crate) fn attach(
+    repo_root: &Path,
+    path: &Path,
+    branch: &str,
+) -> Result<WorktreeHandle, WorktreeError> {
+    if path.exists() {
+        return Err(WorktreeError::AlreadyExists(path.to_path_buf()));
+    }
+    if let Some(parent) = path.parent()
+        && let Err(source) = std::fs::create_dir_all(parent)
+    {
+        return Err(WorktreeError::Spawn {
+            command: format!("mkdir -p {}", parent.display()),
+            source,
+        });
+    }
+    let args = vec![
+        "worktree".to_string(),
+        "add".to_string(),
+        path.display().to_string(),
+        branch.to_string(),
+    ];
+    run_git(repo_root, &args)?;
+
+    Ok(WorktreeHandle {
+        path: path.to_path_buf(),
+        branch: branch.to_string(),
+        repo_root: repo_root.to_path_buf(),
+    })
+}
+
 /// Run a git subcommand in `repo` and return trimmed stdout. Stderr is folded
 /// into the error so the caller can classify it.
 pub(crate) fn run_git(repo: &Path, args: &[String]) -> Result<String, WorktreeError> {
@@ -173,7 +211,12 @@ mod tests {
         };
         let p = req.default_path();
         assert_eq!(p.parent().unwrap(), Path::new("/repo/.caucus/worktrees"));
-        assert!(p.file_name().unwrap().to_string_lossy().ends_with("-backend"));
+        assert!(
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-backend")
+        );
     }
 
     #[test]
@@ -202,5 +245,93 @@ mod tests {
             name_override: None,
         };
         assert_eq!(req.default_branch(), "feature/x");
+    }
+
+    /// `attach` re-adds a worktree on an *existing* branch — the resume path.
+    /// Mirrors `cleanup::create_then_cleanup_a_real_worktree`: a hermetic temp
+    /// git repo, create a branch via `create`, drop the directory, then
+    /// re-attach a fresh worktree on the same branch.
+    #[test]
+    fn attach_re_adds_a_worktree_on_an_existing_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .expect("run git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "caucus-test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        // Create a worktree (which creates the branch), then remove just the
+        // directory — simulating a prior caucus shutdown that cleaned the
+        // worktree dir but kept the branch.
+        let req = WorktreeRequest {
+            repo_root: repo.path().to_path_buf(),
+            session_id: SessionId::new(),
+            role: "backend".into(),
+            branch: Some("caucus/resume-test/backend".into()),
+            base_ref: None,
+            name_override: Some("ts-backend-1".into()),
+        };
+        let created = create(&req).expect("git worktree add -b");
+        let branch = created.branch.clone();
+        run_git(
+            repo.path(),
+            &[
+                "worktree".into(),
+                "remove".into(),
+                "--force".into(),
+                created.path.display().to_string(),
+            ],
+        )
+        .expect("git worktree remove");
+        assert!(!created.path.exists(), "worktree directory removed");
+
+        // Re-attach a fresh worktree on the persisted branch.
+        let attach_path = repo
+            .path()
+            .join(".caucus")
+            .join("worktrees")
+            .join("ts-backend-1-resume");
+        let handle = attach(repo.path(), &attach_path, &branch).expect("git worktree add");
+        assert_eq!(handle.branch, branch);
+        assert!(handle.path.is_dir(), "re-attached worktree directory");
+        assert!(
+            handle.path.join(".git").exists(),
+            "worktree .git marker present"
+        );
+
+        // Attaching onto an existing path is rejected.
+        let err = attach(repo.path(), &attach_path, &branch);
+        assert!(matches!(err, Err(WorktreeError::AlreadyExists(_))));
+    }
+
+    /// Attaching to a branch that does not exist fails — the resume path
+    /// classifies this and spawns the panel fresh instead.
+    #[test]
+    fn attach_fails_when_branch_is_gone() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .expect("run git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "caucus-test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        let path = repo.path().join(".caucus").join("worktrees").join("gone");
+        let err = attach(repo.path(), &path, "caucus/no-such-branch");
+        assert!(
+            matches!(err, Err(WorktreeError::NonZero { .. })),
+            "attaching a missing branch must fail: {err:?}"
+        );
     }
 }

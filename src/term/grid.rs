@@ -362,12 +362,13 @@ impl Grid {
             self.clear_row(top);
             return;
         }
-        let leaving: Vec<Cell> = self.viewport[self.idx(top, 0)..self.idx(top, 0) + self.cols]
-            .to_vec();
+        let leaving: Vec<Cell> =
+            self.viewport[self.idx(top, 0)..self.idx(top, 0) + self.cols].to_vec();
         for r in top..bottom {
             let (dst_lo, dst_hi) = (self.idx(r, 0), self.idx(r, 0) + self.cols);
             let src_lo = self.idx(r + 1, 0);
-            self.viewport.copy_within(src_lo..src_lo + self.cols, dst_lo);
+            self.viewport
+                .copy_within(src_lo..src_lo + self.cols, dst_lo);
             let _ = dst_hi;
         }
         self.clear_row(bottom);
@@ -387,7 +388,8 @@ impl Grid {
         for r in (top + 1..=bottom).rev() {
             let dst_lo = self.idx(r, 0);
             let src_lo = self.idx(r - 1, 0);
-            self.viewport.copy_within(src_lo..src_lo + self.cols, dst_lo);
+            self.viewport
+                .copy_within(src_lo..src_lo + self.cols, dst_lo);
         }
         self.clear_row(top);
     }
@@ -400,7 +402,7 @@ impl Grid {
         let blank = Cell::blank_with(&self.pen);
         let start = self.idx(row, 0);
         for c in &mut self.viewport[start..start + self.cols] {
-            *c = blank.clone();
+            *c = blank;
         }
     }
 
@@ -555,27 +557,27 @@ impl Grid {
                 let start = self.idx(cr, cc);
                 let row_end = self.idx(cr, 0) + self.cols;
                 for c in &mut self.viewport[start..row_end] {
-                    *c = blank.clone();
+                    *c = blank;
                 }
                 let below = self.idx(cr + 1, 0).min(self.viewport.len());
                 for c in &mut self.viewport[below..] {
-                    *c = blank.clone();
+                    *c = blank;
                 }
             }
             1 => {
                 // Start of screen through cursor (inclusive).
                 let above = self.idx(cr, 0);
                 for c in &mut self.viewport[..above] {
-                    *c = blank.clone();
+                    *c = blank;
                 }
                 let end = self.idx(cr, cc) + 1;
                 for c in &mut self.viewport[above..end] {
-                    *c = blank.clone();
+                    *c = blank;
                 }
             }
             2 | 3 => {
                 for c in &mut self.viewport {
-                    *c = blank.clone();
+                    *c = blank;
                 }
                 if mode == 3 {
                     self.scrollback.clear();
@@ -599,7 +601,7 @@ impl Grid {
             _ => return,
         };
         for c in &mut self.viewport[range] {
-            *c = blank.clone();
+            *c = blank;
         }
         self.wrap_pending = false;
     }
@@ -653,7 +655,7 @@ impl Grid {
         self.viewport.copy_within(cur..row_end - n, cur + n);
         let blank = Cell::blank_with(&self.pen);
         for c in &mut self.viewport[cur..cur + n] {
-            *c = blank.clone();
+            *c = blank;
         }
         self.wrap_pending = false;
     }
@@ -669,7 +671,7 @@ impl Grid {
         self.viewport.copy_within(cur + n..row_end, cur);
         let blank = Cell::blank_with(&self.pen);
         for c in &mut self.viewport[row_end - n..row_end] {
-            *c = blank.clone();
+            *c = blank;
         }
         self.wrap_pending = false;
     }
@@ -681,7 +683,7 @@ impl Grid {
         let cur = self.idx(cr, cc);
         let blank = Cell::blank_with(&self.pen);
         for c in &mut self.viewport[cur..cur + n] {
-            *c = blank.clone();
+            *c = blank;
         }
         self.wrap_pending = false;
     }
@@ -703,10 +705,7 @@ impl Grid {
     fn restore_cursor(&mut self) {
         match self.saved_cursor.take() {
             Some(s) => {
-                self.cursor = (
-                    s.cursor.0.min(self.rows - 1),
-                    s.cursor.1.min(self.cols - 1),
-                );
+                self.cursor = (s.cursor.0.min(self.rows - 1), s.cursor.1.min(self.cols - 1));
                 self.pen = s.pen.clone();
                 self.wrap_pending = s.wrap_pending;
                 // Keep the save so a second restore re-applies it (xterm
@@ -914,7 +913,7 @@ impl Perform for Grid {
                 self.cursor.1 = next.min(self.cols - 1);
                 self.wrap_pending = false;
             }
-            0x0A | 0x0B | 0x0C => {
+            0x0A..=0x0C => {
                 // LF / VT / FF — line feed.
                 self.line_feed();
             }
@@ -934,13 +933,7 @@ impl Perform for Grid {
         }
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         // DEC private sequences (`CSI ? Pn h` / `l`). Modes that change cell
         // state — chiefly the alternate screen — are acted on; the rest are
         // accepted and ignored (see [`Grid::set_private_mode`]).
@@ -1046,9 +1039,9 @@ impl Perform for Grid {
             return;
         }
         match byte {
-            b'7' => self.save_cursor(),                     // DECSC
-            b'8' => self.restore_cursor(),                  // DECRC
-            b'D' => self.line_feed(),                       // IND
+            b'7' => self.save_cursor(),    // DECSC
+            b'8' => self.restore_cursor(), // DECRC
+            b'D' => self.line_feed(),      // IND
             b'E' => {
                 // NEL — CR + LF.
                 self.cursor.1 = 0;
@@ -1668,7 +1661,10 @@ mod tests {
     /// the whole screen collapsed onto ~4 overlapping top rows.
     #[test]
     fn live_main_replay_matches_tmux() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/live-main-startup.raw");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/live-main-startup.raw"
+        );
         let bytes = std::fs::read(path).expect("live-main-startup.raw fixture present");
         let mut g = Grid::new(150, 58);
         g.advance(&bytes);

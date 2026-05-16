@@ -130,9 +130,6 @@ mod tests {
         assert_eq!(sig.session_id, session_id);
         assert_eq!(sig.panel_id, panel_id);
         assert_eq!(sig.kind, TurnKind::Stop);
-        assert_eq!(
-            sig.last_message.as_deref(),
-            Some("reviewer pass complete")
-        );
+        assert_eq!(sig.last_message.as_deref(), Some("reviewer pass complete"));
     }
 }

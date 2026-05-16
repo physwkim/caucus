@@ -2,8 +2,8 @@
 //! (`docs/design.md` §0 #4, §9).
 //!
 //! The main worker (a Claude Code agent in one panel) drives every sub-agent
-//! panel through seven MCP tools: `send_keys`, `ctrl_c`, `read_panel`,
-//! `spawn_role`, `kill_panel`, `list_panels`, `wait_for_panels`.
+//! panel through eight MCP tools: `send_keys`, `broadcast`, `ctrl_c`,
+//! `read_panel`, `spawn_role`, `kill_panel`, `list_panels`, `wait_for_panels`.
 //!
 //! ## Architecture
 //!
@@ -24,7 +24,7 @@
 //! `rmcp` (1.7.0) resolves cleanly but its server surface is macro-driven and
 //! its transport runs an internal loop that resists deterministic unit
 //! testing. The MCP slice caucus needs is small — `initialize` / `tools/list`
-//! / `tools/call`, seven tools — so [`jsonrpc`] implements exactly that, with a
+//! / `tools/call`, eight tools — so [`jsonrpc`] implements exactly that, with a
 //! pure dispatch core. See that module's header for the rationale.
 
 pub mod control_client;
@@ -137,6 +137,30 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                     }
                 },
                 "required": ["panel", "text"]
+            }),
+        },
+        ToolDef {
+            name: "broadcast",
+            description: "Send the same text to several panels at once — a \
+                          round's fan-out. Equivalent to one send_keys per \
+                          panel. Follow with wait_for_panels, then \
+                          read_panel(since_last_turn) on each, to run a round.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "panels": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Panel ids (ULIDs) to send the text to."
+                    },
+                    "text": { "type": "string", "description": "Text to type into every panel." },
+                    "enter": {
+                        "type": "boolean",
+                        "description": "Append a newline (submit the line) in every panel.",
+                        "default": false
+                    }
+                },
+                "required": ["panels", "text"]
             }),
         },
         ToolDef {
@@ -254,6 +278,7 @@ mod tests {
             names,
             vec![
                 "send_keys",
+                "broadcast",
                 "ctrl_c",
                 "read_panel",
                 "spawn_role",

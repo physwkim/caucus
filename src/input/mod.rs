@@ -17,6 +17,12 @@
 //! | `Ctrl-A` then `n` / `→`   | focus the next panel                    |
 //! | `Ctrl-A` then `p` / `←`   | focus the previous panel                |
 //! | `Ctrl-A` then `q`         | quit caucus                             |
+//! | `Ctrl-A` then `z`         | toggle zoom on the focused panel        |
+//! | `Ctrl-A` then `<`         | move the focused panel one step earlier |
+//! | `Ctrl-A` then `>`         | move the focused panel one step later   |
+//! | `Ctrl-A` then `Space`     | cycle the layout arrangement mode       |
+//! | `Ctrl-A` then `t`         | toggle the transcript overlay           |
+//! | `Esc` (overlay open)      | hide the transcript overlay             |
 //! | `Ctrl-A` then `Ctrl-A`    | send a literal `Ctrl-A` to the panel    |
 //! | any other key             | forwarded to the focused panel's PTY    |
 //! | `Ctrl-C`                  | forwarded to the focused panel (§0 #11) |
@@ -53,6 +59,18 @@ pub enum CaucusCommand {
     FocusPrev,
     /// Quit caucus.
     Quit,
+    /// Toggle full-screen zoom on the focused panel.
+    ToggleZoom,
+    /// Move the focused panel one step earlier in the panel order.
+    MovePanelEarlier,
+    /// Move the focused panel one step later in the panel order.
+    MovePanelLater,
+    /// Cycle the arrangement mode (`Tiled` → `EvenHorizontal` → ...).
+    CycleLayout,
+    /// Toggle the read-only transcript overlay.
+    ToggleTranscript,
+    /// Hide the transcript overlay (the `Esc` path while it is open).
+    HideTranscript,
 }
 
 /// Tracks which panel currently receives the user's keystrokes, plus whether
@@ -63,6 +81,9 @@ pub struct FocusRouter {
     focused: Option<PanelId>,
     /// `true` after the prefix key was pressed and before the next key.
     prefix_armed: bool,
+    /// `true` while the transcript overlay is open. When set, a bare `Esc`
+    /// hides the overlay instead of being forwarded to the focused panel.
+    transcript_open: bool,
 }
 
 impl FocusRouter {
@@ -86,6 +107,12 @@ impl FocusRouter {
         self.focused = panel;
     }
 
+    /// Tell the router whether the transcript overlay is open — gates the
+    /// `Esc`-hides-overlay diversion in [`FocusRouter::route`].
+    pub fn set_transcript_open(&mut self, open: bool) {
+        self.transcript_open = open;
+    }
+
     /// Route a key event to an [`InputAction`].
     ///
     /// When the prefix is armed the key selects a [`CaucusCommand`]; an
@@ -100,6 +127,12 @@ impl FocusRouter {
         if is_prefix(&key) {
             self.prefix_armed = true;
             return InputAction::Ignore;
+        }
+        // While the transcript overlay is open, a bare `Esc` hides it rather
+        // than reaching the focused panel. Every other key still passes
+        // through — the overlay is read-only and does not capture input.
+        if self.transcript_open && key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            return InputAction::Caucus(CaucusCommand::HideTranscript);
         }
         match self.focused {
             Some(panel) => match encode_key(&key) {
@@ -123,13 +156,14 @@ impl FocusRouter {
             };
         }
         match key.code {
-            KeyCode::Char('n') | KeyCode::Right => {
-                InputAction::Caucus(CaucusCommand::FocusNext)
-            }
-            KeyCode::Char('p') | KeyCode::Left => {
-                InputAction::Caucus(CaucusCommand::FocusPrev)
-            }
+            KeyCode::Char('n') | KeyCode::Right => InputAction::Caucus(CaucusCommand::FocusNext),
+            KeyCode::Char('p') | KeyCode::Left => InputAction::Caucus(CaucusCommand::FocusPrev),
             KeyCode::Char('q') => InputAction::Caucus(CaucusCommand::Quit),
+            KeyCode::Char('z') => InputAction::Caucus(CaucusCommand::ToggleZoom),
+            KeyCode::Char('<') => InputAction::Caucus(CaucusCommand::MovePanelEarlier),
+            KeyCode::Char('>') => InputAction::Caucus(CaucusCommand::MovePanelLater),
+            KeyCode::Char(' ') => InputAction::Caucus(CaucusCommand::CycleLayout),
+            KeyCode::Char('t') => InputAction::Caucus(CaucusCommand::ToggleTranscript),
             // Any other key after the prefix: prefix consumed, nothing done.
             _ => InputAction::Ignore,
         }
@@ -326,6 +360,80 @@ mod tests {
     }
 
     #[test]
+    fn prefix_then_z_is_toggle_zoom() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.route(ctrl('a'));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('z'))),
+            InputAction::Caucus(CaucusCommand::ToggleZoom)
+        ));
+    }
+
+    #[test]
+    fn prefix_then_lt_gt_move_the_panel() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.route(ctrl('a'));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('<'))),
+            InputAction::Caucus(CaucusCommand::MovePanelEarlier)
+        ));
+        router.route(ctrl('a'));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('>'))),
+            InputAction::Caucus(CaucusCommand::MovePanelLater)
+        ));
+    }
+
+    #[test]
+    fn prefix_then_space_is_cycle_layout() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.route(ctrl('a'));
+        assert!(matches!(
+            router.route(key(KeyCode::Char(' '))),
+            InputAction::Caucus(CaucusCommand::CycleLayout)
+        ));
+    }
+
+    #[test]
+    fn prefix_then_t_is_toggle_transcript() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.route(ctrl('a'));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('t'))),
+            InputAction::Caucus(CaucusCommand::ToggleTranscript)
+        ));
+    }
+
+    #[test]
+    fn esc_hides_transcript_only_while_overlay_open() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+
+        // Overlay closed: `Esc` still reaches the focused panel as today.
+        match router.route(key(KeyCode::Esc)) {
+            InputAction::ToPanel { bytes, .. } => assert_eq!(bytes, vec![0x1b]),
+            other => panic!("expected ToPanel with 0x1b, got {other:?}"),
+        }
+
+        // Overlay open: `Esc` diverts to a hide command, not the panel.
+        router.set_transcript_open(true);
+        assert!(matches!(
+            router.route(key(KeyCode::Esc)),
+            InputAction::Caucus(CaucusCommand::HideTranscript)
+        ));
+
+        // Other keys still pass through to the panel while the overlay is open.
+        match router.route(key(KeyCode::Char('x'))) {
+            InputAction::ToPanel { bytes, .. } => assert_eq!(bytes, b"x"),
+            other => panic!("expected ToPanel, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn prefix_then_prefix_forwards_a_literal_ctrl_a() {
         let mut router = FocusRouter::new();
         router.set_focus(Some(PanelId::new()));
@@ -341,9 +449,9 @@ mod tests {
         let mut router = FocusRouter::new();
         router.set_focus(Some(PanelId::new()));
         router.route(ctrl('a'));
-        // 'z' is not a caucus command — consumed, nothing forwarded.
+        // 'k' is not a caucus command — consumed, nothing forwarded.
         assert!(matches!(
-            router.route(key(KeyCode::Char('z'))),
+            router.route(key(KeyCode::Char('k'))),
             InputAction::Ignore
         ));
         assert!(!router.prefix_armed());

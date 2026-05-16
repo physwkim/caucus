@@ -241,10 +241,7 @@ mod tests {
 
     #[test]
     fn over_limit_turns_spill_to_disk_log() {
-        let dir = std::env::temp_dir().join(format!(
-            "caucus-capture-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("caucus-capture-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let log = dir.join("panels").join("panel-1.log");
 
@@ -270,10 +267,8 @@ mod tests {
 
     #[test]
     fn spill_appends_across_calls() {
-        let dir = std::env::temp_dir().join(format!(
-            "caucus-capture-append-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("caucus-capture-append-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let log = dir.join("p.log");
 

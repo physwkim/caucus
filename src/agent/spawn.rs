@@ -43,6 +43,12 @@ pub struct SpawnRequest {
     /// instance loads the caucus MCP server; `None` for every other panel.
     /// Honoured only by the `claude` backend (`--mcp-config`).
     pub mcp_config_path: Option<PathBuf>,
+    /// Claude Code conversation id to resume (`claude --resume <id>`). Set on
+    /// the resume launch path so a relaunched agent continues its prior
+    /// conversation. Honoured only by the `claude` backend — codex/gemini have
+    /// no standard resume flag, so for those it is ignored and the agent
+    /// spawns fresh.
+    pub resume_session_id: Option<String>,
 }
 
 impl Default for SpawnRequest {
@@ -65,6 +71,7 @@ impl Default for SpawnRequest {
             sock_path: None,
             skip_permissions: false,
             mcp_config_path: None,
+            resume_session_id: None,
         }
     }
 }
@@ -115,7 +122,10 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
             model.as_deref(),
             request.skip_permissions,
             request.mcp_config_path.as_deref(),
+            request.resume_session_id.as_deref(),
         ),
+        // codex/gemini have no standard resume flag — `resume_session_id` is
+        // intentionally ignored for them and the agent spawns fresh.
         AgentCli::Codex => codex_args(&request.role, model.as_deref(), request.skip_permissions),
         AgentCli::Gemini => gemini_args(&request.role, model.as_deref(), request.skip_permissions),
     };
@@ -139,15 +149,21 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
 }
 
 /// `claude` argv: `--model`, `--permission-mode`, `--allowedTools`, optionally
-/// `--dangerously-skip-permissions`, and `--mcp-config <path>` for the main
-/// worker panel (so its claude loads the caucus MCP server).
+/// `--dangerously-skip-permissions`, `--mcp-config <path>` for the main
+/// worker panel (so its claude loads the caucus MCP server), and
+/// `--resume <id>` on the resume launch path.
 fn claude_args(
     role: &RoleSpec,
     model: Option<&str>,
     skip_permissions: bool,
     mcp_config: Option<&std::path::Path>,
+    resume_session_id: Option<&str>,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
+    if let Some(id) = resume_session_id {
+        args.push("--resume".into());
+        args.push(id.into());
+    }
     if let Some(m) = model {
         args.push("--model".into());
         args.push(m.into());
@@ -295,7 +311,10 @@ mod tests {
         let args = args_of(&cmd);
         assert!(args.windows(2).any(|w| w == ["--model", "opus"]));
         assert!(args.windows(2).any(|w| w == ["--permission-mode", "plan"]));
-        assert!(args.windows(2).any(|w| w == ["--allowedTools", "Read,Grep"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--allowedTools", "Read,Grep"])
+        );
         assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
@@ -308,9 +327,7 @@ mod tests {
             ..SpawnRequest::default()
         };
         let cmd = build_command(&req, PanelId::new());
-        assert!(
-            args_of(&cmd).contains(&"--dangerously-skip-permissions".to_string())
-        );
+        assert!(args_of(&cmd).contains(&"--dangerously-skip-permissions".to_string()));
     }
 
     #[test]
@@ -327,7 +344,10 @@ mod tests {
         let cmd = build_command(&req, PanelId::new());
         assert_eq!(cmd.program, OsString::from("codex"));
         let args = args_of(&cmd);
-        assert!(args.windows(2).any(|w| w == ["--sandbox", "workspace-write"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--sandbox", "workspace-write"])
+        );
         // No claude model id leaks into a codex invocation.
         assert!(!args.contains(&"--model".to_string()));
     }
@@ -395,6 +415,57 @@ mod tests {
     }
 
     #[test]
+    fn claude_argv_includes_resume_when_set() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "reviewer-r1".into(),
+            resume_session_id: Some("conv-9f3a".into()),
+            ..SpawnRequest::default()
+        };
+        let cmd = build_command(&req, PanelId::new());
+        let args = args_of(&cmd);
+        assert!(
+            args.windows(2).any(|w| w == ["--resume", "conv-9f3a"]),
+            "claude argv must carry --resume <id>: {args:?}"
+        );
+    }
+
+    #[test]
+    fn claude_argv_omits_resume_by_default() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "reviewer-r1".into(),
+            ..SpawnRequest::default()
+        };
+        let cmd = build_command(&req, PanelId::new());
+        assert!(!args_of(&cmd).contains(&"--resume".to_string()));
+    }
+
+    /// codex/gemini have no standard resume flag — a set `resume_session_id`
+    /// must be ignored, not leaked onto their argv.
+    #[test]
+    fn codex_and_gemini_ignore_resume_session_id() {
+        for cli in [AgentCli::Codex, AgentCli::Gemini] {
+            let mut r = role();
+            r.agent_cli = cli;
+            r.model = None;
+            let req = SpawnRequest {
+                role: r,
+                agent_name: "x".into(),
+                resume_session_id: Some("conv-xyz".into()),
+                ..SpawnRequest::default()
+            };
+            let cmd = build_command(&req, PanelId::new());
+            let args = args_of(&cmd);
+            assert!(
+                !args.contains(&"--resume".to_string()),
+                "{cli:?} must ignore resume_session_id: {args:?}"
+            );
+            assert!(!args.contains(&"conv-xyz".to_string()));
+        }
+    }
+
+    #[test]
     fn caucus_env_is_injected() {
         let sock = PathBuf::from("/tmp/caucus.sock");
         let req = SpawnRequest {
@@ -442,7 +513,11 @@ mod tests {
         let outcome = spawn(&req).unwrap();
         assert_eq!(outcome.panel_id, outcome.manifest.panel_id);
         assert_eq!(
-            outcome.command.env.get("CAUCUS_PANEL_ID").map(String::as_str),
+            outcome
+                .command
+                .env
+                .get("CAUCUS_PANEL_ID")
+                .map(String::as_str),
             Some(outcome.panel_id.to_string().as_str())
         );
     }

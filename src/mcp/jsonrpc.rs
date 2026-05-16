@@ -220,7 +220,11 @@ pub async fn serve_stdio<H: ToolHandler>(mut dispatch: McpDispatch<H>) -> anyhow
             Ok(req) => dispatch.handle(req),
             Err(err) => {
                 // Parse error: reply with a JSON-RPC parse error (null id).
-                Some(Response::err(Value::Null, -32700, format!("parse error: {err}")))
+                Some(Response::err(
+                    Value::Null,
+                    -32700,
+                    format!("parse error: {err}"),
+                ))
             }
         };
         if let Some(response) = response {

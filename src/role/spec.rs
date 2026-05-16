@@ -97,6 +97,9 @@ mod tests {
 
     #[test]
     fn agent_cli_serde_is_lowercase() {
-        assert_eq!(serde_json::to_string(&AgentCli::Gemini).unwrap(), "\"gemini\"");
+        assert_eq!(
+            serde_json::to_string(&AgentCli::Gemini).unwrap(),
+            "\"gemini\""
+        );
     }
 }

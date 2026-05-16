@@ -61,6 +61,26 @@ impl Session {
         }
     }
 
+    /// Rebuild a session from a persisted [`super::record::SessionRecord`] —
+    /// the `caucus resume` path. Reuses the original id, topic, repo, and
+    /// `created_at` so the session root (`.caucus/sessions/<id>/`) and its
+    /// `session.json` continue in place; the session is `Active` again.
+    pub fn from_record(record: &super::record::SessionRecord) -> Self {
+        let root_dir = record
+            .repo_path
+            .join(".caucus")
+            .join("sessions")
+            .join(record.id.to_string());
+        Self {
+            id: record.id,
+            topic: record.topic.clone(),
+            state: SessionState::Active,
+            repo_path: record.repo_path.clone(),
+            root_dir,
+            created_at: record.created_at,
+        }
+    }
+
     /// Current state. Read-only accessor; mutation goes through [`transition`].
     pub fn state(&self) -> SessionState {
         self.state
@@ -79,10 +99,7 @@ pub struct IllegalTransition {
 ///
 /// The only legal transition is `Active -> Closed`. `Closed -> *` and the
 /// no-op `Active -> Active` are rejected.
-pub(crate) fn transition(
-    session: &mut Session,
-    to: SessionState,
-) -> Result<(), IllegalTransition> {
+pub(crate) fn transition(session: &mut Session, to: SessionState) -> Result<(), IllegalTransition> {
     let from = session.state;
     match (from, to) {
         (SessionState::Active, SessionState::Closed) => {

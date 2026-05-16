@@ -39,7 +39,11 @@ fn area() -> Rect {
 fn mcp_serve_lists_the_tools_over_stdio() {
     let bin = env!("CARGO_BIN_EXE_caucus");
     let mut child = Command::new(bin)
-        .args(["mcp-serve", "--control-sock", "/tmp/caucus-test-unused.sock"])
+        .args([
+            "mcp-serve",
+            "--control-sock",
+            "/tmp/caucus-test-unused.sock",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -51,9 +55,7 @@ fn mcp_serve_lists_the_tools_over_stdio() {
 
     // initialize
     stdin
-        .write_all(
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
-        )
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
         .unwrap();
     let mut init_line = String::new();
     stdout.read_line(&mut init_line).unwrap();
@@ -78,6 +80,7 @@ fn mcp_serve_lists_the_tools_over_stdio() {
         names,
         vec![
             "send_keys",
+            "broadcast",
             "ctrl_c",
             "read_panel",
             "spawn_role",

@@ -26,7 +26,7 @@ use crate::mcp::control_server::{ControlJob, ControlServer};
 use crate::mcp::protocol::{ControlRequest, ControlResponse};
 use crate::mcp::{McpError, McpToolSurface, PanelSummary, ReadPanelMode};
 use crate::panel::lifecycle::{self, Panel, PanelState};
-use crate::render::{Layout, Rect};
+use crate::render::{Layout, LayoutMode, Rect};
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
 use crate::session::state::Session;
@@ -60,6 +60,19 @@ struct PendingWait {
     reply: oneshot::Sender<ControlResponse>,
 }
 
+/// Arguments to the shared [`Multiplexer::spawn_panel_inner`] path. Bundling
+/// them keeps the function arity sane as the spawn surface grows (worktree
+/// branch + resume id for `caucus resume`).
+struct SpawnPanelOpts<'a> {
+    role: &'a str,
+    agent_cli: Option<AgentCli>,
+    model: Option<String>,
+    worktree_path: Option<PathBuf>,
+    worktree_branch: Option<String>,
+    mcp_config_path: Option<PathBuf>,
+    resume_session_id: Option<String>,
+}
+
 /// The live multiplexer: one [`Session`] plus every panel running in it.
 pub struct Multiplexer {
     /// The session this multiplexer drives.
@@ -91,6 +104,21 @@ pub struct Multiplexer {
     /// `wait_for_panels` requests awaiting a deferred reply
     /// ([`Multiplexer::poll_pending_waits`]).
     pending_waits: Vec<PendingWait>,
+    /// Panel arrangement mode for [`Layout::reflow`] — cycled by `Ctrl-A Space`.
+    layout_mode: LayoutMode,
+    /// When `Some` and the id is still live, the layout shows only that panel
+    /// full-screen (`Ctrl-A z`). Hidden panels keep running — `pump_all`
+    /// always pumps every panel; only the layout is restricted.
+    zoom: Option<PanelId>,
+    /// When set, the read-only transcript overlay is drawn on top of the
+    /// panels (`Ctrl-A t`). Draw-time only — panels keep pumping and input
+    /// keeps routing as normal.
+    show_transcript: bool,
+    /// Git branch of each worktree-backed panel, keyed by panel id. The
+    /// manifest stores only the worktree *path* (which is removed on
+    /// shutdown); the branch persists and is what `caucus resume` re-attaches
+    /// a worktree on. Populated at spawn, dropped on kill.
+    worktree_branches: HashMap<PanelId, String>,
 }
 
 impl Multiplexer {
@@ -137,6 +165,10 @@ impl Multiplexer {
                 quit: false,
                 role_counts: HashMap::new(),
                 pending_waits: Vec::new(),
+                layout_mode: LayoutMode::default(),
+                zoom: None,
+                show_transcript: false,
+                worktree_branches: HashMap::new(),
             },
             signal_server,
             control_server,
@@ -182,9 +214,22 @@ impl Multiplexer {
 
     /// Recompute the layout for the current panels and resize each panel's
     /// PTY/grid to its new slot (`docs/design.md` §0 #10).
+    ///
+    /// When [`Multiplexer::zoom`] names a still-live panel the layout is a
+    /// single full-area slot for that panel; otherwise the panels tile per
+    /// the current [`LayoutMode`]. Hidden (un-tiled) panels keep their last
+    /// PTY size — they are resized again the moment they reappear in a slot.
     fn reflow(&mut self) {
         let ids: Vec<PanelId> = self.panels.iter().map(|p| p.id).collect();
-        self.layout = Layout::reflow(&ids, self.area);
+        let zoomed = self
+            .zoom
+            .filter(|id| self.panels.iter().any(|p| p.id == *id));
+        self.layout = match zoomed {
+            Some(id) => Layout {
+                slots: vec![(id, self.area)],
+            },
+            None => Layout::reflow(&ids, self.area, self.layout_mode),
+        };
         for panel in &mut self.panels {
             if let Some(rect) = self.layout.rect_of(panel.id) {
                 if let Err(err) = panel.resize(rect) {
@@ -207,7 +252,17 @@ impl Multiplexer {
         model: Option<String>,
         worktree_path: Option<PathBuf>,
     ) -> Result<PanelId> {
-        self.spawn_panel_inner(role, agent_cli, model, worktree_path, None)
+        let id = self.spawn_panel_inner(SpawnPanelOpts {
+            role,
+            agent_cli,
+            model,
+            worktree_path,
+            worktree_branch: None,
+            mcp_config_path: None,
+            resume_session_id: None,
+        })?;
+        self.persist_record();
+        Ok(id)
     }
 
     /// Spawn the main worker panel (`docs/design.md` §0 #4, #10).
@@ -218,27 +273,119 @@ impl Multiplexer {
     /// through the six caucus MCP tools. `caucus_bin` is the absolute path of
     /// the running `caucus` binary so the `mcp-serve` child is the exact same
     /// build.
-    pub fn spawn_main_panel(&mut self, role: &str, caucus_bin: &std::path::Path) -> Result<PanelId> {
+    pub fn spawn_main_panel(
+        &mut self,
+        role: &str,
+        caucus_bin: &std::path::Path,
+    ) -> Result<PanelId> {
+        let id = self.spawn_main_panel_resume(role, caucus_bin, None)?;
+        self.persist_record();
+        Ok(id)
+    }
+
+    /// Spawn the main worker panel, optionally resuming its prior Claude
+    /// conversation via `resume_session_id` (`caucus resume`). The record is
+    /// *not* persisted here — the resume path persists once, after the whole
+    /// roster is rebuilt.
+    pub fn spawn_main_panel_resume(
+        &mut self,
+        role: &str,
+        caucus_bin: &std::path::Path,
+        resume_session_id: Option<String>,
+    ) -> Result<PanelId> {
         let mcp_config = crate::mcp::serve::write_mcp_config(
             &self.session.root_dir,
             caucus_bin,
             &self.control_sock_path,
         )
         .context("write main worker panel .mcp.json")?;
-        self.spawn_panel_inner(role, None, None, None, Some(mcp_config))
+        self.spawn_panel_inner(SpawnPanelOpts {
+            role,
+            agent_cli: None,
+            model: None,
+            worktree_path: None,
+            worktree_branch: None,
+            mcp_config_path: Some(mcp_config),
+            resume_session_id,
+        })
     }
 
-    /// Shared spawn path for [`Multiplexer::spawn_panel`] and
-    /// [`Multiplexer::spawn_main_panel`]; `mcp_config_path` is set only for the
-    /// main worker panel.
-    fn spawn_panel_inner(
+    /// Spawn a panel restoring a prior agent — used by `caucus resume`. The
+    /// record is *not* persisted here; the resume path persists once after the
+    /// full roster is rebuilt.
+    pub fn spawn_panel_resume(
         &mut self,
         role: &str,
         agent_cli: Option<AgentCli>,
         model: Option<String>,
         worktree_path: Option<PathBuf>,
-        mcp_config_path: Option<PathBuf>,
+        worktree_branch: Option<String>,
+        resume_session_id: Option<String>,
     ) -> Result<PanelId> {
+        self.spawn_panel_inner(SpawnPanelOpts {
+            role,
+            agent_cli,
+            model,
+            worktree_path,
+            worktree_branch,
+            mcp_config_path: None,
+            resume_session_id,
+        })
+    }
+
+    /// Persist the session roster to `<session_root>/session.json`. Called
+    /// after every roster change so a relaunch can resume from the latest
+    /// state. A write failure is logged, not fatal — a stale record is better
+    /// than aborting the session.
+    pub fn persist_record(&self) {
+        let record = self.build_record();
+        if let Err(err) = record.write(&self.session.root_dir) {
+            warn!(error = %err, "session record write failed");
+        }
+    }
+
+    /// Build a [`SessionRecord`] from the live panels + manifests.
+    fn build_record(&self) -> crate::session::record::SessionRecord {
+        use crate::session::record::{PanelRecord, SessionRecord};
+        let panels = self
+            .panels
+            .iter()
+            .enumerate()
+            .map(|(idx, panel)| {
+                let manifest = self.manifests.get(&panel.id);
+                PanelRecord {
+                    role: panel.role.clone(),
+                    agent_cli: manifest.map(|m| m.agent_cli).unwrap_or(AgentCli::Claude),
+                    model: manifest.and_then(|m| m.model.clone()),
+                    order_index: idx,
+                    worktree_branch: self.worktree_branches.get(&panel.id).cloned(),
+                    claude_session_id: manifest
+                        .and_then(|m| m.claude_session_id().map(str::to_string)),
+                }
+            })
+            .collect();
+        SessionRecord {
+            id: self.session.id,
+            topic: self.session.topic.clone(),
+            repo_path: self.session.repo_path.clone(),
+            created_at: self.session.created_at,
+            layout_mode: self.layout_mode,
+            panels,
+        }
+    }
+
+    /// Shared spawn path. `mcp_config_path` is set only for the main worker
+    /// panel; `worktree_branch` / `resume_session_id` only on the resume path.
+    fn spawn_panel_inner(&mut self, opts: SpawnPanelOpts<'_>) -> Result<PanelId> {
+        let SpawnPanelOpts {
+            role,
+            agent_cli,
+            model,
+            worktree_path,
+            worktree_branch,
+            mcp_config_path,
+            resume_session_id,
+        } = opts;
         let spec = self
             .config
             .roles
@@ -262,6 +409,7 @@ impl Multiplexer {
             // role allowlist remains the real boundary (`SpawnRequest` doc).
             skip_permissions: true,
             mcp_config_path,
+            resume_session_id,
         };
 
         // Provisional layout: compute the slot the new panel will occupy so
@@ -270,17 +418,11 @@ impl Multiplexer {
         let outcome = crate::agent::spawn::spawn(&request)
             .map_err(|e| anyhow::anyhow!("agent spawn: {e}"))?;
         ids.push(outcome.panel_id);
-        let provisional = Layout::reflow(&ids, self.area);
-        let rect = provisional
-            .rect_of(outcome.panel_id)
-            .unwrap_or(self.area);
+        let provisional = Layout::reflow(&ids, self.area, self.layout_mode);
+        let rect = provisional.rect_of(outcome.panel_id).unwrap_or(self.area);
 
-        let mut panel = lifecycle::spawn(
-            &request,
-            outcome.panel_id,
-            outcome.manifest.agent_id,
-            rect,
-        )?;
+        let mut panel =
+            lifecycle::spawn(&request, outcome.panel_id, outcome.manifest.agent_id, rect)?;
         let panel_id = panel.id;
         // Turn-segmented capture spills to `<session>/panels/<panel>.log`
         // (`docs/design.md` §8.5).
@@ -298,6 +440,12 @@ impl Multiplexer {
             warn!(panel = %panel_id, error = %err, "manifest write failed");
         }
         self.manifests.insert(panel_id, mf);
+
+        // Remember the worktree branch — the branch persists across shutdown
+        // and is what `caucus resume` re-attaches a worktree on.
+        if let Some(branch) = worktree_branch {
+            self.worktree_branches.insert(panel_id, branch);
+        }
 
         self.panels.push(panel);
         if self.focus.focused().is_none() {
@@ -331,6 +479,13 @@ impl Multiplexer {
             }
         }
         self.manifests.remove(&panel_id);
+        self.worktree_branches.remove(&panel_id);
+
+        // Killing the zoomed panel clears the zoom — the layout falls back to
+        // the tiled arrangement rather than zooming a now-dead id.
+        if self.zoom == Some(panel_id) {
+            self.zoom = None;
+        }
 
         // Refocus: keep focus valid after removal.
         if self.focus.focused() == Some(panel_id) {
@@ -338,6 +493,7 @@ impl Multiplexer {
             self.focus.set_focus(next.map(|p| p.id));
         }
         self.reflow();
+        self.persist_record();
         Ok(())
     }
 
@@ -409,13 +565,93 @@ impl Multiplexer {
         self.focus.prefix_armed()
     }
 
-    /// Apply a caucus-level command (focus switch / quit).
+    /// Apply a caucus-level command (focus switch / quit / layout control).
     fn apply_command(&mut self, cmd: CaucusCommand) {
         match cmd {
             CaucusCommand::Quit => self.quit = true,
             CaucusCommand::FocusNext => self.cycle_focus(1),
             CaucusCommand::FocusPrev => self.cycle_focus(-1),
+            CaucusCommand::ToggleZoom => self.toggle_zoom(),
+            CaucusCommand::MovePanelEarlier => self.move_panel(-1),
+            CaucusCommand::MovePanelLater => self.move_panel(1),
+            CaucusCommand::CycleLayout => {
+                self.layout_mode = self.layout_mode.next();
+                self.reflow();
+                // The record carries `layout_mode` and the panel order.
+                self.persist_record();
+            }
+            CaucusCommand::ToggleTranscript => {
+                self.show_transcript = !self.show_transcript;
+                self.focus.set_transcript_open(self.show_transcript);
+            }
+            CaucusCommand::HideTranscript => {
+                self.show_transcript = false;
+                self.focus.set_transcript_open(false);
+            }
         }
+    }
+
+    /// Whether the read-only transcript overlay is currently shown.
+    pub fn show_transcript(&self) -> bool {
+        self.show_transcript
+    }
+
+    /// Per-panel manifests, keyed by panel id — read-only, for the overlay.
+    pub fn manifests(&self) -> &HashMap<PanelId, AgentManifest> {
+        &self.manifests
+    }
+
+    /// Toggle full-screen zoom on the focused panel. A second toggle (or a
+    /// toggle while a different panel is zoomed) restores the tiled layout
+    /// or moves the zoom; with no focused panel it is a no-op.
+    fn toggle_zoom(&mut self) {
+        let Some(focused) = self.focus.focused() else {
+            return;
+        };
+        self.zoom = if self.zoom == Some(focused) {
+            None
+        } else {
+            Some(focused)
+        };
+        self.reflow();
+    }
+
+    /// Move the focused panel one step (`delta` = -1 earlier, +1 later) in the
+    /// panel order — which is also the tile order and the focus-cycle order.
+    /// A no-op when there is no focused panel or it is already at the end.
+    fn move_panel(&mut self, delta: isize) {
+        let Some(focused) = self.focus.focused() else {
+            return;
+        };
+        let Some(idx) = self.panels.iter().position(|p| p.id == focused) else {
+            return;
+        };
+        let target = idx as isize + delta;
+        if target < 0 || target as usize >= self.panels.len() {
+            return;
+        }
+        self.panels.swap(idx, target as usize);
+        self.reflow();
+        // `order_index` in the record changed.
+        self.persist_record();
+    }
+
+    /// The current panel arrangement mode (for the status bar).
+    pub fn layout_mode(&self) -> LayoutMode {
+        self.layout_mode
+    }
+
+    /// Set the panel arrangement mode and reflow — used by `caucus resume` to
+    /// restore the persisted layout. Does not persist the record itself; the
+    /// resume path persists once after the whole roster is rebuilt.
+    pub fn set_layout_mode(&mut self, mode: LayoutMode) {
+        self.layout_mode = mode;
+        self.reflow();
+    }
+
+    /// The zoomed panel id, if a panel is currently zoomed.
+    pub fn zoomed(&self) -> Option<PanelId> {
+        self.zoom
     }
 
     /// Move focus by `delta` panels, wrapping around.
@@ -451,12 +687,20 @@ impl Multiplexer {
         }
 
         // Append the TurnCompleted lane event + recompute derived_state.
+        // A turn signal can carry Claude's conversation id for the first time;
+        // re-persist the session record so a relaunch can `--resume` it.
+        let mut session_id_changed = false;
         if let Some(manifest) = self.manifests.get_mut(&signal.panel_id) {
+            let before = manifest.claude_session_id().map(str::to_string);
             if let Err(err) =
                 manifest::record_turn_completed(manifest, &self.session.root_dir, &signal)
             {
                 warn!(panel = %signal.panel_id, error = %err, "manifest turn-signal write failed");
             }
+            session_id_changed = manifest.claude_session_id().map(str::to_string) != before;
+        }
+        if session_id_changed {
+            self.persist_record();
         }
     }
 
@@ -489,6 +733,11 @@ impl Multiplexer {
                     Err(err) => ControlResponse::error(err),
                 }
             }
+            ControlRequest::Broadcast {
+                panels,
+                text,
+                enter,
+            } => self.broadcast(&panels, &text, enter),
             ControlRequest::CtrlC { panel } => match self.ctrl_c(panel) {
                 Ok(()) => ControlResponse::Ok,
                 Err(err) => ControlResponse::error(err),
@@ -559,12 +808,12 @@ impl Multiplexer {
     /// `Spawning`. A panel id that does not exist counts as settled (there is
     /// nothing left to wait for — it was killed or never spawned).
     fn wait_panels_settled(&self, panels: &[PanelId]) -> bool {
-        panels.iter().all(|id| {
-            match self.panels.iter().find(|p| p.id == *id) {
+        panels
+            .iter()
+            .all(|id| match self.panels.iter().find(|p| p.id == *id) {
                 Some(p) => !matches!(p.state(), PanelState::Working | PanelState::Spawning),
                 None => true,
-            }
-        })
+            })
     }
 
     /// Build the deferred reply for a satisfied/timed-out `wait_for_panels`:
@@ -572,12 +821,44 @@ impl Multiplexer {
     /// exists is omitted (it is gone — `list_panels` would not show it
     /// either); the main worker should treat a missing id as fully done.
     fn wait_response(&self, panels: &[PanelId]) -> ControlResponse {
+        ControlResponse::Panels {
+            panels: self.wait_response_summaries(panels),
+        }
+    }
+
+    /// Type the same `text` into every panel in `panels` — a round's fan-out
+    /// (`docs/design.md` §4). Each panel is driven exactly as the MCP
+    /// `send_keys` tool would drive it: the text is written, a `\r` appended
+    /// when `enter`, and on `enter` [`Multiplexer::note_prompt_delivered`]
+    /// opens a capture turn and flips the panel to `Working`.
+    ///
+    /// A panel id that does not exist (or whose write fails) is reported, not
+    /// fatal — the remaining panels still receive the text. The reply is
+    /// always [`ControlResponse::Panels`]: the post-broadcast [`PanelSummary`]
+    /// of each targeted id that exists, the same shape `list_panels` /
+    /// `wait_for_panels` return. A bad id is visible by its absence from that
+    /// list, so the main worker can tell which panels a typo missed while the
+    /// good ones still ran.
+    fn broadcast(&mut self, panels: &[PanelId], text: &str, enter: bool) -> ControlResponse {
+        for &panel in panels {
+            // Per-panel failures (no such panel, write error) are non-fatal:
+            // the other panels in the round still get the text.
+            let _ = self.send_keys(panel, text, enter);
+        }
+        ControlResponse::Panels {
+            panels: self.wait_response_summaries(panels),
+        }
+    }
+
+    /// The [`PanelSummary`] for each id in `panels` that still exists, in the
+    /// caller's order — missing ids are omitted (they were killed or the id
+    /// was bad).
+    fn wait_response_summaries(&self, panels: &[PanelId]) -> Vec<PanelSummary> {
         let all = self.list_panels();
-        let summaries = panels
+        panels
             .iter()
             .filter_map(|id| all.iter().find(|s| s.panel_id == *id).cloned())
-            .collect();
-        ControlResponse::Panels { panels: summaries }
+            .collect()
     }
 
     /// Register a `wait_for_panels` request. If the panels are already all
@@ -684,6 +965,11 @@ impl Multiplexer {
     /// The `Active -> Closed` transition goes through `session::state::transition`
     /// (Invariant I-1, the single owner of session state).
     pub fn shutdown(&mut self) {
+        // Persist the final roster before tearing panels down — this is the
+        // record `caucus resume` reads. Worktree directories are removed
+        // below, but their branches persist, so the record stays resumable.
+        self.persist_record();
+
         // Kill every panel's PTY and collect its worktree. `kill_panel` is
         // avoided here: it enqueues worktree cleanup onto the async queue,
         // whose consumer task is aborted with the tokio runtime the instant
@@ -799,8 +1085,22 @@ impl McpToolSurface for Multiplexer {
             None
         };
         let worktree_path = wt_handle.as_ref().map(|h| h.path.clone());
-        match self.spawn_panel(role, agent_cli, model.map(str::to_string), worktree_path) {
-            Ok(id) => Ok(id),
+        let worktree_branch = wt_handle.as_ref().map(|h| h.branch.clone());
+        // `spawn_panel_resume` with no resume id is a plain spawn that also
+        // records the worktree branch (so `caucus resume` can re-attach it).
+        let spawned = self.spawn_panel_resume(
+            role,
+            agent_cli,
+            model.map(str::to_string),
+            worktree_path,
+            worktree_branch,
+            None,
+        );
+        match spawned {
+            Ok(id) => {
+                self.persist_record();
+                Ok(id)
+            }
             Err(e) => {
                 // The panel never came up — don't leak the worktree (dir +
                 // branch) `create_role_worktree` just created. Enqueue it for
@@ -935,6 +1235,37 @@ mod tests {
         mux
     }
 
+    /// The multiplexer writes `session.json` on `shutdown`, and the record
+    /// round-trips back through `SessionRecord::read`.
+    #[tokio::test]
+    async fn shutdown_persists_a_session_record() {
+        use crate::session::record::SessionRecord;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let root = mux.session.root_dir.clone();
+        let id = mux.session.id;
+
+        mux.shutdown();
+
+        let record = SessionRecord::read(&root).expect("session.json written on shutdown");
+        assert_eq!(record.id, id);
+        assert_eq!(record.layout_mode, LayoutMode::Tiled);
+        assert!(record.panels.is_empty(), "no panels were spawned");
+    }
+
+    /// A layout-mode change persists the new mode into `session.json`.
+    #[tokio::test]
+    async fn cycle_layout_persists_the_record() {
+        use crate::session::record::SessionRecord;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let root = mux.session.root_dir.clone();
+
+        mux.apply_command(CaucusCommand::CycleLayout);
+        let record = SessionRecord::read(&root).expect("session.json written");
+        assert_eq!(record.layout_mode, LayoutMode::EvenHorizontal);
+    }
+
     #[tokio::test]
     async fn new_creates_session_dirs_and_socket() {
         let tmp = TempDir::new().unwrap();
@@ -1014,6 +1345,150 @@ mod tests {
         assert!(mux.should_quit());
     }
 
+    /// `CycleLayout` advances the arrangement mode through the full cycle and
+    /// wraps back to `Tiled`.
+    #[tokio::test]
+    async fn cycle_layout_advances_the_mode() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        assert_eq!(mux.layout_mode(), LayoutMode::Tiled);
+        mux.apply_command(CaucusCommand::CycleLayout);
+        assert_eq!(mux.layout_mode(), LayoutMode::EvenHorizontal);
+        mux.apply_command(CaucusCommand::CycleLayout);
+        assert_eq!(mux.layout_mode(), LayoutMode::EvenVertical);
+        mux.apply_command(CaucusCommand::CycleLayout);
+        assert_eq!(mux.layout_mode(), LayoutMode::MainVertical);
+        mux.apply_command(CaucusCommand::CycleLayout);
+        assert_eq!(mux.layout_mode(), LayoutMode::Tiled);
+    }
+
+    /// `ToggleTranscript` flips `show_transcript`; `HideTranscript` always
+    /// clears it.
+    #[tokio::test]
+    async fn toggle_transcript_flips_show_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        assert!(!mux.show_transcript());
+
+        mux.apply_command(CaucusCommand::ToggleTranscript);
+        assert!(mux.show_transcript());
+
+        mux.apply_command(CaucusCommand::ToggleTranscript);
+        assert!(!mux.show_transcript());
+
+        // Open it, then hide it explicitly.
+        mux.apply_command(CaucusCommand::ToggleTranscript);
+        assert!(mux.show_transcript());
+        mux.apply_command(CaucusCommand::HideTranscript);
+        assert!(!mux.show_transcript());
+    }
+
+    /// `ToggleZoom` with no focused panel is a no-op (no panic).
+    #[tokio::test]
+    async fn toggle_zoom_with_no_panels_is_a_noop() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        mux.apply_command(CaucusCommand::ToggleZoom);
+        assert!(mux.zoomed().is_none());
+    }
+
+    /// The zoom layout is a single full-area slot for the zoomed panel; a
+    /// second toggle restores the tiled layout.
+    #[tokio::test]
+    async fn zoom_yields_one_full_area_slot() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        // Three synthetic panel ids in `panels` would need real panels; the
+        // zoom layout is computed in `reflow` from `self.zoom` + `self.area`,
+        // so drive it directly with a known id.
+        let id = PanelId::new();
+        mux.zoom = Some(id);
+        // `id` is not a live panel — zoom is filtered to live ids only, so
+        // the layout falls back to the (empty) tiled reflow.
+        mux.reflow();
+        assert!(mux.layout().slots.is_empty());
+
+        // With a live zoomed panel the layout is exactly one full-area slot.
+        let Ok(panel) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.focus.set_focus(Some(panel));
+        mux.apply_command(CaucusCommand::ToggleZoom);
+        assert_eq!(mux.zoomed(), Some(panel));
+        assert_eq!(mux.layout().slots.len(), 1);
+        assert_eq!(mux.layout().slots[0], (panel, area()));
+
+        // Toggling again restores the tiled layout.
+        mux.apply_command(CaucusCommand::ToggleZoom);
+        assert!(mux.zoomed().is_none());
+
+        mux.shutdown();
+    }
+
+    /// `MovePanelEarlier`/`MovePanelLater` swap adjacent entries in the panel
+    /// order; moving past either end is a no-op.
+    #[tokio::test]
+    async fn move_panel_swaps_order() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Ok(a) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        let Ok(b) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        let order = |m: &Multiplexer| m.panels().iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(order(&mux), vec![a, b]);
+
+        // Focus `a` (index 0) and move it later — order becomes [b, a].
+        mux.focus.set_focus(Some(a));
+        mux.apply_command(CaucusCommand::MovePanelLater);
+        assert_eq!(order(&mux), vec![b, a]);
+
+        // `a` is now last — moving later again is a no-op.
+        mux.apply_command(CaucusCommand::MovePanelLater);
+        assert_eq!(order(&mux), vec![b, a]);
+
+        // Move `a` back earlier — order returns to [a, b].
+        mux.apply_command(CaucusCommand::MovePanelEarlier);
+        assert_eq!(order(&mux), vec![a, b]);
+
+        // `a` is first — moving earlier again is a no-op.
+        mux.apply_command(CaucusCommand::MovePanelEarlier);
+        assert_eq!(order(&mux), vec![a, b]);
+
+        mux.shutdown();
+    }
+
+    /// Killing the zoomed panel clears the zoom so the layout never points at
+    /// a dead id.
+    #[tokio::test]
+    async fn killing_the_zoomed_panel_clears_zoom() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Ok(panel) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.focus.set_focus(Some(panel));
+        mux.apply_command(CaucusCommand::ToggleZoom);
+        assert_eq!(mux.zoomed(), Some(panel));
+
+        Multiplexer::kill_panel(&mut mux, panel).unwrap();
+        assert!(
+            mux.zoomed().is_none(),
+            "zoom must clear when its panel dies"
+        );
+
+        mux.shutdown();
+    }
+
     /// A `wait_for_panels` whose ids do not exist is answered immediately —
     /// `register_wait` sends the reply now and stashes no `PendingWait`.
     #[tokio::test]
@@ -1054,7 +1529,10 @@ mod tests {
         assert!(reply_rx.try_recv().is_err());
 
         mux.poll_pending_waits();
-        assert!(mux.pending_waits.is_empty(), "timed-out wait must be dropped");
+        assert!(
+            mux.pending_waits.is_empty(),
+            "timed-out wait must be dropped"
+        );
         match reply_rx.try_recv() {
             Ok(ControlResponse::Panels { .. }) => {}
             other => panic!("expected a Panels reply after timeout, got {other:?}"),
@@ -1085,7 +1563,11 @@ mod tests {
 
         let (reply_tx, mut reply_rx) = oneshot::channel();
         mux.register_wait(vec![panel], Some(600), reply_tx);
-        assert_eq!(mux.pending_waits.len(), 1, "wait must be stashed, not answered");
+        assert_eq!(
+            mux.pending_waits.len(),
+            1,
+            "wait must be stashed, not answered"
+        );
 
         // A poll while the panel is still working leaves the wait pending.
         mux.poll_pending_waits();
@@ -1115,6 +1597,56 @@ mod tests {
                 assert_eq!(panels[0].panel_id, panel);
             }
             other => panic!("expected a Panels reply, got {other:?}"),
+        }
+
+        mux.shutdown();
+    }
+
+    /// `execute_control(Broadcast{..})` fans the same text into every panel:
+    /// each real panel that exists is flipped to `Working` (with `enter`) and
+    /// appears in the `Panels` reply; a non-existent id is non-fatal and is
+    /// simply absent from the reply.
+    ///
+    /// Spawning a panel needs a real agent CLI; the test is skipped (not
+    /// failed) when none is on PATH, matching `tests/mcp_integration.rs`.
+    #[tokio::test]
+    async fn broadcast_control_request_fans_text_into_every_panel() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Ok(a) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        let b = mux.spawn_panel("reviewer", None, None, None).unwrap();
+        let ghost = PanelId::new();
+
+        let resp = mux.execute_control(ControlRequest::Broadcast {
+            // The ghost is interleaved between the two real ids — it must not
+            // stop `b` from receiving the text.
+            panels: vec![a, ghost, b],
+            text: "the agenda".into(),
+            enter: true,
+        });
+
+        match resp {
+            ControlResponse::Panels { panels } => {
+                // Only the two real panels come back; the ghost is omitted.
+                assert_eq!(panels.len(), 2, "ghost id must be reported by absence");
+                let ids: Vec<PanelId> = panels.iter().map(|s| s.panel_id).collect();
+                assert!(ids.contains(&a) && ids.contains(&b));
+                assert!(!ids.contains(&ghost));
+            }
+            other => panic!("expected Panels, got {other:?}"),
+        }
+
+        // `enter=true` opened a capture turn and flipped each real panel to
+        // `Working`; the ghost did nothing.
+        for id in [a, b] {
+            assert_eq!(
+                mux.panels().iter().find(|p| p.id == id).unwrap().state(),
+                PanelState::Working,
+            );
         }
 
         mux.shutdown();
@@ -1232,6 +1764,9 @@ mod tests {
         assert!(wt.is_dir(), "worktree directory created");
 
         mux.shutdown();
-        assert!(!wt.exists(), "shutdown must remove the worktree, not leak it");
+        assert!(
+            !wt.exists(),
+            "shutdown must remove the worktree, not leak it"
+        );
     }
 }

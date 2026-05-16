@@ -13,7 +13,7 @@
 | 1 | 이름: `caucus`. 경로: `~/codes/caucus`. |
 | 2 | 실행 모델 = **caucus 자체 멀티플렉서**. 장기 실행 풀스크린 TUI 프로세스. agent는 caucus가 관리하는 **패널별 PTY**에서 도는 `claude` / `codex` CLI 프로세스. tmux / zellij 의존 없음 — 둘은 분석 레퍼런스(kodex 적재)일 뿐. |
 | 3 | VT 레이어 = **공개 크레이트** (경로 B-i): `vte`(escape-sequence 파서) + `portable-pty`(PTY 관리) + `ratatui`(패널 레이아웃·렌더). caucus가 직접 짜는 것은 grid `vte::Perform` 구현(~2-4k LOC) 하나뿐이며 zellij `zellij-server/src/panes/grid.rs`를 라인 단위 레퍼런스로 쓴다. zellij 크레이트 통째 vendor는 기각 — grid가 `output`/`tab`/`ui`/`route`/`screen`/`thread_bus` + `zellij-utils` ~140k LOC와 결합되어 깨끗한 추출 불가. |
-| 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버** 툴(`spawn_role` / `send_keys` / `ctrl_c` / `read_panel` / `kill_panel` / `list_panels`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. |
+| 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버**의 8개 툴(`send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `wait_for_panels`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. |
 | 5 | 턴 완료 신호 = Claude `Stop` hook이 **caucus 실행 프로세스의 소켓에 post**한다. 파일 sentinel(`*.sentinel.json`) + 폴링 watcher는 폐기. |
 | 6 | "라운드" 개념은 유지하되 **라이브화** — 파일 안건 broadcast + `response-*.md` 수집 대신, CEO가 패널에 라이브로 키를 입력하고 §5의 턴 완료 신호로 라운드 진행을 판정한다. |
 | 7 | Role 정의: `~/.caucus/roles.toml` (전역) + `<repo>/.caucus/roles.toml` (프로젝트 오버라이드, 우선). |
@@ -52,7 +52,7 @@
 │  │  pty/    portable-pty 래퍼 (패널별 PTY)    │               │
 │  │  term/   vte 기반 grid (Perform 구현)      │               │
 │  │  render/ ratatui 패널 레이아웃·드로잉      │               │
-│  │  input/  키 라우팅 (focus, Enter, Ctrl-C)  │               │
+│  │  input/  키 라우팅 (Ctrl-A 프리픽스 키맵)   │               │
 │  │  mcp/    main worker용 MCP 서버            │               │
 │  │  hook 소켓 ◄── 각 agent의 Claude Stop hook  │               │
 │  └─────────────────────────────────────────┘               │
@@ -87,7 +87,8 @@ sync). 사용자는 main worker 패널과 대화하고, main worker는 작업을
 | **Round** | main worker가 여러 패널에 같은 안건을 라이브로 던지고 각 패널의 turn signal로 완료를 판정하는 한 묶음. |
 | **Manifest** | 한 agent의 LaneEvent 타임라인 + derived_state + commit_provenance 영속화. |
 | **Lane** | 한 agent의 작업 흐름. claw-code 용어 차용. |
-| **MCP 서버** | caucus가 main worker에게 노출하는 제어 인터페이스(`send_keys` / `spawn_role` / `read_panel` …). |
+| **MCP 서버** | caucus가 main worker에게 노출하는 제어 인터페이스 — 8개 툴(`send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `wait_for_panels`). |
+| **Session record** | 한 세션의 패널 roster 영속 스냅샷(`.caucus/sessions/<id>/session.json`). `caucus resume`가 이를 읽어 패널을 재생성. |
 
 ---
 
@@ -121,6 +122,23 @@ worktree 실행은 패널의 한 속성(`worktree_path`)일 뿐 별도 상태가
 **불변식**: Session 상태 전이는 `session::state::transition()`, Panel 상태 전이는
 `panel::lifecycle::transition()` 단일 owner만 수행. 다른 모듈은 이벤트를 emit하고
 소비자가 transition을 호출한다.
+
+### 3.1 세션 영속화 & resume
+
+caucus 세션은 본래 휘발성이다 — caucus가 종료되면 agent 프로세스도 죽는다.
+agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순서로,
+어떤 CLI/model/worktree/대화-id로 떠 있었나)를 기술하는 단일 파일은 없었다.
+**Session record**가 그 파일이다 — `session::record::SessionRecord`.
+
+[`crate::session::Multiplexer`]는 패널 roster가 바뀔 때마다
+`.caucus/sessions/<session_id>/session.json`을 원자적으로 쓴다. 레코드에는
+세션 id·topic·repo 경로·생성 시각·레이아웃 모드, 그리고 패널별로 role·`agent_cli`·
+`model`·정렬 인덱스·worktree 브랜치·Claude 대화 id가 담긴다.
+
+`caucus resume <session_id>`는 그 레코드를 읽어 패널을 재생성한다 — worktree
+브랜치에 worktree를 다시 attach하고(`worktree::manager::attach`), Claude 대화는
+`claude --resume <id>`로 이어붙인다. `caucus sessions`는 `.caucus/sessions/*/`를
+스캔해 resume 가능한 레코드를 최신순으로 나열한다(§10).
 
 ---
 
@@ -480,21 +498,22 @@ caucus/
 └── src/
     ├── main.rs              (진입점: `caucus` = TUI 기동 / 비-TUI 서브커맨드 분기)
     ├── lib.rs               (라이브러리 노출, 테스트용)
-    ├── cli.rs               (init/doctor/signal/role 등 비-TUI 서브커맨드 dispatch)
+    ├── cli.rs               (init/doctor/signal/role/sessions/resume/mcp-serve 비-TUI 서브커맨드 dispatch)
     ├── config/              (글로벌+프로젝트 config 병합, roles.toml 파싱)
     ├── session/
     │   ├── state.rs         (Session 상태머신, transition() 단일 owner)
-    │   └── id.rs            (ULID 발급)
+    │   ├── id.rs            (ULID 발급)
+    │   └── record.rs        (SessionRecord 영속화 — session.json, `caucus resume` 데이터 소스)
     ├── role/
     │   ├── registry.rs      (이름 → RoleSpec 조회)
     │   └── spec.rs          (RoleSpec: allowlist, prompt_template, permission_mode, agent_cli, model)
     ├── pty/                 (portable-pty 래퍼: 패널별 PTY spawn/read/write/resize/kill)
     ├── term/                (vte 기반 grid: `Perform` 구현, 셀 매트릭스, 스크롤백)
     ├── render/              (ratatui: 패널 레이아웃, reflow, 드로잉, focus 표시)
-    ├── input/               (키 라우팅: focus 패널 결정, Enter/Ctrl-C/임의 키 → PTY)
+    ├── input/               (키 라우팅: `Ctrl-A` 프리픽스 키맵, focus·임의 키 → PTY, §9.2)
     ├── panel/
     │   └── lifecycle.rs     (Panel 구조체 + spawn/kill + 레이아웃 reflow, transition 단일 owner)
-    ├── mcp/                 (main worker용 MCP 서버: send_keys/ctrl_c/read_panel/spawn_role/kill_panel/list_panels)
+    ├── mcp/                 (main worker용 MCP 서버: 8개 툴 — send_keys/broadcast/ctrl_c/read_panel/spawn_role/kill_panel/list_panels/wait_for_panels)
     ├── signal/              (turn-signal 소켓 서버 + `caucus signal post` 클라이언트)
     ├── agent/
     │   ├── spawn.rs         (RoleSpec → 새 패널 + 새 AgentManifest)
@@ -530,14 +549,47 @@ lifecycle이 아니라 main worker가 MCP 툴로 라이브 수행). worktree 생
 
 각 모듈은 외부에 노출하는 함수 외엔 `pub(crate)` 미만으로 잠금. Rust visibility로 강제.
 
+### 9.2 키맵 · 레이아웃 제어 · transcript 오버레이
+
+caucus는 단 하나의 **프리픽스 키** `Ctrl-A`를 자기 명령용으로 예약한다. 그 외
+모든 키 입력은 — `Ctrl-C` 포함 — 터미널 바이트로 인코딩되어 focus 패널의 PTY로
+그대로 forward된다(§0 #11). 프리픽스 키맵은 `input::FocusRouter`가 소유한다:
+
+| 키 | 동작 |
+|---|---|
+| `Ctrl-A` 다음 `n` / `→` | 다음 패널로 focus |
+| `Ctrl-A` 다음 `p` / `←` | 이전 패널로 focus |
+| `Ctrl-A` 다음 `q` | caucus 종료 |
+| `Ctrl-A` 다음 `z` | focus 패널 zoom 토글 |
+| `Ctrl-A` 다음 `<` | focus 패널을 순서상 한 칸 앞으로 |
+| `Ctrl-A` 다음 `>` | focus 패널을 순서상 한 칸 뒤로 |
+| `Ctrl-A` 다음 `Space` | 레이아웃 배치 모드 순환 |
+| `Ctrl-A` 다음 `t` | transcript 오버레이 토글 |
+| `Esc` (오버레이 열림) | transcript 오버레이 닫기 |
+| `Ctrl-A` 다음 `Ctrl-A` | 패널에 리터럴 `Ctrl-A` 전송 |
+
+프리픽스는 소비된다 — `Ctrl-A` 다음 키는 명령을 선택하고 forward되지 않으며,
+예외인 `Ctrl-A Ctrl-A`만 리터럴 `Ctrl-A`(0x01) 한 바이트를 패널로 보낸다.
+
+**레이아웃 모드.** `render::LayoutMode`는 4종 — `Tiled` → `EvenHorizontal` →
+`EvenVertical` → `MainVertical` → (순환). `Ctrl-A Space`가 다음 모드로 cycle하고
+caucus는 패널을 해당 배치로 reflow한다. 패널 동적 spawn/kill 시에도 현재 모드로
+reflow된다(§0 #10).
+
+**transcript 오버레이.** `Ctrl-A t`는 읽기 전용 팀 관찰 뷰를 토글한다 —
+패널 위에 그려지는 bordered 박스로, 패널당 한 행(role · derived_state · 완료
+턴 수 · worktree 브랜치 · agent 최종 메시지 첫 줄)을 보여준다(`render::TranscriptRow`).
+오버레이는 입력을 가로채지 않는다 — 열려 있어도 `Esc` 외의 모든 키는 focus
+패널로 그대로 통과하고, `Esc`만 오버레이를 닫는다.
+
 ---
 
 ## 10. CLI surface
 
 caucus는 이제 장기 실행 TUI다. 라이브 제어(`send_keys` / `spawn_role` …)는 CLI가
-아니라 **MCP 서버**로 main worker에 노출된다(§0 #4). CLI는 기동·부트스트랩·hook용
-으로 축소됐다 — 옛 `session` / `round` / `execute` / `agent` / `watch` 서브커맨드
-군은 전부 폐기.
+아니라 **MCP 서버**로 main worker에 노출된다(§0 #4). CLI는 기동·부트스트랩·hook·
+세션 inspect/resume용으로 축소됐다 — 옛 `session` / `round` / `execute` / `agent` /
+`watch` 서브커맨드군은 전부 폐기.
 
 ```
 caucus                              # 풀스크린 멀티플렉서 TUI 기동 (현 git repo 기준).
@@ -546,12 +598,18 @@ caucus --roles architect,backend,reviewer
                                     # 기동 시 초기 패널 구성까지 (생략 시 main worker 패널만)
 
 caucus init [--install-hook]        # .caucus/ + bin/turn-signal 생성,
-                                    # Claude Stop hook을 ~/.claude/settings.json에 merge
+                                    # --install-hook 시 Claude Stop hook을
+                                    # ~/.claude/settings.json에 merge
 caucus doctor                       # git/claude/codex/gemini/hook + role allowlist `Task` 점검
-caucus role list | show <name>      # role 조회
+caucus role list                    # 알려진 role 나열
+caucus role show <name>             # 한 role의 전체 spec 출력
+caucus sessions [--format json]     # resume 가능한 세션 나열 (최신순; §3.1)
+caucus resume <session_id>          # 영속된 세션을 복원해 TUI 재기동 (§3.1)
 
 caucus signal post --sock <s> --session <id> --panel <id> --kind stop
-                                    # turn-signal hook이 호출 (사람은 안 침)
+                                    # turn-signal hook이 호출 (사람은 안 침, 내부용)
+caucus mcp-serve --control-sock <p> # main worker용 stdio MCP 서버
+                                    # (main worker의 Claude Code가 spawn, 내부용)
 ```
 
 TUI 안에서 사용자는 main worker 패널과 대화하고, main worker가 MCP 툴로 sub-agent
@@ -559,7 +617,7 @@ TUI 안에서 사용자는 main worker 패널과 대화하고, main worker가 MC
 
 ### 10.1 exit code 규약
 
-비-TUI 서브커맨드(`init` / `doctor` / `signal` / `role`)에 적용:
+비-TUI 서브커맨드(`init` / `doctor` / `signal` / `role` / `sessions`)에 적용:
 
 - `0` — 성공
 - `2` — 사용자 오류 (잘못된 인자 등)
@@ -691,11 +749,13 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 
 ## 13. 스코프와 non-goals
 
-### v0 안에 들어 있는 것
+### 스코프 안에 들어 있는 것 (v0 + v1)
 - caucus 멀티플렉서 TUI — 풀스크린, 패널별 PTY(`portable-pty`), `vte` 기반 grid, `ratatui` 렌더
 - 패널 동적 spawn / kill + 레이아웃 reflow
 - 입력 라우팅 — focus 패널 전환, `Enter` / `Ctrl-C` / 임의 키, 완전 양방향 인터랙티브 입력(로그인·OAuth 흐름 포함)
-- main worker용 MCP 서버 — `send_keys` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` 등
+- main worker용 MCP 서버 — 8개 툴: `send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `wait_for_panels`
+- 레이아웃 제어 — `Ctrl-A` 프리픽스 키맵, 4종 레이아웃 모드 순환, transcript 오버레이(§9.2)
+- 세션 영속화 & resume — `session.json` 레코드, `caucus sessions` / `caucus resume`(§3.1)
 - agent 백엔드 다중화 — `claude` / `codex` / `gemini`, role별 `model`·`agent_cli` override, main worker 자체 판단 지정
 - Claude `Stop` hook → caucus 소켓 (턴 완료 라이브 신호)
 - 라이브화된 라운드 진행

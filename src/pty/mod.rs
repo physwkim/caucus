@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -170,11 +170,11 @@ impl Pty {
     /// callers keep draining without erroring on a clean exit.
     pub(crate) fn read(&mut self) -> Result<Vec<u8>, PtyError> {
         let mut out = Vec::new();
-        loop {
-            match self.rx.try_recv() {
-                Ok(chunk) => out.extend_from_slice(&chunk),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
+        // Drain every queued chunk; any error ends the drain — `Empty` means
+        // nothing pending, `Disconnected` means the reader thread finished
+        // after a clean child exit. Both surface as an empty (or partial) read.
+        while let Ok(chunk) = self.rx.try_recv() {
+            out.extend_from_slice(&chunk);
         }
         Ok(out)
     }
@@ -283,7 +283,10 @@ mod tests {
 
         let out = drain_until_nonempty(&mut pty, Duration::from_secs(5));
         let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("hi"), "expected child output 'hi', got {text:?}");
+        assert!(
+            text.contains("hi"),
+            "expected child output 'hi', got {text:?}"
+        );
 
         pty.kill().unwrap();
     }

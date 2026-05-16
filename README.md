@@ -2,10 +2,12 @@
 
 A terminal multiplexer for **teams of AI coding agents**.
 
-> Status: **v0 — redesign in progress.** caucus is pivoting from an async
-> file-based meeting protocol to a live multiplexer. The README describes the
-> target; parts of [`docs/design.md`](./docs/design.md) still reflect the old
-> model and are being rewritten section by section.
+> Status: **v1 feature-complete, pre-1.0.** The pivot from an async
+> file-based meeting protocol to a live multiplexer is done: the live
+> multiplexer, the MCP control plane, layout control, the transcript
+> overlay, and session persistence/resume have all landed.
+> [`docs/design.md`](./docs/design.md) now matches the shipped code. The
+> CLI and MCP surfaces are not yet stable — expect changes before 1.0.
 
 ## What it is
 
@@ -56,10 +58,10 @@ and renders the panels (`ratatui`). tmux and zellij are *not* dependencies —
 they are studied as references for the grid and layout design.
 
 **The main worker drives sub-agents over MCP.** caucus runs an MCP server.
-The main worker gets caucus tools — `send_keys`, `ctrl_c`, `read_panel`,
-`spawn_role`, `kill_panel`, and so on — so a single instruction from you
-turns into the main worker decomposing the task, spawning sub-agent panels,
-and feeding each one its sub-task as real keystrokes.
+The main worker gets eight caucus tools (see [MCP tools](#mcp-tools) below)
+so a single instruction from you turns into the main worker decomposing the
+task, spawning sub-agent panels, and feeding each one its sub-task as real
+keystrokes.
 
 **Sub-agents are dynamic parallel workers.** The team is not a fixed roster
 of specialists. The main worker splits a task into sub-tasks and spawns as
@@ -81,6 +83,93 @@ login or an OAuth device-code prompt.
 **Turn completion is live.** Each agent's Claude `Stop` hook posts to a
 caucus socket the moment a turn ends — no polling, no sentinel files. The
 main worker sees "that sub-agent finished its turn" immediately and reacts.
+
+## Keymap
+
+caucus reserves a single prefix key, `Ctrl-A`, for its own commands. Every
+other keystroke — including `Ctrl-C` — is encoded to terminal bytes and
+forwarded verbatim to the focused panel's PTY, so an agent CLI sees a real
+terminal.
+
+| Key                     | Action                                  |
+|-------------------------|-----------------------------------------|
+| `Ctrl-A` then `n` / `→` | focus the next panel                    |
+| `Ctrl-A` then `p` / `←` | focus the previous panel                |
+| `Ctrl-A` then `q`       | quit caucus                             |
+| `Ctrl-A` then `z`       | toggle zoom on the focused panel        |
+| `Ctrl-A` then `<`       | move the focused panel one step earlier |
+| `Ctrl-A` then `>`       | move the focused panel one step later   |
+| `Ctrl-A` then `Space`   | cycle the layout arrangement mode       |
+| `Ctrl-A` then `t`       | toggle the transcript overlay           |
+| `Esc` (overlay open)    | hide the transcript overlay             |
+| `Ctrl-A` then `Ctrl-A`  | send a literal `Ctrl-A` to the panel    |
+
+The layout modes cycled by `Ctrl-A Space` are **Tiled**, **EvenHorizontal**,
+**EvenVertical**, and **MainVertical** — caucus reflows the panels into the
+chosen arrangement.
+
+The **transcript overlay** (`Ctrl-A t`) is a read-only team observation
+view: one row per panel showing role, derived state, completed-turn count,
+worktree branch, and the first line of the agent's last message. `Esc`
+hides it; it does not capture input, so every other key still reaches the
+focused panel while it is open.
+
+## MCP tools
+
+caucus exposes eight tools to the main worker over MCP. The main worker
+calls them to spawn, drive, observe, and reap sub-agent panels:
+
+| Tool              | What it does                                                              |
+|-------------------|---------------------------------------------------------------------------|
+| `send_keys`       | Type text into a panel's terminal; `enter=true` appends a newline.        |
+| `broadcast`       | Send the same text to several panels at once — a round's fan-out.         |
+| `ctrl_c`          | Send `Ctrl-C` (interrupt) to a panel.                                     |
+| `read_panel`      | Read a panel's captured output (modes below).                             |
+| `spawn_role`      | Spawn a new panel for a role; `worktree`, `model`, `agent_cli` overrides. |
+| `kill_panel`      | Kill a panel; its worktree (if any) is enqueued for cleanup.              |
+| `list_panels`     | List every live panel with its role and derived state.                   |
+| `wait_for_panels` | Block until the named panels settle (leave `working`) or `timeout_secs`. |
+
+`read_panel` takes a `mode`: `screen` (the visible grid), `scrollback` (the
+full scrollback buffer), `since_last_turn` (everything since the last
+prompt — the whole turn, no racing the screen), or `last_message` (the
+agent's final message from its turn signal).
+
+## CLI
+
+`caucus` with no subcommand launches the multiplexer TUI. The subcommands
+are for bootstrap, inspection, and resume — live control is exposed to the
+main worker over MCP, not the CLI.
+
+```
+caucus                              # launch the multiplexer TUI in the current git repo
+caucus --roles architect,backend,reviewer
+                                    # launch with an initial panel roster
+caucus init [--install-hook]        # create .caucus/ + bin/turn-signal;
+                                    # --install-hook merges the Claude Stop hook
+caucus doctor                       # check git / agent CLIs / hook / role allowlists
+caucus role list                    # list known roles
+caucus role show <name>             # show one role's full spec
+caucus sessions [--format json]     # list resumable sessions, newest first
+caucus resume <session_id>          # relaunch the TUI restoring a persisted session
+```
+
+(`caucus signal post` and `caucus mcp-serve` also exist but are internal —
+the Stop hook and the main worker's Claude Code instance invoke them, not a
+human.)
+
+## Sessions
+
+A caucus session is otherwise ephemeral — when caucus exits, the agent
+processes die. To make a session resumable, caucus writes a session record
+to `.caucus/sessions/<session_id>/session.json` whenever the panel roster
+changes: the roles, their order, each panel's CLI/model, any worktree
+branch, and the Claude conversation id.
+
+`caucus sessions` lists those records (id, age, panel count, topic).
+`caucus resume <session_id>` relaunches the TUI and recreates the panels
+from the record — re-attaching worktrees on their branches and continuing
+each Claude conversation via `claude --resume`.
 
 ## Install
 

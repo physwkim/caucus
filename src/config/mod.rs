@@ -97,8 +97,16 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             // grants the project knowledge graph — recall for context, learn
             // to record discoveries (`docs/design.md` §0 #16).
             &[
-                "Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite",
-                "WebFetch", "WebSearch", "mcp__kodex",
+                "Read",
+                "Glob",
+                "Grep",
+                "Edit",
+                "Write",
+                "Bash",
+                "TodoWrite",
+                "WebFetch",
+                "WebSearch",
+                "mcp__kodex",
             ],
             AgentCli::Claude,
             Some("opus"),
@@ -108,7 +116,16 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             "Generic sub-agent. The default parallel worker spawned by the \
              main worker (`docs/design.md` §0 #15). Full file edit + bash.",
             "acceptEdits",
-            &["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite", "mcp__kodex"],
+            &[
+                "Read",
+                "Glob",
+                "Grep",
+                "Edit",
+                "Write",
+                "Bash",
+                "TodoWrite",
+                "mcp__kodex",
+            ],
             AgentCli::Claude,
             Some("sonnet"),
         ),
@@ -116,7 +133,15 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             "architect",
             "Designs the approach, decomposes tasks, no code edits.",
             "plan",
-            &["Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite", "mcp__kodex"],
+            &[
+                "Read",
+                "Glob",
+                "Grep",
+                "WebFetch",
+                "WebSearch",
+                "TodoWrite",
+                "mcp__kodex",
+            ],
             AgentCli::Claude,
             Some("opus"),
         ),
@@ -124,7 +149,16 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             "backend",
             "Implements changes. Full file edit + bash.",
             "acceptEdits",
-            &["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite", "mcp__kodex"],
+            &[
+                "Read",
+                "Glob",
+                "Grep",
+                "Edit",
+                "Write",
+                "Bash",
+                "TodoWrite",
+                "mcp__kodex",
+            ],
             AgentCli::Claude,
             Some("sonnet"),
         ),
@@ -214,7 +248,10 @@ mod tests {
         let specs = embedded_defaults();
         let main = specs.iter().find(|s| s.name == "main").unwrap();
         assert_eq!(main.agent_cli, AgentCli::Claude);
-        assert!(!main.allows_task(), "main role must not grant Task (Invariant I-7)");
+        assert!(
+            !main.allows_task(),
+            "main role must not grant Task (Invariant I-7)"
+        );
     }
 
     #[test]
