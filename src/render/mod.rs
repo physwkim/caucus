@@ -57,6 +57,45 @@ impl From<Rect> for TuiRect {
     }
 }
 
+/// How [`Layout::reflow`] arranges the panels into the screen area.
+///
+/// `Tiled` is the historical roughly-square auto-tile; the rest mirror the
+/// tmux layout names. The arrangement is cycled at runtime via `Ctrl-A Space`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum LayoutMode {
+    /// Roughly-square auto-tile: `cols = ceil(sqrt(n))` columns.
+    #[default]
+    Tiled,
+    /// N side-by-side columns, each full height.
+    EvenHorizontal,
+    /// N stacked rows, each full width.
+    EvenVertical,
+    /// Panel 0 fills the left half; the rest stack in the right half.
+    MainVertical,
+}
+
+impl LayoutMode {
+    /// The next arrangement in the `Ctrl-A Space` cycle.
+    pub fn next(self) -> Self {
+        match self {
+            LayoutMode::Tiled => LayoutMode::EvenHorizontal,
+            LayoutMode::EvenHorizontal => LayoutMode::EvenVertical,
+            LayoutMode::EvenVertical => LayoutMode::MainVertical,
+            LayoutMode::MainVertical => LayoutMode::Tiled,
+        }
+    }
+
+    /// A short human-readable label for the status bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            LayoutMode::Tiled => "tiled",
+            LayoutMode::EvenHorizontal => "even-horizontal",
+            LayoutMode::EvenVertical => "even-vertical",
+            LayoutMode::MainVertical => "main-vertical",
+        }
+    }
+}
+
 /// A computed layout: the screen rectangle assigned to each panel.
 #[derive(Debug, Clone, Default)]
 pub struct Layout {
@@ -65,20 +104,30 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Reflow `panels` into `area` — an even grid split across the live panels
+    /// Reflow `panels` into `area` according to `mode`
     /// (`docs/design.md` §0 #10: caucus reflows on every spawn/kill).
     ///
-    /// Algorithm: pick `cols = ceil(sqrt(n))` columns and
-    /// `rows = ceil(n / cols)` rows, then hand each panel one cell. The last
-    /// row's panels widen to absorb the remainder when `n` is not a perfect
-    /// rectangle, and rounding slack is distributed cell-by-cell so the tiles
-    /// exactly partition `area` with no gaps or overlap.
-    pub fn reflow(panels: &[PanelId], area: Rect) -> Self {
+    /// Every mode partitions `area` exactly — no gaps, no overlap — with
+    /// rounding slack distributed cell-by-cell via [`split`].
+    pub fn reflow(panels: &[PanelId], area: Rect, mode: LayoutMode) -> Self {
         let n = panels.len();
         if n == 0 || area.width == 0 || area.height == 0 {
             return Self::default();
         }
+        match mode {
+            LayoutMode::Tiled => Self::reflow_tiled(panels, area),
+            LayoutMode::EvenHorizontal => Self::reflow_even_horizontal(panels, area),
+            LayoutMode::EvenVertical => Self::reflow_even_vertical(panels, area),
+            LayoutMode::MainVertical => Self::reflow_main_vertical(panels, area),
+        }
+    }
 
+    /// Roughly-square auto-tile: pick `cols = ceil(sqrt(n))` columns and
+    /// `rows = ceil(n / cols)` rows, then hand each panel one cell. The last
+    /// row's panels widen to absorb the remainder when `n` is not a perfect
+    /// rectangle.
+    fn reflow_tiled(panels: &[PanelId], area: Rect) -> Self {
+        let n = panels.len();
         // Grid shape: roughly square, columns >= rows.
         let cols = (n as f64).sqrt().ceil() as usize;
         let rows = n.div_ceil(cols);
@@ -112,6 +161,85 @@ impl Layout {
                     x: cx,
                     y: ry,
                     width: cw,
+                    height: rh,
+                },
+            ));
+        }
+        Self { slots }
+    }
+
+    /// N side-by-side columns, each spanning the full height of `area`.
+    fn reflow_even_horizontal(panels: &[PanelId], area: Rect) -> Self {
+        let cols = split(area.x, area.width, panels.len());
+        let slots = panels
+            .iter()
+            .zip(cols)
+            .map(|(&id, (cx, cw))| {
+                (
+                    id,
+                    Rect {
+                        x: cx,
+                        y: area.y,
+                        width: cw,
+                        height: area.height,
+                    },
+                )
+            })
+            .collect();
+        Self { slots }
+    }
+
+    /// N stacked rows, each spanning the full width of `area`.
+    fn reflow_even_vertical(panels: &[PanelId], area: Rect) -> Self {
+        let rows = split(area.y, area.height, panels.len());
+        let slots = panels
+            .iter()
+            .zip(rows)
+            .map(|(&id, (ry, rh))| {
+                (
+                    id,
+                    Rect {
+                        x: area.x,
+                        y: ry,
+                        width: area.width,
+                        height: rh,
+                    },
+                )
+            })
+            .collect();
+        Self { slots }
+    }
+
+    /// Panel 0 fills the left half of `area`; the remaining panels stack in
+    /// the right half. With a single panel it fills the whole area.
+    fn reflow_main_vertical(panels: &[PanelId], area: Rect) -> Self {
+        if panels.len() == 1 {
+            return Self {
+                slots: vec![(panels[0], area)],
+            };
+        }
+        let cols = split(area.x, area.width, 2);
+        let (lx, lw) = cols[0];
+        let (rx, rw) = cols[1];
+        let mut slots = Vec::with_capacity(panels.len());
+        slots.push((
+            panels[0],
+            Rect {
+                x: lx,
+                y: area.y,
+                width: lw,
+                height: area.height,
+            },
+        ));
+        let rest = &panels[1..];
+        let rows = split(area.y, area.height, rest.len());
+        for (&id, (ry, rh)) in rest.iter().zip(rows) {
+            slots.push((
+                id,
+                Rect {
+                    x: rx,
+                    y: ry,
+                    width: rw,
                     height: rh,
                 },
             ));
@@ -318,22 +446,43 @@ mod tests {
         }
     }
 
+    /// Assert the layout's slots cover every cell of the 80x24 `area()`
+    /// exactly once — no gaps, no overlap.
+    fn assert_partitions_area(layout: &Layout) {
+        let mut covered = vec![0u8; 80 * 24];
+        for (_, r) in &layout.slots {
+            for y in r.y..r.y + r.height {
+                for x in r.x..r.x + r.width {
+                    covered[y as usize * 80 + x as usize] += 1;
+                }
+            }
+        }
+        assert!(
+            covered.iter().all(|&c| c == 1),
+            "every cell covered exactly once"
+        );
+    }
+
     #[test]
     fn reflow_assigns_a_slot_per_panel() {
         let panels = vec![PanelId::new(), PanelId::new()];
-        let layout = Layout::reflow(&panels, area());
+        let layout = Layout::reflow(&panels, area(), LayoutMode::Tiled);
         assert_eq!(layout.slots.len(), 2);
     }
 
     #[test]
     fn reflow_empty_is_empty() {
-        assert!(Layout::reflow(&[], area()).slots.is_empty());
+        assert!(
+            Layout::reflow(&[], area(), LayoutMode::Tiled)
+                .slots
+                .is_empty()
+        );
     }
 
     #[test]
     fn single_panel_fills_the_whole_area() {
         let id = PanelId::new();
-        let layout = Layout::reflow(&[id], area());
+        let layout = Layout::reflow(&[id], area(), LayoutMode::Tiled);
         assert_eq!(
             layout.rect_of(id),
             Some(Rect {
@@ -348,7 +497,7 @@ mod tests {
     #[test]
     fn two_panels_split_into_two_columns() {
         let panels = vec![PanelId::new(), PanelId::new()];
-        let layout = Layout::reflow(&panels, area());
+        let layout = Layout::reflow(&panels, area(), LayoutMode::Tiled);
         // ceil(sqrt(2)) = 2 columns, 1 row.
         let r0 = layout.slots[0].1;
         let r1 = layout.slots[1].1;
@@ -361,7 +510,7 @@ mod tests {
     #[test]
     fn four_panels_form_a_two_by_two_grid() {
         let panels: Vec<_> = (0..4).map(|_| PanelId::new()).collect();
-        let layout = Layout::reflow(&panels, area());
+        let layout = Layout::reflow(&panels, area(), LayoutMode::Tiled);
         // 2x2: each tile 40x12.
         for (_, r) in &layout.slots {
             assert_eq!(r.width, 40);
@@ -373,19 +522,68 @@ mod tests {
     fn tiles_partition_the_area_without_gap_or_overlap() {
         // 5 panels: ceil(sqrt(5))=3 cols, ceil(5/3)=2 rows. Last row has 2.
         let panels: Vec<_> = (0..5).map(|_| PanelId::new()).collect();
-        let layout = Layout::reflow(&panels, area());
-        // Every cell of the 80x24 area must be covered exactly once.
-        let mut covered = vec![0u8; 80 * 24];
-        for (_, r) in &layout.slots {
-            for y in r.y..r.y + r.height {
-                for x in r.x..r.x + r.width {
-                    covered[y as usize * 80 + x as usize] += 1;
-                }
+        let layout = Layout::reflow(&panels, area(), LayoutMode::Tiled);
+        assert_partitions_area(&layout);
+    }
+
+    #[test]
+    fn even_horizontal_partitions_the_area() {
+        for n in 1..=7 {
+            let panels: Vec<_> = (0..n).map(|_| PanelId::new()).collect();
+            let layout = Layout::reflow(&panels, area(), LayoutMode::EvenHorizontal);
+            assert_eq!(layout.slots.len(), n);
+            // Every slot spans the full height — N side-by-side columns.
+            for (_, r) in &layout.slots {
+                assert_eq!(r.height, 24);
+                assert_eq!(r.y, 0);
             }
+            assert_partitions_area(&layout);
         }
-        assert!(
-            covered.iter().all(|&c| c == 1),
-            "every cell covered exactly once"
+    }
+
+    #[test]
+    fn even_vertical_partitions_the_area() {
+        for n in 1..=7 {
+            let panels: Vec<_> = (0..n).map(|_| PanelId::new()).collect();
+            let layout = Layout::reflow(&panels, area(), LayoutMode::EvenVertical);
+            assert_eq!(layout.slots.len(), n);
+            // Every slot spans the full width — N stacked rows.
+            for (_, r) in &layout.slots {
+                assert_eq!(r.width, 80);
+                assert_eq!(r.x, 0);
+            }
+            assert_partitions_area(&layout);
+        }
+    }
+
+    #[test]
+    fn main_vertical_partitions_the_area() {
+        for n in 2..=7 {
+            let panels: Vec<_> = (0..n).map(|_| PanelId::new()).collect();
+            let layout = Layout::reflow(&panels, area(), LayoutMode::MainVertical);
+            assert_eq!(layout.slots.len(), n);
+            // Panel 0 is the left main pane, full height.
+            let main = layout.rect_of(panels[0]).unwrap();
+            assert_eq!(main.x, 0);
+            assert_eq!(main.y, 0);
+            assert_eq!(main.height, 24);
+            assert_eq!(main.width, 40);
+            assert_partitions_area(&layout);
+        }
+    }
+
+    #[test]
+    fn main_vertical_single_panel_fills_the_area() {
+        let id = PanelId::new();
+        let layout = Layout::reflow(&[id], area(), LayoutMode::MainVertical);
+        assert_eq!(
+            layout.rect_of(id),
+            Some(Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24
+            })
         );
     }
 

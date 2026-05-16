@@ -223,7 +223,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mux: &Multiplexer) ->
     Ok(())
 }
 
-/// One-line status bar: panel count, focus, and the keymap hint.
+/// One-line status bar: panel count, focus, layout mode, and the keymap hint.
 fn status_line(mux: &Multiplexer) -> String {
     let focused = mux
         .focused()
@@ -235,10 +235,18 @@ fn status_line(mux: &Multiplexer) -> String {
     } else {
         ""
     };
+    let zoom = if mux.zoomed().is_some() {
+        "  [ZOOM]"
+    } else {
+        ""
+    };
     format!(
-        " caucus · {} panel(s) · focus: {} · Ctrl-A then n/p focus, q quit{}",
+        " caucus · {} panel(s) · focus: {} · layout: {} · \
+         Ctrl-A then n/p focus, z zoom, </> move, Space layout, q quit{}{}",
         mux.panels().len(),
         focused,
+        mux.layout_mode().label(),
+        zoom,
         prefix
     )
 }

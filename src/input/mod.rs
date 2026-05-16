@@ -17,6 +17,10 @@
 //! | `Ctrl-A` then `n` / `→`   | focus the next panel                    |
 //! | `Ctrl-A` then `p` / `←`   | focus the previous panel                |
 //! | `Ctrl-A` then `q`         | quit caucus                             |
+//! | `Ctrl-A` then `z`         | toggle zoom on the focused panel        |
+//! | `Ctrl-A` then `<`         | move the focused panel one step earlier |
+//! | `Ctrl-A` then `>`         | move the focused panel one step later   |
+//! | `Ctrl-A` then `Space`     | cycle the layout arrangement mode       |
 //! | `Ctrl-A` then `Ctrl-A`    | send a literal `Ctrl-A` to the panel    |
 //! | any other key             | forwarded to the focused panel's PTY    |
 //! | `Ctrl-C`                  | forwarded to the focused panel (§0 #11) |
@@ -53,6 +57,14 @@ pub enum CaucusCommand {
     FocusPrev,
     /// Quit caucus.
     Quit,
+    /// Toggle full-screen zoom on the focused panel.
+    ToggleZoom,
+    /// Move the focused panel one step earlier in the panel order.
+    MovePanelEarlier,
+    /// Move the focused panel one step later in the panel order.
+    MovePanelLater,
+    /// Cycle the arrangement mode (`Tiled` → `EvenHorizontal` → ...).
+    CycleLayout,
 }
 
 /// Tracks which panel currently receives the user's keystrokes, plus whether
@@ -130,6 +142,14 @@ impl FocusRouter {
                 InputAction::Caucus(CaucusCommand::FocusPrev)
             }
             KeyCode::Char('q') => InputAction::Caucus(CaucusCommand::Quit),
+            KeyCode::Char('z') => InputAction::Caucus(CaucusCommand::ToggleZoom),
+            KeyCode::Char('<') => {
+                InputAction::Caucus(CaucusCommand::MovePanelEarlier)
+            }
+            KeyCode::Char('>') => {
+                InputAction::Caucus(CaucusCommand::MovePanelLater)
+            }
+            KeyCode::Char(' ') => InputAction::Caucus(CaucusCommand::CycleLayout),
             // Any other key after the prefix: prefix consumed, nothing done.
             _ => InputAction::Ignore,
         }
@@ -326,6 +346,44 @@ mod tests {
     }
 
     #[test]
+    fn prefix_then_z_is_toggle_zoom() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.route(ctrl('a'));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('z'))),
+            InputAction::Caucus(CaucusCommand::ToggleZoom)
+        ));
+    }
+
+    #[test]
+    fn prefix_then_lt_gt_move_the_panel() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.route(ctrl('a'));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('<'))),
+            InputAction::Caucus(CaucusCommand::MovePanelEarlier)
+        ));
+        router.route(ctrl('a'));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('>'))),
+            InputAction::Caucus(CaucusCommand::MovePanelLater)
+        ));
+    }
+
+    #[test]
+    fn prefix_then_space_is_cycle_layout() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.route(ctrl('a'));
+        assert!(matches!(
+            router.route(key(KeyCode::Char(' '))),
+            InputAction::Caucus(CaucusCommand::CycleLayout)
+        ));
+    }
+
+    #[test]
     fn prefix_then_prefix_forwards_a_literal_ctrl_a() {
         let mut router = FocusRouter::new();
         router.set_focus(Some(PanelId::new()));
@@ -341,9 +399,9 @@ mod tests {
         let mut router = FocusRouter::new();
         router.set_focus(Some(PanelId::new()));
         router.route(ctrl('a'));
-        // 'z' is not a caucus command — consumed, nothing forwarded.
+        // 'k' is not a caucus command — consumed, nothing forwarded.
         assert!(matches!(
-            router.route(key(KeyCode::Char('z'))),
+            router.route(key(KeyCode::Char('k'))),
             InputAction::Ignore
         ));
         assert!(!router.prefix_armed());
