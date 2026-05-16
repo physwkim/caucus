@@ -131,6 +131,12 @@ System-prompt templates live under `roles/`. Each sub-agent role inherits the
 claw-code "4-constraint scaffolding" (delegated task / only tools / no
 questions / concise result).
 
+Every role's `allowed_tools` includes `mcp__kodex`: a sub-agent queries the
+kodex knowledge graph (`recall_for_task`) to self-serve codebase context — so
+the main worker hands each one a lean brief and lets it fetch the depth, and
+records discoveries with `learn`. kodex is the user's global MCP server; swap
+or drop it per-project in `roles.toml`.
+
 ## Related projects
 
 - [`tmux`](https://github.com/tmux/tmux) — reference for the session /

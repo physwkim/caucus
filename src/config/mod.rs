@@ -93,8 +93,13 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             // caucus MCP tools, not in-session sub-agents — `Task` MUST NOT
             // appear (Invariant I-7). It also reads, edits, and runs bash to do
             // simple work itself. The caucus MCP server is registered
-            // separately via `--mcp-config`, not the allowlist.
-            &["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite", "WebFetch", "WebSearch"],
+            // separately via `--mcp-config`, not the allowlist. `mcp__kodex`
+            // grants the project knowledge graph — recall for context, learn
+            // to record discoveries (`docs/design.md` §0 #16).
+            &[
+                "Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite",
+                "WebFetch", "WebSearch", "mcp__kodex",
+            ],
             AgentCli::Claude,
             Some("opus"),
         ),
@@ -103,7 +108,7 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             "Generic sub-agent. The default parallel worker spawned by the \
              main worker (`docs/design.md` §0 #15). Full file edit + bash.",
             "acceptEdits",
-            &["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite"],
+            &["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite", "mcp__kodex"],
             AgentCli::Claude,
             Some("sonnet"),
         ),
@@ -111,7 +116,7 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             "architect",
             "Designs the approach, decomposes tasks, no code edits.",
             "plan",
-            &["Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite"],
+            &["Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite", "mcp__kodex"],
             AgentCli::Claude,
             Some("opus"),
         ),
@@ -119,7 +124,7 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             "backend",
             "Implements changes. Full file edit + bash.",
             "acceptEdits",
-            &["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite"],
+            &["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite", "mcp__kodex"],
             AgentCli::Claude,
             Some("sonnet"),
         ),
@@ -127,7 +132,7 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             "reviewer",
             "Reads only. Critiques approach and code.",
             "default",
-            &["Read", "Glob", "Grep", "Bash"],
+            &["Read", "Glob", "Grep", "Bash", "mcp__kodex"],
             AgentCli::Claude,
             Some("opus"),
         ),
@@ -135,7 +140,7 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             "qa",
             "Runs tests. Reports failures.",
             "default",
-            &["Read", "Glob", "Grep", "Bash"],
+            &["Read", "Glob", "Grep", "Bash", "mcp__kodex"],
             AgentCli::Claude,
             Some("haiku"),
         ),
@@ -143,7 +148,7 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             "scribe",
             "Compiles the meeting transcript. No external sync.",
             "acceptEdits",
-            &["Read", "Glob", "Grep", "Edit", "Write"],
+            &["Read", "Glob", "Grep", "Edit", "Write", "mcp__kodex"],
             AgentCli::Claude,
             Some("haiku"),
         ),
@@ -151,7 +156,7 @@ pub fn embedded_defaults() -> Vec<RoleSpec> {
             "serious-reviewer",
             "Adversarial second-opinion reviewer running on codex.",
             "default",
-            &["Read", "Glob", "Grep", "Bash"],
+            &["Read", "Glob", "Grep", "Bash", "mcp__kodex"],
             AgentCli::Codex,
             None,
         ),
