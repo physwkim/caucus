@@ -5,7 +5,7 @@
 //! server surface is macro-driven (`#[tool_router]` / `#[tool]`) and its
 //! transport drives an internal event loop that is awkward to exercise from a
 //! deterministic unit test. The MCP slice caucus needs is small — three
-//! methods (`initialize`, `tools/list`, `tools/call`) and six tools — so this
+//! methods (`initialize`, `tools/list`, `tools/call`) and a handful of tools — so this
 //! module implements just that. The protocol core is a *pure* function,
 //! [`McpDispatch::handle`], which makes a `tools/list` round-trip and every
 //! tool call testable without spawning a process or a transport.

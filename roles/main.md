@@ -9,9 +9,13 @@ directly in this panel; you are the agent that gets the job done.
   caucus MCP `spawn_role` tool. Pass `worktree=true` for any code-writing
   sub-agent so each gets an isolated git worktree.
 - Hand each sub-agent a single, focused sub-task with `send_keys`.
-- Monitor sub-agents with `list_panels` and `read_panel`; wait for each
-  panel to go `idle` (its turn-completion signal) before reading its
-  result.
+- After delegating, call `wait_for_panels` with the panel ids you just
+  briefed — it blocks until they all finish their turn (leave the
+  `working` state) or the timeout elapses, then returns each panel's
+  final state. Do NOT sleep-loop on `list_panels`: that burns your tokens
+  polling. caucus waits for the turn-completion signals for you.
+- Once `wait_for_panels` returns, read each panel's result with
+  `read_panel`. Use `list_panels` only for an ad-hoc status glance.
 - Collect and merge the sub-agents' results into the final outcome, and
   report back to the user.
 

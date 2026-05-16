@@ -181,6 +181,33 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
             panel: panel(args)?,
         }),
         "list_panels" => Ok(ControlRequest::ListPanels),
+        "wait_for_panels" => {
+            let raw = args
+                .get("panels")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "missing array argument `panels`".to_string())?;
+            let panels = raw
+                .iter()
+                .map(|v| {
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| "`panels` entries must be panel-id strings".to_string())?;
+                    s.parse::<PanelId>()
+                        .map_err(|e| format!("invalid panel id `{s}`: {e}"))
+                })
+                .collect::<std::result::Result<Vec<PanelId>, String>>()?;
+            let timeout_secs = match args.get("timeout_secs") {
+                Some(v) => Some(
+                    v.as_u64()
+                        .ok_or_else(|| "`timeout_secs` must be a non-negative integer".to_string())?,
+                ),
+                None => None,
+            };
+            Ok(ControlRequest::WaitForPanels {
+                panels,
+                timeout_secs,
+            })
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -294,6 +321,50 @@ mod tests {
     fn build_list_panels_takes_no_args() {
         let req = build_request("list_panels", &json!({})).unwrap();
         assert_eq!(req, ControlRequest::ListPanels);
+    }
+
+    #[test]
+    fn build_wait_for_panels_request() {
+        let a = PanelId::new();
+        let b = PanelId::new();
+        let req = build_request(
+            "wait_for_panels",
+            &json!({"panels": [a.to_string(), b.to_string()], "timeout_secs": 90}),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::WaitForPanels {
+                panels: vec![a, b],
+                timeout_secs: Some(90),
+            }
+        );
+    }
+
+    #[test]
+    fn build_wait_for_panels_defaults_timeout() {
+        let a = PanelId::new();
+        let req = build_request("wait_for_panels", &json!({"panels": [a.to_string()]})).unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::WaitForPanels {
+                panels: vec![a],
+                timeout_secs: None,
+            }
+        );
+    }
+
+    #[test]
+    fn build_wait_for_panels_requires_panels_array() {
+        let err = build_request("wait_for_panels", &json!({})).unwrap_err();
+        assert!(err.contains("missing array argument `panels`"));
+    }
+
+    #[test]
+    fn build_wait_for_panels_rejects_bad_panel_id() {
+        let err = build_request("wait_for_panels", &json!({"panels": ["not-a-ulid"]}))
+            .unwrap_err();
+        assert!(err.contains("invalid panel id"));
     }
 
     #[test]

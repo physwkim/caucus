@@ -3,7 +3,7 @@
 //!
 //! This process is spawned by the main worker panel's Claude Code instance (caucus
 //! writes an MCP config registering it — see [`crate::mcp::serve::mcp_config_json`]).
-//! It exposes the six caucus tools over stdio JSON-RPC and forwards each call
+//! It exposes the caucus tools over stdio JSON-RPC and forwards each call
 //! to the main `caucus` process over the control socket.
 //!
 //! It owns no panels and no PTYs — all state lives in the main process. This
@@ -18,7 +18,7 @@ use super::control_client::ControlClient;
 use super::jsonrpc::{McpDispatch, serve_stdio};
 use super::tool_catalogue;
 
-/// Run `caucus mcp-serve`: serve the six caucus tools over stdio, forwarding
+/// Run `caucus mcp-serve`: serve the caucus tools over stdio, forwarding
 /// each call to the control socket at `control_sock`.
 ///
 /// Builds its own multi-thread tokio runtime — the synchronous tool-handler

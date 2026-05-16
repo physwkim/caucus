@@ -12,8 +12,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use tokio::sync::oneshot;
 use tracing::warn;
 
 use crate::agent::manifest::{self, AgentManifest};
@@ -32,6 +34,31 @@ use crate::signal::TurnSignal;
 use crate::signal::server::SignalServer;
 use crate::worktree::cleanup::{CleanupJob, CleanupQueue};
 use crate::worktree::manager::{WorktreeRequest, create as create_worktree};
+
+/// Default wait budget for `wait_for_panels` when the caller omits
+/// `timeout_secs`.
+const WAIT_DEFAULT_SECS: u64 = 600;
+/// Hard cap on a `wait_for_panels` budget — a runaway wait can never park the
+/// main worker's blocking MCP call longer than this.
+const WAIT_MAX_SECS: u64 = 3600;
+
+/// A `wait_for_panels` request the event loop has not answered yet.
+///
+/// The control protocol is otherwise "one request → one immediate response";
+/// `WaitForPanels` is the sole exception. [`Multiplexer::drain_control`]
+/// stashes one of these instead of calling `execute_control`, and
+/// [`Multiplexer::poll_pending_waits`] fires + drops it once every waited
+/// panel has settled or `deadline` passes — so the event loop is never
+/// blocked.
+struct PendingWait {
+    /// Panel ids the caller is waiting on. Ids that no longer exist count as
+    /// settled (see [`Multiplexer::wait_panels_settled`]).
+    panels: Vec<PanelId>,
+    /// Wall-clock instant past which the wait is answered regardless of state.
+    deadline: Instant,
+    /// Oneshot the deferred [`ControlResponse`] is delivered on.
+    reply: oneshot::Sender<ControlResponse>,
+}
 
 /// The live multiplexer: one [`Session`] plus every panel running in it.
 pub struct Multiplexer {
@@ -61,6 +88,9 @@ pub struct Multiplexer {
     quit: bool,
     /// Monotonic counter for agent-name suffixes per role.
     role_counts: HashMap<String, usize>,
+    /// `wait_for_panels` requests awaiting a deferred reply
+    /// ([`Multiplexer::poll_pending_waits`]).
+    pending_waits: Vec<PendingWait>,
 }
 
 impl Multiplexer {
@@ -106,6 +136,7 @@ impl Multiplexer {
                 area,
                 quit: false,
                 role_counts: HashMap::new(),
+                pending_waits: Vec::new(),
             },
             signal_server,
             control_server,
@@ -486,6 +517,11 @@ impl Multiplexer {
             ControlRequest::ListPanels => ControlResponse::Panels {
                 panels: self.list_panels(),
             },
+            // `WaitForPanels` is a deferred-reply request — `drain_control`
+            // routes it to `register_wait` and never reaches here. Handled
+            // for match exhaustiveness: answer with the current panel snapshot
+            // (a degenerate zero-timeout wait) rather than panicking.
+            ControlRequest::WaitForPanels { panels, .. } => self.wait_response(&panels),
         }
     }
 
@@ -493,13 +529,99 @@ impl Multiplexer {
     /// each through its oneshot reply. Called once per event-loop tick — the
     /// single point at which main worker MCP tool calls touch live panels, on
     /// the same thread that pumps PTYs (Invariant I-5).
+    ///
+    /// Every request bar [`ControlRequest::WaitForPanels`] is answered
+    /// immediately via [`Multiplexer::execute_control`]. `WaitForPanels` is a
+    /// blocking tool: if its panels are already all settled the reply is sent
+    /// now, otherwise the job is stashed as a [`PendingWait`] and answered
+    /// later by [`Multiplexer::poll_pending_waits`] — the event loop is never
+    /// blocked.
     pub fn drain_control(&mut self, server: &mut ControlServer) {
         while let Ok(job) = server.jobs().try_recv() {
             let ControlJob { request, reply } = job;
-            let response = self.execute_control(request);
-            // A dropped reply channel means the control-socket connection
-            // closed before we answered — nothing to do.
-            let _ = reply.send(response);
+            match request {
+                ControlRequest::WaitForPanels {
+                    panels,
+                    timeout_secs,
+                } => self.register_wait(panels, timeout_secs, reply),
+                other => {
+                    let response = self.execute_control(other);
+                    // A dropped reply channel means the control-socket
+                    // connection closed before we answered — nothing to do.
+                    let _ = reply.send(response);
+                }
+            }
+        }
+    }
+
+    /// Whether a panel id counts as "settled" for `wait_for_panels`: its
+    /// `PanelState` is `Idle`/`Blocked`/`Exited` — i.e. NOT `Working` and NOT
+    /// `Spawning`. A panel id that does not exist counts as settled (there is
+    /// nothing left to wait for — it was killed or never spawned).
+    fn wait_panels_settled(&self, panels: &[PanelId]) -> bool {
+        panels.iter().all(|id| {
+            match self.panels.iter().find(|p| p.id == *id) {
+                Some(p) => !matches!(p.state(), PanelState::Working | PanelState::Spawning),
+                None => true,
+            }
+        })
+    }
+
+    /// Build the deferred reply for a satisfied/timed-out `wait_for_panels`:
+    /// each waited panel's current [`PanelSummary`]. A waited id that no longer
+    /// exists is omitted (it is gone — `list_panels` would not show it
+    /// either); the main worker should treat a missing id as fully done.
+    fn wait_response(&self, panels: &[PanelId]) -> ControlResponse {
+        let all = self.list_panels();
+        let summaries = panels
+            .iter()
+            .filter_map(|id| all.iter().find(|s| s.panel_id == *id).cloned())
+            .collect();
+        ControlResponse::Panels { panels: summaries }
+    }
+
+    /// Register a `wait_for_panels` request. If the panels are already all
+    /// settled the reply is sent immediately; otherwise a [`PendingWait`] is
+    /// stashed for [`Multiplexer::poll_pending_waits`]. The `timeout_secs`
+    /// budget is clamped to `[1, WAIT_MAX_SECS]`, defaulting to
+    /// `WAIT_DEFAULT_SECS`.
+    fn register_wait(
+        &mut self,
+        panels: Vec<PanelId>,
+        timeout_secs: Option<u64>,
+        reply: oneshot::Sender<ControlResponse>,
+    ) {
+        if self.wait_panels_settled(&panels) {
+            let _ = reply.send(self.wait_response(&panels));
+            return;
+        }
+        let budget = timeout_secs
+            .unwrap_or(WAIT_DEFAULT_SECS)
+            .clamp(1, WAIT_MAX_SECS);
+        self.pending_waits.push(PendingWait {
+            panels,
+            deadline: Instant::now() + Duration::from_secs(budget),
+            reply,
+        });
+    }
+
+    /// Fire and remove every [`PendingWait`] whose panels have all settled or
+    /// whose `deadline` has passed. Called once per event-loop tick. A
+    /// `reply.send` failure (the `mcp-serve` connection closed) just drops the
+    /// wait — there is no one left to answer.
+    pub fn poll_pending_waits(&mut self) {
+        if self.pending_waits.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        // Take the vec so the satisfied-check can borrow `self` immutably.
+        let waits = std::mem::take(&mut self.pending_waits);
+        for wait in waits {
+            if now >= wait.deadline || self.wait_panels_settled(&wait.panels) {
+                let _ = wait.reply.send(self.wait_response(&wait.panels));
+            } else {
+                self.pending_waits.push(wait);
+            }
         }
     }
 
@@ -823,5 +945,111 @@ mod tests {
         assert!(!mux.should_quit());
         mux.apply_command(CaucusCommand::Quit);
         assert!(mux.should_quit());
+    }
+
+    /// A `wait_for_panels` whose ids do not exist is answered immediately —
+    /// `register_wait` sends the reply now and stashes no `PendingWait`.
+    #[tokio::test]
+    async fn wait_for_unknown_panels_replies_immediately() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let ghost = PanelId::new();
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        mux.register_wait(vec![ghost], Some(60), reply_tx);
+
+        // No pending wait stashed; the reply is already available.
+        assert!(mux.pending_waits.is_empty());
+        match reply_rx.await.unwrap() {
+            // The ghost id is omitted from the summary (it never existed).
+            ControlResponse::Panels { panels } => assert!(panels.is_empty()),
+            other => panic!("expected Panels, got {other:?}"),
+        }
+    }
+
+    /// A `wait_for_panels` whose deadline has already passed fires on the next
+    /// `poll_pending_waits` tick even though no panel settled.
+    #[tokio::test]
+    async fn wait_times_out_via_poll_pending_waits() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        // Stash a wait whose deadline is already in the past, against a panel
+        // id the multiplexer has no panel for *and* that we keep "unsettled"
+        // by registering it directly with an already-elapsed deadline.
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        mux.pending_waits.push(PendingWait {
+            panels: vec![PanelId::new()],
+            deadline: Instant::now() - Duration::from_secs(1),
+            reply: reply_tx,
+        });
+        // Not yet fired.
+        assert!(reply_rx.try_recv().is_err());
+
+        mux.poll_pending_waits();
+        assert!(mux.pending_waits.is_empty(), "timed-out wait must be dropped");
+        match reply_rx.try_recv() {
+            Ok(ControlResponse::Panels { .. }) => {}
+            other => panic!("expected a Panels reply after timeout, got {other:?}"),
+        }
+    }
+
+    /// The deferred-reply path end to end: register a wait on a `Working`
+    /// panel, confirm `poll_pending_waits` keeps it pending, then settle the
+    /// panel and confirm the next poll fires the reply.
+    ///
+    /// Spawning a panel needs a real agent CLI; the test is skipped (not
+    /// failed) when none is on PATH, matching `tests/mcp_integration.rs`.
+    #[tokio::test]
+    async fn poll_pending_waits_fires_when_a_panel_settles() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Ok(panel) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        // Force the panel into `Working` so the wait is genuinely pending.
+        mux.note_prompt_delivered(panel);
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == panel).unwrap().state(),
+            PanelState::Working,
+        );
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        mux.register_wait(vec![panel], Some(600), reply_tx);
+        assert_eq!(mux.pending_waits.len(), 1, "wait must be stashed, not answered");
+
+        // A poll while the panel is still working leaves the wait pending.
+        mux.poll_pending_waits();
+        assert_eq!(mux.pending_waits.len(), 1);
+        assert!(reply_rx.try_recv().is_err());
+
+        // Settle the panel via a turn-completion signal (Working -> Idle).
+        let session_id = mux.session.id;
+        mux.handle_signal(TurnSignal::now(
+            session_id,
+            panel,
+            crate::signal::TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        ));
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == panel).unwrap().state(),
+            PanelState::Idle,
+        );
+
+        // The next poll fires + drops the wait, returning the panel's summary.
+        mux.poll_pending_waits();
+        assert!(mux.pending_waits.is_empty());
+        match reply_rx.try_recv() {
+            Ok(ControlResponse::Panels { panels }) => {
+                assert_eq!(panels.len(), 1);
+                assert_eq!(panels[0].panel_id, panel);
+            }
+            other => panic!("expected a Panels reply, got {other:?}"),
+        }
+
+        mux.shutdown();
     }
 }

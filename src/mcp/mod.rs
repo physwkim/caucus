@@ -2,8 +2,8 @@
 //! (`docs/design.md` §0 #4, §9).
 //!
 //! The main worker (a Claude Code agent in one panel) drives every sub-agent
-//! panel through six MCP tools: `send_keys`, `ctrl_c`, `read_panel`,
-//! `spawn_role`, `kill_panel`, `list_panels`.
+//! panel through seven MCP tools: `send_keys`, `ctrl_c`, `read_panel`,
+//! `spawn_role`, `kill_panel`, `list_panels`, `wait_for_panels`.
 //!
 //! ## Architecture
 //!
@@ -24,7 +24,7 @@
 //! `rmcp` (1.7.0) resolves cleanly but its server surface is macro-driven and
 //! its transport runs an internal loop that resists deterministic unit
 //! testing. The MCP slice caucus needs is small — `initialize` / `tools/list`
-//! / `tools/call`, six tools — so [`jsonrpc`] implements exactly that, with a
+//! / `tools/call`, seven tools — so [`jsonrpc`] implements exactly that, with a
 //! pure dispatch core. See that module's header for the rationale.
 
 pub mod control_client;
@@ -110,7 +110,7 @@ pub trait McpToolSurface {
     fn list_panels(&self) -> Vec<PanelSummary>;
 }
 
-/// The six MCP tools caucus exposes to the main worker (`docs/design.md` §0 #4).
+/// The MCP tools caucus exposes to the main worker (`docs/design.md` §0 #4).
 ///
 /// One catalogue, shared by [`jsonrpc::McpDispatch`] (the `tools/list`
 /// response) and the control-socket request decoder ([`control_client`]).
@@ -209,6 +209,29 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                           (working / idle / blocked_* / exited).",
             input_schema: json!({ "type": "object", "properties": {} }),
         },
+        ToolDef {
+            name: "wait_for_panels",
+            description: "Block until the named panels all settle (finish their \
+                          turn — leave the 'working' state) or timeout_secs \
+                          elapses (default 600). Returns each panel's final role \
+                          + state. Use this instead of sleep-polling list_panels.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "panels": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Panel ids (ULIDs) to wait on."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Max seconds to block before returning \
+                                        (default 600, max 3600)."
+                    }
+                },
+                "required": ["panels"]
+            }),
+        },
     ]
 }
 
@@ -225,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_catalogue_has_the_six_tools() {
+    fn tool_catalogue_has_every_tool() {
         let names: Vec<&str> = tool_catalogue().iter().map(|t| t.name).collect();
         assert_eq!(
             names,
@@ -236,6 +259,7 @@ mod tests {
                 "spawn_role",
                 "kill_panel",
                 "list_panels",
+                "wait_for_panels",
             ]
         );
     }

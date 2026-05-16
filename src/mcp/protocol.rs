@@ -52,6 +52,15 @@ pub enum ControlRequest {
     KillPanel { panel: PanelId },
     /// List every live panel with role + derived state.
     ListPanels,
+    /// Block until every named panel has settled (left `Working`/`Spawning`)
+    /// or `timeout_secs` elapses. Unlike every other request this is answered
+    /// by a *deferred* reply — the main `caucus` event loop is never blocked
+    /// (`crate::session::runtime::Multiplexer::poll_pending_waits`).
+    WaitForPanels {
+        panels: Vec<PanelId>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
 }
 
 /// One control-socket response — the result of executing a [`ControlRequest`]
@@ -122,6 +131,35 @@ mod tests {
                 worktree: false,
                 model: None,
                 agent_cli: None,
+            }
+        );
+    }
+
+    #[test]
+    fn wait_for_panels_round_trips() {
+        let req = ControlRequest::WaitForPanels {
+            panels: vec![PanelId::new(), PanelId::new()],
+            timeout_secs: Some(120),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"op\":\"wait_for_panels\""));
+        let back: ControlRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn wait_for_panels_timeout_is_optional() {
+        // `timeout_secs` defaults to None when omitted from the wire form.
+        let id = PanelId::new();
+        let req: ControlRequest = serde_json::from_str(&format!(
+            r#"{{"op":"wait_for_panels","panels":["{id}"]}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::WaitForPanels {
+                panels: vec![id],
+                timeout_secs: None,
             }
         );
     }

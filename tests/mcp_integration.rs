@@ -30,13 +30,13 @@ fn area() -> Rect {
     }
 }
 
-/// `caucus mcp-serve` answers a JSON-RPC `tools/list` with the six tools.
+/// `caucus mcp-serve` answers a JSON-RPC `tools/list` with the full tool set.
 ///
 /// The binary is driven over stdio exactly as the main worker's Claude Code instance
 /// drives it; `initialize` and `tools/list` touch no control socket, so a
 /// throwaway socket path is fine.
 #[test]
-fn mcp_serve_lists_the_six_tools_over_stdio() {
+fn mcp_serve_lists_the_tools_over_stdio() {
     let bin = env!("CARGO_BIN_EXE_caucus");
     let mut child = Command::new(bin)
         .args(["mcp-serve", "--control-sock", "/tmp/caucus-test-unused.sock"])
@@ -83,8 +83,9 @@ fn mcp_serve_lists_the_six_tools_over_stdio() {
             "spawn_role",
             "kill_panel",
             "list_panels",
+            "wait_for_panels",
         ],
-        "tools/list must return exactly the six caucus tools"
+        "tools/list must return exactly the caucus tools"
     );
 
     // Closing stdin makes the server exit cleanly.

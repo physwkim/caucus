@@ -153,11 +153,15 @@ async fn run_loop(config: Config, session: Session, roles: &[String]) -> Result<
         // 4. PTY pump — drain every panel into its grid + capture, reap exits.
         mux.pump_all();
 
+        // 5. Deferred waits — answer any `wait_for_panels` whose panels have
+        //    now settled or timed out (signals/pump above just updated state).
+        mux.poll_pending_waits();
+
         if mux.should_quit() {
             break;
         }
 
-        // 5. Redraw on the tick.
+        // 6. Redraw on the tick.
         if last_draw.elapsed() >= TICK {
             draw(&mut terminal, &mux)?;
             last_draw = Instant::now();
