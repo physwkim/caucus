@@ -10,11 +10,20 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::config::Config;
+use crate::doctor::{self, Severity};
+use crate::session::id::{PanelId, SessionId};
 use crate::signal::TurnKind;
+
+/// Exit code for an environment error (`docs/design.md` §10.1).
+const EXIT_ENV_ERROR: u8 = 3;
+/// Exit code for a user error — bad arguments (`docs/design.md` §10.1).
+const EXIT_USER_ERROR: u8 = 2;
 
 /// `caucus` — a terminal multiplexer for teams of AI coding agents.
 #[derive(Debug, Parser)]
@@ -123,52 +132,125 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-/// Launch the full-screen multiplexer TUI.
+/// The git repository caucus operates on — the current working directory.
+fn repo_root() -> Result<PathBuf> {
+    std::env::current_dir().context("determine current working directory")
+}
+
+/// Launch the full-screen multiplexer TUI (`docs/design.md` §0 #2).
+///
+/// Builds the session, spawns the CEO panel plus any `--roles`, and runs the
+/// ratatui event loop. When stdout is not a tty, [`crate::tui::run`] fails
+/// cleanly with a message rather than panicking.
 fn run_tui(roles: &[String]) -> Result<ExitCode> {
-    // TODO(phase 2): build the `Session`, spawn the CEO panel (+ `roles`),
-    // run the ratatui event loop with PTY pumps and the MCP + signal servers.
-    let _ = roles;
-    println!("caucus TUI: TODO");
+    let repo = repo_root()?;
+    crate::tui::run(&repo, roles)?;
     Ok(ExitCode::SUCCESS)
 }
 
-/// `caucus init [--install-hook]`.
+/// `caucus init [--install-hook]` — create `.caucus/` + `bin/turn-signal`,
+/// optionally merge the Claude Stop hook.
 fn run_init(install_hook: bool) -> Result<ExitCode> {
-    // TODO(phase 2): create `.caucus/` + `bin/turn-signal`; when
-    // `install_hook`, merge the Stop hook into `~/.claude/settings.json`.
-    let _ = install_hook;
-    todo!("phase 2: caucus init")
+    let repo = repo_root()?;
+    let outcome = crate::init::run(&repo, install_hook)?;
+    eprintln!("caucus init:");
+    eprintln!("  .caucus dir:   {}", outcome.caucus_dir.display());
+    eprintln!("  hook script:   {}", outcome.hook_script.display());
+    match &outcome.hook_install {
+        Some(crate::init::HookInstall::Merged { settings, backup }) => {
+            eprintln!("  Claude Stop hook merged: {}", settings.display());
+            if let Some(bak) = backup {
+                eprintln!("  prior settings backed up: {}", bak.display());
+            }
+        }
+        Some(crate::init::HookInstall::AlreadyPresent { settings }) => {
+            eprintln!(
+                "  Claude Stop hook already present in {} — no change",
+                settings.display()
+            );
+        }
+        None => {
+            eprintln!("  (Stop hook not installed — re-run with --install-hook)");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
-/// `caucus doctor`.
+/// `caucus doctor` — environment + configuration health check.
+///
+/// Exit code maps from the worst check severity (`docs/design.md` §10.1):
+/// any `Error` → `3` (environment error); otherwise `0`.
 fn run_doctor() -> Result<ExitCode> {
-    // TODO(phase 2): load `Config`, run `doctor::run`, print the report,
-    // map `Report::worst()` to an exit code.
-    todo!("phase 2: caucus doctor")
+    let repo = repo_root()?;
+    let config = Config::load(&repo).context("load caucus configuration")?;
+    let report = doctor::run(&config);
+
+    eprintln!("caucus doctor — {} check(s):", report.checks.len());
+    for check in &report.checks {
+        let marker = match check.severity {
+            Severity::Ok => "ok  ",
+            Severity::Warn => "warn",
+            Severity::Error => "ERR ",
+        };
+        eprintln!("  [{}] {}: {}", marker, check.name, check.detail);
+    }
+
+    let code = match report.worst() {
+        Severity::Error => EXIT_ENV_ERROR,
+        Severity::Ok | Severity::Warn => 0,
+    };
+    Ok(ExitCode::from(code))
 }
 
-/// `caucus signal ...`.
+/// `caucus signal post ...` — the turn-signal hook client.
 fn run_signal(cmd: SignalCommand) -> Result<ExitCode> {
     match cmd {
-        SignalCommand::Post { .. } => {
-            // TODO(phase 2): read the hook payload from stdin, build a
-            // `TurnSignal`, connect to `sock`, write one JSON line.
-            todo!("phase 2: caucus signal post")
+        SignalCommand::Post {
+            sock,
+            session,
+            panel,
+            kind,
+        } => {
+            let session_id = SessionId::from_str(&session)
+                .with_context(|| format!("invalid --session id '{session}'"))?;
+            let panel_id = PanelId::from_str(&panel)
+                .with_context(|| format!("invalid --panel id '{panel}'"))?;
+            crate::signal::post::run(&sock, session_id, panel_id, kind.into())?;
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
 
-/// `caucus role list | show <name>`.
+/// `caucus role list | show <name>` — role inspection.
 fn run_role(cmd: RoleCommand) -> Result<ExitCode> {
+    let repo = repo_root()?;
+    let config = Config::load(&repo).context("load caucus configuration")?;
     match cmd {
         RoleCommand::List => {
-            // TODO(phase 2): load `Config`, print role names.
-            todo!("phase 2: caucus role list")
+            for spec in config.roles.specs() {
+                println!("{:<18} {}", spec.name, spec.description);
+            }
+            Ok(ExitCode::SUCCESS)
         }
-        RoleCommand::Show { .. } => {
-            // TODO(phase 2): load `Config`, print the role spec.
-            todo!("phase 2: caucus role show")
-        }
+        RoleCommand::Show { name } => match config.roles.get(&name) {
+            Ok(spec) => {
+                println!("name:            {}", spec.name);
+                println!("description:     {}", spec.description);
+                println!("agent_cli:       {}", spec.agent_cli.binary());
+                println!(
+                    "model:           {}",
+                    spec.model.as_deref().unwrap_or("(CLI default)")
+                );
+                println!("permission_mode: {}", spec.permission_mode);
+                println!("allowed_tools:   {}", spec.allowed_tools_csv());
+                println!("prompt_template: {}", spec.system_prompt_template);
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(err) => {
+                eprintln!("caucus: {err}");
+                Ok(ExitCode::from(EXIT_USER_ERROR))
+            }
+        },
     }
 }
 

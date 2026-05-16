@@ -4,4 +4,4 @@
 pub mod lifecycle;
 
 pub use crate::session::id::PanelId;
-pub use lifecycle::{Panel, PanelState};
+pub use lifecycle::{IllegalTransition, Panel, PanelError, PanelState};

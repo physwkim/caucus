@@ -2,7 +2,9 @@
 //! around one topic. See `docs/design.md` §3.
 
 pub mod id;
+pub mod runtime;
 pub mod state;
 
 pub use id::{AgentId, PanelId, SessionId};
+pub use runtime::Multiplexer;
 pub use state::{Session, SessionState};

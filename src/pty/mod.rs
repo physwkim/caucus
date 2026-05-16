@@ -187,6 +187,15 @@ impl Pty {
         Ok(())
     }
 
+    /// Whether the child agent process is still running.
+    ///
+    /// Non-blocking: a [`Child::try_wait`] probe. A child that has exited (or
+    /// whose status can no longer be read) reports `false`, so the panel
+    /// event loop can transition the panel to `Exited` and reflow.
+    pub(crate) fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
     /// Resize the PTY (on layout reflow).
     pub(crate) fn resize(&mut self, cols: u16, rows: u16) -> Result<(), PtyError> {
         let size = PtySize {

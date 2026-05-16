@@ -8,6 +8,7 @@ pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod doctor;
+pub mod init;
 pub mod input;
 pub mod mcp;
 pub mod panel;
@@ -17,6 +18,7 @@ pub mod role;
 pub mod session;
 pub mod signal;
 pub mod term;
+pub mod tui;
 pub mod worktree;
 
 /// Compile-time package version, exposed for `caucus --version`.
