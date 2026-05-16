@@ -11,12 +11,17 @@
 //!   ratatui [`Frame`], with a titled border (role + derived state) and a
 //!   focus highlight.
 
+use std::collections::HashMap;
+
 use ratatui::Frame;
 use ratatui::layout::Rect as TuiRect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::agent::derive_state::DerivedState;
+use crate::agent::lane_event::LaneEventKind;
+use crate::agent::manifest::AgentManifest;
 use crate::panel::Panel;
 use crate::session::id::PanelId;
 use crate::term::Grid;
@@ -433,6 +438,230 @@ fn palette_color(idx: u8) -> Option<Color> {
     }
 }
 
+/// One row of the transcript overlay — a pure summary of a panel's activity,
+/// derived from its [`Panel`] plus its [`AgentManifest`]. Built by
+/// [`TranscriptRow::build`] so the formatting (turn count, branch, message
+/// truncation) is unit-testable without a ratatui frame.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TranscriptRow {
+    /// Role name driving the panel.
+    pub role: String,
+    /// Lower-case derived-state label (`working` / `idle` / `blocked_*` / ...).
+    pub state: String,
+    /// Whether this panel currently has focus.
+    pub focused: bool,
+    /// Number of `TurnCompleted` lane events on the manifest.
+    pub turns: usize,
+    /// Worktree branch name, if the panel runs in a worktree.
+    pub branch: Option<String>,
+    /// First line of the agent's last message, untruncated.
+    pub last_message: String,
+}
+
+impl TranscriptRow {
+    /// Build a row from a panel and its manifest. The manifest is optional —
+    /// before the first manifest write a panel falls back to its coarse
+    /// panel-state label and a zero turn count.
+    pub fn build(panel: &Panel, manifest: Option<&AgentManifest>, focused: bool) -> Self {
+        let state = match manifest {
+            Some(m) => derived_state_label(m.derived_state()).to_string(),
+            None => panel.state_label().to_string(),
+        };
+        let turns = manifest.map(turn_count).unwrap_or(0);
+        // The worktree branch is the last path component of the worktree dir
+        // (`worktree::manager::create` names the dir after the branch).
+        let branch = panel.worktree_path.as_ref().and_then(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        });
+        let last_message = manifest
+            .and_then(|m| m.last_message())
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Self {
+            role: panel.role.clone(),
+            state,
+            focused,
+            turns,
+            branch,
+            last_message,
+        }
+    }
+
+    /// Render the row to a single display string clipped to `width` columns.
+    /// The fixed-width prefix (marker, role, state, turns, branch) is laid
+    /// out first; the last message takes whatever width is left, truncated
+    /// with an ellipsis.
+    pub fn render_line(&self, width: usize) -> String {
+        let marker = if self.focused { "▸ " } else { "  " };
+        let branch = match &self.branch {
+            Some(b) => format!(" [{b}]"),
+            None => String::new(),
+        };
+        let prefix = format!(
+            "{marker}{role} · {state} · {turns} turn(s){branch}  ",
+            role = self.role,
+            state = self.state,
+            turns = self.turns,
+        );
+        let prefix_w = prefix.chars().count();
+        if prefix_w >= width {
+            return truncate_ellipsis(&prefix, width);
+        }
+        let msg = truncate_ellipsis(&self.last_message, width - prefix_w);
+        format!("{prefix}{msg}")
+    }
+}
+
+/// Count the `TurnCompleted` lane events on a manifest — the panel's turn
+/// count shown in the transcript overlay.
+fn turn_count(manifest: &AgentManifest) -> usize {
+    manifest
+        .lane_events()
+        .iter()
+        .filter(|e| matches!(e.kind, LaneEventKind::TurnCompleted))
+        .count()
+}
+
+/// Lower-case label for a [`DerivedState`], matching the overlay's vocabulary
+/// (`working` / `idle` / `blocked_*` / `exited` / ...).
+fn derived_state_label(state: DerivedState) -> &'static str {
+    match state {
+        DerivedState::Working => "working",
+        DerivedState::Idle => "idle",
+        DerivedState::BlockedPermissionPrompt => "blocked_permission",
+        DerivedState::BlockedMergeConflict => "blocked_merge",
+        DerivedState::BlockedBackgroundJob => "blocked_job",
+        DerivedState::DegradedMcp => "degraded_mcp",
+        DerivedState::InterruptedTransport => "interrupted",
+        DerivedState::Exited => "exited",
+    }
+}
+
+/// Colour-code a state label: green idle, yellow working, red blocked/exited/
+/// interrupted, gray otherwise.
+fn state_color(state: &str) -> Color {
+    if state == "idle" {
+        Color::Green
+    } else if state == "working" {
+        Color::Yellow
+    } else if state.starts_with("blocked")
+        || state == "exited"
+        || state == "interrupted"
+        || state == "degraded_mcp"
+    {
+        Color::Red
+    } else {
+        Color::Gray
+    }
+}
+
+/// Truncate `s` to at most `width` display columns, appending `…` when it had
+/// to be cut. A `width` of 0 yields an empty string.
+fn truncate_ellipsis(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let kept: String = s.chars().take(width - 1).collect();
+    format!("{kept}…")
+}
+
+/// Draw the read-only transcript overlay on top of the panels: a bordered,
+/// near-full-screen popup with one summary row per panel.
+///
+/// Draw-time only — the panels keep rendering underneath; this just paints
+/// over them. The popup area is blanked with [`Clear`] first so the panels
+/// beneath do not bleed through.
+pub fn draw_transcript(
+    frame: &mut Frame,
+    panels: &[Panel],
+    manifests: &HashMap<PanelId, AgentManifest>,
+    focused: Option<PanelId>,
+) {
+    let full = frame.area();
+    if full.width < 8 || full.height < 6 {
+        return;
+    }
+    // Inset the popup two cells on every side so the panels remain visible
+    // as a frame around it.
+    let popup = TuiRect {
+        x: full.x + 2,
+        y: full.y + 2,
+        width: full.width.saturating_sub(4),
+        height: full.height.saturating_sub(4),
+    };
+
+    let title = format!(" caucus · transcript — {} panel(s) ", panels.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .title(Span::styled(
+            title,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+
+    // Interior: the popup minus its single-cell border.
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let inner_h = popup.height.saturating_sub(2) as usize;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if panels.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no panels)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        // Reserve one row for a "… +N more" line when there are too many
+        // panels to fit; otherwise every panel gets a row.
+        let fits = inner_h;
+        let (visible, overflow) = if panels.len() > fits && fits > 0 {
+            (fits.saturating_sub(1), panels.len() - fits.saturating_sub(1))
+        } else {
+            (panels.len(), 0)
+        };
+        for panel in panels.iter().take(visible) {
+            let row = TranscriptRow::build(
+                panel,
+                manifests.get(&panel.id),
+                focused == Some(panel.id),
+            );
+            lines.push(transcript_row_line(&row, inner_w));
+        }
+        if overflow > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{overflow} more"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Render one [`TranscriptRow`] as a styled ratatui [`Line`]: the state token
+/// is colour-coded, the rest is plain.
+fn transcript_row_line(row: &TranscriptRow, width: usize) -> Line<'static> {
+    let text = row.render_line(width);
+    // Colour the whole line by the panel's state — simple and legible; the
+    // state word is the at-a-glance signal the overlay exists for.
+    let mut style = Style::default().fg(state_color(&row.state));
+    if row.focused {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    Line::from(Span::styled(text, style))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +855,103 @@ mod tests {
         };
         assert_eq!(r.inner().width, 0);
         assert_eq!(r.inner().height, 0);
+    }
+
+    fn row(role: &str, msg: &str) -> TranscriptRow {
+        TranscriptRow {
+            role: role.into(),
+            state: "working".into(),
+            focused: false,
+            turns: 3,
+            branch: None,
+            last_message: msg.into(),
+        }
+    }
+
+    #[test]
+    fn truncate_ellipsis_cuts_and_marks() {
+        assert_eq!(truncate_ellipsis("hello", 10), "hello");
+        assert_eq!(truncate_ellipsis("hello", 5), "hello");
+        assert_eq!(truncate_ellipsis("hello world", 5), "hell…");
+        assert_eq!(truncate_ellipsis("hello", 1), "…");
+        assert_eq!(truncate_ellipsis("hello", 0), "");
+    }
+
+    #[test]
+    fn render_line_truncates_the_message_to_width() {
+        let r = row("backend", "this is a fairly long last message that will not fit");
+        let line = r.render_line(50);
+        assert!(line.chars().count() <= 50, "got {} cols", line.chars().count());
+        assert!(line.ends_with('…'), "long message must be ellipsised: {line:?}");
+        assert!(line.contains("backend"));
+        assert!(line.contains("3 turn(s)"));
+    }
+
+    #[test]
+    fn render_line_keeps_a_short_message_intact() {
+        let r = row("qa", "done");
+        let line = r.render_line(80);
+        assert!(line.contains("done"));
+        assert!(!line.ends_with('…'));
+    }
+
+    #[test]
+    fn render_line_clips_the_prefix_when_width_is_tiny() {
+        let r = row("architect", "ignored");
+        let line = r.render_line(6);
+        assert_eq!(line.chars().count(), 6);
+        assert!(line.ends_with('…'));
+    }
+
+    #[test]
+    fn focused_row_gets_the_marker() {
+        let mut r = row("backend", "x");
+        r.focused = true;
+        assert!(r.render_line(80).starts_with("▸ "));
+        r.focused = false;
+        assert!(r.render_line(80).starts_with("  "));
+    }
+
+    #[test]
+    fn render_line_shows_the_branch() {
+        let mut r = row("backend", "x");
+        r.branch = Some("caucus-abc-backend-1".into());
+        assert!(r.render_line(120).contains("[caucus-abc-backend-1]"));
+    }
+
+    #[test]
+    fn turn_count_counts_turn_completed_events() {
+        use crate::agent::lane_event::LaneEvent;
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+        use crate::session::id::{PanelId, SessionId};
+
+        let mut m = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        // A fresh manifest has only a `Started` event — zero turns.
+        assert_eq!(turn_count(&m), 0);
+
+        // Append two TurnCompleted events directly to the timeline.
+        m.lane_events
+            .push(LaneEvent::now(LaneEventKind::TurnCompleted));
+        m.lane_events
+            .push(LaneEvent::now(LaneEventKind::TurnCompleted));
+        assert_eq!(turn_count(&m), 2);
+    }
+
+    #[test]
+    fn state_color_codes_idle_working_and_blocked() {
+        assert_eq!(state_color("idle"), Color::Green);
+        assert_eq!(state_color("working"), Color::Yellow);
+        assert_eq!(state_color("blocked_permission"), Color::Red);
+        assert_eq!(state_color("exited"), Color::Red);
+        assert_eq!(state_color("interrupted"), Color::Red);
+        assert_eq!(state_color("spawning"), Color::Gray);
     }
 }

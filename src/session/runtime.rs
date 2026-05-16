@@ -97,6 +97,10 @@ pub struct Multiplexer {
     /// full-screen (`Ctrl-A z`). Hidden panels keep running — `pump_all`
     /// always pumps every panel; only the layout is restricted.
     zoom: Option<PanelId>,
+    /// When set, the read-only transcript overlay is drawn on top of the
+    /// panels (`Ctrl-A t`). Draw-time only — panels keep pumping and input
+    /// keeps routing as normal.
+    show_transcript: bool,
 }
 
 impl Multiplexer {
@@ -145,6 +149,7 @@ impl Multiplexer {
                 pending_waits: Vec::new(),
                 layout_mode: LayoutMode::default(),
                 zoom: None,
+                show_transcript: false,
             },
             signal_server,
             control_server,
@@ -449,7 +454,25 @@ impl Multiplexer {
                 self.layout_mode = self.layout_mode.next();
                 self.reflow();
             }
+            CaucusCommand::ToggleTranscript => {
+                self.show_transcript = !self.show_transcript;
+                self.focus.set_transcript_open(self.show_transcript);
+            }
+            CaucusCommand::HideTranscript => {
+                self.show_transcript = false;
+                self.focus.set_transcript_open(false);
+            }
         }
+    }
+
+    /// Whether the read-only transcript overlay is currently shown.
+    pub fn show_transcript(&self) -> bool {
+        self.show_transcript
+    }
+
+    /// Per-panel manifests, keyed by panel id — read-only, for the overlay.
+    pub fn manifests(&self) -> &HashMap<PanelId, AgentManifest> {
+        &self.manifests
     }
 
     /// Toggle full-screen zoom on the focused panel. A second toggle (or a
@@ -1106,6 +1129,27 @@ mod tests {
         assert_eq!(mux.layout_mode(), LayoutMode::MainVertical);
         mux.apply_command(CaucusCommand::CycleLayout);
         assert_eq!(mux.layout_mode(), LayoutMode::Tiled);
+    }
+
+    /// `ToggleTranscript` flips `show_transcript`; `HideTranscript` always
+    /// clears it.
+    #[tokio::test]
+    async fn toggle_transcript_flips_show_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        assert!(!mux.show_transcript());
+
+        mux.apply_command(CaucusCommand::ToggleTranscript);
+        assert!(mux.show_transcript());
+
+        mux.apply_command(CaucusCommand::ToggleTranscript);
+        assert!(!mux.show_transcript());
+
+        // Open it, then hide it explicitly.
+        mux.apply_command(CaucusCommand::ToggleTranscript);
+        assert!(mux.show_transcript());
+        mux.apply_command(CaucusCommand::HideTranscript);
+        assert!(!mux.show_transcript());
     }
 
     /// `ToggleZoom` with no focused panel is a no-op (no panic).

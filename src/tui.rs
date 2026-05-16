@@ -210,6 +210,17 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mux: &Multiplexer) ->
 
             render::draw(frame, mux.layout(), mux.panels(), mux.focused());
 
+            // The transcript overlay paints on top of the panels — draw-time
+            // only; the panels keep pumping and input keeps routing.
+            if mux.show_transcript() {
+                render::draw_transcript(
+                    frame,
+                    mux.panels(),
+                    mux.manifests(),
+                    mux.focused(),
+                );
+            }
+
             let status = status_line(mux);
             frame.render_widget(
                 Paragraph::new(Span::styled(
@@ -240,13 +251,19 @@ fn status_line(mux: &Multiplexer) -> String {
     } else {
         ""
     };
+    let transcript = if mux.show_transcript() {
+        "  [TRANSCRIPT]"
+    } else {
+        ""
+    };
     format!(
         " caucus · {} panel(s) · focus: {} · layout: {} · \
-         Ctrl-A then n/p focus, z zoom, </> move, Space layout, q quit{}{}",
+         Ctrl-A then n/p focus, z zoom, </> move, Space layout, t transcript, q quit{}{}{}",
         mux.panels().len(),
         focused,
         mux.layout_mode().label(),
         zoom,
+        transcript,
         prefix
     )
 }
