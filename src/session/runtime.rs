@@ -33,7 +33,7 @@ use crate::session::state::Session;
 use crate::signal::TurnSignal;
 use crate::signal::server::SignalServer;
 use crate::worktree::cleanup::{CleanupJob, CleanupQueue};
-use crate::worktree::manager::{WorktreeRequest, create as create_worktree};
+use crate::worktree::manager::{WorktreeHandle, WorktreeRequest, create as create_worktree};
 
 /// Default wait budget for `wait_for_panels` when the caller omits
 /// `timeout_secs`.
@@ -768,13 +768,30 @@ impl McpToolSurface for Multiplexer {
         model: Option<&str>,
         agent_cli: Option<AgentCli>,
     ) -> Result<PanelId, McpError> {
-        let worktree_path = if worktree {
+        let wt_handle = if worktree {
             Some(self.create_role_worktree(role)?)
         } else {
             None
         };
-        self.spawn_panel(role, agent_cli, model.map(str::to_string), worktree_path)
-            .map_err(|e| McpError::Tool(format!("spawn_role: {e:#}")))
+        let worktree_path = wt_handle.as_ref().map(|h| h.path.clone());
+        match self.spawn_panel(role, agent_cli, model.map(str::to_string), worktree_path) {
+            Ok(id) => Ok(id),
+            Err(e) => {
+                // The panel never came up — don't leak the worktree (dir +
+                // branch) `create_role_worktree` just created. Enqueue it for
+                // serial cleanup (Invariant I-3); the branch is empty (the
+                // sub-agent never ran) so it is deleted, not preserved.
+                if let Some(h) = wt_handle {
+                    let _ = self.cleanup.enqueue(CleanupJob {
+                        repo_root: self.session.repo_path.clone(),
+                        worktree_paths: vec![h.path],
+                        branches_to_delete: vec![h.branch],
+                        done: None,
+                    });
+                }
+                Err(McpError::Tool(format!("spawn_role: {e:#}")))
+            }
+        }
     }
 
     fn kill_panel(&mut self, panel: PanelId) -> Result<(), McpError> {
@@ -818,7 +835,7 @@ impl Multiplexer {
     /// `worktree::manager::create` is synchronous (`git worktree add` is a
     /// fast subprocess); the event loop calls it directly on its own thread —
     /// no async bridging, so no nested-runtime panic.
-    fn create_role_worktree(&self, role: &str) -> Result<PathBuf, McpError> {
+    fn create_role_worktree(&self, role: &str) -> Result<WorktreeHandle, McpError> {
         let req = WorktreeRequest {
             repo_root: self.session.repo_path.clone(),
             session_id: self.session.id,
@@ -834,10 +851,7 @@ impl Multiplexer {
                 self.role_counts.get(role).copied().unwrap_or(0) + 1,
             )),
         };
-        match create_worktree(&req) {
-            Ok(wt) => Ok(wt.path),
-            Err(err) => Err(McpError::Tool(format!("worktree create: {err}"))),
-        }
+        create_worktree(&req).map_err(|err| McpError::Tool(format!("worktree create: {err}")))
     }
 }
 
@@ -1094,5 +1108,58 @@ mod tests {
         );
         assert!(text.contains("hello"), "got: {text:?}");
         assert!(text.contains("from caucus"), "got: {text:?}");
+    }
+
+    /// `spawn_role(worktree=true)` must not leak the worktree when the panel
+    /// spawn fails. `create_role_worktree` does not validate the role, so an
+    /// unknown role creates the worktree and then fails in `spawn_panel` —
+    /// exactly the orphan path. The worktree must be enqueued for cleanup.
+    #[tokio::test]
+    async fn spawn_role_failure_does_not_leak_the_worktree() {
+        use std::time::Duration;
+
+        // A temp git repo so `git worktree add` succeeds.
+        let tmp = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(tmp.path())
+                .args(args)
+                .output()
+                .expect("run git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "caucus-test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        let mut mux = mux(&tmp);
+        let worktrees = tmp.path().join(".caucus").join("worktrees");
+
+        let resp = mux.execute_control(ControlRequest::SpawnRole {
+            role: "no-such-role-xyz".into(),
+            worktree: true,
+            model: None,
+            agent_cli: None,
+        });
+        assert!(
+            matches!(resp, ControlResponse::Error { .. }),
+            "unknown role must fail: {resp:?}"
+        );
+
+        // Cleanup is a serial async queue — poll for the orphan's removal.
+        let mut cleaned = false;
+        for _ in 0..100 {
+            let empty = std::fs::read_dir(&worktrees)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true);
+            if empty {
+                cleaned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(cleaned, "orphan worktree must be enqueued for cleanup");
+
+        mux.shutdown();
     }
 }
