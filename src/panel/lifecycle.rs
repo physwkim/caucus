@@ -105,6 +105,19 @@ impl Panel {
         if bytes.is_empty() {
             return Ok(0);
         }
+        // Debug aid: when `CAUCUS_DUMP_PTY` is set, append every raw PTY byte
+        // to `/tmp/caucus-pty-<panel_id>.raw` so a corrupted live render can
+        // be replayed offline through `term::Grid`. Off by default.
+        if std::env::var_os("CAUCUS_DUMP_PTY").is_some() {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(format!("/tmp/caucus-pty-{}.raw", self.id))
+            {
+                use std::io::Write;
+                let _ = f.write_all(&bytes);
+            }
+        }
         // Single sanctioned grid mutation path: PTY bytes through `advance`.
         self.grid.advance(&bytes);
         // Capture is turn-segmented; `push` is a no-op until a turn is open,
