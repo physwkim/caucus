@@ -60,6 +60,19 @@ struct PendingWait {
     reply: oneshot::Sender<ControlResponse>,
 }
 
+/// Arguments to the shared [`Multiplexer::spawn_panel_inner`] path. Bundling
+/// them keeps the function arity sane as the spawn surface grows (worktree
+/// branch + resume id for `caucus resume`).
+struct SpawnPanelOpts<'a> {
+    role: &'a str,
+    agent_cli: Option<AgentCli>,
+    model: Option<String>,
+    worktree_path: Option<PathBuf>,
+    worktree_branch: Option<String>,
+    mcp_config_path: Option<PathBuf>,
+    resume_session_id: Option<String>,
+}
+
 /// The live multiplexer: one [`Session`] plus every panel running in it.
 pub struct Multiplexer {
     /// The session this multiplexer drives.
@@ -101,6 +114,11 @@ pub struct Multiplexer {
     /// panels (`Ctrl-A t`). Draw-time only — panels keep pumping and input
     /// keeps routing as normal.
     show_transcript: bool,
+    /// Git branch of each worktree-backed panel, keyed by panel id. The
+    /// manifest stores only the worktree *path* (which is removed on
+    /// shutdown); the branch persists and is what `caucus resume` re-attaches
+    /// a worktree on. Populated at spawn, dropped on kill.
+    worktree_branches: HashMap<PanelId, String>,
 }
 
 impl Multiplexer {
@@ -150,6 +168,7 @@ impl Multiplexer {
                 layout_mode: LayoutMode::default(),
                 zoom: None,
                 show_transcript: false,
+                worktree_branches: HashMap::new(),
             },
             signal_server,
             control_server,
@@ -233,7 +252,17 @@ impl Multiplexer {
         model: Option<String>,
         worktree_path: Option<PathBuf>,
     ) -> Result<PanelId> {
-        self.spawn_panel_inner(role, agent_cli, model, worktree_path, None)
+        let id = self.spawn_panel_inner(SpawnPanelOpts {
+            role,
+            agent_cli,
+            model,
+            worktree_path,
+            worktree_branch: None,
+            mcp_config_path: None,
+            resume_session_id: None,
+        })?;
+        self.persist_record();
+        Ok(id)
     }
 
     /// Spawn the main worker panel (`docs/design.md` §0 #4, #10).
@@ -245,26 +274,116 @@ impl Multiplexer {
     /// the running `caucus` binary so the `mcp-serve` child is the exact same
     /// build.
     pub fn spawn_main_panel(&mut self, role: &str, caucus_bin: &std::path::Path) -> Result<PanelId> {
+        let id = self.spawn_main_panel_resume(role, caucus_bin, None)?;
+        self.persist_record();
+        Ok(id)
+    }
+
+    /// Spawn the main worker panel, optionally resuming its prior Claude
+    /// conversation via `resume_session_id` (`caucus resume`). The record is
+    /// *not* persisted here — the resume path persists once, after the whole
+    /// roster is rebuilt.
+    pub fn spawn_main_panel_resume(
+        &mut self,
+        role: &str,
+        caucus_bin: &std::path::Path,
+        resume_session_id: Option<String>,
+    ) -> Result<PanelId> {
         let mcp_config = crate::mcp::serve::write_mcp_config(
             &self.session.root_dir,
             caucus_bin,
             &self.control_sock_path,
         )
         .context("write main worker panel .mcp.json")?;
-        self.spawn_panel_inner(role, None, None, None, Some(mcp_config))
+        self.spawn_panel_inner(SpawnPanelOpts {
+            role,
+            agent_cli: None,
+            model: None,
+            worktree_path: None,
+            worktree_branch: None,
+            mcp_config_path: Some(mcp_config),
+            resume_session_id,
+        })
     }
 
-    /// Shared spawn path for [`Multiplexer::spawn_panel`] and
-    /// [`Multiplexer::spawn_main_panel`]; `mcp_config_path` is set only for the
-    /// main worker panel.
-    fn spawn_panel_inner(
+    /// Spawn a panel restoring a prior agent — used by `caucus resume`. The
+    /// record is *not* persisted here; the resume path persists once after the
+    /// full roster is rebuilt.
+    pub fn spawn_panel_resume(
         &mut self,
         role: &str,
         agent_cli: Option<AgentCli>,
         model: Option<String>,
         worktree_path: Option<PathBuf>,
-        mcp_config_path: Option<PathBuf>,
+        worktree_branch: Option<String>,
+        resume_session_id: Option<String>,
     ) -> Result<PanelId> {
+        self.spawn_panel_inner(SpawnPanelOpts {
+            role,
+            agent_cli,
+            model,
+            worktree_path,
+            worktree_branch,
+            mcp_config_path: None,
+            resume_session_id,
+        })
+    }
+
+    /// Persist the session roster to `<session_root>/session.json`. Called
+    /// after every roster change so a relaunch can resume from the latest
+    /// state. A write failure is logged, not fatal — a stale record is better
+    /// than aborting the session.
+    pub fn persist_record(&self) {
+        let record = self.build_record();
+        if let Err(err) = record.write(&self.session.root_dir) {
+            warn!(error = %err, "session record write failed");
+        }
+    }
+
+    /// Build a [`SessionRecord`] from the live panels + manifests.
+    fn build_record(&self) -> crate::session::record::SessionRecord {
+        use crate::session::record::{PanelRecord, SessionRecord};
+        let panels = self
+            .panels
+            .iter()
+            .enumerate()
+            .map(|(idx, panel)| {
+                let manifest = self.manifests.get(&panel.id);
+                PanelRecord {
+                    role: panel.role.clone(),
+                    agent_cli: manifest
+                        .map(|m| m.agent_cli)
+                        .unwrap_or(AgentCli::Claude),
+                    model: manifest.and_then(|m| m.model.clone()),
+                    order_index: idx,
+                    worktree_branch: self.worktree_branches.get(&panel.id).cloned(),
+                    claude_session_id: manifest
+                        .and_then(|m| m.claude_session_id().map(str::to_string)),
+                }
+            })
+            .collect();
+        SessionRecord {
+            id: self.session.id,
+            topic: self.session.topic.clone(),
+            repo_path: self.session.repo_path.clone(),
+            created_at: self.session.created_at,
+            layout_mode: self.layout_mode,
+            panels,
+        }
+    }
+
+    /// Shared spawn path. `mcp_config_path` is set only for the main worker
+    /// panel; `worktree_branch` / `resume_session_id` only on the resume path.
+    fn spawn_panel_inner(&mut self, opts: SpawnPanelOpts<'_>) -> Result<PanelId> {
+        let SpawnPanelOpts {
+            role,
+            agent_cli,
+            model,
+            worktree_path,
+            worktree_branch,
+            mcp_config_path,
+            resume_session_id,
+        } = opts;
         let spec = self
             .config
             .roles
@@ -288,6 +407,7 @@ impl Multiplexer {
             // role allowlist remains the real boundary (`SpawnRequest` doc).
             skip_permissions: true,
             mcp_config_path,
+            resume_session_id,
         };
 
         // Provisional layout: compute the slot the new panel will occupy so
@@ -325,6 +445,12 @@ impl Multiplexer {
         }
         self.manifests.insert(panel_id, mf);
 
+        // Remember the worktree branch — the branch persists across shutdown
+        // and is what `caucus resume` re-attaches a worktree on.
+        if let Some(branch) = worktree_branch {
+            self.worktree_branches.insert(panel_id, branch);
+        }
+
         self.panels.push(panel);
         if self.focus.focused().is_none() {
             self.focus.set_focus(Some(panel_id));
@@ -357,6 +483,7 @@ impl Multiplexer {
             }
         }
         self.manifests.remove(&panel_id);
+        self.worktree_branches.remove(&panel_id);
 
         // Killing the zoomed panel clears the zoom — the layout falls back to
         // the tiled arrangement rather than zooming a now-dead id.
@@ -370,6 +497,7 @@ impl Multiplexer {
             self.focus.set_focus(next.map(|p| p.id));
         }
         self.reflow();
+        self.persist_record();
         Ok(())
     }
 
@@ -453,6 +581,8 @@ impl Multiplexer {
             CaucusCommand::CycleLayout => {
                 self.layout_mode = self.layout_mode.next();
                 self.reflow();
+                // The record carries `layout_mode` and the panel order.
+                self.persist_record();
             }
             CaucusCommand::ToggleTranscript => {
                 self.show_transcript = !self.show_transcript;
@@ -506,11 +636,21 @@ impl Multiplexer {
         }
         self.panels.swap(idx, target as usize);
         self.reflow();
+        // `order_index` in the record changed.
+        self.persist_record();
     }
 
     /// The current panel arrangement mode (for the status bar).
     pub fn layout_mode(&self) -> LayoutMode {
         self.layout_mode
+    }
+
+    /// Set the panel arrangement mode and reflow — used by `caucus resume` to
+    /// restore the persisted layout. Does not persist the record itself; the
+    /// resume path persists once after the whole roster is rebuilt.
+    pub fn set_layout_mode(&mut self, mode: LayoutMode) {
+        self.layout_mode = mode;
+        self.reflow();
     }
 
     /// The zoomed panel id, if a panel is currently zoomed.
@@ -551,12 +691,20 @@ impl Multiplexer {
         }
 
         // Append the TurnCompleted lane event + recompute derived_state.
+        // A turn signal can carry Claude's conversation id for the first time;
+        // re-persist the session record so a relaunch can `--resume` it.
+        let mut session_id_changed = false;
         if let Some(manifest) = self.manifests.get_mut(&signal.panel_id) {
+            let before = manifest.claude_session_id().map(str::to_string);
             if let Err(err) =
                 manifest::record_turn_completed(manifest, &self.session.root_dir, &signal)
             {
                 warn!(panel = %signal.panel_id, error = %err, "manifest turn-signal write failed");
             }
+            session_id_changed = manifest.claude_session_id().map(str::to_string) != before;
+        }
+        if session_id_changed {
+            self.persist_record();
         }
     }
 
@@ -784,6 +932,11 @@ impl Multiplexer {
     /// The `Active -> Closed` transition goes through `session::state::transition`
     /// (Invariant I-1, the single owner of session state).
     pub fn shutdown(&mut self) {
+        // Persist the final roster before tearing panels down — this is the
+        // record `caucus resume` reads. Worktree directories are removed
+        // below, but their branches persist, so the record stays resumable.
+        self.persist_record();
+
         // Kill every panel's PTY and collect its worktree. `kill_panel` is
         // avoided here: it enqueues worktree cleanup onto the async queue,
         // whose consumer task is aborted with the tokio runtime the instant
@@ -899,8 +1052,22 @@ impl McpToolSurface for Multiplexer {
             None
         };
         let worktree_path = wt_handle.as_ref().map(|h| h.path.clone());
-        match self.spawn_panel(role, agent_cli, model.map(str::to_string), worktree_path) {
-            Ok(id) => Ok(id),
+        let worktree_branch = wt_handle.as_ref().map(|h| h.branch.clone());
+        // `spawn_panel_resume` with no resume id is a plain spawn that also
+        // records the worktree branch (so `caucus resume` can re-attach it).
+        let spawned = self.spawn_panel_resume(
+            role,
+            agent_cli,
+            model.map(str::to_string),
+            worktree_path,
+            worktree_branch,
+            None,
+        );
+        match spawned {
+            Ok(id) => {
+                self.persist_record();
+                Ok(id)
+            }
             Err(e) => {
                 // The panel never came up — don't leak the worktree (dir +
                 // branch) `create_role_worktree` just created. Enqueue it for
@@ -1033,6 +1200,37 @@ mod tests {
         let config = Config::load(tmp.path()).unwrap();
         let (mux, _signal, _control) = Multiplexer::new(session, config, area()).unwrap();
         mux
+    }
+
+    /// The multiplexer writes `session.json` on `shutdown`, and the record
+    /// round-trips back through `SessionRecord::read`.
+    #[tokio::test]
+    async fn shutdown_persists_a_session_record() {
+        use crate::session::record::SessionRecord;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let root = mux.session.root_dir.clone();
+        let id = mux.session.id;
+
+        mux.shutdown();
+
+        let record = SessionRecord::read(&root).expect("session.json written on shutdown");
+        assert_eq!(record.id, id);
+        assert_eq!(record.layout_mode, LayoutMode::Tiled);
+        assert!(record.panels.is_empty(), "no panels were spawned");
+    }
+
+    /// A layout-mode change persists the new mode into `session.json`.
+    #[tokio::test]
+    async fn cycle_layout_persists_the_record() {
+        use crate::session::record::SessionRecord;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let root = mux.session.root_dir.clone();
+
+        mux.apply_command(CaucusCommand::CycleLayout);
+        let record = SessionRecord::read(&root).expect("session.json written");
+        assert_eq!(record.layout_mode, LayoutMode::EvenHorizontal);
     }
 
     #[tokio::test]

@@ -67,6 +67,12 @@ pub struct AgentManifest {
     /// (`docs/design.md` §7.4, §8.5). Backs `read_panel(mode=last_message)`.
     #[serde(default)]
     pub(crate) last_message: Option<String>,
+    /// Claude Code's own conversation id, lifted from the Stop hook payload's
+    /// `session_id` field. `claude --resume <id>` needs this to continue the
+    /// agent's conversation after a caucus relaunch. `None` until the first
+    /// turn signal carries one (or for non-claude backends).
+    #[serde(default)]
+    pub(crate) claude_session_id: Option<String>,
 }
 
 impl AgentManifest {
@@ -99,6 +105,7 @@ impl AgentManifest {
             derived_state: DerivedState::Working,
             error: None,
             last_message: None,
+            claude_session_id: None,
         }
     }
 
@@ -106,6 +113,12 @@ impl AgentManifest {
     /// (`docs/design.md` §7.4) — backs `read_panel(mode=last_message)`.
     pub fn last_message(&self) -> Option<&str> {
         self.last_message.as_deref()
+    }
+
+    /// Claude Code's conversation id for this agent, if a turn signal has
+    /// carried one — what `claude --resume` needs to continue the session.
+    pub fn claude_session_id(&self) -> Option<&str> {
+        self.claude_session_id.as_deref()
     }
 
     /// Read-only view of the lane-event timeline.
@@ -180,6 +193,18 @@ pub(crate) fn record_turn_completed(
         .lane_events
         .push(LaneEvent::now(LaneEventKind::TurnCompleted));
     manifest.last_message = signal.last_message.clone();
+
+    // Lift Claude Code's own conversation id from the Stop hook payload — it
+    // is what `claude --resume <id>` needs to continue this agent after a
+    // caucus relaunch. Absent for non-claude backends; keep any prior value
+    // if a later signal omits it.
+    if let Some(sid) = signal
+        .raw_hook_payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        manifest.claude_session_id = Some(sid.to_string());
+    }
 
     // A non-Stop turn signal carries a failure; map it onto a blocker so the
     // derived state shows the agent as blocked/interrupted rather than idle.
@@ -365,6 +390,64 @@ mod tests {
         // Persisted: a fresh read sees the same derived state.
         let back = read(tmp.path(), manifest.agent_id).unwrap();
         assert_eq!(back.derived_state(), DerivedState::Idle);
+    }
+
+    /// A turn signal whose raw hook payload carries `session_id` lands that
+    /// id on the manifest as `claude_session_id` — what `claude --resume`
+    /// needs to continue the conversation.
+    #[test]
+    fn record_turn_completed_extracts_claude_session_id() {
+        use crate::signal::{TurnKind, TurnSignal};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            None,
+        );
+        assert_eq!(manifest.claude_session_id(), None);
+
+        let signal = TurnSignal::now(
+            manifest.session_id,
+            manifest.panel_id,
+            TurnKind::Stop,
+            Some("done".into()),
+            serde_json::json!({ "session_id": "claude-conv-7b2", "cwd": "/repo" }),
+        );
+        record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
+        assert_eq!(manifest.claude_session_id(), Some("claude-conv-7b2"));
+
+        // Persisted: a fresh read sees the same id.
+        let back = read(tmp.path(), manifest.agent_id).unwrap();
+        assert_eq!(back.claude_session_id(), Some("claude-conv-7b2"));
+    }
+
+    /// A turn signal without a `session_id` in its payload leaves the
+    /// manifest's `claude_session_id` untouched (and prior values survive).
+    #[test]
+    fn record_turn_completed_without_session_id_keeps_prior() {
+        use crate::signal::{TurnKind, TurnSignal};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            None,
+        );
+        manifest.claude_session_id = Some("kept-id".into());
+        let signal = TurnSignal::now(
+            manifest.session_id,
+            manifest.panel_id,
+            TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        );
+        record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
+        assert_eq!(manifest.claude_session_id(), Some("kept-id"));
     }
 
     #[test]

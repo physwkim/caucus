@@ -63,6 +63,24 @@ pub enum Command {
         #[arg(long)]
         control_sock: PathBuf,
     },
+    /// List resumable sessions persisted under `.caucus/sessions/`.
+    Sessions {
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Relaunch the TUI restoring a previously-persisted session.
+    Resume {
+        /// Session id to resume (see `caucus sessions`).
+        session_id: String,
+    },
+}
+
+/// Output format for listing subcommands.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
 }
 
 /// `caucus signal ...` — the turn-signal hook client.
@@ -138,6 +156,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Some(Command::Signal(cmd)) => run_signal(cmd),
         Some(Command::Role(cmd)) => run_role(cmd),
         Some(Command::McpServe { control_sock }) => run_mcp_serve(&control_sock),
+        Some(Command::Sessions { format }) => run_sessions(format),
+        Some(Command::Resume { session_id }) => run_resume(&session_id),
     }
 }
 
@@ -273,6 +293,66 @@ fn run_role(cmd: RoleCommand) -> Result<ExitCode> {
     }
 }
 
+/// `caucus sessions [--format json]` — list resumable sessions.
+///
+/// Scans `<repo>/.caucus/sessions/*/session.json`, newest first. Text mode
+/// prints id, topic, panel count, and age; JSON mode emits the records array.
+fn run_sessions(format: OutputFormat) -> Result<ExitCode> {
+    let repo = repo_root()?;
+    let records = crate::session::record::discover(&repo);
+    match format {
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&records)
+                .context("serialise session records")?;
+            println!("{json}");
+        }
+        OutputFormat::Text => {
+            if records.is_empty() {
+                eprintln!("caucus: no resumable sessions under .caucus/sessions/");
+            } else {
+                println!(
+                    "{:<28} {:<10} {:<8} TOPIC",
+                    "SESSION", "AGE", "PANELS"
+                );
+                let now = chrono::Utc::now();
+                for rec in &records {
+                    println!(
+                        "{:<28} {:<10} {:<8} {}",
+                        rec.id,
+                        humanize_age(now - rec.created_at),
+                        rec.panels.len(),
+                        rec.topic,
+                    );
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Compact human-readable age string for a `chrono` duration.
+fn humanize_age(d: chrono::Duration) -> String {
+    let secs = d.num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// `caucus resume <session_id>` — relaunch the TUI restoring a session.
+fn run_resume(session_id: &str) -> Result<ExitCode> {
+    let repo = repo_root()?;
+    let id = SessionId::from_str(session_id)
+        .with_context(|| format!("invalid session id '{session_id}'"))?;
+    crate::tui::run_resumed(&repo, id)?;
+    Ok(ExitCode::SUCCESS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +403,76 @@ mod tests {
     fn roles_flag_splits_on_comma() {
         let cli = Cli::try_parse_from(["caucus", "--roles", "architect,backend"]).unwrap();
         assert_eq!(cli.roles, vec!["architect", "backend"]);
+    }
+
+    #[test]
+    fn sessions_subcommand_parses_with_format() {
+        let cli = Cli::try_parse_from(["caucus", "sessions", "--format", "json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sessions {
+                format: OutputFormat::Json
+            })
+        ));
+        // Default format is text.
+        let cli = Cli::try_parse_from(["caucus", "sessions"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sessions {
+                format: OutputFormat::Text
+            })
+        ));
+    }
+
+    #[test]
+    fn resume_subcommand_parses_session_id() {
+        let cli = Cli::try_parse_from(["caucus", "resume", "01ABCXYZ"]).unwrap();
+        match cli.command {
+            Some(Command::Resume { session_id }) => assert_eq!(session_id, "01ABCXYZ"),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    /// `caucus sessions` discovers a written `session.json`: build a record
+    /// under a temp `.caucus/sessions/<id>/`, then confirm `discover` (the
+    /// listing's data source) returns it.
+    #[test]
+    fn sessions_listing_finds_a_written_record() {
+        use crate::render::LayoutMode;
+        use crate::role::spec::AgentCli;
+        use crate::session::record::{PanelRecord, SessionRecord};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let record = SessionRecord {
+            id: SessionId::new(),
+            topic: "resume me".into(),
+            repo_path: repo.to_path_buf(),
+            created_at: chrono::Utc::now(),
+            layout_mode: LayoutMode::Tiled,
+            panels: vec![PanelRecord {
+                role: "main".into(),
+                agent_cli: AgentCli::Claude,
+                model: None,
+                order_index: 0,
+                worktree_branch: None,
+                claude_session_id: Some("conv-1".into()),
+            }],
+        };
+        let root = repo
+            .join(".caucus")
+            .join("sessions")
+            .join(record.id.to_string());
+        record.write(&root).unwrap();
+
+        let found = crate::session::record::discover(repo);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, record.id);
+        assert_eq!(found[0].topic, "resume me");
+        assert_eq!(found[0].panels.len(), 1);
+
+        // `humanize_age` produces a compact string for a fresh record.
+        let age = humanize_age(chrono::Utc::now() - record.created_at);
+        assert!(age.ends_with('s') || age.ends_with('m'), "age: {age}");
     }
 }

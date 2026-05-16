@@ -66,7 +66,10 @@ impl From<Rect> for TuiRect {
 ///
 /// `Tiled` is the historical roughly-square auto-tile; the rest mirror the
 /// tmux layout names. The arrangement is cycled at runtime via `Ctrl-A Space`.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum LayoutMode {
     /// Roughly-square auto-tile: `cols = ceil(sqrt(n))` columns.
     #[default]
