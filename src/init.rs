@@ -64,6 +64,10 @@ pub fn run(repo: &Path, install_hook: bool) -> Result<InitOutcome> {
     let hook_script = bin_dir.join("turn-signal");
     write_executable(&hook_script, TURN_SIGNAL_SCRIPT)
         .with_context(|| format!("write {}", hook_script.display()))?;
+    // The Stop hook is installed globally and fires in every Claude session
+    // regardless of cwd — the hook command must be an absolute path, never
+    // relative to whatever directory a panel's agent happens to run in.
+    let hook_script = hook_script.canonicalize().unwrap_or(hook_script);
 
     let mut outcome = InitOutcome {
         caucus_dir,
@@ -72,7 +76,7 @@ pub fn run(repo: &Path, install_hook: bool) -> Result<InitOutcome> {
     };
 
     if install_hook {
-        outcome.hook_install = Some(install_claude_hook()?);
+        outcome.hook_install = Some(install_claude_hook(&outcome.hook_script)?);
     }
 
     Ok(outcome)
@@ -96,7 +100,7 @@ fn write_executable(path: &Path, content: &str) -> Result<()> {
 /// Idempotent: a caucus Stop hook already present leaves the file untouched
 /// ([`HookInstall::AlreadyPresent`]); otherwise the hook is merged and any
 /// prior file is backed up to `.bak` ([`HookInstall::Merged`]).
-fn install_claude_hook() -> Result<HookInstall> {
+fn install_claude_hook(hook_script: &Path) -> Result<HookInstall> {
     let home = std::env::var_os("HOME").context("$HOME not set — cannot locate ~/.claude")?;
     let claude_dir = PathBuf::from(home).join(".claude");
     std::fs::create_dir_all(&claude_dir)
@@ -129,7 +133,7 @@ fn install_claude_hook() -> Result<HookInstall> {
         None
     };
 
-    merge_stop_hook(&mut settings);
+    merge_stop_hook(&mut settings, &hook_script.display().to_string());
     let serialized = serde_json::to_string_pretty(&settings)?;
     std::fs::write(&settings_path, serialized)
         .with_context(|| format!("write {}", settings_path.display()))?;
@@ -151,10 +155,10 @@ fn hook_already_present(settings: &serde_json::Value) -> bool {
 
 /// Append the caucus Stop-hook entry into `settings.hooks.Stop`, creating the
 /// intermediate objects/arrays as needed and preserving any existing hooks.
-fn merge_stop_hook(settings: &mut serde_json::Value) {
+fn merge_stop_hook(settings: &mut serde_json::Value, hook_command: &str) {
     let entry = serde_json::json!({
         "hooks": [
-            { "type": "command", "command": ".caucus/bin/turn-signal" }
+            { "type": "command", "command": hook_command }
         ]
     });
 
@@ -221,8 +225,13 @@ mod tests {
     #[test]
     fn merge_stop_hook_into_empty_settings() {
         let mut settings = serde_json::json!({});
-        merge_stop_hook(&mut settings);
+        merge_stop_hook(&mut settings, "/abs/repo/.caucus/bin/turn-signal");
         assert!(hook_already_present(&settings));
+        // The hook command must be absolute, not a relative path.
+        let cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.starts_with('/'), "hook command must be absolute: {cmd}");
     }
 
     #[test]
@@ -232,7 +241,7 @@ mod tests {
                 "Stop": [{ "hooks": [{ "type": "command", "command": "/other" }] }]
             }
         });
-        merge_stop_hook(&mut settings);
+        merge_stop_hook(&mut settings, "/abs/repo/.caucus/bin/turn-signal");
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2, "existing hook kept, caucus hook appended");
         assert!(hook_already_present(&settings));

@@ -29,9 +29,8 @@ pub fn run(control_sock: &Path) -> Result<()> {
         .enable_all()
         .build()
         .context("start tokio runtime for mcp-serve")?;
-    let handle = runtime.handle().clone();
 
-    let client = ControlClient::new(control_sock, handle);
+    let client = ControlClient::new(control_sock);
     let dispatch = McpDispatch::new(tool_catalogue(), client);
 
     runtime.block_on(async move { serve_stdio(dispatch).await })

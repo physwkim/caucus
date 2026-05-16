@@ -27,27 +27,50 @@ use super::protocol::{ControlRequest, ControlResponse};
 /// A client of the main process's control socket.
 pub struct ControlClient {
     sock_path: PathBuf,
-    /// A tokio handle for blocking the synchronous [`ToolHandler::call`] on the
-    /// async round-trip. `mcp-serve` runs the dispatch loop on this runtime.
-    handle: tokio::runtime::Handle,
 }
 
 impl ControlClient {
     /// Build a client for the control socket at `sock_path`.
-    pub fn new(sock_path: impl Into<PathBuf>, handle: tokio::runtime::Handle) -> Self {
+    pub fn new(sock_path: impl Into<PathBuf>) -> Self {
         Self {
             sock_path: sock_path.into(),
-            handle,
         }
     }
+}
 
-    /// Send one [`ControlRequest`] and await its [`ControlResponse`].
-    ///
-    /// Opens a fresh connection, writes the request as one JSON line, reads
-    /// one JSON line back, and closes.
-    pub async fn request(&self, req: &ControlRequest) -> Result<ControlResponse> {
-        roundtrip(&self.sock_path, req).await
+/// Blocking control-socket round-trip — used by `mcp-serve`'s synchronous
+/// [`ToolHandler::call`].
+///
+/// `ToolHandler::call` is invoked from inside `mcp-serve`'s tokio runtime, so
+/// it cannot drive an async future — `Handle::block_on` and `block_in_place`
+/// both panic, as neither leaves the runtime context. Instead the round-trip
+/// uses plain blocking `std` sockets: one connect / write-line / read-line /
+/// close, no runtime involved. `mcp-serve` handles one MCP request at a time,
+/// so briefly blocking the worker is harmless.
+fn roundtrip_blocking(sock_path: &Path, req: &ControlRequest) -> Result<ControlResponse> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let stream = UnixStream::connect(sock_path)
+        .with_context(|| format!("connect to caucus control socket {}", sock_path.display()))?;
+
+    let mut line = serde_json::to_string(req).context("serialise control request")?;
+    line.push('\n');
+    (&stream)
+        .write_all(line.as_bytes())
+        .context("write control request")?;
+    (&stream).flush().ok();
+
+    let mut reader = BufReader::new(&stream);
+    let mut resp_line = String::new();
+    let n = reader
+        .read_line(&mut resp_line)
+        .context("read control response")?;
+    if n == 0 {
+        anyhow::bail!("caucus control socket closed without a response");
     }
+    serde_json::from_str(resp_line.trim_end())
+        .with_context(|| format!("parse control response: {}", resp_line.trim_end()))
 }
 
 /// One control-socket request/response round-trip on a fresh connection.
@@ -184,10 +207,9 @@ impl ToolHandler for ControlClient {
             Ok(req) => req,
             Err(msg) => return ToolOutcome::Err(msg),
         };
-        // Block this synchronous handler on the async round-trip. The dispatch
-        // loop runs inside the same runtime via `block_in_place` semantics:
-        // `mcp-serve` uses a multi-thread runtime so `block_on` here is safe.
-        match self.handle.block_on(roundtrip(&self.sock_path, &req)) {
+        // Blocking std-socket round-trip — no runtime gymnastics
+        // (see `roundtrip_blocking`).
+        match roundtrip_blocking(&self.sock_path, &req) {
             Ok(resp) => render_response(resp),
             Err(err) => ToolOutcome::Err(format!("caucus control socket: {err:#}")),
         }
