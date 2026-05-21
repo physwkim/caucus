@@ -28,6 +28,13 @@ pub struct SpawnRequest {
     pub model_override: Option<String>,
     /// Worktree to use as cwd, if this is an execute-phase agent.
     pub worktree_path: Option<PathBuf>,
+    /// Session repo root — the directory caucus was launched in
+    /// (`std::env::current_dir`). Used as the panel's cwd when it has no
+    /// worktree, so a non-worktree panel (the main worker, and any
+    /// `worktree=false` sub-agent) runs in the repo the user started caucus in
+    /// rather than `$HOME`. Empty `PathBuf` means "unset" (test/default), which
+    /// leaves the cwd unspecified.
+    pub repo_root: PathBuf,
     /// Path to the caucus turn-signal socket for this session
     /// (`docs/design.md` §7.1). Injected into the agent as `CAUCUS_SOCK`.
     /// `None` when no socket is wired (e.g. unit tests).
@@ -68,6 +75,7 @@ impl Default for SpawnRequest {
             agent_cli_override: None,
             model_override: None,
             worktree_path: None,
+            repo_root: PathBuf::new(),
             sock_path: None,
             skip_permissions: false,
             mcp_config_path: None,
@@ -140,10 +148,19 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
         env.insert("CAUCUS_SOCK".to_string(), sock.display().to_string());
     }
 
+    // A panel runs in its worktree if it has one, otherwise the session repo
+    // root (the launch dir). Leaving this `None` is not equivalent to "inherit
+    // caucus's cwd" — portable-pty resolves an unset cwd to `$HOME`, which is
+    // why a non-worktree panel would otherwise start in the home directory.
+    let cwd = request.worktree_path.clone().or_else(|| {
+        let root = &request.repo_root;
+        (!root.as_os_str().is_empty()).then(|| root.clone())
+    });
+
     PtyCommand {
         program: OsString::from(cli.binary()),
         args,
-        cwd: request.worktree_path.clone(),
+        cwd,
         env,
     }
 }
@@ -497,10 +514,44 @@ mod tests {
             role: role(),
             agent_name: "x".into(),
             worktree_path: Some(wt.clone()),
+            repo_root: PathBuf::from("/repo"),
             ..SpawnRequest::default()
         };
         let cmd = build_command(&req, PanelId::new());
+        // A worktree wins over the repo root.
         assert_eq!(cmd.cwd.as_deref(), Some(wt.as_path()));
+    }
+
+    #[test]
+    fn repo_root_becomes_cwd_without_a_worktree() {
+        // No worktree (the main worker, or a worktree=false sub-agent): the cwd
+        // must be the session repo root, not `None` — an unset cwd makes
+        // portable-pty spawn the child in `$HOME`.
+        let repo = PathBuf::from("/repo");
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "x".into(),
+            worktree_path: None,
+            repo_root: repo.clone(),
+            ..SpawnRequest::default()
+        };
+        let cmd = build_command(&req, PanelId::new());
+        assert_eq!(cmd.cwd.as_deref(), Some(repo.as_path()));
+    }
+
+    #[test]
+    fn empty_repo_root_leaves_cwd_unspecified() {
+        // The default/test boundary: no worktree and an empty repo root leaves
+        // the cwd `None` rather than an empty path.
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "x".into(),
+            worktree_path: None,
+            repo_root: PathBuf::new(),
+            ..SpawnRequest::default()
+        };
+        let cmd = build_command(&req, PanelId::new());
+        assert_eq!(cmd.cwd, None);
     }
 
     #[test]

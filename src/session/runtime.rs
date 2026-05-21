@@ -455,6 +455,7 @@ impl Multiplexer {
             agent_cli_override: agent_cli,
             model_override: model,
             worktree_path: worktree_path.clone(),
+            repo_root: self.session.repo_path.clone(),
             sock_path: Some(self.sock_path.clone()),
             // Panels are non-interactive for the agent's own prompts; the
             // role allowlist remains the real boundary (`SpawnRequest` doc).
