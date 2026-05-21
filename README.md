@@ -58,7 +58,7 @@ and renders the panels (`ratatui`). tmux and zellij are *not* dependencies —
 they are studied as references for the grid and layout design.
 
 **The main worker drives sub-agents over MCP.** caucus runs an MCP server.
-The main worker gets eight caucus tools (see [MCP tools](#mcp-tools) below)
+The main worker gets ten caucus tools (see [MCP tools](#mcp-tools) below)
 so a single instruction from you turns into the main worker decomposing the
 task, spawning sub-agent panels, and feeding each one its sub-task as real
 keystrokes.
@@ -102,6 +102,7 @@ terminal.
 | `Ctrl-A` then `Space`   | cycle the layout arrangement mode       |
 | `Ctrl-A` then `t`       | toggle the transcript overlay           |
 | `Esc` (overlay open)    | hide the transcript overlay             |
+| `Ctrl-A` then `[`       | open the scrollback pager (focused panel) |
 | `Ctrl-A` then `Ctrl-A`  | send a literal `Ctrl-A` to the panel    |
 
 The layout modes cycled by `Ctrl-A Space` are **Tiled**, **EvenHorizontal**,
@@ -114,9 +115,17 @@ worktree branch, and the first line of the agent's last message. `Esc`
 hides it; it does not capture input, so every other key still reaches the
 focused panel while it is open.
 
+The **scrollback pager** (`Ctrl-A [`) is a tmux copy-mode-style view of the
+focused panel's terminal scrollback (the grid ring, up to 10,000 rows). It
+opens at the newest line; `↑/↓ k/j` scroll a line, `PgUp/PgDn` a page,
+`g/Home` jumps to the oldest line, `G/End` to the newest, and `Esc/q` exits.
+Unlike the transcript overlay, the pager **captures** input — keys drive
+scrolling and none reach the panel's PTY — and shows a frozen snapshot (the
+panel keeps running; new output appears after you exit).
+
 ## MCP tools
 
-caucus exposes eight tools to the main worker over MCP. The main worker
+caucus exposes ten tools to the main worker over MCP. The main worker
 calls them to spawn, drive, observe, and reap sub-agent panels:
 
 | Tool              | What it does                                                              |
@@ -128,12 +137,21 @@ calls them to spawn, drive, observe, and reap sub-agent panels:
 | `spawn_role`      | Spawn a new panel for a role; `worktree`, `model`, `agent_cli` overrides. |
 | `kill_panel`      | Kill a panel; its worktree (if any) is enqueued for cleanup.              |
 | `list_panels`     | List every live panel with its role and derived state.                   |
-| `wait_for_panels` | Block until the named panels settle (leave `working`) or `timeout_secs`. |
+| `register_round`  | Register a round; caucus pushes the panels' results back when they settle (or `fallback_secs`). |
+| `read_menu`       | Read a panel's interactive selection menu (question + numbered options).  |
+| `select_option`   | Answer a panel's selection menu by picking an option number.              |
 
 `read_panel` takes a `mode`: `screen` (the visible grid), `scrollback` (the
 full scrollback buffer), `since_last_turn` (everything since the last
 prompt — the whole turn, no racing the screen), or `last_message` (the
 agent's final message from its turn signal).
+
+When a sub-agent stops mid-turn on an interactive chooser (an
+AskUserQuestion-style menu), no turn signal fires, so the panel reads
+`awaiting_selection` and its round cannot settle on its own. caucus detects
+the menu and pushes the main worker a notice; the main worker answers it
+with `read_menu` + `select_option` (or, for a free-text reply, picks the
+menu's "type something" option, then `send_keys`), unblocking the round.
 
 ## CLI
 

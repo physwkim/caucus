@@ -208,7 +208,7 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
             panel: panel(args)?,
         }),
         "list_panels" => Ok(ControlRequest::ListPanels),
-        "wait_for_panels" => {
+        "register_round" => {
             let raw = args
                 .get("panels")
                 .and_then(Value::as_array)
@@ -223,16 +223,40 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                         .map_err(|e| format!("invalid panel id `{s}`: {e}"))
                 })
                 .collect::<std::result::Result<Vec<PanelId>, String>>()?;
-            let timeout_secs =
-                match args.get("timeout_secs") {
+            let read_mode = match args.get("read_mode").and_then(Value::as_str) {
+                Some(raw) => Some(serde_json::from_value(json!(raw)).map_err(|_| {
+                    format!(
+                        "invalid read_mode `{raw}` \
+                         (expected screen|scrollback|since_last_turn|last_message)"
+                    )
+                })?),
+                None => None,
+            };
+            let fallback_secs =
+                match args.get("fallback_secs") {
                     Some(v) => Some(v.as_u64().ok_or_else(|| {
-                        "`timeout_secs` must be a non-negative integer".to_string()
+                        "`fallback_secs` must be a non-negative integer".to_string()
                     })?),
                     None => None,
                 };
-            Ok(ControlRequest::WaitForPanels {
+            Ok(ControlRequest::RegisterRound {
                 panels,
-                timeout_secs,
+                read_mode,
+                fallback_secs,
+            })
+        }
+        "read_menu" => Ok(ControlRequest::ReadMenu {
+            panel: panel(args)?,
+        }),
+        "select_option" => {
+            let index = args
+                .get("index")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "missing integer argument `index`".to_string())?
+                as usize;
+            Ok(ControlRequest::SelectOption {
+                panel: panel(args)?,
+                index,
             })
         }
         other => Err(format!("unknown tool: {other}")),
@@ -409,46 +433,77 @@ mod tests {
     }
 
     #[test]
-    fn build_wait_for_panels_request() {
+    fn build_register_round_request() {
         let a = PanelId::new();
         let b = PanelId::new();
         let req = build_request(
-            "wait_for_panels",
-            &json!({"panels": [a.to_string(), b.to_string()], "timeout_secs": 90}),
+            "register_round",
+            &json!({
+                "panels": [a.to_string(), b.to_string()],
+                "read_mode": "since_last_turn",
+                "fallback_secs": 90
+            }),
         )
         .unwrap();
         assert_eq!(
             req,
-            ControlRequest::WaitForPanels {
+            ControlRequest::RegisterRound {
                 panels: vec![a, b],
-                timeout_secs: Some(90),
+                read_mode: Some(super::super::ReadPanelMode::SinceLastTurn),
+                fallback_secs: Some(90),
             }
         );
     }
 
     #[test]
-    fn build_wait_for_panels_defaults_timeout() {
+    fn build_register_round_defaults_optional_fields() {
         let a = PanelId::new();
-        let req = build_request("wait_for_panels", &json!({"panels": [a.to_string()]})).unwrap();
+        let req = build_request("register_round", &json!({"panels": [a.to_string()]})).unwrap();
         assert_eq!(
             req,
-            ControlRequest::WaitForPanels {
+            ControlRequest::RegisterRound {
                 panels: vec![a],
-                timeout_secs: None,
+                read_mode: None,
+                fallback_secs: None,
             }
         );
     }
 
     #[test]
-    fn build_wait_for_panels_requires_panels_array() {
-        let err = build_request("wait_for_panels", &json!({})).unwrap_err();
+    fn build_register_round_requires_panels_array() {
+        let err = build_request("register_round", &json!({})).unwrap_err();
         assert!(err.contains("missing array argument `panels`"));
     }
 
     #[test]
-    fn build_wait_for_panels_rejects_bad_panel_id() {
-        let err = build_request("wait_for_panels", &json!({"panels": ["not-a-ulid"]})).unwrap_err();
+    fn build_register_round_rejects_bad_panel_id() {
+        let err = build_request("register_round", &json!({"panels": ["not-a-ulid"]})).unwrap_err();
         assert!(err.contains("invalid panel id"));
+    }
+
+    #[test]
+    fn build_read_menu_request() {
+        let a = PanelId::new();
+        let req = build_request("read_menu", &json!({"panel": a.to_string()})).unwrap();
+        assert_eq!(req, ControlRequest::ReadMenu { panel: a });
+    }
+
+    #[test]
+    fn build_select_option_request() {
+        let a = PanelId::new();
+        let req = build_request(
+            "select_option",
+            &json!({"panel": a.to_string(), "index": 2}),
+        )
+        .unwrap();
+        assert_eq!(req, ControlRequest::SelectOption { panel: a, index: 2 });
+    }
+
+    #[test]
+    fn build_select_option_requires_index() {
+        let a = PanelId::new();
+        let err = build_request("select_option", &json!({"panel": a.to_string()})).unwrap_err();
+        assert!(err.contains("missing integer argument `index`"));
     }
 
     #[test]

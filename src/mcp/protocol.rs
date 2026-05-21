@@ -61,15 +61,28 @@ pub enum ControlRequest {
     KillPanel { panel: PanelId },
     /// List every live panel with role + derived state.
     ListPanels,
-    /// Block until every named panel has settled (left `Working`/`Spawning`)
-    /// or `timeout_secs` elapses. Unlike every other request this is answered
-    /// by a *deferred* reply — the main `caucus` event loop is never blocked
-    /// (`crate::session::runtime::Multiplexer::poll_pending_waits`).
-    WaitForPanels {
+    /// Register a *round*: caucus watches `panels` and, once they have all
+    /// settled (left `Working`/`Spawning`) — or `fallback_secs` elapses —
+    /// assembles their results and injects them into the main worker's panel
+    /// as a fresh turn. Answered *immediately* with a snapshot of the named
+    /// panels: the round runs in the background, so the main worker ends its
+    /// turn and is re-prompted by caucus on completion (no blocking, no
+    /// timeout-shaped wait). `read_mode` selects what each panel's result is
+    /// read as on delivery (default `last_message`).
+    /// (`crate::session::runtime::Multiplexer::poll_pending_rounds`).
+    RegisterRound {
         panels: Vec<PanelId>,
         #[serde(default)]
-        timeout_secs: Option<u64>,
+        read_mode: Option<ReadPanelMode>,
+        #[serde(default)]
+        fallback_secs: Option<u64>,
     },
+    /// Read the interactive selection menu shown in a panel (if any) as
+    /// readable text. Answered with a [`ControlResponse::Panel`].
+    ReadMenu { panel: PanelId },
+    /// Pick option `index` (the displayed 1-based number) in a panel's
+    /// selection menu: caucus navigates the chooser there and presses Enter.
+    SelectOption { panel: PanelId, index: usize },
 }
 
 /// One control-socket response — the result of executing a [`ControlRequest`]
@@ -176,31 +189,57 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_panels_round_trips() {
-        let req = ControlRequest::WaitForPanels {
+    fn register_round_round_trips() {
+        let req = ControlRequest::RegisterRound {
             panels: vec![PanelId::new(), PanelId::new()],
-            timeout_secs: Some(120),
+            read_mode: Some(ReadPanelMode::SinceLastTurn),
+            fallback_secs: Some(120),
         };
         let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"op\":\"wait_for_panels\""));
+        assert!(line.contains("\"op\":\"register_round\""));
         let back: ControlRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(req, back);
     }
 
     #[test]
-    fn wait_for_panels_timeout_is_optional() {
-        // `timeout_secs` defaults to None when omitted from the wire form.
+    fn register_round_optional_fields_default_to_none() {
+        // `read_mode` and `fallback_secs` default to None when omitted.
         let id = PanelId::new();
         let req: ControlRequest =
-            serde_json::from_str(&format!(r#"{{"op":"wait_for_panels","panels":["{id}"]}}"#))
+            serde_json::from_str(&format!(r#"{{"op":"register_round","panels":["{id}"]}}"#))
                 .unwrap();
         assert_eq!(
             req,
-            ControlRequest::WaitForPanels {
+            ControlRequest::RegisterRound {
                 panels: vec![id],
-                timeout_secs: None,
+                read_mode: None,
+                fallback_secs: None,
             }
         );
+    }
+
+    #[test]
+    fn read_menu_round_trips() {
+        let req = ControlRequest::ReadMenu {
+            panel: PanelId::new(),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"op\":\"read_menu\""));
+        let back: ControlRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn select_option_carries_index() {
+        let req = ControlRequest::SelectOption {
+            panel: PanelId::new(),
+            index: 3,
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"op\":\"select_option\""));
+        assert!(line.contains("\"index\":3"));
+        let back: ControlRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(req, back);
     }
 
     #[test]

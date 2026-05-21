@@ -24,6 +24,7 @@ use crate::agent::lane_event::LaneEventKind;
 use crate::agent::manifest::AgentManifest;
 use crate::panel::Panel;
 use crate::session::id::PanelId;
+use crate::session::runtime::ScrollState;
 use crate::term::Grid;
 use crate::term::grid::attr;
 
@@ -529,6 +530,7 @@ fn derived_state_label(state: DerivedState) -> &'static str {
         DerivedState::BlockedPermissionPrompt => "blocked_permission",
         DerivedState::BlockedMergeConflict => "blocked_merge",
         DerivedState::BlockedBackgroundJob => "blocked_job",
+        DerivedState::AwaitingSelection => "awaiting_selection",
         DerivedState::DegradedMcp => "degraded_mcp",
         DerivedState::InterruptedTransport => "interrupted",
         DerivedState::Exited => "exited",
@@ -546,6 +548,7 @@ fn state_color(state: &str) -> Color {
         || state == "exited"
         || state == "interrupted"
         || state == "degraded_mcp"
+        || state == "awaiting_selection"
     {
         Color::Red
     } else {
@@ -661,6 +664,89 @@ fn transcript_row_line(row: &TranscriptRow, width: usize) -> Line<'static> {
     Line::from(Span::styled(text, style))
 }
 
+/// Window the scrollback into the visible slice plus a title string — the
+/// pure, frame-free core of [`draw_scroll_pager`], unit-testable without a
+/// ratatui [`Frame`] (like [`TranscriptRow::render_line`]).
+///
+/// Returns `lines[offset .. offset+height]` (clamped to the buffer) and a
+/// title reporting the panel role and the 1-based visible range
+/// `start–end/total`.
+fn scroll_window<'a>(
+    role: &str,
+    lines: &'a [String],
+    offset: usize,
+    height: usize,
+) -> (&'a [String], String) {
+    let total = lines.len();
+    let start = offset.min(total);
+    let end = (start + height).min(total);
+    let visible = &lines[start..end];
+    let range = if total == 0 {
+        "empty".to_string()
+    } else {
+        format!("{}–{}/{}", start + 1, end, total)
+    };
+    let title = format!(" caucus · scrollback — {role} [{range}] · ↑↓ PgUp/PgDn g/G · Esc/q exit ");
+    (visible, title)
+}
+
+/// Draw the scrollback pager (`Ctrl-A [`) full-screen over the panels: a
+/// bordered box titled with the panel role + visible range + key hints, the
+/// body being the windowed scrollback lines.
+///
+/// Like [`draw_transcript`], this is draw-time only — the panels keep running
+/// underneath; the popup area is [`Clear`]ed first so they do not bleed
+/// through. The pager is *modal* (it captures input via the router's
+/// `scroll_open` gate), but rendering-wise it is just a top overlay.
+///
+/// `pub(crate)`: [`ScrollState`] is an internal type, drawn only by `tui::draw`.
+pub(crate) fn draw_scroll_pager(frame: &mut Frame, state: &ScrollState) {
+    let full = frame.area();
+    if full.width < 8 || full.height < 6 {
+        return;
+    }
+    let popup = TuiRect {
+        x: full.x + 2,
+        y: full.y + 2,
+        width: full.width.saturating_sub(4),
+        height: full.height.saturating_sub(4),
+    };
+
+    // Interior height (popup minus its single-cell border) is the real visible
+    // body; window the snapshot to exactly that many rows.
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    let (visible, title) = scroll_window(&state.role, &state.lines, state.offset, inner_h);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let lines: Vec<Line<'static>> = if visible.is_empty() {
+        vec![Line::from(Span::styled(
+            "  (no scrollback)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        visible
+            .iter()
+            .map(|l| Line::from(Span::raw(l.clone())))
+            .collect()
+    };
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +782,29 @@ mod tests {
         let panels = vec![PanelId::new(), PanelId::new()];
         let layout = Layout::reflow(&panels, area(), LayoutMode::Tiled);
         assert_eq!(layout.slots.len(), 2);
+    }
+
+    #[test]
+    fn scroll_window_slices_and_reports_the_range() {
+        let lines: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+
+        // Mid-buffer: offset 3, height 4 → lines[3..7], range "4–7/10".
+        let (vis, title) = scroll_window("worker", &lines, 3, 4);
+        assert_eq!(vis, &lines[3..7]);
+        assert!(title.contains("worker"));
+        assert!(title.contains("4–7/10"), "title was {title:?}");
+
+        // Bottom clamp: a window past the end stops at total, not out of range.
+        let (vis, title) = scroll_window("worker", &lines, 8, 4);
+        assert_eq!(vis, &lines[8..10]);
+        assert!(title.contains("9–10/10"), "title was {title:?}");
+    }
+
+    #[test]
+    fn scroll_window_handles_an_empty_buffer() {
+        let (vis, title) = scroll_window("worker", &[], 0, 5);
+        assert!(vis.is_empty());
+        assert!(title.contains("empty"), "title was {title:?}");
     }
 
     #[test]

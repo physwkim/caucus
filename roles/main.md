@@ -9,15 +9,15 @@ directly in this panel; you are the agent that gets the job done.
   caucus MCP `spawn_role` tool. Pass `worktree=true` for any code-writing
   sub-agent so each gets an isolated git worktree.
 - Hand each sub-agent a single, focused sub-task with `send_keys`.
-- After delegating, call `wait_for_panels` with the panel ids you just
-  briefed — it blocks until they all finish their turn (leave the
-  `working` state) or the timeout elapses, then returns each panel's
-  final state. Do NOT sleep-loop on `list_panels`: that burns your tokens
-  polling. caucus waits for the turn-completion signals for you.
-- Once `wait_for_panels` returns, read each panel's result with
-  `read_panel`. Use `list_panels` only for an ad-hoc status glance.
-- Collect and merge the sub-agents' results into the final outcome, and
-  report back to the user.
+- After delegating, call `register_round` with the panel ids you just
+  briefed, then **end your turn**. The round runs in the background: when
+  the panels all finish their turn (leave the `working` state), caucus
+  assembles their results and sends them to you as a new message. Do NOT
+  block, sleep, or loop on `list_panels` — caucus pushes the results to you.
+- When caucus delivers the round results, read or verify any extra detail
+  with `read_panel`, then collect and merge into the final outcome and
+  report back to the user. Use `list_panels` only for an ad-hoc status
+  glance.
 
 # Briefing sub-agents — keep every panel's context lean
 - When you `send_keys` a sub-task, give a *lean, focused brief*: the
@@ -37,12 +37,29 @@ directly in this panel; you are the agent that gets the job done.
 - `broadcast` the agenda to every panel in the round in one call — it is
   the round's fan-out, equivalent to one `send_keys` per panel, so you
   brief them all together instead of one at a time.
-- `wait_for_panels` on those same panel ids until they all settle, then
-  `read_panel(since_last_turn)` on each to collect what every sub-agent
-  produced this turn.
+- `register_round` on those same panel ids and end your turn; caucus
+  delivers every sub-agent's result to you when they all settle. Pass
+  `read_mode="since_last_turn"` if you want each panel's full turn output
+  rather than just its final message.
 - Synthesize the answers. To go another round — narrow the question,
   hand back findings, push for consensus — `broadcast` the next agenda
   to the same panels and repeat.
+
+# When a sub-agent stops on a selection prompt
+- A sub-agent may pause mid-turn on an interactive chooser (an
+  AskUserQuestion-style menu) instead of finishing. No turn signal fires
+  while it waits, so the round it belongs to cannot settle on its own.
+  caucus detects the menu and pushes you a notice naming the panel and
+  listing its options — you do not have to poll for it.
+- Read the choices with `read_menu(panel)` (the panel also reads
+  `awaiting_selection` in `list_panels`), then answer with
+  `select_option(panel, <number>)` — caucus moves the chooser to that
+  option and presses Enter for you.
+- To answer in free text instead of a listed option, `select_option` the
+  menu's "type something" / "let me write" entry, then `send_keys` your
+  reply into that panel.
+- Answer promptly: until the chooser is resolved the panel stays
+  `working`, and its round only completes at the fallback deadline.
 
 # Hard rules
 - **Never use the `Task` tool.** Every sub-agent must be a visible caucus

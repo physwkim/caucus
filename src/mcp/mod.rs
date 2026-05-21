@@ -2,8 +2,9 @@
 //! (`docs/design.md` §0 #4, §9).
 //!
 //! The main worker (a Claude Code agent in one panel) drives every sub-agent
-//! panel through eight MCP tools: `send_keys`, `broadcast`, `ctrl_c`,
-//! `read_panel`, `spawn_role`, `kill_panel`, `list_panels`, `wait_for_panels`.
+//! panel through ten MCP tools: `send_keys`, `broadcast`, `ctrl_c`,
+//! `read_panel`, `spawn_role`, `kill_panel`, `list_panels`, `register_round`,
+//! `read_menu`, `select_option`.
 //!
 //! ## Architecture
 //!
@@ -24,7 +25,7 @@
 //! `rmcp` (1.7.0) resolves cleanly but its server surface is macro-driven and
 //! its transport runs an internal loop that resists deterministic unit
 //! testing. The MCP slice caucus needs is small — `initialize` / `tools/list`
-//! / `tools/call`, eight tools — so [`jsonrpc`] implements exactly that, with a
+//! / `tools/call`, ten tools — so [`jsonrpc`] implements exactly that, with a
 //! pure dispatch core. See that module's header for the rationale.
 
 pub mod control_client;
@@ -62,7 +63,9 @@ pub enum ReadPanelMode {
 pub struct PanelSummary {
     pub panel_id: PanelId,
     pub role: String,
-    /// Derived state, lower-cased (`working` / `idle` / `blocked_*` / `exited`).
+    /// Derived state as its canonical `snake_case` name (`working` / `idle` /
+    /// `awaiting_selection` / `blocked_*` / `exited`), from
+    /// [`crate::agent::derive_state::DerivedState::as_str`].
     pub state: String,
     pub agent_cli: AgentCli,
 }
@@ -108,6 +111,16 @@ pub trait McpToolSurface {
 
     /// List every live panel with its derived state.
     fn list_panels(&self) -> Vec<PanelSummary>;
+
+    /// Read the interactive selection menu shown in a panel, if any — the
+    /// question, its numbered options, and the highlighted one as readable
+    /// text. Empty when no menu is on screen (`docs/design.md` §8.3).
+    fn read_menu(&self, panel: PanelId) -> Result<String, McpError>;
+
+    /// Answer a panel's selection menu by picking option `index` (the displayed
+    /// 1-based number): caucus navigates the chooser to that option and presses
+    /// Enter (`docs/design.md` §8.3).
+    fn select_option(&mut self, panel: PanelId, index: usize) -> Result<(), McpError>;
 }
 
 /// The MCP tools caucus exposes to the main worker (`docs/design.md` §0 #4).
@@ -143,8 +156,9 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
             name: "broadcast",
             description: "Send the same text to several panels at once — a \
                           round's fan-out. Equivalent to one send_keys per \
-                          panel. Follow with wait_for_panels, then \
-                          read_panel(since_last_turn) on each, to run a round.",
+                          panel. Follow with register_round on the same \
+                          panels, then end your turn; caucus delivers their \
+                          assembled results when the round settles.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -234,26 +248,71 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
             input_schema: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
-            name: "wait_for_panels",
-            description: "Block until the named panels all settle (finish their \
-                          turn — leave the 'working' state) or timeout_secs \
-                          elapses (default 600). Returns each panel's final role \
-                          + state. Use this instead of sleep-polling list_panels.",
+            name: "register_round",
+            description: "Register a round: caucus watches the named panels and, \
+                          when they ALL settle (finish their turn — leave the \
+                          'working' state) or fallback_secs elapses, delivers \
+                          their assembled results to you as a new message. \
+                          Returns immediately — after calling this, end your \
+                          turn; caucus re-prompts you when the round completes. \
+                          Do NOT sleep-poll list_panels.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "panels": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Panel ids (ULIDs) to wait on."
+                        "description": "Panel ids (ULIDs) in the round."
                     },
-                    "timeout_secs": {
+                    "read_mode": {
+                        "type": "string",
+                        "enum": ["last_message", "since_last_turn"],
+                        "description": "What to read from each panel for the \
+                                        delivered report (default last_message)."
+                    },
+                    "fallback_secs": {
                         "type": "integer",
-                        "description": "Max seconds to block before returning \
-                                        (default 600, max 3600)."
+                        "description": "Safety-net seconds: if the panels never \
+                                        all settle, caucus delivers a partial \
+                                        report after this (default 600, max 3600)."
                     }
                 },
                 "required": ["panels"]
+            }),
+        },
+        ToolDef {
+            name: "read_menu",
+            description: "Read the interactive selection menu currently shown in \
+                          a panel — an AskUserQuestion-style chooser. Returns the \
+                          question, the numbered options, and which is \
+                          highlighted. Empty if no menu is on screen. Use this \
+                          when a panel reads 'awaiting_selection' (or caucus tells \
+                          you it is waiting) to see the choices before answering \
+                          with select_option.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "panel": panel_prop() },
+                "required": ["panel"]
+            }),
+        },
+        ToolDef {
+            name: "select_option",
+            description: "Answer a panel's selection menu: pick option number \
+                          'index' (the 1-based number shown by read_menu) and \
+                          caucus navigates the chooser there and presses Enter. \
+                          To answer in free text instead, select the menu's \
+                          'type something' option this way, then send_keys your \
+                          text.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "panel": panel_prop(),
+                    "index": {
+                        "type": "integer",
+                        "description": "Option number to pick (1-based, as shown)."
+                    }
+                },
+                "required": ["panel", "index"]
             }),
         },
     ]
@@ -284,7 +343,9 @@ mod tests {
                 "spawn_role",
                 "kill_panel",
                 "list_panels",
-                "wait_for_panels",
+                "register_round",
+                "read_menu",
+                "select_option",
             ]
         );
     }

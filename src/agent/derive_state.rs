@@ -23,12 +23,40 @@ pub enum DerivedState {
     BlockedMergeConflict,
     /// Grid shows a stuck background job.
     BlockedBackgroundJob,
+    /// Grid shows an interactive selection menu (an `AskUserQuestion`-style
+    /// chooser): the agent stopped mid-turn waiting for an option to be picked.
+    /// No `Stop` hook fires here, so this is detected from the grid, not a
+    /// turn signal. The main worker answers it with `select_option`.
+    AwaitingSelection,
     /// MCP handshake degraded.
     DegradedMcp,
     /// The transport to the agent was interrupted.
     InterruptedTransport,
     /// The agent process exited.
     Exited,
+}
+
+impl DerivedState {
+    /// Canonical `snake_case` name — the wire string `list_panels` returns to
+    /// the main worker and the vocabulary `docs/design.md` §8.3 documents
+    /// (`working` / `idle` / `awaiting_selection` / `blocked_permission_prompt`
+    /// / …). Mirrors the `#[serde(rename_all = "snake_case")]` representation
+    /// (pinned by a test) so the MCP string and the serde wire form cannot
+    /// drift. This is the single source of the state's external name — callers
+    /// must not re-derive it from `Debug`, which drops the underscores.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DerivedState::Working => "working",
+            DerivedState::Idle => "idle",
+            DerivedState::BlockedPermissionPrompt => "blocked_permission_prompt",
+            DerivedState::BlockedMergeConflict => "blocked_merge_conflict",
+            DerivedState::BlockedBackgroundJob => "blocked_background_job",
+            DerivedState::AwaitingSelection => "awaiting_selection",
+            DerivedState::DegradedMcp => "degraded_mcp",
+            DerivedState::InterruptedTransport => "interrupted_transport",
+            DerivedState::Exited => "exited",
+        }
+    }
 }
 
 /// Hint extracted from a panel's grid by the regex fallback in `term/`.
@@ -42,6 +70,9 @@ pub enum GridHint {
     PromptReady,
     /// A `Allow this tool? [y/n]`-style permission prompt is visible.
     PermissionPromptVisible,
+    /// An interactive selection menu (`AskUserQuestion`-style chooser) is
+    /// visible — the agent is waiting for an option to be picked.
+    SelectionMenuVisible,
     /// A merge-conflict marker is visible.
     MergeConflictVisible,
     /// A long-running background job appears stuck.
@@ -88,6 +119,7 @@ pub fn derive_agent_state(
     if let Some(hint) = grid_hint {
         match hint {
             GridHint::PermissionPromptVisible => return DerivedState::BlockedPermissionPrompt,
+            GridHint::SelectionMenuVisible => return DerivedState::AwaitingSelection,
             GridHint::MergeConflictVisible => return DerivedState::BlockedMergeConflict,
             GridHint::BackgroundJobVisible => return DerivedState::BlockedBackgroundJob,
             GridHint::PromptReady => {}
@@ -122,6 +154,41 @@ fn blocker_state(class: LaneFailureClass) -> DerivedState {
 mod tests {
     use super::*;
 
+    /// `as_str` is the single source of each state's external name, and must
+    /// stay identical to the `#[serde(rename_all = "snake_case")]` wire form —
+    /// `list_panels` uses `as_str`, protocol round-trips use serde, and they
+    /// must agree. Enumerated explicitly so a newly added variant fails to
+    /// compile here until it is listed (and thus checked).
+    #[test]
+    fn as_str_matches_the_serde_snake_case_name() {
+        use DerivedState::*;
+        for state in [
+            Working,
+            Idle,
+            BlockedPermissionPrompt,
+            BlockedMergeConflict,
+            BlockedBackgroundJob,
+            AwaitingSelection,
+            DegradedMcp,
+            InterruptedTransport,
+            Exited,
+        ] {
+            let serde_name = serde_json::to_value(state).unwrap();
+            assert_eq!(
+                serde_name.as_str().unwrap(),
+                state.as_str(),
+                "as_str must match the serde snake_case name for {state:?}"
+            );
+        }
+        // Spot-check the underscored forms the Debug-lowercase path used to
+        // drop — the exact regression the MCP wire string had.
+        assert_eq!(
+            BlockedPermissionPrompt.as_str(),
+            "blocked_permission_prompt"
+        );
+        assert_eq!(AwaitingSelection.as_str(), "awaiting_selection");
+    }
+
     #[test]
     fn live_with_no_signal_is_working() {
         assert_eq!(
@@ -149,6 +216,22 @@ mod tests {
                 Some(&GridHint::PermissionPromptVisible)
             ),
             DerivedState::BlockedPermissionPrompt
+        );
+    }
+
+    #[test]
+    fn selection_menu_hint_is_awaiting_selection() {
+        // A visible selection menu means the agent stopped mid-turn for a
+        // choice — distinct from a [y/n] permission prompt.
+        assert_eq!(
+            derive_agent_state(
+                "live",
+                None,
+                None,
+                None,
+                Some(&GridHint::SelectionMenuVisible)
+            ),
+            DerivedState::AwaitingSelection
         );
     }
 

@@ -302,15 +302,23 @@ async fn event_loop(
         // 4. PTY pump — drain every panel into its grid + capture, reap exits.
         mux.pump_all();
 
-        // 5. Deferred waits — answer any `wait_for_panels` whose panels have
-        //    now settled or timed out (signals/pump above just updated state).
-        mux.poll_pending_waits();
+        // 5. Selection prompts — if a panel in a pending round has stopped on
+        //    an interactive chooser (no Stop hook fires, so its round never
+        //    settles), announce it to the main worker so it can answer and let
+        //    the round finish. Runs before round delivery: unblocking a stuck
+        //    panel takes precedence, and both share the one-push-per-tick gate.
+        mux.poll_round_selection_prompts();
+
+        // 6. Round delivery — if a registered round's panels have now settled
+        //    (or its fallback deadline passed), assemble their results and
+        //    inject them into the main worker's panel (the caucus→main push).
+        mux.poll_pending_rounds();
 
         if mux.should_quit() {
             break;
         }
 
-        // 6. Redraw on the tick.
+        // 7. Redraw on the tick.
         if last_draw.elapsed() >= TICK {
             draw(&mut terminal, &mux)?;
             last_draw = Instant::now();
@@ -365,6 +373,13 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mux: &Multiplexer) ->
                 render::draw_transcript(frame, mux.panels(), mux.manifests(), mux.focused());
             }
 
+            // The scrollback pager (`Ctrl-A [`) is modal and supersedes the
+            // transcript overlay — drawn last so it sits on top. Panels keep
+            // pumping underneath; the pager shows a frozen snapshot.
+            if let Some(scroll) = mux.scroll_state() {
+                render::draw_scroll_pager(frame, scroll);
+            }
+
             let status = status_line(mux);
             frame.render_widget(
                 Paragraph::new(Span::styled(
@@ -396,9 +411,15 @@ fn status_line(mux: &Multiplexer) -> String {
     } else {
         ""
     };
+    // While the pager is open it is modal and captures input, so show its own
+    // key hints rather than the live keymap.
+    if mux.scroll_state().is_some() {
+        return " caucus · scrollback · ↑↓ k/j line · PgUp/PgDn page · g/G top/bottom · Esc/q exit"
+            .to_string();
+    }
     format!(
         " caucus · {} panel(s) · focus: {} · layout: {} · \
-         Ctrl-A then n/p focus, z zoom, </> move, Space layout, t transcript, q quit{}{}{}",
+         Ctrl-A then n/p focus, z zoom, </> move, Space layout, t transcript, [ scroll, q quit{}{}{}",
         mux.panels().len(),
         focused,
         mux.layout_mode().label(),
