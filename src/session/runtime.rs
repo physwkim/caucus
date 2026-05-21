@@ -1383,6 +1383,40 @@ impl Multiplexer {
     }
 }
 
+/// Bytes to write to a panel's PTY to deliver `text` and, when `enter`,
+/// submit it.
+///
+/// A TUI agent (e.g. Claude Code) that has enabled bracketed-paste mode
+/// (`CSI ?2004h`) treats a multi-byte input burst as a *paste*: a `\r` carried
+/// inside the burst is inserted into the prompt buffer as a literal newline
+/// instead of submitting the line — the "Enter doesn't go through, but caucus
+/// thinks it did" bug. Delivering `text` as a *proper* bracketed paste
+/// (`ESC[200~` … `ESC[201~`) and placing the submitting `\r` **after** the
+/// paste-end marker makes the agent insert the text verbatim (multi-line safe,
+/// so a multi-line round report no longer submits at its first newline) and
+/// then see the trailing `\r` as a discrete keypress that submits. The
+/// paste-end marker delimits the paste explicitly, so this is robust in a
+/// single burst — no inter-write timing gap is needed.
+///
+/// When `bracketed` is false the agent has not enabled the mode, so the
+/// markers would land as literal `[200~`/`[201~` garbage; fall back to the raw
+/// `text` (+ `\r`). An empty `text` is never wrapped — a bare Enter is just
+/// `\r`.
+fn encode_input(text: &[u8], enter: bool, bracketed: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 14);
+    if bracketed && !text.is_empty() {
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(text);
+        out.extend_from_slice(b"\x1b[201~");
+    } else {
+        out.extend_from_slice(text);
+    }
+    if enter {
+        out.push(b'\r');
+    }
+    out
+}
+
 /// The main worker's MCP tool surface, backed by the live panel registry
 /// (`docs/design.md` §0 #4). Every method runs on the multiplexer's own
 /// thread — control jobs are executed by [`Multiplexer::drain_control`] inside
@@ -1394,10 +1428,11 @@ impl McpToolSurface for Multiplexer {
             .iter_mut()
             .find(|p| p.id == panel)
             .ok_or(McpError::NoSuchPanel(panel))?;
-        let mut bytes = text.as_bytes().to_vec();
-        if enter {
-            bytes.push(b'\r');
-        }
+        // Frame the prompt for the agent's input mode: when it has enabled
+        // bracketed paste, deliver `text` as a real paste so the submitting
+        // `\r` is seen as a discrete keypress (and any newline *inside* the
+        // text does not submit early) — see `encode_input`.
+        let bytes = encode_input(text.as_bytes(), enter, p.grid().bracketed_paste());
         p.write_input(&bytes)
             .map_err(|e| McpError::Tool(format!("send_keys: {e}")))?;
 
@@ -1878,6 +1913,49 @@ mod tests {
             Multiplexer::overlay_menu_state(InterruptedTransport, true),
             InterruptedTransport
         );
+    }
+
+    /// `encode_input` frames a prompt for the agent's input mode — bracketed
+    /// when the agent enabled `?2004h`, raw otherwise — per boundary.
+    #[test]
+    fn encode_input_wraps_a_paste_with_enter_after_the_marker() {
+        // Bracketed + submit: text inside the paste, the submitting `\r` AFTER
+        // the paste-end marker so it is a discrete keypress, not absorbed.
+        assert_eq!(
+            encode_input(b"hello", true, true),
+            b"\x1b[200~hello\x1b[201~\r",
+        );
+    }
+
+    #[test]
+    fn encode_input_paste_keeps_internal_newlines_inside_the_markers() {
+        // A multi-line report: the internal newline stays *inside* the paste
+        // (does not submit early); only the trailing `\r` is outside.
+        assert_eq!(
+            encode_input(b"line1\nline2", true, true),
+            b"\x1b[200~line1\nline2\x1b[201~\r",
+        );
+    }
+
+    #[test]
+    fn encode_input_bracketed_without_enter_has_no_trailing_cr() {
+        assert_eq!(encode_input(b"hi", false, true), b"\x1b[200~hi\x1b[201~");
+    }
+
+    #[test]
+    fn encode_input_unbracketed_is_raw_text_plus_cr() {
+        // Agent without `?2004`: markers would be literal garbage, so fall back
+        // to raw text + `\r`.
+        assert_eq!(encode_input(b"hello", true, false), b"hello\r");
+        assert_eq!(encode_input(b"hello", false, false), b"hello");
+    }
+
+    #[test]
+    fn encode_input_empty_text_is_a_bare_enter_never_wrapped() {
+        // A bare Enter (e.g. confirming) is just `\r`, never empty paste markers.
+        assert_eq!(encode_input(b"", true, true), b"\r");
+        assert_eq!(encode_input(b"", true, false), b"\r");
+        assert_eq!(encode_input(b"", false, true), b"");
     }
 
     /// `menu_nav_bytes` emits the right count + direction of arrow keys, then

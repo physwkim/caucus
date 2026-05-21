@@ -128,6 +128,12 @@ pub struct Grid {
     /// screen (`CSI ?1049h` / `?1047h` / `?47h`). `Some` exactly while the alt
     /// screen is active; restored verbatim on the matching reset.
     alt_saved: Option<AltScreen>,
+    /// Whether the agent has enabled bracketed-paste mode (`CSI ?2004h`). This
+    /// does not affect the scraped cell grid — it is a queryable hint for the
+    /// *input* path: `send_keys` frames a multi-byte prompt as a real
+    /// bracketed paste so the agent does not absorb the submitting `\r` as a
+    /// literal newline (`session::runtime::encode_input`).
+    bracketed_paste: bool,
 }
 
 /// Cursor + pen state preserved by DECSC (`ESC 7`) / SCO save (`CSI s`).
@@ -182,6 +188,7 @@ impl Grid {
             hyperlink: None,
             saved_cursor: None,
             alt_saved: None,
+            bracketed_paste: false,
         }
     }
 
@@ -189,6 +196,13 @@ impl Grid {
     /// friends). Diagnostic / test helper.
     pub fn on_alt_screen(&self) -> bool {
         self.alt_saved.is_some()
+    }
+
+    /// Whether the agent has enabled bracketed-paste mode (`CSI ?2004h`). The
+    /// input path consults this to frame a programmatic prompt as a real
+    /// bracketed paste; see `session::runtime::encode_input`.
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
     }
 
     /// Viewport dimensions, `(cols, rows)`.
@@ -790,10 +804,11 @@ impl Grid {
 
     /// Apply one DEC private mode set/reset (`CSI ? Pn h` / `l`).
     ///
-    /// Only the modes that change cell state are acted on; cursor-visibility
-    /// (`?25`), bracketed paste (`?2004`), mouse modes, synchronized output
-    /// (`?2026`) etc. remain deliberately ignored — they do not affect the
-    /// scraped grid.
+    /// Modes that change cell state (the alternate screen) are acted on, and
+    /// bracketed paste (`?2004`) is tracked as an input-framing hint (it does
+    /// not change the scraped grid). Cursor-visibility (`?25`), mouse modes,
+    /// synchronized output (`?2026`) etc. remain deliberately ignored — they
+    /// do not affect the scraped grid.
     fn set_private_mode(&mut self, mode: u16, enable: bool) {
         match mode {
             // Alternate screen buffer. `?47` is the legacy bare switch;
@@ -809,6 +824,10 @@ impl Grid {
                     self.leave_alt_screen();
                 }
             }
+            // Bracketed paste: tracked, not rendered. The input path frames a
+            // programmatic prompt as a real paste when this is on so the
+            // submitting `\r` is not absorbed into the prompt buffer.
+            2004 => self.bracketed_paste = enable,
             _ => {}
         }
     }
@@ -887,10 +906,12 @@ fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
 ///   prose, which is UTF-8, so box-drawing glyph substitution is unnecessary.
 /// - Combining marks / zero-width joiners are dropped rather than merged into
 ///   the base cell.
-/// - DEC private modes other than the alternate screen (`?25` cursor
-///   visibility, `?2004` bracketed paste, `?2026` synchronized output, mouse
-///   modes) are accepted and ignored — they do not affect the scraped cell
-///   grid. The alternate screen *is* honoured (see `csi_dispatch` above).
+/// - DEC private modes other than the alternate screen and bracketed paste
+///   (`?25` cursor visibility, `?2026` synchronized output, mouse modes) are
+///   accepted and ignored — they do not affect the scraped cell grid. The
+///   alternate screen *is* honoured (see `csi_dispatch` above); bracketed
+///   paste (`?2004`) is *tracked* (queryable via [`Grid::bracketed_paste`])
+///   as an input-framing hint, though it too does not change the grid.
 /// - DCS strings (`hook`/`put`/`unhook`) are ignored.
 impl Perform for Grid {
     fn print(&mut self, c: char) {
@@ -1069,6 +1090,7 @@ impl Perform for Grid {
                 self.hyperlink = None;
                 self.saved_cursor = None;
                 self.alt_saved = None;
+                self.bracketed_paste = false;
             }
             _ => {}
         }
@@ -1390,12 +1412,14 @@ mod tests {
     #[test]
     fn ris_resets_grid() {
         let mut g = Grid::new(10, 3);
-        g.advance(b"\x1b[31mhello\x1b]0;t\x07");
+        g.advance(b"\x1b[31mhello\x1b]0;t\x07\x1b[?2004h");
+        assert!(g.bracketed_paste());
         g.advance(b"\x1bc"); // RIS
         assert_eq!(at(&g, 0, 0), ' ');
         assert_eq!(g.cursor(), (0, 0));
         assert_eq!(g.title(), None);
         assert_eq!(g.cell(0, 0).unwrap().fg, 0);
+        assert!(!g.bracketed_paste(), "RIS clears bracketed-paste mode");
     }
 
     #[test]
@@ -1428,13 +1452,24 @@ mod tests {
     }
 
     #[test]
-    fn cosmetic_private_modes_are_ignored() {
-        // `?25` (cursor visibility) and `?2004` (bracketed paste) do not
-        // affect the cell grid; they must not disturb glyph printing.
+    fn cosmetic_private_modes_do_not_disturb_the_grid() {
+        // `?25` (cursor visibility) and `?2004` (bracketed paste) do not affect
+        // the cell grid; they must not disturb glyph printing. `?2004` is still
+        // *tracked* for the input path (asserted below) — just not rendered.
         let mut g = Grid::new(10, 3);
         g.advance(b"\x1b[?25l\x1b[?2004hX");
         assert_eq!(at(&g, 0, 0), 'X');
         assert!(!g.on_alt_screen());
+    }
+
+    #[test]
+    fn bracketed_paste_mode_is_tracked() {
+        let mut g = Grid::new(10, 3);
+        assert!(!g.bracketed_paste(), "off by default");
+        g.advance(b"\x1b[?2004h");
+        assert!(g.bracketed_paste(), "?2004h enables it");
+        g.advance(b"\x1b[?2004l");
+        assert!(!g.bracketed_paste(), "?2004l disables it");
     }
 
     // ----- alternate screen (banner bleed-through regression) --------------
