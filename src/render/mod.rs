@@ -530,6 +530,7 @@ fn derived_state_label(state: DerivedState) -> &'static str {
         DerivedState::BlockedPermissionPrompt => "blocked_permission",
         DerivedState::BlockedMergeConflict => "blocked_merge",
         DerivedState::BlockedBackgroundJob => "blocked_job",
+        DerivedState::AwaitingSelection => "awaiting_selection",
         DerivedState::DegradedMcp => "degraded_mcp",
         DerivedState::InterruptedTransport => "interrupted",
         DerivedState::Exited => "exited",
@@ -547,6 +548,7 @@ fn state_color(state: &str) -> Color {
         || state == "exited"
         || state == "interrupted"
         || state == "degraded_mcp"
+        || state == "awaiting_selection"
     {
         Color::Red
     } else {

@@ -77,6 +77,12 @@ pub enum ControlRequest {
         #[serde(default)]
         fallback_secs: Option<u64>,
     },
+    /// Read the interactive selection menu shown in a panel (if any) as
+    /// readable text. Answered with a [`ControlResponse::Panel`].
+    ReadMenu { panel: PanelId },
+    /// Pick option `index` (the displayed 1-based number) in a panel's
+    /// selection menu: caucus navigates the chooser there and presses Enter.
+    SelectOption { panel: PanelId, index: usize },
 }
 
 /// One control-socket response — the result of executing a [`ControlRequest`]
@@ -210,6 +216,30 @@ mod tests {
                 fallback_secs: None,
             }
         );
+    }
+
+    #[test]
+    fn read_menu_round_trips() {
+        let req = ControlRequest::ReadMenu {
+            panel: PanelId::new(),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"op\":\"read_menu\""));
+        let back: ControlRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn select_option_carries_index() {
+        let req = ControlRequest::SelectOption {
+            panel: PanelId::new(),
+            index: 3,
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"op\":\"select_option\""));
+        assert!(line.contains("\"index\":3"));
+        let back: ControlRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(req, back);
     }
 
     #[test]

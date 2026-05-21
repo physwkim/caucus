@@ -302,7 +302,14 @@ async fn event_loop(
         // 4. PTY pump — drain every panel into its grid + capture, reap exits.
         mux.pump_all();
 
-        // 5. Round delivery — if a registered round's panels have now settled
+        // 5. Selection prompts — if a panel in a pending round has stopped on
+        //    an interactive chooser (no Stop hook fires, so its round never
+        //    settles), announce it to the main worker so it can answer and let
+        //    the round finish. Runs before round delivery: unblocking a stuck
+        //    panel takes precedence, and both share the one-push-per-tick gate.
+        mux.poll_round_selection_prompts();
+
+        // 6. Round delivery — if a registered round's panels have now settled
         //    (or its fallback deadline passed), assemble their results and
         //    inject them into the main worker's panel (the caucus→main push).
         mux.poll_pending_rounds();
@@ -311,7 +318,7 @@ async fn event_loop(
             break;
         }
 
-        // 6. Redraw on the tick.
+        // 7. Redraw on the tick.
         if last_draw.elapsed() >= TICK {
             draw(&mut terminal, &mux)?;
             last_draw = Instant::now();

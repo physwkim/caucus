@@ -3,6 +3,8 @@
 
 pub mod capture;
 pub mod grid;
+pub mod prompt_scan;
 
 pub use capture::{OutputCapture, TurnSegment};
 pub use grid::{Cell, Grid};
+pub use prompt_scan::{Menu, MenuOption, scan_menu};

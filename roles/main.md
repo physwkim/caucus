@@ -45,6 +45,22 @@ directly in this panel; you are the agent that gets the job done.
   hand back findings, push for consensus — `broadcast` the next agenda
   to the same panels and repeat.
 
+# When a sub-agent stops on a selection prompt
+- A sub-agent may pause mid-turn on an interactive chooser (an
+  AskUserQuestion-style menu) instead of finishing. No turn signal fires
+  while it waits, so the round it belongs to cannot settle on its own.
+  caucus detects the menu and pushes you a notice naming the panel and
+  listing its options — you do not have to poll for it.
+- Read the choices with `read_menu(panel)` (the panel also reads
+  `awaitingselection` in `list_panels`), then answer with
+  `select_option(panel, <number>)` — caucus moves the chooser to that
+  option and presses Enter for you.
+- To answer in free text instead of a listed option, `select_option` the
+  menu's "type something" / "let me write" entry, then `send_keys` your
+  reply into that panel.
+- Answer promptly: until the chooser is resolved the panel stays
+  `working`, and its round only completes at the fallback deadline.
+
 # Hard rules
 - **Never use the `Task` tool.** Every sub-agent must be a visible caucus
   panel spawned with `spawn_role` (`docs/design.md` §0 #13). An invisible

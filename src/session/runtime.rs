@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tracing::warn;
 
+use crate::agent::derive_state::DerivedState;
 use crate::agent::manifest::{self, AgentManifest};
 use crate::agent::spawn::SpawnRequest;
 use crate::config::Config;
@@ -135,6 +136,14 @@ pub struct Multiplexer {
     /// round delivery so an injected turn never collides with a line the user
     /// is mid-compose (see [`QUIET_WINDOW`]).
     last_human_input: Option<Instant>,
+    /// Selection menus already announced to the main worker, keyed by the
+    /// panel showing the menu — value is the menu's content signature
+    /// ([`Multiplexer::menu_signature`]). Dedups the proactive
+    /// selection-prompt push ([`Multiplexer::poll_round_selection_prompts`])
+    /// so a panel sitting on one chooser is announced once, not every tick;
+    /// an entry is dropped when its panel leaves the menu, and replaced when
+    /// the menu's content changes.
+    notified_menus: HashMap<PanelId, u64>,
     /// Panel arrangement mode for [`Layout::reflow`] — cycled by `Ctrl-A Space`.
     layout_mode: LayoutMode,
     /// When `Some` and the id is still live, the layout shows only that panel
@@ -202,6 +211,7 @@ impl Multiplexer {
                 pending_rounds: Vec::new(),
                 main_panel_id: None,
                 last_human_input: None,
+                notified_menus: HashMap::new(),
                 layout_mode: LayoutMode::default(),
                 zoom: None,
                 show_transcript: false,
@@ -897,6 +907,16 @@ impl Multiplexer {
                 read_mode,
                 fallback_secs,
             } => self.register_round(panels, read_mode, fallback_secs),
+            ControlRequest::ReadMenu { panel } => match self.read_menu(panel) {
+                Ok(text) => ControlResponse::Panel { text },
+                Err(err) => ControlResponse::error(err),
+            },
+            ControlRequest::SelectOption { panel, index } => {
+                match self.select_option(panel, index) {
+                    Ok(()) => ControlResponse::Ok,
+                    Err(err) => ControlResponse::error(err),
+                }
+            }
         }
     }
 
@@ -1025,16 +1045,7 @@ impl Multiplexer {
         let rounds = std::mem::take(&mut self.pending_rounds);
 
         let main_id = self.main_panel_id;
-        let main_idle = main_id.is_some_and(|id| {
-            self.panels
-                .iter()
-                .find(|p| p.id == id)
-                .is_some_and(|p| p.state() == PanelState::Idle)
-        });
-        let quiet = self
-            .last_human_input
-            .is_none_or(|t| now.duration_since(t) >= QUIET_WINDOW);
-        let deliverable = main_idle && quiet;
+        let deliverable = self.main_deliverable();
 
         let mut delivered = false;
         for round in rounds {
@@ -1056,6 +1067,143 @@ impl Multiplexer {
                 _ => self.pending_rounds.push(round),
             }
         }
+    }
+
+    /// Whether a caucus→main push may land *this tick*: the main panel exists,
+    /// is coarse `Idle`, and no human keystroke hit it within [`QUIET_WINDOW`]
+    /// (so the user is not mid-compose). The single gate shared by both push
+    /// paths — round completion ([`Multiplexer::poll_pending_rounds`]) and
+    /// selection prompts ([`Multiplexer::poll_round_selection_prompts`]). Each
+    /// push flips the main panel to `Working`, closing the gate for the rest
+    /// of the tick, so at most one push of either kind lands per tick.
+    fn main_deliverable(&self) -> bool {
+        let main_idle = self.main_panel_id.is_some_and(|id| {
+            self.panels
+                .iter()
+                .find(|p| p.id == id)
+                .is_some_and(|p| p.state() == PanelState::Idle)
+        });
+        let quiet = self
+            .last_human_input
+            .is_none_or(|t| Instant::now().duration_since(t) >= QUIET_WINDOW);
+        main_idle && quiet
+    }
+
+    /// Announce to the main worker when a panel in a pending round has stopped
+    /// on an interactive selection menu — the caucus→main *selection* push.
+    ///
+    /// A chooser fires no `Stop` hook, so the panel stays coarse `Working` and
+    /// its round never settles; without this the main worker would only learn
+    /// at the fallback deadline. caucus pushes an interim notice so the main
+    /// worker can answer it (`read_menu` / `select_option`) and let the round
+    /// finish. Gated by [`Multiplexer::main_deliverable`] and deduped by menu
+    /// content signature ([`Multiplexer::notified_menus`]): a panel sitting on
+    /// one menu is announced once; a menu whose content changes re-announces;
+    /// a panel that leaves its menu is forgotten so a future menu re-announces.
+    /// At most one notice per tick (shares the deliverability gate with round
+    /// completion, which a push closes by flipping the main panel to `Working`).
+    pub fn poll_round_selection_prompts(&mut self) {
+        let Some(main_id) = self.main_panel_id else {
+            return;
+        };
+        if self.pending_rounds.is_empty() {
+            return;
+        }
+
+        // Round panels currently showing a menu, with a content signature
+        // (question + options, not the cursor row) so cursor movement alone
+        // never re-announces.
+        let round_panels: std::collections::HashSet<PanelId> = self
+            .pending_rounds
+            .iter()
+            .flat_map(|r| r.panels.iter().copied())
+            .collect();
+        let mut open: Vec<(PanelId, u64)> = Vec::new();
+        let mut menus: HashMap<PanelId, crate::term::Menu> = HashMap::new();
+        for pid in round_panels {
+            if pid == main_id {
+                continue;
+            }
+            if let Some(p) = self.panels.iter().find(|p| p.id == pid)
+                && let Some(menu) = Self::panel_menu(p)
+            {
+                open.push((pid, Self::menu_signature(&menu)));
+                menus.insert(pid, menu);
+            }
+        }
+
+        let (pick, open_set) = Self::pick_menu_to_notify(&open, &self.notified_menus);
+        // Forget panels that have left their menu, so a future menu re-announces.
+        self.notified_menus.retain(|pid, _| open_set.contains(pid));
+
+        // One notice per tick, only while the gate is open. Dedup state above
+        // is updated regardless; the panel is marked notified only on a real
+        // push, so a closed gate this tick still announces next tick.
+        if !self.main_deliverable() {
+            return;
+        }
+        let Some(pid) = pick else {
+            return;
+        };
+        // `pick` came from `open`, so both lookups are present.
+        let sig = open
+            .iter()
+            .find(|(p, _)| *p == pid)
+            .map(|(_, s)| *s)
+            .unwrap();
+        let menu = menus.remove(&pid).unwrap();
+        let role = self
+            .panels
+            .iter()
+            .find(|p| p.id == pid)
+            .map(|p| p.role.clone())
+            .unwrap_or_default();
+        let notice = format!(
+            "[caucus] panel {pid} (role: {role}) is waiting on a selection — \
+             answer it so the round can finish.\n{}\n(answer with \
+             select_option({pid}, <number>); for a free-text reply pick the \
+             'type something' option, then send_keys your text.)",
+            Self::render_menu(&menu)
+        );
+        if let Err(err) = McpToolSurface::send_keys(self, main_id, &notice, true) {
+            warn!(error = %err, "selection-prompt notice to main panel failed");
+        }
+        self.notified_menus.insert(pid, sig);
+    }
+
+    /// Pick which round panel to announce a selection menu for this tick.
+    ///
+    /// Pure decision core of [`Multiplexer::poll_round_selection_prompts`]:
+    /// given the panels currently showing a menu as `(panel, signature)` and
+    /// the already-notified set, return the first panel whose signature is new
+    /// or changed (the one to push), plus the set of panels showing a menu now
+    /// (so the caller can prune stale dedup entries).
+    fn pick_menu_to_notify(
+        open: &[(PanelId, u64)],
+        notified: &HashMap<PanelId, u64>,
+    ) -> (Option<PanelId>, std::collections::HashSet<PanelId>) {
+        let open_set = open.iter().map(|(p, _)| *p).collect();
+        let pick = open
+            .iter()
+            .find(|(p, sig)| notified.get(p) != Some(sig))
+            .map(|(p, _)| *p);
+        (pick, open_set)
+    }
+
+    /// Content signature of a selection menu — a hash of the question and the
+    /// numbered option labels, **excluding** the cursor row. Two reads of the
+    /// same chooser hash equal even as the highlighted row moves; a changed
+    /// question or option set hashes differently. Used to dedup the
+    /// selection-prompt push ([`Multiplexer::notified_menus`]).
+    fn menu_signature(menu: &crate::term::Menu) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        menu.question.hash(&mut h);
+        for opt in &menu.options {
+            opt.number.hash(&mut h);
+            opt.label.hash(&mut h);
+        }
+        h.finish()
     }
 
     /// Assemble a round's delivery message: a self-describing block per panel
@@ -1119,6 +1267,30 @@ impl Multiplexer {
             out.pop();
         }
         out
+    }
+
+    /// Scan a panel's visible grid for an interactive selection menu
+    /// ([`crate::term::scan_menu`]). `None` unless one is confidently detected.
+    fn panel_menu(panel: &Panel) -> Option<crate::term::Menu> {
+        let (_, rows) = panel.grid().size();
+        let lines: Vec<String> = (0..rows)
+            .map(|r| panel.grid().row_text(r).trim_end().to_string())
+            .collect();
+        crate::term::scan_menu(&lines)
+    }
+
+    /// Overlay a live selection-menu detection onto the turn-signal-derived
+    /// state. A visible menu means the agent stopped mid-turn for a choice —
+    /// which the `Stop`-hook state cannot see — so it outranks the
+    /// signal-derived `Working`/`Idle` (mirroring `derive_agent_state`, where
+    /// a grid hint is weighed before the turn signal). It never masks a
+    /// stronger state (`Exited`/`Blocked*`/`Interrupted`/`Degraded`).
+    fn overlay_menu_state(base: DerivedState, has_menu: bool) -> DerivedState {
+        if has_menu && matches!(base, DerivedState::Working | DerivedState::Idle) {
+            DerivedState::AwaitingSelection
+        } else {
+            base
+        }
     }
 
     /// Render a panel's scrollback ring as text, oldest row first.
@@ -1334,11 +1506,16 @@ impl McpToolSurface for Multiplexer {
             .map(|p| {
                 // Prefer the manifest's derived_state (turn-signal fed); fall
                 // back to the coarse panel-state label before the first turn.
+                // A live selection menu on the grid overlays `awaiting_selection`
+                // (no Stop hook fires while a chooser is open).
                 let (state, agent_cli) = match self.manifests.get(&p.id) {
-                    Some(m) => (
-                        format!("{:?}", m.derived_state()).to_ascii_lowercase(),
-                        m.agent_cli,
-                    ),
+                    Some(m) => {
+                        let st = Self::overlay_menu_state(
+                            m.derived_state(),
+                            Self::panel_menu(p).is_some(),
+                        );
+                        (format!("{st:?}").to_ascii_lowercase(), m.agent_cli)
+                    }
                     None => (p.state_label().to_string(), AgentCli::Claude),
                 };
                 PanelSummary {
@@ -1349,6 +1526,97 @@ impl McpToolSurface for Multiplexer {
                 }
             })
             .collect()
+    }
+
+    fn read_menu(&self, panel: PanelId) -> Result<String, McpError> {
+        let p = self
+            .panels
+            .iter()
+            .find(|p| p.id == panel)
+            .ok_or(McpError::NoSuchPanel(panel))?;
+        Ok(match Self::panel_menu(p) {
+            Some(menu) => Self::render_menu(&menu),
+            None => "(no selection menu visible on this panel)".to_string(),
+        })
+    }
+
+    fn select_option(&mut self, panel: PanelId, index: usize) -> Result<(), McpError> {
+        // Scan the menu (immutable) before writing (mutable) — no overlapping
+        // borrows of `self.panels`.
+        let menu = {
+            let p = self
+                .panels
+                .iter()
+                .find(|p| p.id == panel)
+                .ok_or(McpError::NoSuchPanel(panel))?;
+            Self::panel_menu(p)
+                .ok_or_else(|| McpError::Tool("no selection menu visible on this panel".into()))?
+        };
+        let target = menu
+            .options
+            .iter()
+            .position(|o| o.number == index)
+            .ok_or_else(|| {
+                McpError::Tool(format!(
+                    "no option {index} in the menu (options 1..={})",
+                    menu.options.len()
+                ))
+            })?;
+        let bytes = Self::menu_nav_bytes(menu.cursor, target);
+
+        let p = self
+            .panels
+            .iter_mut()
+            .find(|p| p.id == panel)
+            .ok_or(McpError::NoSuchPanel(panel))?;
+        p.write_input(&bytes)
+            .map_err(|e| McpError::Tool(format!("select_option: {e}")))?;
+        // Submitting a selection resumes the agent's turn — open a capture turn
+        // and flip the panel to `Working`, exactly like the `send_keys` path.
+        self.note_prompt_delivered(panel);
+        Ok(())
+    }
+}
+
+impl Multiplexer {
+    /// Render a detected [`crate::term::Menu`] as readable text for the main
+    /// worker: the question, the numbered options (the highlighted one marked),
+    /// and how to answer.
+    fn render_menu(menu: &crate::term::Menu) -> String {
+        let mut out = String::from("selection menu:\n");
+        if !menu.question.is_empty() {
+            out.push_str(&format!("question: {}\n", menu.question));
+        }
+        for (i, opt) in menu.options.iter().enumerate() {
+            let marker = if i == menu.cursor { "❯ " } else { "  " };
+            out.push_str(&format!("{marker}{}. {}\n", opt.number, opt.label));
+        }
+        out.push_str("(answer with select_option(panel, <number>))");
+        out
+    }
+
+    /// Bytes that move a chooser's cursor from `cursor` to `target` and submit:
+    /// `|target-cursor|` arrow keys (down when target is lower, up otherwise)
+    /// then Enter. Reuses [`crate::input::encode_key`] so the xterm sequences
+    /// match what a real keyboard would send.
+    fn menu_nav_bytes(cursor: usize, target: usize) -> Vec<u8> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (code, count) = if target >= cursor {
+            (KeyCode::Down, target - cursor)
+        } else {
+            (KeyCode::Up, cursor - target)
+        };
+        let arrow =
+            crate::input::encode_key(&KeyEvent::new(code, KeyModifiers::NONE)).unwrap_or_default();
+        let mut bytes = Vec::new();
+        for _ in 0..count {
+            bytes.extend_from_slice(&arrow);
+        }
+        bytes.extend_from_slice(
+            &crate::input::encode_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap_or_default(),
+        );
+        bytes
     }
 }
 
@@ -1581,6 +1849,150 @@ mod tests {
         assert!(mux.show_transcript());
         mux.apply_command(CaucusCommand::HideTranscript);
         assert!(!mux.show_transcript());
+    }
+
+    /// A live selection menu overlays `AwaitingSelection` onto an otherwise
+    /// signal-derived state, but never masks a stronger state.
+    #[test]
+    fn overlay_menu_state_only_overrides_working_and_idle() {
+        use DerivedState::*;
+        // Mid-turn (Working) or back-at-prompt (Idle) + menu → AwaitingSelection.
+        assert_eq!(
+            Multiplexer::overlay_menu_state(Working, true),
+            AwaitingSelection
+        );
+        assert_eq!(
+            Multiplexer::overlay_menu_state(Idle, true),
+            AwaitingSelection
+        );
+        // No menu detected → unchanged.
+        assert_eq!(Multiplexer::overlay_menu_state(Working, false), Working);
+        // Stronger states are never masked by a stray on-screen menu.
+        assert_eq!(Multiplexer::overlay_menu_state(Exited, true), Exited);
+        assert_eq!(
+            Multiplexer::overlay_menu_state(BlockedMergeConflict, true),
+            BlockedMergeConflict
+        );
+        assert_eq!(
+            Multiplexer::overlay_menu_state(InterruptedTransport, true),
+            InterruptedTransport
+        );
+    }
+
+    /// `menu_nav_bytes` emits the right count + direction of arrow keys, then
+    /// Enter — per navigation boundary.
+    #[test]
+    fn menu_nav_bytes_moves_the_cursor_and_submits() {
+        // Down two then Enter (cursor 0 → option index 2).
+        assert_eq!(Multiplexer::menu_nav_bytes(0, 2), b"\x1b[B\x1b[B\r");
+        // Up two then Enter (cursor 2 → index 0).
+        assert_eq!(Multiplexer::menu_nav_bytes(2, 0), b"\x1b[A\x1b[A\r");
+        // Already on target: just Enter, no arrows.
+        assert_eq!(Multiplexer::menu_nav_bytes(1, 1), b"\r");
+    }
+
+    /// `render_menu` lists the options and marks the highlighted one.
+    #[test]
+    fn render_menu_marks_the_cursor_option() {
+        let menu = crate::term::Menu {
+            question: "Pick one".to_string(),
+            options: vec![
+                crate::term::MenuOption {
+                    number: 1,
+                    label: "alpha".to_string(),
+                },
+                crate::term::MenuOption {
+                    number: 2,
+                    label: "beta".to_string(),
+                },
+            ],
+            cursor: 1,
+        };
+        let text = Multiplexer::render_menu(&menu);
+        assert!(text.contains("question: Pick one"));
+        assert!(text.contains("❯ 2. beta"), "cursor option marked: {text:?}");
+        assert!(text.contains("  1. alpha"));
+        assert!(text.contains("select_option"));
+    }
+
+    /// Build a two-option menu with the given question, labels, and cursor.
+    fn menu_of(question: &str, labels: [&str; 2], cursor: usize) -> crate::term::Menu {
+        crate::term::Menu {
+            question: question.to_string(),
+            options: labels
+                .iter()
+                .enumerate()
+                .map(|(i, l)| crate::term::MenuOption {
+                    number: i + 1,
+                    label: l.to_string(),
+                })
+                .collect(),
+            cursor,
+        }
+    }
+
+    /// `menu_signature` tracks menu *content* — question + option labels — and
+    /// ignores the cursor row, so navigation alone never re-announces.
+    #[test]
+    fn menu_signature_ignores_cursor_tracks_content() {
+        let base = menu_of("Pick one", ["alpha", "beta"], 0);
+        // Same content, cursor moved → same signature.
+        let moved = menu_of("Pick one", ["alpha", "beta"], 1);
+        assert_eq!(
+            Multiplexer::menu_signature(&base),
+            Multiplexer::menu_signature(&moved),
+            "cursor movement must not change the signature"
+        );
+        // Changed option label → different signature.
+        let relabelled = menu_of("Pick one", ["alpha", "gamma"], 0);
+        assert_ne!(
+            Multiplexer::menu_signature(&base),
+            Multiplexer::menu_signature(&relabelled),
+            "a changed option must change the signature"
+        );
+        // Changed question → different signature.
+        let requestioned = menu_of("Pick another", ["alpha", "beta"], 0);
+        assert_ne!(
+            Multiplexer::menu_signature(&base),
+            Multiplexer::menu_signature(&requestioned),
+            "a changed question must change the signature"
+        );
+    }
+
+    /// `pick_menu_to_notify` announces a panel's menu once, re-announces on a
+    /// content change, stays silent while unchanged, and reports the open set
+    /// so the caller can prune panels that have left their menus.
+    #[test]
+    fn pick_menu_to_notify_announces_new_and_dedups() {
+        let pid = PanelId::new();
+        let sig_a = 11u64;
+        let sig_b = 22u64;
+
+        // Nothing on screen → nothing to announce, empty open set.
+        let (pick, open) = Multiplexer::pick_menu_to_notify(&[], &HashMap::new());
+        assert_eq!(pick, None);
+        assert!(open.is_empty());
+
+        // A menu not yet notified → announce it; open set carries the panel.
+        let (pick, open) = Multiplexer::pick_menu_to_notify(&[(pid, sig_a)], &HashMap::new());
+        assert_eq!(pick, Some(pid));
+        assert!(open.contains(&pid));
+
+        // Same menu already notified → silent.
+        let notified = HashMap::from([(pid, sig_a)]);
+        let (pick, open) = Multiplexer::pick_menu_to_notify(&[(pid, sig_a)], &notified);
+        assert_eq!(pick, None);
+        assert!(open.contains(&pid));
+
+        // Menu content changed under the same panel → re-announce.
+        let (pick, _) = Multiplexer::pick_menu_to_notify(&[(pid, sig_b)], &notified);
+        assert_eq!(pick, Some(pid));
+
+        // Panel left its menu (not in `open`) → not in the open set, so the
+        // caller's retain drops its dedup entry.
+        let (pick, open) = Multiplexer::pick_menu_to_notify(&[], &notified);
+        assert_eq!(pick, None);
+        assert!(!open.contains(&pid));
     }
 
     /// `EnterScroll` with no focused panel is a no-op (no pager, no panic).

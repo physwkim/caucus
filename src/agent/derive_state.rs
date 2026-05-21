@@ -23,6 +23,11 @@ pub enum DerivedState {
     BlockedMergeConflict,
     /// Grid shows a stuck background job.
     BlockedBackgroundJob,
+    /// Grid shows an interactive selection menu (an `AskUserQuestion`-style
+    /// chooser): the agent stopped mid-turn waiting for an option to be picked.
+    /// No `Stop` hook fires here, so this is detected from the grid, not a
+    /// turn signal. The main worker answers it with `select_option`.
+    AwaitingSelection,
     /// MCP handshake degraded.
     DegradedMcp,
     /// The transport to the agent was interrupted.
@@ -42,6 +47,9 @@ pub enum GridHint {
     PromptReady,
     /// A `Allow this tool? [y/n]`-style permission prompt is visible.
     PermissionPromptVisible,
+    /// An interactive selection menu (`AskUserQuestion`-style chooser) is
+    /// visible — the agent is waiting for an option to be picked.
+    SelectionMenuVisible,
     /// A merge-conflict marker is visible.
     MergeConflictVisible,
     /// A long-running background job appears stuck.
@@ -88,6 +96,7 @@ pub fn derive_agent_state(
     if let Some(hint) = grid_hint {
         match hint {
             GridHint::PermissionPromptVisible => return DerivedState::BlockedPermissionPrompt,
+            GridHint::SelectionMenuVisible => return DerivedState::AwaitingSelection,
             GridHint::MergeConflictVisible => return DerivedState::BlockedMergeConflict,
             GridHint::BackgroundJobVisible => return DerivedState::BlockedBackgroundJob,
             GridHint::PromptReady => {}
@@ -149,6 +158,22 @@ mod tests {
                 Some(&GridHint::PermissionPromptVisible)
             ),
             DerivedState::BlockedPermissionPrompt
+        );
+    }
+
+    #[test]
+    fn selection_menu_hint_is_awaiting_selection() {
+        // A visible selection menu means the agent stopped mid-turn for a
+        // choice — distinct from a [y/n] permission prompt.
+        assert_eq!(
+            derive_agent_state(
+                "live",
+                None,
+                None,
+                None,
+                Some(&GridHint::SelectionMenuVisible)
+            ),
+            DerivedState::AwaitingSelection
         );
     }
 

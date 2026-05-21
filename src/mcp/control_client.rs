@@ -245,6 +245,20 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                 fallback_secs,
             })
         }
+        "read_menu" => Ok(ControlRequest::ReadMenu {
+            panel: panel(args)?,
+        }),
+        "select_option" => {
+            let index = args
+                .get("index")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "missing integer argument `index`".to_string())?
+                as usize;
+            Ok(ControlRequest::SelectOption {
+                panel: panel(args)?,
+                index,
+            })
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -465,6 +479,31 @@ mod tests {
     fn build_register_round_rejects_bad_panel_id() {
         let err = build_request("register_round", &json!({"panels": ["not-a-ulid"]})).unwrap_err();
         assert!(err.contains("invalid panel id"));
+    }
+
+    #[test]
+    fn build_read_menu_request() {
+        let a = PanelId::new();
+        let req = build_request("read_menu", &json!({"panel": a.to_string()})).unwrap();
+        assert_eq!(req, ControlRequest::ReadMenu { panel: a });
+    }
+
+    #[test]
+    fn build_select_option_request() {
+        let a = PanelId::new();
+        let req = build_request(
+            "select_option",
+            &json!({"panel": a.to_string(), "index": 2}),
+        )
+        .unwrap();
+        assert_eq!(req, ControlRequest::SelectOption { panel: a, index: 2 });
+    }
+
+    #[test]
+    fn build_select_option_requires_index() {
+        let a = PanelId::new();
+        let err = build_request("select_option", &json!({"panel": a.to_string()})).unwrap_err();
+        assert!(err.contains("missing integer argument `index`"));
     }
 
     #[test]

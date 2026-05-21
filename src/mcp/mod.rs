@@ -2,8 +2,9 @@
 //! (`docs/design.md` §0 #4, §9).
 //!
 //! The main worker (a Claude Code agent in one panel) drives every sub-agent
-//! panel through eight MCP tools: `send_keys`, `broadcast`, `ctrl_c`,
-//! `read_panel`, `spawn_role`, `kill_panel`, `list_panels`, `register_round`.
+//! panel through ten MCP tools: `send_keys`, `broadcast`, `ctrl_c`,
+//! `read_panel`, `spawn_role`, `kill_panel`, `list_panels`, `register_round`,
+//! `read_menu`, `select_option`.
 //!
 //! ## Architecture
 //!
@@ -24,7 +25,7 @@
 //! `rmcp` (1.7.0) resolves cleanly but its server surface is macro-driven and
 //! its transport runs an internal loop that resists deterministic unit
 //! testing. The MCP slice caucus needs is small — `initialize` / `tools/list`
-//! / `tools/call`, eight tools — so [`jsonrpc`] implements exactly that, with a
+//! / `tools/call`, ten tools — so [`jsonrpc`] implements exactly that, with a
 //! pure dispatch core. See that module's header for the rationale.
 
 pub mod control_client;
@@ -62,7 +63,8 @@ pub enum ReadPanelMode {
 pub struct PanelSummary {
     pub panel_id: PanelId,
     pub role: String,
-    /// Derived state, lower-cased (`working` / `idle` / `blocked_*` / `exited`).
+    /// Derived state, lower-cased (`working` / `idle` / `awaitingselection` /
+    /// `blocked_*` / `exited`).
     pub state: String,
     pub agent_cli: AgentCli,
 }
@@ -108,6 +110,16 @@ pub trait McpToolSurface {
 
     /// List every live panel with its derived state.
     fn list_panels(&self) -> Vec<PanelSummary>;
+
+    /// Read the interactive selection menu shown in a panel, if any — the
+    /// question, its numbered options, and the highlighted one as readable
+    /// text. Empty when no menu is on screen (`docs/design.md` §8.3).
+    fn read_menu(&self, panel: PanelId) -> Result<String, McpError>;
+
+    /// Answer a panel's selection menu by picking option `index` (the displayed
+    /// 1-based number): caucus navigates the chooser to that option and presses
+    /// Enter (`docs/design.md` §8.3).
+    fn select_option(&mut self, panel: PanelId, index: usize) -> Result<(), McpError>;
 }
 
 /// The MCP tools caucus exposes to the main worker (`docs/design.md` §0 #4).
@@ -267,6 +279,41 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                 "required": ["panels"]
             }),
         },
+        ToolDef {
+            name: "read_menu",
+            description: "Read the interactive selection menu currently shown in \
+                          a panel — an AskUserQuestion-style chooser. Returns the \
+                          question, the numbered options, and which is \
+                          highlighted. Empty if no menu is on screen. Use this \
+                          when a panel reads 'awaitingselection' (or caucus tells \
+                          you it is waiting) to see the choices before answering \
+                          with select_option.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "panel": panel_prop() },
+                "required": ["panel"]
+            }),
+        },
+        ToolDef {
+            name: "select_option",
+            description: "Answer a panel's selection menu: pick option number \
+                          'index' (the 1-based number shown by read_menu) and \
+                          caucus navigates the chooser there and presses Enter. \
+                          To answer in free text instead, select the menu's \
+                          'type something' option this way, then send_keys your \
+                          text.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "panel": panel_prop(),
+                    "index": {
+                        "type": "integer",
+                        "description": "Option number to pick (1-based, as shown)."
+                    }
+                },
+                "required": ["panel", "index"]
+            }),
+        },
     ]
 }
 
@@ -296,6 +343,8 @@ mod tests {
                 "kill_panel",
                 "list_panels",
                 "register_round",
+                "read_menu",
+                "select_option",
             ]
         );
     }

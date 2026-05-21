@@ -87,6 +87,8 @@ fn mcp_serve_lists_the_tools_over_stdio() {
             "kill_panel",
             "list_panels",
             "register_round",
+            "read_menu",
+            "select_option",
         ],
         "tools/list must return exactly the caucus tools"
     );
