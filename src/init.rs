@@ -28,13 +28,17 @@ exec caucus signal post \\\n\
 /// Result of the `--install-hook` step.
 #[derive(Debug)]
 pub enum HookInstall {
-    /// The Stop hook was merged into `~/.claude/settings.json`. `backup` is
-    /// the `.bak` of a prior settings file, when one was overwritten.
+    /// The current caucus Stop hook was merged into `~/.claude/settings.json`.
+    /// `backup` is the `.bak` of a prior settings file, when one was
+    /// overwritten. `migrated` is set when a *stale* caucus hook (e.g. a prior
+    /// `sentinel-stop`) was removed in the process.
     Merged {
         settings: PathBuf,
         backup: Option<PathBuf>,
+        migrated: bool,
     },
-    /// A caucus Stop hook was already present — settings left untouched.
+    /// The current caucus Stop hook was already present — settings left
+    /// untouched.
     AlreadyPresent { settings: PathBuf },
 }
 
@@ -96,9 +100,13 @@ fn write_executable(path: &Path, content: &str) -> Result<()> {
 
 /// Merge the caucus `Stop` hook into `~/.claude/settings.json`.
 ///
-/// Idempotent: a caucus Stop hook already present leaves the file untouched
-/// ([`HookInstall::AlreadyPresent`]); otherwise the hook is merged and any
-/// prior file is backed up to `.bak` ([`HookInstall::Merged`]).
+/// Idempotent on the *current* hook: when the exact `turn-signal` command is
+/// already wired, the file is left untouched ([`HookInstall::AlreadyPresent`]).
+/// Otherwise the hook is merged ([`HookInstall::Merged`]) and any prior file is
+/// backed up to `.bak`. A *stale* caucus hook (a different caucus hook command,
+/// e.g. a prior `sentinel-stop`) is removed in the process so the new install
+/// replaces it rather than stacking a second, dead hook — the migration the
+/// loose "mentions caucus" check used to block.
 fn install_claude_hook(hook_script: &Path) -> Result<HookInstall> {
     let home = std::env::var_os("HOME").context("$HOME not set — cannot locate ~/.claude")?;
     let claude_dir = PathBuf::from(home).join(".claude");
@@ -113,7 +121,9 @@ fn install_claude_hook(hook_script: &Path) -> Result<HookInstall> {
         _ => serde_json::json!({}),
     };
 
-    if hook_already_present(&settings) {
+    let hook_command = hook_script.display().to_string();
+
+    if current_hook_present(&settings, &hook_command) {
         return Ok(HookInstall::AlreadyPresent {
             settings: settings_path,
         });
@@ -129,7 +139,11 @@ fn install_claude_hook(hook_script: &Path) -> Result<HookInstall> {
         None
     };
 
-    merge_stop_hook(&mut settings, &hook_script.display().to_string());
+    // Drop any stale caucus hook (a caucus hook command that is not the current
+    // one), then wire the current one — so a prior `sentinel-stop` is replaced,
+    // not left alongside a dead duplicate.
+    let migrated = prune_stale_caucus_hooks(&mut settings, &hook_command) > 0;
+    merge_stop_hook(&mut settings, &hook_command);
     let serialized = serde_json::to_string_pretty(&settings)?;
     std::fs::write(&settings_path, serialized)
         .with_context(|| format!("write {}", settings_path.display()))?;
@@ -137,16 +151,84 @@ fn install_claude_hook(hook_script: &Path) -> Result<HookInstall> {
     Ok(HookInstall::Merged {
         settings: settings_path,
         backup,
+        migrated,
     })
 }
 
-/// Whether a caucus Stop hook is already wired in `settings`.
-fn hook_already_present(settings: &serde_json::Value) -> bool {
-    settings
-        .get("hooks")
-        .and_then(|h| h.get("Stop"))
-        .map(json_mentions_caucus)
-        .unwrap_or(false)
+/// Whether the *current* caucus hook (`hook_command`, the exact `turn-signal`
+/// path) is already wired into `settings.hooks.Stop`. Exact-match, not a loose
+/// "mentions caucus" — so a stale caucus hook never masquerades as the current
+/// one (the bug that blocked migration).
+fn current_hook_present(settings: &serde_json::Value, hook_command: &str) -> bool {
+    stop_strings(settings)
+        .into_iter()
+        .any(|s| s == hook_command)
+}
+
+/// Whether a Stop-hook `command` belongs to caucus: it runs one of caucus's
+/// hook scripts (`.../.caucus/bin/...`) or a caucus signal subcommand. This is
+/// caucus-specific — it does *not* match an unrelated command that merely has
+/// "caucus" somewhere in its path — so migration prunes only caucus's own
+/// hooks and leaves third-party Stop hooks alone.
+fn is_caucus_hook_command(cmd: &str) -> bool {
+    cmd.contains("/.caucus/bin/")
+        || cmd.contains("caucus signal post")
+        || cmd.contains("caucus sentinel")
+}
+
+/// Remove every *stale* caucus Stop hook — a caucus hook command that is not
+/// the current `hook_command` — from `settings.hooks.Stop`, preserving all
+/// other hooks. Matcher groups left with no hooks are dropped. Returns how
+/// many stale caucus hook commands were removed.
+fn prune_stale_caucus_hooks(settings: &mut serde_json::Value, hook_command: &str) -> usize {
+    let Some(stop) = settings
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("Stop"))
+        .and_then(|s| s.as_array_mut())
+    else {
+        return 0;
+    };
+    let mut removed = 0;
+    for group in stop.iter_mut() {
+        if let Some(hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+            let before = hooks.len();
+            hooks.retain(|hook| match hook.get("command").and_then(|c| c.as_str()) {
+                Some(cmd) => !(is_caucus_hook_command(cmd) && cmd != hook_command),
+                None => true,
+            });
+            removed += before - hooks.len();
+        }
+    }
+    // Drop matcher groups whose hooks array is now empty; leave groups without
+    // a `hooks` array untouched.
+    stop.retain(|group| {
+        group
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .is_none_or(|a| !a.is_empty())
+    });
+    removed
+}
+
+/// Every string under `settings.hooks.Stop`, gathered recursively so command
+/// strings are found regardless of the exact nesting Claude uses (matcher
+/// group → `hooks` → `command`).
+fn stop_strings(settings: &serde_json::Value) -> Vec<&str> {
+    let mut out = Vec::new();
+    if let Some(stop) = settings.get("hooks").and_then(|h| h.get("Stop")) {
+        collect_strings(stop, &mut out);
+    }
+    out
+}
+
+/// Recursively push every string value in `v` onto `out`.
+fn collect_strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s),
+        serde_json::Value::Array(items) => items.iter().for_each(|i| collect_strings(i, out)),
+        serde_json::Value::Object(map) => map.values().for_each(|i| collect_strings(i, out)),
+        _ => {}
+    }
 }
 
 /// Append the caucus Stop-hook entry into `settings.hooks.Stop`, creating the
@@ -173,16 +255,6 @@ fn merge_stop_hook(settings: &mut serde_json::Value, hook_command: &str) {
     } else {
         // A non-array `Stop` value is replaced with a fresh array.
         *stop = serde_json::json!([entry]);
-    }
-}
-
-/// Recursively scan a JSON value for a string mentioning `caucus`.
-fn json_mentions_caucus(v: &serde_json::Value) -> bool {
-    match v {
-        serde_json::Value::String(s) => s.contains("caucus"),
-        serde_json::Value::Array(items) => items.iter().any(json_mentions_caucus),
-        serde_json::Value::Object(map) => map.values().any(json_mentions_caucus),
-        _ => false,
     }
 }
 
@@ -216,11 +288,14 @@ mod tests {
         assert_ne!(mode & 0o111, 0, "turn-signal script must be executable");
     }
 
+    const TURN_SIGNAL: &str = "/abs/repo/.caucus/bin/turn-signal";
+    const SENTINEL_STOP: &str = "/abs/repo/.caucus/bin/sentinel-stop";
+
     #[test]
     fn merge_stop_hook_into_empty_settings() {
         let mut settings = serde_json::json!({});
-        merge_stop_hook(&mut settings, "/abs/repo/.caucus/bin/turn-signal");
-        assert!(hook_already_present(&settings));
+        merge_stop_hook(&mut settings, TURN_SIGNAL);
+        assert!(current_hook_present(&settings, TURN_SIGNAL));
         // The hook command must be absolute, not a relative path.
         let cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
@@ -235,19 +310,102 @@ mod tests {
                 "Stop": [{ "hooks": [{ "type": "command", "command": "/other" }] }]
             }
         });
-        merge_stop_hook(&mut settings, "/abs/repo/.caucus/bin/turn-signal");
+        merge_stop_hook(&mut settings, TURN_SIGNAL);
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2, "existing hook kept, caucus hook appended");
-        assert!(hook_already_present(&settings));
+        assert!(current_hook_present(&settings, TURN_SIGNAL));
     }
 
     #[test]
-    fn hook_already_present_is_idempotent_signal() {
+    fn current_hook_present_is_exact_match_not_substring() {
+        // The current hook is wired → present.
         let with = serde_json::json!({
-            "hooks": { "Stop": [{ "command": ".caucus/bin/turn-signal" }] }
+            "hooks": { "Stop": [{ "hooks": [{ "command": TURN_SIGNAL }] }] }
         });
-        assert!(hook_already_present(&with));
+        assert!(current_hook_present(&with, TURN_SIGNAL));
         let without = serde_json::json!({ "hooks": { "Stop": [] } });
-        assert!(!hook_already_present(&without));
+        assert!(!current_hook_present(&without, TURN_SIGNAL));
+        // A *stale* caucus hook must NOT count as the current one — this exact
+        // confusion (any "caucus" mention satisfies the check) is the bug that
+        // blocked migration off sentinel-stop.
+        let stale = serde_json::json!({
+            "hooks": { "Stop": [{ "hooks": [{ "command": SENTINEL_STOP }] }] }
+        });
+        assert!(!current_hook_present(&stale, TURN_SIGNAL));
+    }
+
+    #[test]
+    fn is_caucus_hook_command_matches_caucus_only() {
+        assert!(is_caucus_hook_command(TURN_SIGNAL));
+        assert!(is_caucus_hook_command(SENTINEL_STOP));
+        assert!(is_caucus_hook_command("caucus signal post --kind stop"));
+        assert!(is_caucus_hook_command("/usr/bin/caucus sentinel write"));
+        // A third-party Stop hook must not be mistaken for caucus's own.
+        assert!(!is_caucus_hook_command(
+            "/Users/me/codes/claude-config/hooks/no-deferral-guard.py"
+        ));
+        assert!(!is_caucus_hook_command("/usr/bin/true"));
+    }
+
+    #[test]
+    fn prune_stale_caucus_hooks_replaces_sentinel_and_keeps_others() {
+        // A real-world settings.json: the stale sentinel-stop hook sits
+        // alongside an unrelated third-party hook in one Stop group.
+        let third_party = "/Users/me/codes/claude-config/hooks/no-deferral-guard.py";
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [{
+                    "matcher": "",
+                    "hooks": [
+                        { "type": "command", "command": SENTINEL_STOP },
+                        { "type": "command", "command": third_party }
+                    ]
+                }]
+            }
+        });
+
+        let removed = prune_stale_caucus_hooks(&mut settings, TURN_SIGNAL);
+        assert_eq!(removed, 1, "the stale sentinel-stop hook is pruned");
+
+        let hooks = settings["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+        let commands: Vec<&str> = hooks.iter().filter_map(|h| h["command"].as_str()).collect();
+        assert_eq!(
+            commands,
+            vec![third_party],
+            "third-party hook preserved, stale caucus hook gone"
+        );
+
+        // After the prune, merging the current hook yields a clean single
+        // caucus hook — no stacked duplicate.
+        merge_stop_hook(&mut settings, TURN_SIGNAL);
+        assert!(current_hook_present(&settings, TURN_SIGNAL));
+    }
+
+    #[test]
+    fn prune_stale_caucus_hooks_keeps_the_current_hook() {
+        // The current hook is already wired — prune must leave it alone.
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [{ "hooks": [{ "type": "command", "command": TURN_SIGNAL }] }]
+            }
+        });
+        let removed = prune_stale_caucus_hooks(&mut settings, TURN_SIGNAL);
+        assert_eq!(removed, 0);
+        assert!(current_hook_present(&settings, TURN_SIGNAL));
+    }
+
+    #[test]
+    fn prune_stale_caucus_hooks_drops_emptied_groups() {
+        // A Stop group containing only the stale caucus hook is removed
+        // entirely, not left as an empty husk.
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [{ "matcher": "", "hooks": [{ "command": SENTINEL_STOP }] }]
+            }
+        });
+        let removed = prune_stale_caucus_hooks(&mut settings, TURN_SIGNAL);
+        assert_eq!(removed, 1);
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert!(stop.is_empty(), "the emptied group is dropped: {stop:?}");
     }
 }

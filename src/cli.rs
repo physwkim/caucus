@@ -196,8 +196,15 @@ fn run_init(install_hook: bool) -> Result<ExitCode> {
     eprintln!("  .caucus dir:   {}", outcome.caucus_dir.display());
     eprintln!("  hook script:   {}", outcome.hook_script.display());
     match &outcome.hook_install {
-        Some(crate::init::HookInstall::Merged { settings, backup }) => {
+        Some(crate::init::HookInstall::Merged {
+            settings,
+            backup,
+            migrated,
+        }) => {
             eprintln!("  Claude Stop hook merged: {}", settings.display());
+            if *migrated {
+                eprintln!("  migrated: removed a stale caucus Stop hook (e.g. sentinel-stop)");
+            }
             if let Some(bak) = backup {
                 eprintln!("  prior settings backed up: {}", bak.display());
             }
