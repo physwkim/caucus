@@ -143,8 +143,9 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
             name: "broadcast",
             description: "Send the same text to several panels at once — a \
                           round's fan-out. Equivalent to one send_keys per \
-                          panel. Follow with wait_for_panels, then \
-                          read_panel(since_last_turn) on each, to run a round.",
+                          panel. Follow with register_round on the same \
+                          panels, then end your turn; caucus delivers their \
+                          assembled results when the round settles.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
