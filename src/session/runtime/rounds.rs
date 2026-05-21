@@ -1,0 +1,673 @@
+use super::*;
+use crate::agent::derive_state::DerivedState;
+use crate::mcp::protocol::ControlResponse;
+use crate::mcp::{McpToolSurface, ReadPanelMode};
+use crate::panel::lifecycle::{Panel, PanelState};
+use crate::session::id::PanelId;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use tracing::warn;
+
+/// Default fallback budget for a registered round when the caller omits
+/// `fallback_secs` — the safety-net deadline after which caucus delivers a
+/// partial report even if some panels never settled.
+const ROUND_FALLBACK_DEFAULT_SECS: u64 = 600;
+/// Hard cap on a round's fallback budget.
+const ROUND_FALLBACK_MAX_SECS: u64 = 3600;
+/// A registered round's results are only injected into the main worker's
+/// panel once it has been free of human keystrokes for at least this long —
+/// so a delivery never lands in the middle of a line the user is composing.
+const QUIET_WINDOW: Duration = Duration::from_millis(1000);
+
+/// A round caucus is watching on the main worker's behalf
+/// ([`Multiplexer::poll_pending_rounds`]).
+///
+/// Unlike a control request (each answered immediately), a round carries no
+/// reply channel — `register_round` already acked at registration. Instead
+/// the event loop watches it each tick and, once every panel has settled (or
+/// `fallback_deadline` passes), assembles the panels' results and *injects*
+/// them into the main worker's panel as a fresh turn. This is the caucus→main
+/// push that the pull-only MCP transport cannot do.
+pub(super) struct PendingRound {
+    /// Panel ids in the round. Ids that no longer exist count as settled
+    /// (see [`Multiplexer::wait_panels_settled`]).
+    panels: Vec<PanelId>,
+    /// How each panel's result is read for the delivered report.
+    pub(super) read_mode: ReadPanelMode,
+    /// Wall-clock instant past which the round is delivered regardless of
+    /// state — the safety net, marking still-`working` panels unfinished.
+    fallback_deadline: Instant,
+}
+
+impl Multiplexer {
+    /// Register a round on `panels`: stash a [`PendingRound`] for the event
+    /// loop to deliver and ack immediately with the panels' current snapshot.
+    /// `fallback_secs` is clamped to `[1, ROUND_FALLBACK_MAX_SECS]`, defaulting
+    /// to `ROUND_FALLBACK_DEFAULT_SECS`; `read_mode` defaults to `LastMessage`.
+    ///
+    /// Unlike the removed blocking wait, this never special-cases an
+    /// already-settled round — delivery is decided uniformly by
+    /// [`Multiplexer::poll_pending_rounds`] (which also gates on the main panel
+    /// being idle), so the registration path has exactly one shape.
+    pub(crate) fn register_round(
+        &mut self,
+        panels: Vec<PanelId>,
+        read_mode: Option<ReadPanelMode>,
+        fallback_secs: Option<u64>,
+    ) -> ControlResponse {
+        let budget = fallback_secs
+            .unwrap_or(ROUND_FALLBACK_DEFAULT_SECS)
+            .clamp(1, ROUND_FALLBACK_MAX_SECS);
+        let ack = self.panel_snapshot(&panels);
+        self.pending_rounds.push(PendingRound {
+            panels,
+            read_mode: read_mode.unwrap_or(ReadPanelMode::LastMessage),
+            fallback_deadline: Instant::now() + Duration::from_secs(budget),
+        });
+        ack
+    }
+
+    /// Deliver one due, deliverable round to the main worker — the caucus→main
+    /// push. Called once per event-loop tick, after signals + pump have
+    /// updated panel state.
+    ///
+    /// A round is *due* when all its panels have settled, or its
+    /// `fallback_deadline` has passed. It is *delivered* only while the main
+    /// panel exists, is `Idle`, and has seen no human keystroke within
+    /// [`QUIET_WINDOW`] — so an injected turn never collides with a line the
+    /// user is composing. At most one round is delivered per tick: the
+    /// injection flips the main panel to `Working`, so any other due round
+    /// naturally holds until the main worker is idle again. A due round with
+    /// no main panel to deliver to is dropped (it would otherwise be stranded).
+    pub fn poll_pending_rounds(&mut self) {
+        if self.pending_rounds.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        // Take the queue so the settle-checks below can borrow `self`.
+        let rounds = std::mem::take(&mut self.pending_rounds);
+
+        let main_id = self.main_panel_id;
+        let deliverable = self.main_deliverable();
+
+        let mut delivered = false;
+        for round in rounds {
+            let due = now >= round.fallback_deadline || self.wait_panels_settled(&round.panels);
+            match main_id {
+                // Due, gate open, nothing delivered yet this tick: assemble +
+                // inject into the main panel, then drop the round.
+                Some(main_id) if due && deliverable && !delivered => {
+                    let report = self.assemble_round_report(&round.panels, round.read_mode);
+                    if let Err(err) = McpToolSurface::send_keys(self, main_id, &report, true) {
+                        warn!(error = %err, "round delivery to main panel failed");
+                    }
+                    delivered = true;
+                }
+                // Due but there is no main panel to deliver to: drop it.
+                None if due => {}
+                // Not due, gate closed, or already delivered one this tick:
+                // keep it for a later tick.
+                _ => self.pending_rounds.push(round),
+            }
+        }
+    }
+
+    /// Whether a caucus→main push may land *this tick*: the main panel exists,
+    /// is coarse `Idle`, and no human keystroke hit it within [`QUIET_WINDOW`]
+    /// (so the user is not mid-compose). The single gate shared by both push
+    /// paths — round completion ([`Multiplexer::poll_pending_rounds`]) and
+    /// selection prompts ([`Multiplexer::poll_round_selection_prompts`]). Each
+    /// push flips the main panel to `Working`, closing the gate for the rest
+    /// of the tick, so at most one push of either kind lands per tick.
+    fn main_deliverable(&self) -> bool {
+        let main_idle = self.main_panel_id.is_some_and(|id| {
+            self.panels
+                .iter()
+                .find(|p| p.id == id)
+                .is_some_and(|p| p.state() == PanelState::Idle)
+        });
+        let quiet = self
+            .last_human_input
+            .is_none_or(|t| Instant::now().duration_since(t) >= QUIET_WINDOW);
+        main_idle && quiet
+    }
+
+    /// Announce to the main worker when a panel in a pending round has stopped
+    /// on an interactive selection menu — the caucus→main *selection* push.
+    ///
+    /// A chooser fires no `Stop` hook, so the panel stays coarse `Working` and
+    /// its round never settles; without this the main worker would only learn
+    /// at the fallback deadline. caucus pushes an interim notice so the main
+    /// worker can answer it (`read_menu` / `select_option`) and let the round
+    /// finish. Gated by [`Multiplexer::main_deliverable`] and deduped by menu
+    /// content signature ([`Multiplexer::notified_menus`]): a panel sitting on
+    /// one menu is announced once; a menu whose content changes re-announces;
+    /// a panel that leaves its menu is forgotten so a future menu re-announces.
+    /// At most one notice per tick (shares the deliverability gate with round
+    /// completion, which a push closes by flipping the main panel to `Working`).
+    pub fn poll_round_selection_prompts(&mut self) {
+        let Some(main_id) = self.main_panel_id else {
+            return;
+        };
+        if self.pending_rounds.is_empty() {
+            return;
+        }
+
+        // Round panels currently showing a menu, with a content signature
+        // (question + options, not the cursor row) so cursor movement alone
+        // never re-announces.
+        let round_panels: std::collections::HashSet<PanelId> = self
+            .pending_rounds
+            .iter()
+            .flat_map(|r| r.panels.iter().copied())
+            .collect();
+        let mut open: Vec<(PanelId, u64)> = Vec::new();
+        let mut menus: HashMap<PanelId, crate::term::Menu> = HashMap::new();
+        for pid in round_panels {
+            if pid == main_id {
+                continue;
+            }
+            if let Some(p) = self.panels.iter().find(|p| p.id == pid)
+                && let Some(menu) = Self::panel_menu(p)
+            {
+                open.push((pid, Self::menu_signature(&menu)));
+                menus.insert(pid, menu);
+            }
+        }
+
+        let (pick, open_set) = Self::pick_menu_to_notify(&open, &self.notified_menus);
+        // Forget panels that have left their menu, so a future menu re-announces.
+        self.notified_menus.retain(|pid, _| open_set.contains(pid));
+
+        // One notice per tick, only while the gate is open. Dedup state above
+        // is updated regardless; the panel is marked notified only on a real
+        // push, so a closed gate this tick still announces next tick.
+        if !self.main_deliverable() {
+            return;
+        }
+        let Some(pid) = pick else {
+            return;
+        };
+        // `pick` came from `open`, so both lookups are present.
+        let sig = open
+            .iter()
+            .find(|(p, _)| *p == pid)
+            .map(|(_, s)| *s)
+            .unwrap();
+        let menu = menus.remove(&pid).unwrap();
+        let role = self
+            .panels
+            .iter()
+            .find(|p| p.id == pid)
+            .map(|p| p.role.clone())
+            .unwrap_or_default();
+        let notice = format!(
+            "[caucus] panel {pid} (role: {role}) is waiting on a selection — \
+             answer it so the round can finish.\n{}\n(answer with \
+             select_option({pid}, <number>); for a free-text reply pick the \
+             'type something' option, then send_keys your text.)",
+            Self::render_menu(&menu)
+        );
+        if let Err(err) = McpToolSurface::send_keys(self, main_id, &notice, true) {
+            warn!(error = %err, "selection-prompt notice to main panel failed");
+        }
+        self.notified_menus.insert(pid, sig);
+    }
+
+    /// Pick which round panel to announce a selection menu for this tick.
+    ///
+    /// Pure decision core of [`Multiplexer::poll_round_selection_prompts`]:
+    /// given the panels currently showing a menu as `(panel, signature)` and
+    /// the already-notified set, return the first panel whose signature is new
+    /// or changed (the one to push), plus the set of panels showing a menu now
+    /// (so the caller can prune stale dedup entries).
+    fn pick_menu_to_notify(
+        open: &[(PanelId, u64)],
+        notified: &HashMap<PanelId, u64>,
+    ) -> (Option<PanelId>, std::collections::HashSet<PanelId>) {
+        let open_set = open.iter().map(|(p, _)| *p).collect();
+        let pick = open
+            .iter()
+            .find(|(p, sig)| notified.get(p) != Some(sig))
+            .map(|(p, _)| *p);
+        (pick, open_set)
+    }
+
+    /// Content signature of a selection menu — a hash of the question and the
+    /// numbered option labels, **excluding** the cursor row. Two reads of the
+    /// same chooser hash equal even as the highlighted row moves; a changed
+    /// question or option set hashes differently. Used to dedup the
+    /// selection-prompt push ([`Multiplexer::notified_menus`]).
+    fn menu_signature(menu: &crate::term::Menu) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        menu.question.hash(&mut h);
+        for opt in &menu.options {
+            opt.number.hash(&mut h);
+            opt.label.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Assemble a round's delivery message: a self-describing block per panel
+    /// — role + current state, plus its result read via `read_mode` (settled
+    /// panels) or an "unfinished" marker (a panel still `working` when the
+    /// fallback deadline forced delivery). A panel id that no longer exists is
+    /// reported as gone. This is the text injected into the main worker's
+    /// panel as a fresh turn.
+    fn assemble_round_report(&self, panels: &[PanelId], read_mode: ReadPanelMode) -> String {
+        let all_settled = self.wait_panels_settled(panels);
+        let mut out = format!(
+            "[caucus] Round complete — {} panel(s){}.\n",
+            panels.len(),
+            if all_settled {
+                ""
+            } else {
+                " (fallback deadline reached; some panels did not finish)"
+            }
+        );
+        for &id in panels {
+            let Some(panel) = self.panels.iter().find(|p| p.id == id) else {
+                out.push_str(&format!("\n## panel {id} — gone (killed)\n"));
+                continue;
+            };
+            let state = panel.state();
+            out.push_str(&format!(
+                "\n## panel {id} (role: {}) — {}\n",
+                panel.role,
+                state.label()
+            ));
+            if matches!(state, PanelState::Working | PanelState::Spawning) {
+                out.push_str("⏳ still working — did not finish within the fallback window.\n");
+                continue;
+            }
+            let body = self
+                .read_panel(id, read_mode)
+                .unwrap_or_else(|e| format!("(could not read panel: {e})"));
+            let body = body.trim();
+            out.push_str(if body.is_empty() {
+                "(no output captured)\n"
+            } else {
+                body
+            });
+            if !body.is_empty() {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Render a panel's visible grid viewport as text, one row per line.
+    pub(crate) fn screen_text(panel: &Panel) -> String {
+        let (_, rows) = panel.grid().size();
+        let mut out = String::new();
+        for row in 0..rows {
+            out.push_str(panel.grid().row_text(row).trim_end());
+            out.push('\n');
+        }
+        // Drop trailing blank lines so the main worker is not handed a wall of spaces.
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
+        out
+    }
+
+    /// Scan a panel's visible grid for an interactive selection menu
+    /// ([`crate::term::scan_menu`]). `None` unless one is confidently detected.
+    pub(crate) fn panel_menu(panel: &Panel) -> Option<crate::term::Menu> {
+        let (_, rows) = panel.grid().size();
+        let lines: Vec<String> = (0..rows)
+            .map(|r| panel.grid().row_text(r).trim_end().to_string())
+            .collect();
+        crate::term::scan_menu(&lines)
+    }
+
+    /// Overlay a live selection-menu detection onto the turn-signal-derived
+    /// state. A visible menu means the agent stopped mid-turn for a choice —
+    /// which the `Stop`-hook state cannot see — so it outranks the
+    /// signal-derived `Working`/`Idle` (mirroring `derive_agent_state`, where
+    /// a grid hint is weighed before the turn signal). It never masks a
+    /// stronger state (`Exited`/`Blocked*`/`Interrupted`/`Degraded`).
+    pub(crate) fn overlay_menu_state(base: DerivedState, has_menu: bool) -> DerivedState {
+        if has_menu && matches!(base, DerivedState::Working | DerivedState::Idle) {
+            DerivedState::AwaitingSelection
+        } else {
+            base
+        }
+    }
+
+    /// Render a panel's scrollback ring as text, oldest row first.
+    pub(crate) fn scrollback_text(panel: &Panel) -> String {
+        let mut out = String::new();
+        for row in panel.grid().scrollback() {
+            let line: String = row.iter().filter(|c| c.ch != '\0').map(|c| c.ch).collect();
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        // Include the live viewport so `scrollback` is the complete retained
+        // buffer (history + current screen), not just the off-screen rows.
+        out.push_str(&Self::screen_text(panel));
+        out
+    }
+
+    /// Render a raw PTY byte capture — a whole turn, escape sequences and all —
+    /// into readable text by replaying it through a throwaway grid. Without
+    /// this, `read_panel(since_last_turn)` would hand the main worker an
+    /// escape-sequence soup instead of the turn's rendered output.
+    pub(crate) fn rendered_capture_text(bytes: &[u8], cols: usize) -> String {
+        let mut grid = crate::term::Grid::new(cols.max(20), 50);
+        grid.advance(bytes);
+        let mut out = String::new();
+        for row in grid.scrollback() {
+            let line: String = row.iter().filter(|c| c.ch != '\0').map(|c| c.ch).collect();
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        let (_, rows) = grid.size();
+        for r in 0..rows {
+            out.push_str(grid.row_text(r).trim_end());
+            out.push('\n');
+        }
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::runtime::test_support::*;
+    use crate::signal::TurnSignal;
+    use tempfile::TempDir;
+
+    /// `register_round` acks immediately with a panel snapshot and stashes a
+    /// `PendingRound` — it never blocks. An unknown id is omitted from the ack
+    /// (it would not appear in `list_panels` either). `read_mode` defaults to
+    /// `last_message`.
+    #[tokio::test]
+    async fn register_round_acks_and_stashes_a_pending_round() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let ghost = PanelId::new();
+
+        let ack = mux.register_round(vec![ghost], None, Some(60));
+        match ack {
+            ControlResponse::Panels { panels } => assert!(panels.is_empty()),
+            other => panic!("expected an immediate Panels ack, got {other:?}"),
+        }
+        assert_eq!(mux.pending_rounds.len(), 1, "round must be stashed");
+        assert_eq!(mux.pending_rounds[0].read_mode, ReadPanelMode::LastMessage);
+    }
+
+    /// `assemble_round_report` reports an id that no longer exists as gone
+    /// rather than panicking or omitting it silently.
+    #[tokio::test]
+    async fn assemble_round_report_marks_a_missing_panel_gone() {
+        let tmp = TempDir::new().unwrap();
+        let mux = mux(&tmp);
+        let ghost = PanelId::new();
+
+        let report = mux.assemble_round_report(&[ghost], ReadPanelMode::LastMessage);
+        assert!(report.contains("Round complete"), "report: {report}");
+        assert!(
+            report.contains("gone"),
+            "a missing panel must be marked gone: {report}"
+        );
+    }
+
+    /// `assemble_round_report` marks a panel still `Working` (the fallback
+    /// case) as unfinished rather than reading a half-done turn.
+    ///
+    /// Spawning a panel needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn assemble_round_report_marks_a_working_panel_unfinished() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let Ok(sub) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.note_prompt_delivered(sub);
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == sub).unwrap().state(),
+            PanelState::Working,
+        );
+
+        let report = mux.assemble_round_report(&[sub], ReadPanelMode::LastMessage);
+        assert!(
+            report.contains("still working"),
+            "a Working panel must be marked unfinished: {report}"
+        );
+
+        mux.shutdown();
+    }
+
+    /// A due round with no main panel to deliver to is dropped — it would
+    /// otherwise be stranded forever. (A non-existent id counts as settled, so
+    /// the round is due immediately.)
+    #[tokio::test]
+    async fn poll_pending_rounds_drops_a_due_round_with_no_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        assert!(mux.main_panel_id.is_none());
+
+        mux.register_round(vec![PanelId::new()], None, Some(600));
+        assert_eq!(mux.pending_rounds.len(), 1);
+
+        mux.poll_pending_rounds();
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "a due round with no main panel must be dropped"
+        );
+    }
+
+    /// A due round is *held*, not delivered, while the main panel is not idle.
+    /// Here `main_panel_id` points at an id with no live panel, so the idle
+    /// gate is closed and the round stays pending for a later tick.
+    #[tokio::test]
+    async fn poll_pending_rounds_holds_when_main_not_idle() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        mux.main_panel_id = Some(PanelId::new());
+
+        mux.register_round(vec![PanelId::new()], None, Some(600));
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "round must be held while the main panel is not idle"
+        );
+    }
+
+    /// The caucus→main push end to end: a round on a `Working` sub-panel is
+    /// held until the panel settles, then delivered to the idle main panel —
+    /// proven by the main panel flipping to `Working` (the injection opens a
+    /// turn) and the round being dropped. A fresh human keystroke also holds
+    /// delivery (the quiet window).
+    ///
+    /// Spawning panels needs a real agent CLI; the test is skipped (not
+    /// failed) when none is on PATH, matching `tests/mcp_integration.rs`.
+    #[tokio::test]
+    async fn poll_pending_rounds_delivers_to_idle_main_on_settle() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let session_id = mux.session.id;
+
+        // Spawn a main panel and drive it to Idle (Spawning -> Working -> Idle).
+        let Ok(main) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+        mux.note_prompt_delivered(main);
+        mux.handle_signal(TurnSignal::now(
+            session_id,
+            main,
+            crate::signal::TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        ));
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+        );
+
+        // A sub-panel in `Working`, with a round registered on it.
+        let Ok(sub) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.note_prompt_delivered(sub);
+        mux.register_round(vec![sub], None, Some(600));
+
+        // Sub still working -> round held.
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "round held while the sub-panel is working"
+        );
+
+        // Settle the sub-panel (Working -> Idle).
+        mux.handle_signal(TurnSignal::now(
+            session_id,
+            sub,
+            crate::signal::TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        ));
+
+        // A fresh human keystroke to main closes the quiet window: still held.
+        mux.last_human_input = Some(Instant::now());
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "round held while the user is mid-compose (quiet window)"
+        );
+
+        // Clear the quiet window: now the round delivers.
+        mux.last_human_input = None;
+        mux.poll_pending_rounds();
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "round delivered once due + main idle + quiet"
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "delivery injects a turn into the main panel",
+        );
+
+        mux.shutdown();
+    }
+
+    /// A live selection menu overlays `AwaitingSelection` onto an otherwise
+    /// signal-derived state, but never masks a stronger state.
+    #[test]
+    fn overlay_menu_state_only_overrides_working_and_idle() {
+        use DerivedState::*;
+        // Mid-turn (Working) or back-at-prompt (Idle) + menu → AwaitingSelection.
+        assert_eq!(
+            Multiplexer::overlay_menu_state(Working, true),
+            AwaitingSelection
+        );
+        assert_eq!(
+            Multiplexer::overlay_menu_state(Idle, true),
+            AwaitingSelection
+        );
+        // No menu detected → unchanged.
+        assert_eq!(Multiplexer::overlay_menu_state(Working, false), Working);
+        // Stronger states are never masked by a stray on-screen menu.
+        assert_eq!(Multiplexer::overlay_menu_state(Exited, true), Exited);
+        assert_eq!(
+            Multiplexer::overlay_menu_state(BlockedMergeConflict, true),
+            BlockedMergeConflict
+        );
+        assert_eq!(
+            Multiplexer::overlay_menu_state(InterruptedTransport, true),
+            InterruptedTransport
+        );
+    }
+
+    /// `menu_signature` tracks menu *content* — question + option labels — and
+    /// ignores the cursor row, so navigation alone never re-announces.
+    #[test]
+    fn menu_signature_ignores_cursor_tracks_content() {
+        let base = menu_of("Pick one", ["alpha", "beta"], 0);
+        // Same content, cursor moved → same signature.
+        let moved = menu_of("Pick one", ["alpha", "beta"], 1);
+        assert_eq!(
+            Multiplexer::menu_signature(&base),
+            Multiplexer::menu_signature(&moved),
+            "cursor movement must not change the signature"
+        );
+        // Changed option label → different signature.
+        let relabelled = menu_of("Pick one", ["alpha", "gamma"], 0);
+        assert_ne!(
+            Multiplexer::menu_signature(&base),
+            Multiplexer::menu_signature(&relabelled),
+            "a changed option must change the signature"
+        );
+        // Changed question → different signature.
+        let requestioned = menu_of("Pick another", ["alpha", "beta"], 0);
+        assert_ne!(
+            Multiplexer::menu_signature(&base),
+            Multiplexer::menu_signature(&requestioned),
+            "a changed question must change the signature"
+        );
+    }
+
+    /// `pick_menu_to_notify` announces a panel's menu once, re-announces on a
+    /// content change, stays silent while unchanged, and reports the open set
+    /// so the caller can prune panels that have left their menus.
+    #[test]
+    fn pick_menu_to_notify_announces_new_and_dedups() {
+        let pid = PanelId::new();
+        let sig_a = 11u64;
+        let sig_b = 22u64;
+
+        // Nothing on screen → nothing to announce, empty open set.
+        let (pick, open) = Multiplexer::pick_menu_to_notify(&[], &HashMap::new());
+        assert_eq!(pick, None);
+        assert!(open.is_empty());
+
+        // A menu not yet notified → announce it; open set carries the panel.
+        let (pick, open) = Multiplexer::pick_menu_to_notify(&[(pid, sig_a)], &HashMap::new());
+        assert_eq!(pick, Some(pid));
+        assert!(open.contains(&pid));
+
+        // Same menu already notified → silent.
+        let notified = HashMap::from([(pid, sig_a)]);
+        let (pick, open) = Multiplexer::pick_menu_to_notify(&[(pid, sig_a)], &notified);
+        assert_eq!(pick, None);
+        assert!(open.contains(&pid));
+
+        // Menu content changed under the same panel → re-announce.
+        let (pick, _) = Multiplexer::pick_menu_to_notify(&[(pid, sig_b)], &notified);
+        assert_eq!(pick, Some(pid));
+
+        // Panel left its menu (not in `open`) → not in the open set, so the
+        // caller's retain drops its dedup entry.
+        let (pick, open) = Multiplexer::pick_menu_to_notify(&[], &notified);
+        assert_eq!(pick, None);
+        assert!(!open.contains(&pid));
+    }
+
+    #[test]
+    fn rendered_capture_strips_escape_sequences() {
+        // A raw turn capture: SGR colour, CR/LF, cursor moves — what a real
+        // agent emits. `read_panel(since_last_turn)` must hand the main
+        // worker readable text, never this escape soup.
+        let raw = b"\x1b[1;32mhello\x1b[0m\r\nfrom \x1b[31mcaucus\x1b[0m\x1b[K\r\n";
+        let text = Multiplexer::rendered_capture_text(raw, 80);
+        assert!(
+            !text.contains('\x1b'),
+            "escape sequences must be rendered away: {text:?}"
+        );
+        assert!(text.contains("hello"), "got: {text:?}");
+        assert!(text.contains("from caucus"), "got: {text:?}");
+    }
+}
