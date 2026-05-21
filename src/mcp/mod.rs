@@ -3,7 +3,7 @@
 //!
 //! The main worker (a Claude Code agent in one panel) drives every sub-agent
 //! panel through eight MCP tools: `send_keys`, `broadcast`, `ctrl_c`,
-//! `read_panel`, `spawn_role`, `kill_panel`, `list_panels`, `wait_for_panels`.
+//! `read_panel`, `spawn_role`, `kill_panel`, `list_panels`, `register_round`.
 //!
 //! ## Architecture
 //!
@@ -234,23 +234,33 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
             input_schema: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
-            name: "wait_for_panels",
-            description: "Block until the named panels all settle (finish their \
-                          turn — leave the 'working' state) or timeout_secs \
-                          elapses (default 600). Returns each panel's final role \
-                          + state. Use this instead of sleep-polling list_panels.",
+            name: "register_round",
+            description: "Register a round: caucus watches the named panels and, \
+                          when they ALL settle (finish their turn — leave the \
+                          'working' state) or fallback_secs elapses, delivers \
+                          their assembled results to you as a new message. \
+                          Returns immediately — after calling this, end your \
+                          turn; caucus re-prompts you when the round completes. \
+                          Do NOT sleep-poll list_panels.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "panels": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Panel ids (ULIDs) to wait on."
+                        "description": "Panel ids (ULIDs) in the round."
                     },
-                    "timeout_secs": {
+                    "read_mode": {
+                        "type": "string",
+                        "enum": ["last_message", "since_last_turn"],
+                        "description": "What to read from each panel for the \
+                                        delivered report (default last_message)."
+                    },
+                    "fallback_secs": {
                         "type": "integer",
-                        "description": "Max seconds to block before returning \
-                                        (default 600, max 3600)."
+                        "description": "Safety-net seconds: if the panels never \
+                                        all settle, caucus delivers a partial \
+                                        report after this (default 600, max 3600)."
                     }
                 },
                 "required": ["panels"]
@@ -284,7 +294,7 @@ mod tests {
                 "spawn_role",
                 "kill_panel",
                 "list_panels",
-                "wait_for_panels",
+                "register_round",
             ]
         );
     }

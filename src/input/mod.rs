@@ -23,6 +23,10 @@
 //! | `Ctrl-A` then `Space`     | cycle the layout arrangement mode       |
 //! | `Ctrl-A` then `t`         | toggle the transcript overlay           |
 //! | `Esc` (overlay open)      | hide the transcript overlay             |
+//! | `Ctrl-A` then `[`         | open the scrollback pager (focused panel)|
+//! | (pager open) `↑↓ k j`     | scroll a line; `PgUp/PgDn` a page       |
+//! | (pager open) `g G Home End`| jump to oldest / newest line           |
+//! | (pager open) `Esc` / `q`  | exit the scrollback pager               |
 //! | `Ctrl-A` then `Ctrl-A`    | send a literal `Ctrl-A` to the panel    |
 //! | any other key             | forwarded to the focused panel's PTY    |
 //! | `Ctrl-C`                  | forwarded to the focused panel (§0 #11) |
@@ -71,6 +75,22 @@ pub enum CaucusCommand {
     ToggleTranscript,
     /// Hide the transcript overlay (the `Esc` path while it is open).
     HideTranscript,
+    /// Open the scrollback pager on the focused panel (`Ctrl-A [`).
+    EnterScroll,
+    /// Close the scrollback pager, returning to the live tiled view.
+    ExitScroll,
+    /// Scroll the pager one line toward older output.
+    ScrollUp,
+    /// Scroll the pager one line toward newer output.
+    ScrollDown,
+    /// Scroll the pager one page toward older output.
+    ScrollPageUp,
+    /// Scroll the pager one page toward newer output.
+    ScrollPageDown,
+    /// Jump the pager to the oldest line.
+    ScrollTop,
+    /// Jump the pager to the newest line.
+    ScrollBottom,
 }
 
 /// Tracks which panel currently receives the user's keystrokes, plus whether
@@ -84,6 +104,10 @@ pub struct FocusRouter {
     /// `true` while the transcript overlay is open. When set, a bare `Esc`
     /// hides the overlay instead of being forwarded to the focused panel.
     transcript_open: bool,
+    /// `true` while the scrollback pager is open. When set, navigation keys
+    /// drive scrolling and are *captured* — every key is consumed by the
+    /// pager and none reach the focused panel's PTY.
+    scroll_open: bool,
 }
 
 impl FocusRouter {
@@ -113,6 +137,13 @@ impl FocusRouter {
         self.transcript_open = open;
     }
 
+    /// Tell the router whether the scrollback pager is open — when open, the
+    /// pager captures every key in [`FocusRouter::route`] (navigation keys
+    /// scroll, all others are swallowed).
+    pub fn set_scroll_open(&mut self, open: bool) {
+        self.scroll_open = open;
+    }
+
     /// Route a key event to an [`InputAction`].
     ///
     /// When the prefix is armed the key selects a [`CaucusCommand`]; an
@@ -120,6 +151,15 @@ impl FocusRouter {
     /// either way). Otherwise the key is encoded to terminal bytes and
     /// forwarded to the focused panel.
     pub fn route(&mut self, key: KeyEvent) -> InputAction {
+        // While the scrollback pager is open it is fully modal: it captures
+        // every key. Navigation keys scroll it; `Esc`/`q` close it; all other
+        // keys are swallowed and never reach the focused panel's PTY (unlike
+        // the read-only transcript overlay, which passes input through).
+        if self.scroll_open {
+            return scroll_command(&key)
+                .map(InputAction::Caucus)
+                .unwrap_or(InputAction::Ignore);
+        }
         if self.prefix_armed {
             self.prefix_armed = false;
             return self.route_prefixed(key);
@@ -164,9 +204,28 @@ impl FocusRouter {
             KeyCode::Char('>') => InputAction::Caucus(CaucusCommand::MovePanelLater),
             KeyCode::Char(' ') => InputAction::Caucus(CaucusCommand::CycleLayout),
             KeyCode::Char('t') => InputAction::Caucus(CaucusCommand::ToggleTranscript),
+            KeyCode::Char('[') => InputAction::Caucus(CaucusCommand::EnterScroll),
             // Any other key after the prefix: prefix consumed, nothing done.
             _ => InputAction::Ignore,
         }
+    }
+}
+
+/// Map a key to a scrollback-pager command while the pager is open. Returns
+/// `None` for keys the pager swallows (they reach neither caucus nor the PTY).
+///
+/// Bindings mirror tmux copy-mode / `less`: `↑↓ k j` line, `PgUp/PgDn b Space`
+/// page, `g/Home` oldest, `G/End` newest, `Esc/q` exit.
+fn scroll_command(key: &KeyEvent) -> Option<CaucusCommand> {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => Some(CaucusCommand::ScrollUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(CaucusCommand::ScrollDown),
+        KeyCode::PageUp | KeyCode::Char('b') => Some(CaucusCommand::ScrollPageUp),
+        KeyCode::PageDown | KeyCode::Char(' ') => Some(CaucusCommand::ScrollPageDown),
+        KeyCode::Home | KeyCode::Char('g') => Some(CaucusCommand::ScrollTop),
+        KeyCode::End | KeyCode::Char('G') => Some(CaucusCommand::ScrollBottom),
+        KeyCode::Esc | KeyCode::Char('q') => Some(CaucusCommand::ExitScroll),
+        _ => None,
     }
 }
 
@@ -462,6 +521,59 @@ mod tests {
         let mut router = FocusRouter::new();
         router.set_focus(Some(PanelId::new()));
         assert!(matches!(router.route(ctrl('a')), InputAction::Ignore));
+    }
+
+    #[test]
+    fn prefix_then_bracket_enters_scroll() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.route(ctrl('a'));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('['))),
+            InputAction::Caucus(CaucusCommand::EnterScroll)
+        ));
+    }
+
+    #[test]
+    fn open_pager_captures_navigation_keys() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.set_scroll_open(true);
+
+        let cases = [
+            (KeyCode::Up, CaucusCommand::ScrollUp),
+            (KeyCode::Char('k'), CaucusCommand::ScrollUp),
+            (KeyCode::Down, CaucusCommand::ScrollDown),
+            (KeyCode::Char('j'), CaucusCommand::ScrollDown),
+            (KeyCode::PageUp, CaucusCommand::ScrollPageUp),
+            (KeyCode::PageDown, CaucusCommand::ScrollPageDown),
+            (KeyCode::Home, CaucusCommand::ScrollTop),
+            (KeyCode::Char('g'), CaucusCommand::ScrollTop),
+            (KeyCode::End, CaucusCommand::ScrollBottom),
+            (KeyCode::Char('G'), CaucusCommand::ScrollBottom),
+            (KeyCode::Esc, CaucusCommand::ExitScroll),
+            (KeyCode::Char('q'), CaucusCommand::ExitScroll),
+        ];
+        for (code, want) in cases {
+            match router.route(key(code)) {
+                InputAction::Caucus(got) => assert_eq!(got, want, "key {code:?}"),
+                other => panic!("expected Caucus({want:?}) for {code:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn open_pager_swallows_other_keys_instead_of_forwarding() {
+        // Capture (not pass-through): a plain char must NOT reach the PTY while
+        // the pager is open — this is what distinguishes it from the
+        // read-only transcript overlay.
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.set_scroll_open(true);
+        assert!(matches!(
+            router.route(key(KeyCode::Char('a'))),
+            InputAction::Ignore
+        ));
     }
 
     #[test]

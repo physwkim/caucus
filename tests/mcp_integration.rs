@@ -86,7 +86,7 @@ fn mcp_serve_lists_the_tools_over_stdio() {
             "spawn_role",
             "kill_panel",
             "list_panels",
-            "wait_for_panels",
+            "register_round",
         ],
         "tools/list must return exactly the caucus tools"
     );

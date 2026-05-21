@@ -13,7 +13,7 @@
 | 1 | 이름: `caucus`. 경로: `~/codes/caucus`. |
 | 2 | 실행 모델 = **caucus 자체 멀티플렉서**. 장기 실행 풀스크린 TUI 프로세스. agent는 caucus가 관리하는 **패널별 PTY**에서 도는 `claude` / `codex` CLI 프로세스. tmux / zellij 의존 없음 — 둘은 분석 레퍼런스(kodex 적재)일 뿐. |
 | 3 | VT 레이어 = **공개 크레이트** (경로 B-i): `vte`(escape-sequence 파서) + `portable-pty`(PTY 관리) + `ratatui`(패널 레이아웃·렌더). caucus가 직접 짜는 것은 grid `vte::Perform` 구현(~2-4k LOC) 하나뿐이며 zellij `zellij-server/src/panes/grid.rs`를 라인 단위 레퍼런스로 쓴다. zellij 크레이트 통째 vendor는 기각 — grid가 `output`/`tab`/`ui`/`route`/`screen`/`thread_bus` + `zellij-utils` ~140k LOC와 결합되어 깨끗한 추출 불가. |
-| 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버**의 8개 툴(`send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `wait_for_panels`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. |
+| 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버**의 8개 툴(`send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `register_round`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. |
 | 5 | 턴 완료 신호 = Claude `Stop` hook이 **caucus 실행 프로세스의 소켓에 post**한다. 파일 sentinel(`*.sentinel.json`) + 폴링 watcher는 폐기. |
 | 6 | "라운드" 개념은 유지하되 **라이브화** — 파일 안건 broadcast + `response-*.md` 수집 대신, CEO가 패널에 라이브로 키를 입력하고 §5의 턴 완료 신호로 라운드 진행을 판정한다. |
 | 7 | Role 정의: `~/.caucus/roles.toml` (전역) + `<repo>/.caucus/roles.toml` (프로젝트 오버라이드, 우선). |
@@ -87,7 +87,7 @@ sync). 사용자는 main worker 패널과 대화하고, main worker는 작업을
 | **Round** | main worker가 여러 패널에 같은 안건을 라이브로 던지고 각 패널의 turn signal로 완료를 판정하는 한 묶음. |
 | **Manifest** | 한 agent의 LaneEvent 타임라인 + derived_state + commit_provenance 영속화. |
 | **Lane** | 한 agent의 작업 흐름. claw-code 용어 차용. |
-| **MCP 서버** | caucus가 main worker에게 노출하는 제어 인터페이스 — 8개 툴(`send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `wait_for_panels`). |
+| **MCP 서버** | caucus가 main worker에게 노출하는 제어 인터페이스 — 8개 툴(`send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `register_round`). |
 | **Session record** | 한 세션의 패널 roster 영속 스냅샷(`.caucus/sessions/<id>/session.json`). `caucus resume`가 이를 읽어 패널을 재생성. |
 
 ---
@@ -144,30 +144,34 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
 
 ## 4. Round 프로토콜 (라이브)
 
-라운드 = main worker가 여러 sub-agent 패널에 sub-task를 라이브로 던지고 각
-패널의 turn signal로 완료를 거두는 한 묶음. 파일 안건도, `response-*.md` 수집도
-없다.
+라운드 = main worker가 여러 sub-agent 패널에 sub-task를 라이브로 던지고, 각
+패널의 turn signal로 완료를 감지한 caucus가 결과를 모아 main에 push하는 한
+묶음. 파일 안건도, `response-*.md` 수집도 없다.
 
 ```
-1. main worker가 MCP 툴 호출 — 작업을 sub-task로 분해해 병렬 분배:
-     send_keys(panel=<worker-1>, text="<sub-task 1>", enter=true)
-     send_keys(panel=<worker-2>, text="<sub-task 2>", enter=true)
-     send_keys(panel=<worker-3>, text="<sub-task 3>", enter=true)
-   sub-task 텍스트는 main worker가 자기 컨텍스트에서 직접 작성해 패널에 입력한다.
+1. main worker가 MCP 툴 호출 — 작업을 sub-task로 분해해 병렬 분배한 뒤
+   라운드를 등록하고 자기 턴을 닫는다:
+     broadcast(panels=[<worker-1>,<worker-2>,<worker-3>], text="<공통 안건>", enter=true)
+     (패널별로 다른 sub-task면 send_keys를 패널마다)
+     register_round(panels=[<worker-1>,<worker-2>,<worker-3>])
+   register_round는 즉시 반환한다 — 블로킹도 timeout 대기도 없다. main worker는
+   턴을 끝내고 자유로워진다.
 
 2. 각 패널의 sub-agent가 작업 → 턴 종료 시 Claude Stop hook이 caucus 소켓에
    turn signal을 post (panel_id, last_message 포함, §7).
 
 3. caucus가 turn signal 수신 → 해당 패널 manifest에 TurnCompleted LaneEvent
-   append → derived_state를 idle로. main worker는 MCP `list_panels`로 어느
-   패널이 idle인지 본다.
+   append → derived_state를 idle로. caucus는 매 tick `poll_pending_rounds`로
+   등록된 라운드의 패널이 모두 settle했는지 확인한다.
 
-4. 대상 패널이 모두 idle이 되면 main worker가 `read_panel(mode="since_last_turn")`
-   으로 각 패널이 이번 턴에 낸 출력 전체를 읽어 결과를 병합한다 — 빠르게 지나간
-   화면도 caucus가 캡처해 두므로 빠짐없이 읽힌다(§8.5).
+4. 라운드의 패널이 모두 idle이 되면 caucus가 각 패널 결과(read_mode 기본
+   last_message, since_last_turn도 가능)를 모아 **main worker 패널에 새 turn으로
+   주입**한다 — pull-only MCP가 못 하는 caucus→main push다(§8.5). main worker가
+   idle이고 사용자가 입력 중이 아닐 때 전달된다. 안전망: fallback_secs가 지나면
+   미완 패널을 "still working"으로 표시해 부분 결과를 전달한다.
 
-5. main worker 판단:
-     - 라운드 더  → 새 sub-task로 send_keys 반복
+5. main worker가 주입된 라운드 결과를 받고 판단:
+     - 라운드 더  → 새 안건으로 broadcast + register_round 반복
      - 병합 완료  → 결과를 종합해 사용자에게 보고
      - 막힘      → 사용자에게 보고
 ```
@@ -175,9 +179,9 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
 라이브 모델에는 `max_rounds` 같은 강제 캡이 없다 — main worker가 자기 토큰
 예산(§0 #12)에 맞춰 라운드를 몇 번 돌지 스스로 판단한다.
 
-**순차 의존**이 필요하면 main worker가 선행 패널에 먼저 `send_keys` → turn
-signal 대기 → 후행 패널에 `send_keys` 하면 된다. caucus 코어에 별도 `--lead`
-메커니즘은 필요 없다.
+**순차 의존**이 필요하면 main worker가 선행 패널에 `send_keys` → 그 패널만으로
+`register_round` → 완료 push를 받은 뒤 후행 패널에 `send_keys` 하면 된다. caucus
+코어에 별도 `--lead` 메커니즘은 필요 없다.
 
 ---
 
@@ -465,9 +469,9 @@ turn signal 수신 또는 grid 변화 시 재계산.
    유지한다(zellij/tmux와 동일).
 2. **턴 단위 출력 로그.** caucus는 패널 PTY 출력을 턴 경계로 구간해 append-only로
    캡처한다 — `PromptDelivered`부터 `TurnCompleted`까지가 한 턴.
-   `.caucus/sessions/<id>/panels/<panel_id>.log`(메모리 링 + 디스크 spill). main
-   worker는 turn signal을 받은 *뒤* "패널 X의 턴 N 출력"을 통째로, 자기 페이스로
-   읽는다 — 경주 없음.
+   `.caucus/sessions/<id>/panels/<panel_id>.log`(메모리 링 + 디스크 spill). 라운드가
+   settle하면 caucus가 이 캡처에서 각 패널 결과를 모아 main 패널에 push하고(§4),
+   main worker는 더 필요한 디테일을 `read_panel`로 자기 페이스로 읽는다 — 경주 없음.
 3. **`read_panel` 모드.** MCP `read_panel` 툴은 `mode`를 받는다:
    - `screen` — 현재 보이는 grid
    - `scrollback` — 스크롤백 버퍼 전체
@@ -513,7 +517,7 @@ caucus/
     ├── input/               (키 라우팅: `Ctrl-A` 프리픽스 키맵, focus·임의 키 → PTY, §9.2)
     ├── panel/
     │   └── lifecycle.rs     (Panel 구조체 + spawn/kill + 레이아웃 reflow, transition 단일 owner)
-    ├── mcp/                 (main worker용 MCP 서버: 8개 툴 — send_keys/broadcast/ctrl_c/read_panel/spawn_role/kill_panel/list_panels/wait_for_panels)
+    ├── mcp/                 (main worker용 MCP 서버: 8개 툴 — send_keys/broadcast/ctrl_c/read_panel/spawn_role/kill_panel/list_panels/register_round)
     ├── signal/              (turn-signal 소켓 서버 + `caucus signal post` 클라이언트)
     ├── agent/
     │   ├── spawn.rs         (RoleSpec → 새 패널 + 새 AgentManifest)
@@ -549,7 +553,7 @@ lifecycle이 아니라 main worker가 MCP 툴로 라이브 수행). worktree 생
 
 각 모듈은 외부에 노출하는 함수 외엔 `pub(crate)` 미만으로 잠금. Rust visibility로 강제.
 
-### 9.2 키맵 · 레이아웃 제어 · transcript 오버레이
+### 9.2 키맵 · 레이아웃 제어 · transcript 오버레이 · 스크롤백 페이저
 
 caucus는 단 하나의 **프리픽스 키** `Ctrl-A`를 자기 명령용으로 예약한다. 그 외
 모든 키 입력은 — `Ctrl-C` 포함 — 터미널 바이트로 인코딩되어 focus 패널의 PTY로
@@ -566,6 +570,10 @@ caucus는 단 하나의 **프리픽스 키** `Ctrl-A`를 자기 명령용으로 
 | `Ctrl-A` 다음 `Space` | 레이아웃 배치 모드 순환 |
 | `Ctrl-A` 다음 `t` | transcript 오버레이 토글 |
 | `Esc` (오버레이 열림) | transcript 오버레이 닫기 |
+| `Ctrl-A` 다음 `[` | focus 패널 스크롤백 페이저 열기 |
+| (페이저 열림) `↑↓ k j` / `PgUp PgDn` | 한 줄 / 한 페이지 스크롤 |
+| (페이저 열림) `g G` / `Home End` | 가장 오래된 / 최신 줄로 점프 |
+| (페이저 열림) `Esc` / `q` | 페이저 닫기 |
 | `Ctrl-A` 다음 `Ctrl-A` | 패널에 리터럴 `Ctrl-A` 전송 |
 
 프리픽스는 소비된다 — `Ctrl-A` 다음 키는 명령을 선택하고 forward되지 않으며,
@@ -581,6 +589,17 @@ reflow된다(§0 #10).
 턴 수 · worktree 브랜치 · agent 최종 메시지 첫 줄)을 보여준다(`render::TranscriptRow`).
 오버레이는 입력을 가로채지 않는다 — 열려 있어도 `Esc` 외의 모든 키는 focus
 패널로 그대로 통과하고, `Esc`만 오버레이를 닫는다.
+
+**스크롤백 페이저.** `Ctrl-A [`는 focus 패널의 터미널 스크롤백(grid 링, 기본
+10,000행, §8.5)을 tmux copy-mode 식으로 보여주는 읽기 전용 전체 화면 뷰를
+연다(`render::draw_scroll_pager`, 스냅샷·윈도잉은 `runtime::ScrollState` +
+순수 헬퍼 `render::scroll_window`). 진입 시 최신 줄에서 열리고 `↑↓ k j`(줄)·
+`PgUp/PgDn`(페이지)·`g/Home`(최古)·`G/End`(최新)으로 이동, `Esc/q`로 닫는다.
+transcript 오버레이와 달리 페이저는 입력을 **가로챈다** — 키는 스크롤만 구동하고
+PTY로는 한 바이트도 가지 않는다(`FocusRouter::scroll_open` 게이트). 보여주는 것은
+진입 시점의 *고정 스냅샷*이다 — 패널은 밑에서 계속 돌고, 새 출력은 페이저를 닫은
+뒤에 보인다. 소스는 bounded grid 스크롤백이며, unbounded 턴 로그/디스크 spill
+페이징(`Turn N` 구분자 포함)은 향후 확장이다.
 
 ---
 
@@ -753,8 +772,8 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 - caucus 멀티플렉서 TUI — 풀스크린, 패널별 PTY(`portable-pty`), `vte` 기반 grid, `ratatui` 렌더
 - 패널 동적 spawn / kill + 레이아웃 reflow
 - 입력 라우팅 — focus 패널 전환, `Enter` / `Ctrl-C` / 임의 키, 완전 양방향 인터랙티브 입력(로그인·OAuth 흐름 포함)
-- main worker용 MCP 서버 — 8개 툴: `send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `wait_for_panels`
-- 레이아웃 제어 — `Ctrl-A` 프리픽스 키맵, 4종 레이아웃 모드 순환, transcript 오버레이(§9.2)
+- main worker용 MCP 서버 — 8개 툴: `send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `register_round`
+- 레이아웃 제어 — `Ctrl-A` 프리픽스 키맵, 4종 레이아웃 모드 순환, transcript 오버레이 + 스크롤백 페이저(§9.2)
 - 세션 영속화 & resume — `session.json` 레코드, `caucus sessions` / `caucus resume`(§3.1)
 - agent 백엔드 다중화 — `claude` / `codex` / `gemini`, role별 `model`·`agent_cli` override, main worker 자체 판단 지정
 - Claude `Stop` hook → caucus 소켓 (턴 완료 라이브 신호)

@@ -15,7 +15,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tokio::sync::oneshot;
 use tracing::warn;
 
 use crate::agent::manifest::{self, AgentManifest};
@@ -35,29 +34,54 @@ use crate::signal::server::SignalServer;
 use crate::worktree::cleanup::{CleanupJob, CleanupQueue};
 use crate::worktree::manager::{WorktreeHandle, WorktreeRequest, create as create_worktree};
 
-/// Default wait budget for `wait_for_panels` when the caller omits
-/// `timeout_secs`.
-const WAIT_DEFAULT_SECS: u64 = 600;
-/// Hard cap on a `wait_for_panels` budget — a runaway wait can never park the
-/// main worker's blocking MCP call longer than this.
-const WAIT_MAX_SECS: u64 = 3600;
+/// Default fallback budget for a registered round when the caller omits
+/// `fallback_secs` — the safety-net deadline after which caucus delivers a
+/// partial report even if some panels never settled.
+const ROUND_FALLBACK_DEFAULT_SECS: u64 = 600;
+/// Hard cap on a round's fallback budget.
+const ROUND_FALLBACK_MAX_SECS: u64 = 3600;
+/// A registered round's results are only injected into the main worker's
+/// panel once it has been free of human keystrokes for at least this long —
+/// so a delivery never lands in the middle of a line the user is composing.
+const QUIET_WINDOW: Duration = Duration::from_millis(1000);
 
-/// A `wait_for_panels` request the event loop has not answered yet.
+/// A round caucus is watching on the main worker's behalf
+/// ([`Multiplexer::poll_pending_rounds`]).
 ///
-/// The control protocol is otherwise "one request → one immediate response";
-/// `WaitForPanels` is the sole exception. [`Multiplexer::drain_control`]
-/// stashes one of these instead of calling `execute_control`, and
-/// [`Multiplexer::poll_pending_waits`] fires + drops it once every waited
-/// panel has settled or `deadline` passes — so the event loop is never
-/// blocked.
-struct PendingWait {
-    /// Panel ids the caller is waiting on. Ids that no longer exist count as
-    /// settled (see [`Multiplexer::wait_panels_settled`]).
+/// Unlike a control request (each answered immediately), a round carries no
+/// reply channel — `register_round` already acked at registration. Instead
+/// the event loop watches it each tick and, once every panel has settled (or
+/// `fallback_deadline` passes), assembles the panels' results and *injects*
+/// them into the main worker's panel as a fresh turn. This is the caucus→main
+/// push that the pull-only MCP transport cannot do.
+struct PendingRound {
+    /// Panel ids in the round. Ids that no longer exist count as settled
+    /// (see [`Multiplexer::wait_panels_settled`]).
     panels: Vec<PanelId>,
-    /// Wall-clock instant past which the wait is answered regardless of state.
-    deadline: Instant,
-    /// Oneshot the deferred [`ControlResponse`] is delivered on.
-    reply: oneshot::Sender<ControlResponse>,
+    /// How each panel's result is read for the delivered report.
+    read_mode: ReadPanelMode,
+    /// Wall-clock instant past which the round is delivered regardless of
+    /// state — the safety net, marking still-`working` panels unfinished.
+    fallback_deadline: Instant,
+}
+
+/// Open scrollback-pager state (`Ctrl-A [`): a *frozen* snapshot of one
+/// panel's rendered scrollback plus the current scroll offset.
+///
+/// The panel keeps running underneath; the pager shows this snapshot until
+/// closed (tmux copy-mode behavior — new output appears only after exit).
+/// Built by [`Multiplexer::enter_scroll`]; fields are `pub(crate)` so the
+/// `render` layer can window the lines without a getter per field.
+pub(crate) struct ScrollState {
+    /// Role of the snapshotted panel, for the pager header.
+    pub(crate) role: String,
+    /// Rendered scrollback + live viewport, one entry per line, oldest first.
+    pub(crate) lines: Vec<String>,
+    /// Index of the topmost visible line — `0` is the oldest.
+    pub(crate) offset: usize,
+    /// Visible body height in rows (the page step), set at entry. Also the
+    /// clamp window: the maximum offset is `lines.len() - page`.
+    pub(crate) page: usize,
 }
 
 /// Arguments to the shared [`Multiplexer::spawn_panel_inner`] path. Bundling
@@ -101,9 +125,16 @@ pub struct Multiplexer {
     quit: bool,
     /// Monotonic counter for agent-name suffixes per role.
     role_counts: HashMap<String, usize>,
-    /// `wait_for_panels` requests awaiting a deferred reply
-    /// ([`Multiplexer::poll_pending_waits`]).
-    pending_waits: Vec<PendingWait>,
+    /// Rounds caucus is watching to deliver to the main worker
+    /// ([`Multiplexer::poll_pending_rounds`]).
+    pending_rounds: Vec<PendingRound>,
+    /// The main worker panel — the round-delivery target. Set when the main
+    /// panel is spawned; `None` before then.
+    main_panel_id: Option<PanelId>,
+    /// Instant of the last human keystroke routed to the main panel. Gates
+    /// round delivery so an injected turn never collides with a line the user
+    /// is mid-compose (see [`QUIET_WINDOW`]).
+    last_human_input: Option<Instant>,
     /// Panel arrangement mode for [`Layout::reflow`] — cycled by `Ctrl-A Space`.
     layout_mode: LayoutMode,
     /// When `Some` and the id is still live, the layout shows only that panel
@@ -114,6 +145,10 @@ pub struct Multiplexer {
     /// panels (`Ctrl-A t`). Draw-time only — panels keep pumping and input
     /// keeps routing as normal.
     show_transcript: bool,
+    /// Open scrollback pager (`Ctrl-A [`), or `None` for the live tiled view.
+    /// While `Some`, the pager is drawn full-screen and captures input via the
+    /// router's `scroll_open` gate; panels keep pumping underneath.
+    scroll: Option<ScrollState>,
     /// Git branch of each worktree-backed panel, keyed by panel id. The
     /// manifest stores only the worktree *path* (which is removed on
     /// shutdown); the branch persists and is what `caucus resume` re-attaches
@@ -164,10 +199,13 @@ impl Multiplexer {
                 area,
                 quit: false,
                 role_counts: HashMap::new(),
-                pending_waits: Vec::new(),
+                pending_rounds: Vec::new(),
+                main_panel_id: None,
+                last_human_input: None,
                 layout_mode: LayoutMode::default(),
                 zoom: None,
                 show_transcript: false,
+                scroll: None,
                 worktree_branches: HashMap::new(),
             },
             signal_server,
@@ -299,7 +337,7 @@ impl Multiplexer {
             &self.control_sock_path,
         )
         .context("write main worker panel .mcp.json")?;
-        self.spawn_panel_inner(SpawnPanelOpts {
+        let id = self.spawn_panel_inner(SpawnPanelOpts {
             role,
             agent_cli: None,
             model: None,
@@ -307,7 +345,10 @@ impl Multiplexer {
             worktree_branch: None,
             mcp_config_path: Some(mcp_config),
             resume_session_id,
-        })
+        })?;
+        // The main worker panel is caucus's round-delivery target.
+        self.main_panel_id = Some(id);
+        Ok(id)
     }
 
     /// Spawn a panel restoring a prior agent — used by `caucus resume`. The
@@ -543,6 +584,12 @@ impl Multiplexer {
         use crate::input::InputAction;
         match self.focus.route(key) {
             InputAction::ToPanel { panel, bytes } => {
+                // A human keystroke to the main panel: stamp it so a round
+                // delivery never lands in the middle of a line the user is
+                // composing (see `poll_pending_rounds` / `QUIET_WINDOW`).
+                if Some(panel) == self.main_panel_id {
+                    self.last_human_input = Some(Instant::now());
+                }
                 if let Some(p) = self.panels.iter_mut().find(|p| p.id == panel) {
                     if let Err(err) = p.write_input(&bytes) {
                         warn!(panel = %panel, error = %err, "panel write failed");
@@ -588,12 +635,91 @@ impl Multiplexer {
                 self.show_transcript = false;
                 self.focus.set_transcript_open(false);
             }
+            CaucusCommand::EnterScroll => self.enter_scroll(),
+            CaucusCommand::ExitScroll => self.exit_scroll(),
+            CaucusCommand::ScrollUp => self.scroll_by(-1),
+            CaucusCommand::ScrollDown => self.scroll_by(1),
+            CaucusCommand::ScrollPageUp => self.scroll_page(-1),
+            CaucusCommand::ScrollPageDown => self.scroll_page(1),
+            CaucusCommand::ScrollTop => self.scroll_to_edge(true),
+            CaucusCommand::ScrollBottom => self.scroll_to_edge(false),
         }
     }
 
     /// Whether the read-only transcript overlay is currently shown.
     pub fn show_transcript(&self) -> bool {
         self.show_transcript
+    }
+
+    /// The open scrollback pager, if any — for the draw layer (`tui::draw`).
+    /// `pub(crate)`: [`ScrollState`] is an internal type, consumed only in-crate.
+    pub(crate) fn scroll_state(&self) -> Option<&ScrollState> {
+        self.scroll.as_ref()
+    }
+
+    /// Open the scrollback pager on the focused panel (`Ctrl-A [`): snapshot
+    /// its rendered scrollback and freeze it for scrolling. A no-op when no
+    /// panel is focused (or the focused id no longer resolves). Opening the
+    /// pager supersedes the transcript overlay.
+    fn enter_scroll(&mut self) {
+        let Some(focused) = self.focus.focused() else {
+            return;
+        };
+        let Some(panel) = self.panels.iter().find(|p| p.id == focused) else {
+            return;
+        };
+        let role = panel.role.clone();
+        let lines: Vec<String> = Self::scrollback_text(panel)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // Body height = whole screen minus the pager's border (2) + title (1)
+        // + status (1). Approximate; the render layer re-clamps to the real
+        // height, and `offset` clamps against this `page` consistently.
+        let page = (self.area.height as usize).saturating_sub(4).max(1);
+        // Open at the bottom (newest), like tmux copy-mode entry.
+        let offset = lines.len().saturating_sub(page);
+        self.show_transcript = false;
+        self.focus.set_transcript_open(false);
+        self.scroll = Some(ScrollState {
+            role,
+            lines,
+            offset,
+            page,
+        });
+        self.focus.set_scroll_open(true);
+    }
+
+    /// Close the scrollback pager, returning to the live tiled view.
+    fn exit_scroll(&mut self) {
+        self.scroll = None;
+        self.focus.set_scroll_open(false);
+    }
+
+    /// Scroll the pager by `delta` lines (negative = toward older output),
+    /// clamped to `[0, lines.len() - page]`. No-op when the pager is closed.
+    fn scroll_by(&mut self, delta: isize) {
+        if let Some(state) = self.scroll.as_mut() {
+            let max = state.lines.len().saturating_sub(state.page) as isize;
+            state.offset = (state.offset as isize + delta).clamp(0, max) as usize;
+        }
+    }
+
+    /// Scroll the pager by `pages` pages (negative = toward older output).
+    fn scroll_page(&mut self, pages: isize) {
+        let step = self.scroll.as_ref().map_or(0, |s| s.page as isize);
+        self.scroll_by(pages * step);
+    }
+
+    /// Jump the pager to the oldest line (`top`) or the newest (`!top`).
+    fn scroll_to_edge(&mut self, top: bool) {
+        if let Some(state) = self.scroll.as_mut() {
+            state.offset = if top {
+                0
+            } else {
+                state.lines.len().saturating_sub(state.page)
+            };
+        }
     }
 
     /// Per-panel manifests, keyed by panel id — read-only, for the overlay.
@@ -766,11 +892,11 @@ impl Multiplexer {
             ControlRequest::ListPanels => ControlResponse::Panels {
                 panels: self.list_panels(),
             },
-            // `WaitForPanels` is a deferred-reply request — `drain_control`
-            // routes it to `register_wait` and never reaches here. Handled
-            // for match exhaustiveness: answer with the current panel snapshot
-            // (a degenerate zero-timeout wait) rather than panicking.
-            ControlRequest::WaitForPanels { panels, .. } => self.wait_response(&panels),
+            ControlRequest::RegisterRound {
+                panels,
+                read_mode,
+                fallback_secs,
+            } => self.register_round(panels, read_mode, fallback_secs),
         }
     }
 
@@ -779,31 +905,22 @@ impl Multiplexer {
     /// single point at which main worker MCP tool calls touch live panels, on
     /// the same thread that pumps PTYs (Invariant I-5).
     ///
-    /// Every request bar [`ControlRequest::WaitForPanels`] is answered
-    /// immediately via [`Multiplexer::execute_control`]. `WaitForPanels` is a
-    /// blocking tool: if its panels are already all settled the reply is sent
-    /// now, otherwise the job is stashed as a [`PendingWait`] and answered
-    /// later by [`Multiplexer::poll_pending_waits`] — the event loop is never
-    /// blocked.
+    /// Every request is answered immediately via
+    /// [`Multiplexer::execute_control`]. `register_round` is non-blocking too:
+    /// it acks with a panel snapshot and the round is delivered later by the
+    /// caucus→main push in [`Multiplexer::poll_pending_rounds`] — so the event
+    /// loop is never blocked and there is no deferred-reply path.
     pub fn drain_control(&mut self, server: &mut ControlServer) {
         while let Ok(job) = server.jobs().try_recv() {
             let ControlJob { request, reply } = job;
-            match request {
-                ControlRequest::WaitForPanels {
-                    panels,
-                    timeout_secs,
-                } => self.register_wait(panels, timeout_secs, reply),
-                other => {
-                    let response = self.execute_control(other);
-                    // A dropped reply channel means the control-socket
-                    // connection closed before we answered — nothing to do.
-                    let _ = reply.send(response);
-                }
-            }
+            let response = self.execute_control(request);
+            // A dropped reply channel means the control-socket connection
+            // closed before we answered — nothing to do.
+            let _ = reply.send(response);
         }
     }
 
-    /// Whether a panel id counts as "settled" for `wait_for_panels`: its
+    /// Whether every panel id counts as "settled" for a round: its
     /// `PanelState` is `Idle`/`Blocked`/`Exited` — i.e. NOT `Working` and NOT
     /// `Spawning`. A panel id that does not exist counts as settled (there is
     /// nothing left to wait for — it was killed or never spawned).
@@ -816,13 +933,12 @@ impl Multiplexer {
             })
     }
 
-    /// Build the deferred reply for a satisfied/timed-out `wait_for_panels`:
-    /// each waited panel's current [`PanelSummary`]. A waited id that no longer
-    /// exists is omitted (it is gone — `list_panels` would not show it
-    /// either); the main worker should treat a missing id as fully done.
-    fn wait_response(&self, panels: &[PanelId]) -> ControlResponse {
+    /// A [`ControlResponse::Panels`] snapshot of `panels` — the immediate ack
+    /// `register_round` returns. A missing id is omitted (it is gone —
+    /// `list_panels` would not show it either).
+    fn panel_snapshot(&self, panels: &[PanelId]) -> ControlResponse {
         ControlResponse::Panels {
-            panels: self.wait_response_summaries(panels),
+            panels: self.panel_summaries(panels),
         }
     }
 
@@ -836,7 +952,7 @@ impl Multiplexer {
     /// fatal — the remaining panels still receive the text. The reply is
     /// always [`ControlResponse::Panels`]: the post-broadcast [`PanelSummary`]
     /// of each targeted id that exists, the same shape `list_panels` /
-    /// `wait_for_panels` return. A bad id is visible by its absence from that
+    /// `register_round` return. A bad id is visible by its absence from that
     /// list, so the main worker can tell which panels a typo missed while the
     /// good ones still ran.
     fn broadcast(&mut self, panels: &[PanelId], text: &str, enter: bool) -> ControlResponse {
@@ -846,14 +962,14 @@ impl Multiplexer {
             let _ = self.send_keys(panel, text, enter);
         }
         ControlResponse::Panels {
-            panels: self.wait_response_summaries(panels),
+            panels: self.panel_summaries(panels),
         }
     }
 
     /// The [`PanelSummary`] for each id in `panels` that still exists, in the
     /// caller's order — missing ids are omitted (they were killed or the id
     /// was bad).
-    fn wait_response_summaries(&self, panels: &[PanelId]) -> Vec<PanelSummary> {
+    fn panel_summaries(&self, panels: &[PanelId]) -> Vec<PanelSummary> {
         let all = self.list_panels();
         panels
             .iter()
@@ -861,49 +977,133 @@ impl Multiplexer {
             .collect()
     }
 
-    /// Register a `wait_for_panels` request. If the panels are already all
-    /// settled the reply is sent immediately; otherwise a [`PendingWait`] is
-    /// stashed for [`Multiplexer::poll_pending_waits`]. The `timeout_secs`
-    /// budget is clamped to `[1, WAIT_MAX_SECS]`, defaulting to
-    /// `WAIT_DEFAULT_SECS`.
-    fn register_wait(
+    /// Register a round on `panels`: stash a [`PendingRound`] for the event
+    /// loop to deliver and ack immediately with the panels' current snapshot.
+    /// `fallback_secs` is clamped to `[1, ROUND_FALLBACK_MAX_SECS]`, defaulting
+    /// to `ROUND_FALLBACK_DEFAULT_SECS`; `read_mode` defaults to `LastMessage`.
+    ///
+    /// Unlike the removed blocking wait, this never special-cases an
+    /// already-settled round — delivery is decided uniformly by
+    /// [`Multiplexer::poll_pending_rounds`] (which also gates on the main panel
+    /// being idle), so the registration path has exactly one shape.
+    fn register_round(
         &mut self,
         panels: Vec<PanelId>,
-        timeout_secs: Option<u64>,
-        reply: oneshot::Sender<ControlResponse>,
-    ) {
-        if self.wait_panels_settled(&panels) {
-            let _ = reply.send(self.wait_response(&panels));
-            return;
-        }
-        let budget = timeout_secs
-            .unwrap_or(WAIT_DEFAULT_SECS)
-            .clamp(1, WAIT_MAX_SECS);
-        self.pending_waits.push(PendingWait {
+        read_mode: Option<ReadPanelMode>,
+        fallback_secs: Option<u64>,
+    ) -> ControlResponse {
+        let budget = fallback_secs
+            .unwrap_or(ROUND_FALLBACK_DEFAULT_SECS)
+            .clamp(1, ROUND_FALLBACK_MAX_SECS);
+        let ack = self.panel_snapshot(&panels);
+        self.pending_rounds.push(PendingRound {
             panels,
-            deadline: Instant::now() + Duration::from_secs(budget),
-            reply,
+            read_mode: read_mode.unwrap_or(ReadPanelMode::LastMessage),
+            fallback_deadline: Instant::now() + Duration::from_secs(budget),
         });
+        ack
     }
 
-    /// Fire and remove every [`PendingWait`] whose panels have all settled or
-    /// whose `deadline` has passed. Called once per event-loop tick. A
-    /// `reply.send` failure (the `mcp-serve` connection closed) just drops the
-    /// wait — there is no one left to answer.
-    pub fn poll_pending_waits(&mut self) {
-        if self.pending_waits.is_empty() {
+    /// Deliver one due, deliverable round to the main worker — the caucus→main
+    /// push. Called once per event-loop tick, after signals + pump have
+    /// updated panel state.
+    ///
+    /// A round is *due* when all its panels have settled, or its
+    /// `fallback_deadline` has passed. It is *delivered* only while the main
+    /// panel exists, is `Idle`, and has seen no human keystroke within
+    /// [`QUIET_WINDOW`] — so an injected turn never collides with a line the
+    /// user is composing. At most one round is delivered per tick: the
+    /// injection flips the main panel to `Working`, so any other due round
+    /// naturally holds until the main worker is idle again. A due round with
+    /// no main panel to deliver to is dropped (it would otherwise be stranded).
+    pub fn poll_pending_rounds(&mut self) {
+        if self.pending_rounds.is_empty() {
             return;
         }
         let now = Instant::now();
-        // Take the vec so the satisfied-check can borrow `self` immutably.
-        let waits = std::mem::take(&mut self.pending_waits);
-        for wait in waits {
-            if now >= wait.deadline || self.wait_panels_settled(&wait.panels) {
-                let _ = wait.reply.send(self.wait_response(&wait.panels));
-            } else {
-                self.pending_waits.push(wait);
+        // Take the queue so the settle-checks below can borrow `self`.
+        let rounds = std::mem::take(&mut self.pending_rounds);
+
+        let main_id = self.main_panel_id;
+        let main_idle = main_id.is_some_and(|id| {
+            self.panels
+                .iter()
+                .find(|p| p.id == id)
+                .is_some_and(|p| p.state() == PanelState::Idle)
+        });
+        let quiet = self
+            .last_human_input
+            .is_none_or(|t| now.duration_since(t) >= QUIET_WINDOW);
+        let deliverable = main_idle && quiet;
+
+        let mut delivered = false;
+        for round in rounds {
+            let due = now >= round.fallback_deadline || self.wait_panels_settled(&round.panels);
+            match main_id {
+                // Due, gate open, nothing delivered yet this tick: assemble +
+                // inject into the main panel, then drop the round.
+                Some(main_id) if due && deliverable && !delivered => {
+                    let report = self.assemble_round_report(&round.panels, round.read_mode);
+                    if let Err(err) = McpToolSurface::send_keys(self, main_id, &report, true) {
+                        warn!(error = %err, "round delivery to main panel failed");
+                    }
+                    delivered = true;
+                }
+                // Due but there is no main panel to deliver to: drop it.
+                None if due => {}
+                // Not due, gate closed, or already delivered one this tick:
+                // keep it for a later tick.
+                _ => self.pending_rounds.push(round),
             }
         }
+    }
+
+    /// Assemble a round's delivery message: a self-describing block per panel
+    /// — role + current state, plus its result read via `read_mode` (settled
+    /// panels) or an "unfinished" marker (a panel still `working` when the
+    /// fallback deadline forced delivery). A panel id that no longer exists is
+    /// reported as gone. This is the text injected into the main worker's
+    /// panel as a fresh turn.
+    fn assemble_round_report(&self, panels: &[PanelId], read_mode: ReadPanelMode) -> String {
+        let all_settled = self.wait_panels_settled(panels);
+        let mut out = format!(
+            "[caucus] Round complete — {} panel(s){}.\n",
+            panels.len(),
+            if all_settled {
+                ""
+            } else {
+                " (fallback deadline reached; some panels did not finish)"
+            }
+        );
+        for &id in panels {
+            let Some(panel) = self.panels.iter().find(|p| p.id == id) else {
+                out.push_str(&format!("\n## panel {id} — gone (killed)\n"));
+                continue;
+            };
+            let state = panel.state();
+            out.push_str(&format!(
+                "\n## panel {id} (role: {}) — {}\n",
+                panel.role,
+                state.label()
+            ));
+            if matches!(state, PanelState::Working | PanelState::Spawning) {
+                out.push_str("⏳ still working — did not finish within the fallback window.\n");
+                continue;
+            }
+            let body = self
+                .read_panel(id, read_mode)
+                .unwrap_or_else(|e| format!("(could not read panel: {e})"));
+            let body = body.trim();
+            out.push_str(if body.is_empty() {
+                "(no output captured)\n"
+            } else {
+                body
+            });
+            if !body.is_empty() {
+                out.push('\n');
+            }
+        }
+        out
     }
 
     /// Render a panel's visible grid viewport as text, one row per line.
@@ -1383,6 +1583,108 @@ mod tests {
         assert!(!mux.show_transcript());
     }
 
+    /// `EnterScroll` with no focused panel is a no-op (no pager, no panic).
+    #[tokio::test]
+    async fn enter_scroll_with_no_focus_is_a_noop() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        mux.apply_command(CaucusCommand::EnterScroll);
+        assert!(mux.scroll_state().is_none());
+    }
+
+    /// Inject a known pager state directly (no PTY needed) and prove the offset
+    /// clamps at both ends — per-boundary, not per-scenario.
+    #[tokio::test]
+    async fn scroll_offset_clamps_at_both_ends() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        // 10 lines, page of 4 → max offset = 6. Start mid-buffer.
+        let lines: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+        mux.scroll = Some(ScrollState {
+            role: "worker".to_string(),
+            lines,
+            offset: 3,
+            page: 4,
+        });
+
+        mux.apply_command(CaucusCommand::ScrollUp);
+        assert_eq!(mux.scroll_state().unwrap().offset, 2);
+        mux.apply_command(CaucusCommand::ScrollDown);
+        assert_eq!(mux.scroll_state().unwrap().offset, 3);
+
+        // Top edge: never below 0.
+        mux.apply_command(CaucusCommand::ScrollTop);
+        assert_eq!(mux.scroll_state().unwrap().offset, 0);
+        mux.apply_command(CaucusCommand::ScrollUp);
+        assert_eq!(mux.scroll_state().unwrap().offset, 0);
+        mux.apply_command(CaucusCommand::ScrollPageUp);
+        assert_eq!(mux.scroll_state().unwrap().offset, 0);
+
+        // Bottom edge: never past lines.len() - page (= 6).
+        mux.apply_command(CaucusCommand::ScrollBottom);
+        assert_eq!(mux.scroll_state().unwrap().offset, 6);
+        mux.apply_command(CaucusCommand::ScrollDown);
+        assert_eq!(mux.scroll_state().unwrap().offset, 6);
+        mux.apply_command(CaucusCommand::ScrollPageDown);
+        assert_eq!(mux.scroll_state().unwrap().offset, 6);
+
+        // One page up from the bottom lands a page (4) earlier.
+        mux.apply_command(CaucusCommand::ScrollPageUp);
+        assert_eq!(mux.scroll_state().unwrap().offset, 2);
+    }
+
+    /// A buffer shorter than a page pins the offset at 0 (max = 0).
+    #[tokio::test]
+    async fn scroll_offset_pins_at_zero_when_buffer_shorter_than_page() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        mux.scroll = Some(ScrollState {
+            role: "worker".to_string(),
+            lines: vec!["only line".to_string()],
+            offset: 0,
+            page: 4,
+        });
+        mux.apply_command(CaucusCommand::ScrollBottom);
+        assert_eq!(mux.scroll_state().unwrap().offset, 0);
+        mux.apply_command(CaucusCommand::ScrollDown);
+        assert_eq!(mux.scroll_state().unwrap().offset, 0);
+    }
+
+    /// `ExitScroll` clears the pager state.
+    #[tokio::test]
+    async fn exit_scroll_clears_the_pager() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        mux.scroll = Some(ScrollState {
+            role: "worker".to_string(),
+            lines: vec!["a".to_string(), "b".to_string()],
+            offset: 0,
+            page: 1,
+        });
+        mux.apply_command(CaucusCommand::ExitScroll);
+        assert!(mux.scroll_state().is_none());
+    }
+
+    /// `EnterScroll` snapshots the focused panel and opens at the bottom
+    /// (newest). CLI-gated: spawning a panel needs a real agent CLI.
+    #[tokio::test]
+    async fn enter_scroll_snapshots_the_focused_panel() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let Ok(_id) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        // Spawning the first panel auto-focuses it.
+        mux.apply_command(CaucusCommand::EnterScroll);
+        let state = mux.scroll_state().expect("pager open after EnterScroll");
+        assert_eq!(state.role, "reviewer");
+        // Opened at the bottom: offset is the clamped maximum.
+        assert_eq!(state.offset, state.lines.len().saturating_sub(state.page));
+
+        mux.shutdown();
+    }
+
     /// `ToggleZoom` with no focused panel is a no-op (no panic).
     #[tokio::test]
     async fn toggle_zoom_with_no_panels_is_a_noop() {
@@ -1489,115 +1791,184 @@ mod tests {
         mux.shutdown();
     }
 
-    /// A `wait_for_panels` whose ids do not exist is answered immediately —
-    /// `register_wait` sends the reply now and stashes no `PendingWait`.
+    /// `register_round` acks immediately with a panel snapshot and stashes a
+    /// `PendingRound` — it never blocks. An unknown id is omitted from the ack
+    /// (it would not appear in `list_panels` either). `read_mode` defaults to
+    /// `last_message`.
     #[tokio::test]
-    async fn wait_for_unknown_panels_replies_immediately() {
+    async fn register_round_acks_and_stashes_a_pending_round() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let ghost = PanelId::new();
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        mux.register_wait(vec![ghost], Some(60), reply_tx);
-
-        // No pending wait stashed; the reply is already available.
-        assert!(mux.pending_waits.is_empty());
-        match reply_rx.await.unwrap() {
-            // The ghost id is omitted from the summary (it never existed).
+        let ack = mux.register_round(vec![ghost], None, Some(60));
+        match ack {
             ControlResponse::Panels { panels } => assert!(panels.is_empty()),
-            other => panic!("expected Panels, got {other:?}"),
+            other => panic!("expected an immediate Panels ack, got {other:?}"),
         }
+        assert_eq!(mux.pending_rounds.len(), 1, "round must be stashed");
+        assert_eq!(mux.pending_rounds[0].read_mode, ReadPanelMode::LastMessage);
     }
 
-    /// A `wait_for_panels` whose deadline has already passed fires on the next
-    /// `poll_pending_waits` tick even though no panel settled.
+    /// `assemble_round_report` reports an id that no longer exists as gone
+    /// rather than panicking or omitting it silently.
     #[tokio::test]
-    async fn wait_times_out_via_poll_pending_waits() {
+    async fn assemble_round_report_marks_a_missing_panel_gone() {
+        let tmp = TempDir::new().unwrap();
+        let mux = mux(&tmp);
+        let ghost = PanelId::new();
+
+        let report = mux.assemble_round_report(&[ghost], ReadPanelMode::LastMessage);
+        assert!(report.contains("Round complete"), "report: {report}");
+        assert!(
+            report.contains("gone"),
+            "a missing panel must be marked gone: {report}"
+        );
+    }
+
+    /// A due round with no main panel to deliver to is dropped — it would
+    /// otherwise be stranded forever. (A non-existent id counts as settled, so
+    /// the round is due immediately.)
+    #[tokio::test]
+    async fn poll_pending_rounds_drops_a_due_round_with_no_main() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
+        assert!(mux.main_panel_id.is_none());
 
-        // Stash a wait whose deadline is already in the past, against a panel
-        // id the multiplexer has no panel for *and* that we keep "unsettled"
-        // by registering it directly with an already-elapsed deadline.
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        mux.pending_waits.push(PendingWait {
-            panels: vec![PanelId::new()],
-            deadline: Instant::now() - Duration::from_secs(1),
-            reply: reply_tx,
-        });
-        // Not yet fired.
-        assert!(reply_rx.try_recv().is_err());
+        mux.register_round(vec![PanelId::new()], None, Some(600));
+        assert_eq!(mux.pending_rounds.len(), 1);
 
-        mux.poll_pending_waits();
+        mux.poll_pending_rounds();
         assert!(
-            mux.pending_waits.is_empty(),
-            "timed-out wait must be dropped"
+            mux.pending_rounds.is_empty(),
+            "a due round with no main panel must be dropped"
         );
-        match reply_rx.try_recv() {
-            Ok(ControlResponse::Panels { .. }) => {}
-            other => panic!("expected a Panels reply after timeout, got {other:?}"),
-        }
     }
 
-    /// The deferred-reply path end to end: register a wait on a `Working`
-    /// panel, confirm `poll_pending_waits` keeps it pending, then settle the
-    /// panel and confirm the next poll fires the reply.
+    /// A due round is *held*, not delivered, while the main panel is not idle.
+    /// Here `main_panel_id` points at an id with no live panel, so the idle
+    /// gate is closed and the round stays pending for a later tick.
+    #[tokio::test]
+    async fn poll_pending_rounds_holds_when_main_not_idle() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        mux.main_panel_id = Some(PanelId::new());
+
+        mux.register_round(vec![PanelId::new()], None, Some(600));
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "round must be held while the main panel is not idle"
+        );
+    }
+
+    /// The caucus→main push end to end: a round on a `Working` sub-panel is
+    /// held until the panel settles, then delivered to the idle main panel —
+    /// proven by the main panel flipping to `Working` (the injection opens a
+    /// turn) and the round being dropped. A fresh human keystroke also holds
+    /// delivery (the quiet window).
     ///
-    /// Spawning a panel needs a real agent CLI; the test is skipped (not
+    /// Spawning panels needs a real agent CLI; the test is skipped (not
     /// failed) when none is on PATH, matching `tests/mcp_integration.rs`.
     #[tokio::test]
-    async fn poll_pending_waits_fires_when_a_panel_settles() {
+    async fn poll_pending_rounds_delivers_to_idle_main_on_settle() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
+        let session_id = mux.session.id;
 
-        let Ok(panel) = mux.spawn_panel("reviewer", None, None, None) else {
+        // Spawn a main panel and drive it to Idle (Spawning -> Working -> Idle).
+        let Ok(main) = mux.spawn_panel("reviewer", None, None, None) else {
             eprintln!("skipping: no agent CLI on PATH");
             return;
         };
-        // Force the panel into `Working` so the wait is genuinely pending.
-        mux.note_prompt_delivered(panel);
-        assert_eq!(
-            mux.panels().iter().find(|p| p.id == panel).unwrap().state(),
-            PanelState::Working,
-        );
-
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        mux.register_wait(vec![panel], Some(600), reply_tx);
-        assert_eq!(
-            mux.pending_waits.len(),
-            1,
-            "wait must be stashed, not answered"
-        );
-
-        // A poll while the panel is still working leaves the wait pending.
-        mux.poll_pending_waits();
-        assert_eq!(mux.pending_waits.len(), 1);
-        assert!(reply_rx.try_recv().is_err());
-
-        // Settle the panel via a turn-completion signal (Working -> Idle).
-        let session_id = mux.session.id;
+        mux.main_panel_id = Some(main);
+        mux.note_prompt_delivered(main);
         mux.handle_signal(TurnSignal::now(
             session_id,
-            panel,
+            main,
             crate::signal::TurnKind::Stop,
             None,
             serde_json::Value::Null,
         ));
         assert_eq!(
-            mux.panels().iter().find(|p| p.id == panel).unwrap().state(),
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
             PanelState::Idle,
         );
 
-        // The next poll fires + drops the wait, returning the panel's summary.
-        mux.poll_pending_waits();
-        assert!(mux.pending_waits.is_empty());
-        match reply_rx.try_recv() {
-            Ok(ControlResponse::Panels { panels }) => {
-                assert_eq!(panels.len(), 1);
-                assert_eq!(panels[0].panel_id, panel);
-            }
-            other => panic!("expected a Panels reply, got {other:?}"),
-        }
+        // A sub-panel in `Working`, with a round registered on it.
+        let Ok(sub) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.note_prompt_delivered(sub);
+        mux.register_round(vec![sub], None, Some(600));
+
+        // Sub still working -> round held.
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "round held while the sub-panel is working"
+        );
+
+        // Settle the sub-panel (Working -> Idle).
+        mux.handle_signal(TurnSignal::now(
+            session_id,
+            sub,
+            crate::signal::TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        ));
+
+        // A fresh human keystroke to main closes the quiet window: still held.
+        mux.last_human_input = Some(Instant::now());
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "round held while the user is mid-compose (quiet window)"
+        );
+
+        // Clear the quiet window: now the round delivers.
+        mux.last_human_input = None;
+        mux.poll_pending_rounds();
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "round delivered once due + main idle + quiet"
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "delivery injects a turn into the main panel",
+        );
+
+        mux.shutdown();
+    }
+
+    /// `assemble_round_report` marks a panel still `Working` (the fallback
+    /// case) as unfinished rather than reading a half-done turn.
+    ///
+    /// Spawning a panel needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn assemble_round_report_marks_a_working_panel_unfinished() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let Ok(sub) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.note_prompt_delivered(sub);
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == sub).unwrap().state(),
+            PanelState::Working,
+        );
+
+        let report = mux.assemble_round_report(&[sub], ReadPanelMode::LastMessage);
+        assert!(
+            report.contains("still working"),
+            "a Working panel must be marked unfinished: {report}"
+        );
 
         mux.shutdown();
     }

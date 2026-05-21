@@ -102,6 +102,7 @@ terminal.
 | `Ctrl-A` then `Space`   | cycle the layout arrangement mode       |
 | `Ctrl-A` then `t`       | toggle the transcript overlay           |
 | `Esc` (overlay open)    | hide the transcript overlay             |
+| `Ctrl-A` then `[`       | open the scrollback pager (focused panel) |
 | `Ctrl-A` then `Ctrl-A`  | send a literal `Ctrl-A` to the panel    |
 
 The layout modes cycled by `Ctrl-A Space` are **Tiled**, **EvenHorizontal**,
@@ -113,6 +114,14 @@ view: one row per panel showing role, derived state, completed-turn count,
 worktree branch, and the first line of the agent's last message. `Esc`
 hides it; it does not capture input, so every other key still reaches the
 focused panel while it is open.
+
+The **scrollback pager** (`Ctrl-A [`) is a tmux copy-mode-style view of the
+focused panel's terminal scrollback (the grid ring, up to 10,000 rows). It
+opens at the newest line; `↑/↓ k/j` scroll a line, `PgUp/PgDn` a page,
+`g/Home` jumps to the oldest line, `G/End` to the newest, and `Esc/q` exits.
+Unlike the transcript overlay, the pager **captures** input — keys drive
+scrolling and none reach the panel's PTY — and shows a frozen snapshot (the
+panel keeps running; new output appears after you exit).
 
 ## MCP tools
 
@@ -128,7 +137,7 @@ calls them to spawn, drive, observe, and reap sub-agent panels:
 | `spawn_role`      | Spawn a new panel for a role; `worktree`, `model`, `agent_cli` overrides. |
 | `kill_panel`      | Kill a panel; its worktree (if any) is enqueued for cleanup.              |
 | `list_panels`     | List every live panel with its role and derived state.                   |
-| `wait_for_panels` | Block until the named panels settle (leave `working`) or `timeout_secs`. |
+| `register_round`  | Register a round; caucus pushes the panels' results back when they settle (or `fallback_secs`). |
 
 `read_panel` takes a `mode`: `screen` (the visible grid), `scrollback` (the
 full scrollback buffer), `since_last_turn` (everything since the last
