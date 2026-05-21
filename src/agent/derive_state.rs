@@ -36,6 +36,29 @@ pub enum DerivedState {
     Exited,
 }
 
+impl DerivedState {
+    /// Canonical `snake_case` name — the wire string `list_panels` returns to
+    /// the main worker and the vocabulary `docs/design.md` §8.3 documents
+    /// (`working` / `idle` / `awaiting_selection` / `blocked_permission_prompt`
+    /// / …). Mirrors the `#[serde(rename_all = "snake_case")]` representation
+    /// (pinned by a test) so the MCP string and the serde wire form cannot
+    /// drift. This is the single source of the state's external name — callers
+    /// must not re-derive it from `Debug`, which drops the underscores.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DerivedState::Working => "working",
+            DerivedState::Idle => "idle",
+            DerivedState::BlockedPermissionPrompt => "blocked_permission_prompt",
+            DerivedState::BlockedMergeConflict => "blocked_merge_conflict",
+            DerivedState::BlockedBackgroundJob => "blocked_background_job",
+            DerivedState::AwaitingSelection => "awaiting_selection",
+            DerivedState::DegradedMcp => "degraded_mcp",
+            DerivedState::InterruptedTransport => "interrupted_transport",
+            DerivedState::Exited => "exited",
+        }
+    }
+}
+
 /// Hint extracted from a panel's grid by the regex fallback in `term/`.
 /// `None` means caucus has no opinion. Used for backends without a
 /// turn-completion hook, and for blocked-state detection (`docs/design.md`
@@ -130,6 +153,41 @@ fn blocker_state(class: LaneFailureClass) -> DerivedState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `as_str` is the single source of each state's external name, and must
+    /// stay identical to the `#[serde(rename_all = "snake_case")]` wire form —
+    /// `list_panels` uses `as_str`, protocol round-trips use serde, and they
+    /// must agree. Enumerated explicitly so a newly added variant fails to
+    /// compile here until it is listed (and thus checked).
+    #[test]
+    fn as_str_matches_the_serde_snake_case_name() {
+        use DerivedState::*;
+        for state in [
+            Working,
+            Idle,
+            BlockedPermissionPrompt,
+            BlockedMergeConflict,
+            BlockedBackgroundJob,
+            AwaitingSelection,
+            DegradedMcp,
+            InterruptedTransport,
+            Exited,
+        ] {
+            let serde_name = serde_json::to_value(state).unwrap();
+            assert_eq!(
+                serde_name.as_str().unwrap(),
+                state.as_str(),
+                "as_str must match the serde snake_case name for {state:?}"
+            );
+        }
+        // Spot-check the underscored forms the Debug-lowercase path used to
+        // drop — the exact regression the MCP wire string had.
+        assert_eq!(
+            BlockedPermissionPrompt.as_str(),
+            "blocked_permission_prompt"
+        );
+        assert_eq!(AwaitingSelection.as_str(), "awaiting_selection");
+    }
 
     #[test]
     fn live_with_no_signal_is_working() {

@@ -455,7 +455,8 @@ exited
 main worker에 push 알림을 보낸다(라운드는 settle 못 하므로 — §4). main은 `read_menu`로
 선택지를 읽고 `select_option(panel, n)`으로 답한다(caucus가 화살표 n칸 + Enter 주입);
 자유 입력은 메뉴의 'type something' 옵션을 고른 뒤 `send_keys`. `list_panels` 표면 문자열은
-`awaitingselection`(Debug-lowercase).
+이 §8.3 이름 그대로 `awaiting_selection` — 모든 state 문자열은 `DerivedState::as_str`(serde
+snake_case와 동일, 테스트로 고정)을 단일 소스로 쓴다.
 
 turn-completion hook이 없는 백엔드(codex/gemini가 hook 미지원 시): caucus가 grid
 관찰로 `idle`을 판정한다 — agent 프롬프트 복귀 패턴 매치. 휴리스틱이므로 hook

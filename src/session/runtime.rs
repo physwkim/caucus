@@ -1514,7 +1514,7 @@ impl McpToolSurface for Multiplexer {
                             m.derived_state(),
                             Self::panel_menu(p).is_some(),
                         );
-                        (format!("{st:?}").to_ascii_lowercase(), m.agent_cli)
+                        (st.as_str().to_string(), m.agent_cli)
                     }
                     None => (p.state_label().to_string(), AgentCli::Claude),
                 };

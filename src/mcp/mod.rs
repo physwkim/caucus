@@ -63,8 +63,9 @@ pub enum ReadPanelMode {
 pub struct PanelSummary {
     pub panel_id: PanelId,
     pub role: String,
-    /// Derived state, lower-cased (`working` / `idle` / `awaitingselection` /
-    /// `blocked_*` / `exited`).
+    /// Derived state as its canonical `snake_case` name (`working` / `idle` /
+    /// `awaiting_selection` / `blocked_*` / `exited`), from
+    /// [`crate::agent::derive_state::DerivedState::as_str`].
     pub state: String,
     pub agent_cli: AgentCli,
 }
@@ -285,7 +286,7 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                           a panel — an AskUserQuestion-style chooser. Returns the \
                           question, the numbered options, and which is \
                           highlighted. Empty if no menu is on screen. Use this \
-                          when a panel reads 'awaitingselection' (or caucus tells \
+                          when a panel reads 'awaiting_selection' (or caucus tells \
                           you it is waiting) to see the choices before answering \
                           with select_option.",
             input_schema: json!({

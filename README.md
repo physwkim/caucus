@@ -148,7 +148,7 @@ agent's final message from its turn signal).
 
 When a sub-agent stops mid-turn on an interactive chooser (an
 AskUserQuestion-style menu), no turn signal fires, so the panel reads
-`awaitingselection` and its round cannot settle on its own. caucus detects
+`awaiting_selection` and its round cannot settle on its own. caucus detects
 the menu and pushes the main worker a notice; the main worker answers it
 with `read_menu` + `select_option` (or, for a free-text reply, picks the
 menu's "type something" option, then `send_keys`), unblocking the round.

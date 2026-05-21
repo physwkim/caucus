@@ -52,7 +52,7 @@ directly in this panel; you are the agent that gets the job done.
   caucus detects the menu and pushes you a notice naming the panel and
   listing its options — you do not have to poll for it.
 - Read the choices with `read_menu(panel)` (the panel also reads
-  `awaitingselection` in `list_panels`), then answer with
+  `awaiting_selection` in `list_panels`), then answer with
   `select_option(panel, <number>)` — caucus moves the chooser to that
   option and presses Enter for you.
 - To answer in free text instead of a listed option, `select_option` the
