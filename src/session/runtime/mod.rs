@@ -73,10 +73,15 @@ pub struct Multiplexer {
     /// The main worker panel — the round-delivery target. Set when the main
     /// panel is spawned; `None` before then.
     main_panel_id: Option<PanelId>,
-    /// Instant of the last human keystroke routed to the main panel. Gates
-    /// round delivery so an injected turn never collides with a line the user
-    /// is mid-compose (see [`rounds::QUIET_WINDOW`]).
-    last_human_input: Option<Instant>,
+    /// Instant of the last *un-submitted* human keystroke to the main panel —
+    /// i.e. the user may be mid-composing a line that has not been sent yet.
+    /// Cleared the moment that line is submitted
+    /// ([`Multiplexer::note_prompt_delivered`]), so it never outlives the
+    /// compose and a stale timestamp from an already-submitted line cannot hold
+    /// the next round. Gates round delivery: caucus holds an injected turn for
+    /// `COMPOSE_GRACE` after this instant so the injection never lands in the
+    /// middle of a line the user is composing.
+    main_compose_since: Option<Instant>,
     /// Selection menus already announced to the main worker, keyed by the
     /// panel showing the menu — value is the menu's content signature
     /// ([`Multiplexer::menu_signature`]). Dedups the proactive
@@ -151,7 +156,7 @@ impl Multiplexer {
                 role_counts: HashMap::new(),
                 pending_rounds: Vec::new(),
                 main_panel_id: None,
-                last_human_input: None,
+                main_compose_since: None,
                 notified_menus: HashMap::new(),
                 layout_mode: LayoutMode::default(),
                 zoom: None,

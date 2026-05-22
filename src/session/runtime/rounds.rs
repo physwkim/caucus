@@ -14,10 +14,18 @@ use tracing::warn;
 const ROUND_FALLBACK_DEFAULT_SECS: u64 = 600;
 /// Hard cap on a round's fallback budget.
 const ROUND_FALLBACK_MAX_SECS: u64 = 3600;
-/// A registered round's results are only injected into the main worker's
-/// panel once it has been free of human keystrokes for at least this long —
-/// so a delivery never lands in the middle of a line the user is composing.
-const QUIET_WINDOW: Duration = Duration::from_millis(1000);
+/// How long caucus holds an injected round after the user's last un-submitted
+/// keystroke to the main panel — the grace across a mid-compose pause, so a
+/// delivery never lands in the middle of a line the user is still typing.
+///
+/// Longer than a reflexive "quiet" debounce on purpose: a human pausing
+/// mid-sentence to think routinely exceeds a second, and the hold is only ever
+/// armed by an *un-submitted* line (`main_compose_since` is cleared the instant
+/// the line is sent — see [`Multiplexer::note_prompt_delivered`]). The sole
+/// cost of the longer grace is delivery latency in the rare case the user types
+/// a line and walks away without submitting it; correctness (never splicing a
+/// round into a half-typed line) is the priority.
+const COMPOSE_GRACE: Duration = Duration::from_secs(5);
 
 /// A round caucus is watching on the main worker's behalf
 /// ([`Multiplexer::poll_pending_rounds`]).
@@ -73,8 +81,8 @@ impl Multiplexer {
     ///
     /// A round is *due* when all its panels have settled, or its
     /// `fallback_deadline` has passed. It is *delivered* only while the main
-    /// panel exists, is `Idle`, and has seen no human keystroke within
-    /// `QUIET_WINDOW` — so an injected turn never collides with a line the
+    /// panel exists, is `Idle`, and has no un-submitted human keystroke within
+    /// `COMPOSE_GRACE` — so an injected turn never collides with a line the
     /// user is composing. At most one round is delivered per tick: the
     /// injection flips the main panel to `Working`, so any other due round
     /// naturally holds until the main worker is idle again. A due round with
@@ -113,12 +121,13 @@ impl Multiplexer {
     }
 
     /// Whether a caucus→main push may land *this tick*: the main panel exists,
-    /// is coarse `Idle`, and no human keystroke hit it within [`QUIET_WINDOW`]
-    /// (so the user is not mid-compose). The single gate shared by both push
-    /// paths — round completion ([`Multiplexer::poll_pending_rounds`]) and
-    /// selection prompts ([`Multiplexer::poll_round_selection_prompts`]). Each
-    /// push flips the main panel to `Working`, closing the gate for the rest
-    /// of the tick, so at most one push of either kind lands per tick.
+    /// is coarse `Idle`, and has no un-submitted human keystroke within
+    /// `COMPOSE_GRACE` (so the user is not mid-compose). The single gate shared
+    /// by both push paths — round completion
+    /// ([`Multiplexer::poll_pending_rounds`]) and selection prompts
+    /// ([`Multiplexer::poll_round_selection_prompts`]). Each push flips the main
+    /// panel to `Working`, closing the gate for the rest of the tick, so at most
+    /// one push of either kind lands per tick.
     fn main_deliverable(&self) -> bool {
         let main_idle = self.main_panel_id.is_some_and(|id| {
             self.panels
@@ -127,8 +136,8 @@ impl Multiplexer {
                 .is_some_and(|p| p.state() == PanelState::Idle)
         });
         let quiet = self
-            .last_human_input
-            .is_none_or(|t| Instant::now().duration_since(t) >= QUIET_WINDOW);
+            .main_compose_since
+            .is_none_or(|t| Instant::now().duration_since(t) >= COMPOSE_GRACE);
         main_idle && quiet
     }
 
@@ -578,17 +587,17 @@ mod tests {
             serde_json::Value::Null,
         ));
 
-        // A fresh human keystroke to main closes the quiet window: still held.
-        mux.last_human_input = Some(Instant::now());
+        // A fresh un-submitted keystroke to main arms the compose hold: still held.
+        mux.main_compose_since = Some(Instant::now());
         mux.poll_pending_rounds();
         assert_eq!(
             mux.pending_rounds.len(),
             1,
-            "round held while the user is mid-compose (quiet window)"
+            "round held while the user is mid-compose (compose grace)"
         );
 
-        // Clear the quiet window: now the round delivers.
-        mux.last_human_input = None;
+        // Clear the compose hold: now the round delivers.
+        mux.main_compose_since = None;
         mux.poll_pending_rounds();
         assert!(
             mux.pending_rounds.is_empty(),

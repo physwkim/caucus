@@ -13,11 +13,14 @@ impl Multiplexer {
         use crate::input::InputAction;
         match self.focus.route(key) {
             InputAction::ToPanel { panel, bytes } => {
-                // A human keystroke to the main panel: stamp it so a round
-                // delivery never lands in the middle of a line the user is
-                // composing (see `poll_pending_rounds` / `QUIET_WINDOW`).
-                if Some(panel) == self.main_panel_id {
-                    self.last_human_input = Some(Instant::now());
+                let submit = bytes.contains(&b'\r') || bytes.contains(&b'\n');
+                // A non-submit keystroke to the main panel means the user may
+                // be composing an un-submitted line: open the compose hold so a
+                // round delivery never lands mid-line (see `poll_pending_rounds`
+                // / `COMPOSE_GRACE`). A submit is not a compose — it is handled
+                // by `note_prompt_delivered` below, which clears the hold.
+                if Some(panel) == self.main_panel_id && !submit {
+                    self.main_compose_since = Some(Instant::now());
                 }
                 if let Some(p) = self.panels.iter_mut().find(|p| p.id == panel) {
                     if let Err(err) = p.write_input(&bytes) {
@@ -27,7 +30,7 @@ impl Multiplexer {
                 // A submitted line (Enter) typed directly into a panel is a
                 // prompt delivered by the user — flip it to `Working`, the
                 // same as the MCP `send_keys` path.
-                if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
+                if submit {
                     self.note_prompt_delivered(panel);
                 }
             }
@@ -152,7 +155,14 @@ impl Multiplexer {
 
     /// Mark a panel as having received a prompt: open a capture turn and flip
     /// it to `Working` (`docs/design.md` §4). Used by the MCP `send_keys` path.
+    ///
+    /// A submitted prompt to the *main* panel consumes the input line, so any
+    /// compose hold is over — clear `main_compose_since` so the next round is
+    /// not held by a stale timestamp left from the line that was just sent.
     pub fn note_prompt_delivered(&mut self, panel_id: PanelId) {
+        if Some(panel_id) == self.main_panel_id {
+            self.main_compose_since = None;
+        }
         if let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) {
             panel.begin_turn();
             match panel.state() {
@@ -168,8 +178,45 @@ impl Multiplexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::id::PanelId;
     use crate::session::runtime::test_support::*;
     use tempfile::TempDir;
+
+    /// A submitted prompt to the main panel clears the compose hold so a stale
+    /// timestamp from the just-sent line cannot hold the next round — even
+    /// before the panel itself flips state (the clear precedes the lookup).
+    #[tokio::test]
+    async fn note_prompt_delivered_clears_main_compose_hold() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = PanelId::new();
+        mux.main_panel_id = Some(main);
+        mux.main_compose_since = Some(Instant::now());
+
+        mux.note_prompt_delivered(main);
+        assert!(
+            mux.main_compose_since.is_none(),
+            "submitting the main line must clear the compose hold"
+        );
+    }
+
+    /// A prompt delivered to a *non-main* panel (the usual MCP `send_keys`
+    /// fan-out) must not touch the main panel's compose hold.
+    #[tokio::test]
+    async fn note_prompt_delivered_for_non_main_keeps_compose_hold() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        mux.main_panel_id = Some(PanelId::new());
+        let held = Instant::now();
+        mux.main_compose_since = Some(held);
+
+        mux.note_prompt_delivered(PanelId::new());
+        assert_eq!(
+            mux.main_compose_since,
+            Some(held),
+            "a prompt to another panel must not clear the main compose hold"
+        );
+    }
 
     /// `ToggleTranscript` flips `show_transcript`; `HideTranscript` always
     /// clears it.
