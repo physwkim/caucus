@@ -352,17 +352,36 @@ fn grid_lines(grid: &Grid, rect: &TuiRect) -> Vec<Line<'static>> {
 
     let mut lines = Vec::with_capacity(take_rows);
     for r in 0..take_rows {
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(take_cols);
-        let mut c = 0;
-        while c < take_cols {
+        // Coalesce a run of consecutive cells that share a style into one span:
+        // one `String` + one `Span` per style-run instead of per cell. A
+        // terminal row is mostly long same-style runs, so this cuts the
+        // per-frame allocation count sharply. The rendered cells are identical
+        // — ratatui lays spans out left to right, so "ab" in one styled span
+        // draws the same columns as "a","b" in two (pinned byte-for-byte by
+        // `grid_lines_coalesces_runs_identically`).
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut run = String::new();
+        let mut run_style: Option<Style> = None;
+        for c in 0..take_cols {
             let Some(cell) = grid.cell(r, c) else { break };
             if cell.ch == '\0' {
-                // Trailing half of a wide glyph — already emitted by the lead.
-                c += 1;
+                // Trailing half of a wide glyph — covered by its lead cell's
+                // char. Emit nothing; this does not break the run.
                 continue;
             }
-            spans.push(Span::styled(cell.ch.to_string(), cell_style(cell)));
-            c += 1;
+            let style = cell_style(cell);
+            if run_style == Some(style) {
+                run.push(cell.ch);
+            } else {
+                if let Some(prev) = run_style.take() {
+                    spans.push(Span::styled(std::mem::take(&mut run), prev));
+                }
+                run.push(cell.ch);
+                run_style = Some(style);
+            }
+        }
+        if let Some(prev) = run_style {
+            spans.push(Span::styled(run, prev));
         }
         lines.push(Line::from(spans));
     }
@@ -810,6 +829,58 @@ mod tests {
             "SGR 97 → bright white"
         );
         assert_eq!(palette_color(200), Some(Color::Indexed(200)));
+    }
+
+    /// The run-length coalesce in `grid_lines` must not change the rendered
+    /// cells: the flattened `(char, style)` sequence per row must equal the
+    /// per-cell reference (the pre-coalesce shape — one span per non-null
+    /// cell). It must also actually merge runs (fewer spans than cells).
+    #[test]
+    fn grid_lines_coalesces_runs_identically() {
+        // A row with two same-style runs ("RED" red, then default), a wide
+        // CJK glyph, and the trailing blank cells the grid pads with.
+        let mut grid = crate::term::Grid::new(16, 1);
+        grid.advance("\x1b[31mRED\x1b[0mab中cd".as_bytes());
+        let rect = TuiRect {
+            x: 0,
+            y: 0,
+            width: 18, // interior width 16 = grid cols
+            height: 3, // interior height 1 = grid rows
+        };
+
+        let lines = grid_lines(&grid, &rect);
+        assert_eq!(lines.len(), 1, "one row in, one Line out");
+
+        // Per-cell reference: exactly what the old loop emitted — one
+        // (char, style) per non-null cell, in column order.
+        let (cols, _) = grid.size();
+        let expected: Vec<(char, Style)> = (0..cols.min(16))
+            .filter_map(|c| grid.cell(0, c))
+            .filter(|cell| cell.ch != '\0')
+            .map(|cell| (cell.ch, cell_style(cell)))
+            .collect();
+
+        // Flatten the coalesced spans back to (char, style) per grapheme.
+        let actual: Vec<(char, Style)> = lines[0]
+            .spans
+            .iter()
+            .flat_map(|s| {
+                let st = s.style;
+                s.content.chars().map(move |c| (c, st))
+            })
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "coalesced output must render the same cells as the per-cell form"
+        );
+
+        // The optimization actually fired: fewer spans than non-null cells.
+        assert!(
+            lines[0].spans.len() < expected.len(),
+            "runs must coalesce: {} spans for {} cells",
+            lines[0].spans.len(),
+            expected.len()
+        );
     }
 
     #[test]
