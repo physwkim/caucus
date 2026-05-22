@@ -23,6 +23,11 @@ every panel and points outside any worktree — see `design.md` §7.1).
 # review: src/foo.rs
 status: FINDINGS          # CLEAN | FINDINGS — the ONLY line main parses to decide termination
 iteration: 3
+gate:                     # the objective convergence signal — a real test run, not a claim
+  command: cargo nextest run -p caucus
+  exit: 1                 # the process exit code, pasted verbatim from the run
+  summary: 2 failed, 330 passed
+  at: it3                 # the iteration this run belongs to; a stale gate does not count
 reviewer: reviewer-2
 findings:
 - id: F1
@@ -41,11 +46,17 @@ findings:
 
 Rules for the doc:
 - `status` is machine-checkable. `CLEAN` ⟺ every finding is `fixed: yes(...)`
-  with `regression: pass`. Anything else is `FINDINGS`.
+  with `regression: pass` **and** the `gate:` block shows `exit: 0` at the
+  current `iteration`. Anything else is `FINDINGS`.
 - Findings have **stable ids**. A fixer never deletes a finding; it sets
   `fixed: yes(it<n>)`. The regression reviewer sets `regression: pass|fail`.
   Stable ids are what let main detect a regression (a `pass` that flips to
   `fail`) or no-progress (the same id never reaching `pass`).
+- The `gate:` block is the objective half of convergence: `fixed`/`regression`
+  are the reviewer's per-finding judgment, `gate` is the test suite's verdict
+  on the whole tree. A finding may be `regression: pass` only while the gate at
+  its iteration is green; a `pass` under a red or stale gate is contradictory
+  and main rejects the `CLEAN`.
 
 ## Actors (existing roles)
 
@@ -62,30 +73,62 @@ with `register_round`; caucus wakes main when the panel settles.
 1. **Review.** `send_keys(reviewer, "Review src/foo.rs. Write findings to
    $CAUCUS_SESSION_DIR/reviews/foo.md using the review-doc schema. Set status:
    CLEAN if you find nothing.")`, then `register_round([reviewer])`, end turn.
-2. On wake: `read_panel(reviewer, last_message)`, then read the doc.
-   If `status: CLEAN` → **done**, report to the user.
+2. On wake: `read_panel(reviewer, last_message)`, then read the doc. If the
+   first scan is already `status: CLEAN`, do not report done yet — go to step 4
+   to get a gate run, so even "nothing to fix" is confirmed by a green test run
+   (the part may have a failure the scan did not name). Otherwise continue.
 3. **Fix.** `send_keys(backend, "Fix the open findings (fixed: no) in
    $CAUCUS_SESSION_DIR/reviews/foo.md. Mark each fixed: yes(it<n>). Do not
    delete findings.")`, `register_round([backend])`, end turn.
-4. **Regression.** On wake: `send_keys(serious-reviewer, "Regression-check
-   the fix against $CAUCUS_SESSION_DIR/reviews/foo.md and the test suite. Set
-   regression: pass|fail per finding; add any new finding with a fresh id;
-   set status accordingly.")`, `register_round([serious-reviewer])`, end turn.
+4. **Regression.** On wake: `send_keys(serious-reviewer, "Regression-check the
+   fix against $CAUCUS_SESSION_DIR/reviews/foo.md. Run the gate command, paste
+   its real exit code and summary into the gate: block with at: set to this
+   iteration. Set regression: pass|fail per finding; add any new finding with a
+   fresh id. Set status: CLEAN only if the gate exited 0 and every finding is
+   fixed + pass.")`, `register_round([serious-reviewer])`, end turn.
 5. On wake: read the doc. Apply the **termination rule** below. If not done,
    go to step 3 with the still-open findings (or step 1 to re-scan).
 
 ## Termination rule (main decides — caucus has no loop control)
 
 Stop and report when **any** holds:
-- `status: CLEAN`.
+- `status: CLEAN` **and** the `gate:` block shows `exit: 0` with `at:` equal to
+  the current `iteration`. A `CLEAN` with a missing, stale (earlier-iteration),
+  or non-zero gate does **not** terminate — main re-runs the regression step.
 - `iteration >= MAX` (default 5) — stop and hand the doc to the user.
 - **No-progress guard**: a finding marked `fixed: yes(...)` whose
   `regression` is `fail`, *twice* for the same id → stop and escalate; the
   fixer is not converging on that finding.
 
 Without an explicit rule the loop runs forever and burns tokens. The rule is
-deterministic precisely because `status` and the per-finding fields are
-structured, not prose main has to judge.
+deterministic precisely because `status`, the gate, and the per-finding fields
+are structured, not prose main has to judge.
+
+## Objective gate — convergence is a green test run, not a self-report
+
+`status: CLEAN` and per-finding `regression: pass` are the reviewer's
+*judgment*; on their own they let the loop "converge" on an agent's *looks fine
+to me*. The `gate:` block anchors convergence to an objective artifact: the
+regression reviewer runs the project's test/build command in the tree the fixer
+changed and pastes the **real exit code** and summary, tagged with the current
+iteration. main terminates on `CLEAN` only when that gate is green *at this
+iteration* — a stale or red gate is treated as not clean no matter what
+`status` says.
+
+This raises the bar from vibes to a pasted run; it does not fully eliminate
+trust — an agent could paste a fake `exit: 0`. Two mitigations within existing
+primitives, strongest last:
+
+- Keep the **exact gate command in the brief** so the pasted `summary` is
+  checkable against a known command (a fabricated summary that does not match
+  the command's real output shape is a tell).
+- Before reporting `CLEAN` to the user on a high-stakes part, **re-run the gate
+  yourself**: `send_keys` the gate command to the fixer's panel (its tree holds
+  the fix) and `read_panel` the result, rather than trusting the pasted block.
+
+The full closure of the trust gap is caucus running the gate command itself and
+recording the exit code — a mechanism, not policy, and not yet built; until
+then the re-run-yourself step is the objective check.
 
 ## Worktree / visibility
 
