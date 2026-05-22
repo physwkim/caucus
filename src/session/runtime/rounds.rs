@@ -463,6 +463,45 @@ mod tests {
         );
     }
 
+    /// Killing a panel keeps `main_panel_id` an accurate invariant — it points
+    /// to a live panel or is None. Boundary: killing a non-main panel leaves it
+    /// intact; killing main clears it, so a due round then *drops* (reaching the
+    /// no-main drop arm) instead of re-queuing forever — the leak this guards.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn kill_panel_clears_main_panel_id_only_for_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let Ok(main) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        let other = mux.spawn_panel("reviewer", None, None, None).unwrap();
+        mux.main_panel_id = Some(main);
+
+        // Killing a non-main panel must not disturb main_panel_id.
+        mux.kill_panel(other).unwrap();
+        assert_eq!(mux.main_panel_id, Some(main));
+
+        // A round on a non-existent id is due immediately (a missing id counts
+        // as settled). Killing main clears the id, so the next poll drops it.
+        mux.register_round(vec![PanelId::new()], None, Some(600));
+        mux.kill_panel(main).unwrap();
+        assert!(
+            mux.main_panel_id.is_none(),
+            "killing main must clear main_panel_id"
+        );
+
+        mux.poll_pending_rounds();
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "a due round must drop once main is gone, not re-queue forever"
+        );
+
+        mux.shutdown();
+    }
+
     /// A due round is *held*, not delivered, while the main panel is not idle.
     /// Here `main_panel_id` points at an id with no live panel, so the idle
     /// gate is closed and the round stays pending for a later tick.

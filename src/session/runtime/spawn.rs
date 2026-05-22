@@ -231,6 +231,15 @@ impl Multiplexer {
         self.manifests.remove(&panel_id);
         self.worktree_branches.remove(&panel_id);
 
+        // Keep `main_panel_id` an accurate invariant: it points to a live
+        // panel or is None. Without this, killing main leaves it Some(stale),
+        // so `poll_pending_rounds` neither delivers (the gate resolves the id
+        // to no live panel) nor drops the round (its drop arm fires only when
+        // the id is None) — every due round would re-queue forever.
+        if self.main_panel_id == Some(panel_id) {
+            self.main_panel_id = None;
+        }
+
         // Killing the zoomed panel clears the zoom — the layout falls back to
         // the tiled arrangement rather than zooming a now-dead id.
         if self.zoom == Some(panel_id) {
