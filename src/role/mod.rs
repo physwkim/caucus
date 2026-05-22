@@ -1,6 +1,7 @@
 //! Role: architect / backend / reviewer etc. — a system prompt + tool
 //! allowlist + default `model`/`agent_cli`. See `docs/design.md` §6.
 
+pub mod prompt;
 pub mod registry;
 pub mod spec;
 

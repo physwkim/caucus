@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use thiserror::Error;
+use tracing::warn;
 
 use crate::pty::PtyCommand;
 use crate::role::spec::{AgentCli, RoleSpec};
@@ -63,6 +64,12 @@ pub struct SpawnRequest {
     /// no standard resume flag, so for those it is ignored and the agent
     /// spawns fresh.
     pub resume_session_id: Option<String>,
+    /// The role's system-prompt text, already resolved from
+    /// `role.system_prompt_template` (`crate::role::prompt::resolve`). `None`
+    /// when the role configures no prompt. Injected via `claude
+    /// --append-system-prompt`; codex/gemini have no system-prompt flag, so for
+    /// those it is warned and dropped (`build_command`).
+    pub system_prompt: Option<String>,
 }
 
 impl Default for SpawnRequest {
@@ -88,6 +95,7 @@ impl Default for SpawnRequest {
             skip_permissions: false,
             mcp_config_path: None,
             resume_session_id: None,
+            system_prompt: None,
         }
     }
 }
@@ -139,11 +147,31 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
             request.skip_permissions,
             request.mcp_config_path.as_deref(),
             request.resume_session_id.as_deref(),
+            request.system_prompt.as_deref(),
         ),
         // codex/gemini have no standard resume flag — `resume_session_id` is
-        // intentionally ignored for them and the agent spawns fresh.
-        AgentCli::Codex => codex_args(&request.role, model.as_deref(), request.skip_permissions),
-        AgentCli::Gemini => gemini_args(&request.role, model.as_deref(), request.skip_permissions),
+        // intentionally ignored for them and the agent spawns fresh. They also
+        // have no system-prompt flag, so a resolved role prompt cannot be
+        // injected for those backends; warn and drop it rather than guess a
+        // flag (the agent still runs, prompt-less, as before this wiring).
+        AgentCli::Codex => {
+            if request.system_prompt.is_some() {
+                warn!(
+                    role = %request.role.name,
+                    "codex has no system-prompt flag; role system prompt is not injected for this backend"
+                );
+            }
+            codex_args(&request.role, model.as_deref(), request.skip_permissions)
+        }
+        AgentCli::Gemini => {
+            if request.system_prompt.is_some() {
+                warn!(
+                    role = %request.role.name,
+                    "gemini system-prompt injection is not wired; role system prompt is not injected for this backend"
+                );
+            }
+            gemini_args(&request.role, model.as_deref(), request.skip_permissions)
+        }
     };
 
     let mut env: HashMap<String, String> = HashMap::new();
@@ -181,7 +209,8 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
     }
 }
 
-/// `claude` argv: `--model`, `--permission-mode`, `--allowedTools`, optionally
+/// `claude` argv: `--model`, `--permission-mode`, `--allowedTools`,
+/// `--append-system-prompt <text>` for the role's system prompt, optionally
 /// `--dangerously-skip-permissions`, `--mcp-config <path>` for the main
 /// worker panel (so its claude loads the caucus MCP server), and
 /// `--resume <id>` on the resume launch path.
@@ -191,6 +220,7 @@ fn claude_args(
     skip_permissions: bool,
     mcp_config: Option<&std::path::Path>,
     resume_session_id: Option<&str>,
+    system_prompt: Option<&str>,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     if let Some(id) = resume_session_id {
@@ -200,6 +230,12 @@ fn claude_args(
     if let Some(m) = model {
         args.push("--model".into());
         args.push(m.into());
+    }
+    // Append the role's guidance to claude's default system prompt (the role
+    // .md is "claw-code constraints + role-specific", `design.md` §6.1).
+    if let Some(prompt) = system_prompt {
+        args.push("--append-system-prompt".into());
+        args.push(prompt.into());
     }
     args.push("--permission-mode".into());
     args.push(role.permission_mode.as_str().into());
@@ -349,6 +385,51 @@ mod tests {
                 .any(|w| w == ["--allowedTools", "Read,Grep"])
         );
         assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn claude_argv_injects_resolved_system_prompt() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "reviewer-r1".into(),
+            system_prompt: Some("You are a reviewer.".into()),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--append-system-prompt", "You are a reviewer."]),
+            "args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn claude_argv_omits_system_prompt_when_unset() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "reviewer-r1".into(),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(!args.contains(&"--append-system-prompt".to_string()));
+    }
+
+    /// codex has no system-prompt flag, so a resolved role prompt must not leak
+    /// into its argv (it is warned + dropped for that backend).
+    #[test]
+    fn codex_argv_does_not_carry_system_prompt() {
+        let mut r = role();
+        r.agent_cli = AgentCli::Codex;
+        r.model = None;
+        let req = SpawnRequest {
+            role: r,
+            agent_name: "sr".into(),
+            system_prompt: Some("ROLE GUIDANCE".into()),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(!args.contains(&"--append-system-prompt".to_string()));
+        assert!(!args.contains(&"ROLE GUIDANCE".to_string()));
     }
 
     #[test]

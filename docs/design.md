@@ -325,6 +325,14 @@ You are a `reviewer` sub-agent in a caucus session.
 role-specific 가이드만 다름. 응답이 *자기 터미널*로 간다는 점이 구 모델(response
 파일)과의 핵심 차이다 — main worker가 `read_panel`로 직접 읽는다.
 
+**구현 노트.** 템플릿은 spawn 시 `crate::role::prompt::resolve`로 텍스트로
+해석되어 `claude --append-system-prompt <text>`로 주입된다(claude 기본 system
+prompt에 *덧붙임*). 기본 role 8종은 바이너리에 임베드(`include_str!`)되어 설치형
+caucus가 `roles/` 디렉터리 없이도 동작하고, 사용자 정의 template은 repo root
+기준 파일에서 읽는다(누락 시 spawn 에러로 surface). **codex/gemini는
+system-prompt 플래그가 없어 현재 주입되지 않는다** — 그 백엔드는 role prompt
+없이 뜨며 caucus가 경고를 남긴다(claude가 기본/주 경로).
+
 ---
 
 ## 7. Turn-completion 신호 (Stop hook → 소켓)

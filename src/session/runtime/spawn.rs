@@ -142,6 +142,19 @@ impl Multiplexer {
             .with_context(|| format!("unknown role '{role}'"))?
             .clone();
 
+        // Resolve the role's system prompt now (fallible I/O) so build_command
+        // stays infallible. Embedded defaults resolve without disk; a missing
+        // user template fails the spawn with a clear error rather than spawning
+        // an agent silently stripped of its role guidance.
+        let system_prompt =
+            crate::role::prompt::resolve(&spec.system_prompt_template, &self.session.repo_path)
+                .with_context(|| {
+                    format!(
+                        "resolve system prompt '{}' for role '{role}'",
+                        spec.system_prompt_template
+                    )
+                })?;
+
         let count = self.role_counts.entry(role.to_string()).or_insert(0);
         *count += 1;
         let agent_name = format!("{role}-{count}");
@@ -161,6 +174,7 @@ impl Multiplexer {
             skip_permissions: true,
             mcp_config_path,
             resume_session_id,
+            system_prompt,
         };
 
         // Provisional layout: compute the slot the new panel will occupy so
