@@ -1,7 +1,7 @@
 //! Turn-signal socket server.
 //!
 //! **Invariant I-6** (`docs/design.md` §12): turn signals arriving on the
-//! socket are parsed and applied to manifests *only* by [`ingest`]. The
+//! socket are parsed and applied to manifests *only* by `ingest`. The
 //! `UnixListener` lives exclusively inside this module; no other module reads
 //! the socket.
 

@@ -2,14 +2,14 @@
 //! See `docs/design.md` §0 #3, §9.
 //!
 //! **Invariant I-5** (`docs/design.md` §12): PTYs are created and destroyed
-//! only by [`Pty::spawn`] / [`Pty::kill`]. No module calls `openpty`/`fork`
+//! only by `Pty::spawn` / `Pty::kill`. No module calls `openpty`/`fork`
 //! directly.
 //!
-//! Layout: [`Pty::spawn`] opens a PTY pair, spawns the child on the slave,
+//! Layout: `Pty::spawn` opens a PTY pair, spawns the child on the slave,
 //! drops the slave, and starts a single reader thread that drains the master
-//! reader into an `mpsc` channel. [`Pty::read`] non-blockingly drains that
-//! channel; [`Pty::write`] feeds the master writer (`docs/design.md` §0 #11,
-//! the fully bidirectional input path); [`Pty::kill`] kills the child and
+//! reader into an `mpsc` channel. `Pty::read` non-blockingly drains that
+//! channel; `Pty::write` feeds the master writer (`docs/design.md` §0 #11,
+//! the fully bidirectional input path); `Pty::kill` kills the child and
 //! joins the reader thread so no fd or thread leaks.
 
 use std::collections::HashMap;

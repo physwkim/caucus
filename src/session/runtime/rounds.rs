@@ -74,7 +74,7 @@ impl Multiplexer {
     /// A round is *due* when all its panels have settled, or its
     /// `fallback_deadline` has passed. It is *delivered* only while the main
     /// panel exists, is `Idle`, and has seen no human keystroke within
-    /// [`QUIET_WINDOW`] — so an injected turn never collides with a line the
+    /// `QUIET_WINDOW` — so an injected turn never collides with a line the
     /// user is composing. At most one round is delivered per tick: the
     /// injection flips the main panel to `Working`, so any other due round
     /// naturally holds until the main worker is idle again. A due round with
@@ -139,8 +139,8 @@ impl Multiplexer {
     /// its round never settles; without this the main worker would only learn
     /// at the fallback deadline. caucus pushes an interim notice so the main
     /// worker can answer it (`read_menu` / `select_option`) and let the round
-    /// finish. Gated by [`Multiplexer::main_deliverable`] and deduped by menu
-    /// content signature ([`Multiplexer::notified_menus`]): a panel sitting on
+    /// finish. Gated by `Multiplexer::main_deliverable` and deduped by menu
+    /// content signature (`Multiplexer::notified_menus`): a panel sitting on
     /// one menu is announced once; a menu whose content changes re-announces;
     /// a panel that leaves its menu is forgotten so a future menu re-announces.
     /// At most one notice per tick (shares the deliverability gate with round

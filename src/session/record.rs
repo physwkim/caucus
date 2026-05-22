@@ -36,7 +36,7 @@ pub struct PanelRecord {
     pub order_index: usize,
     /// Git branch of the panel's worktree, if it had one. The branch persists
     /// across shutdown (it holds the agent's commits); resume re-attaches a
-    /// worktree on it via [`crate::worktree::manager::attach`].
+    /// worktree on it via `crate::worktree::manager::attach`.
     #[serde(default)]
     pub worktree_branch: Option<String>,
     /// Claude Code conversation id, when the agent emitted one. `claude

@@ -115,7 +115,7 @@ impl Layout {
     /// (`docs/design.md` §0 #10: caucus reflows on every spawn/kill).
     ///
     /// Every mode partitions `area` exactly — no gaps, no overlap — with
-    /// rounding slack distributed cell-by-cell via [`split`].
+    /// rounding slack distributed cell-by-cell via `split`.
     pub fn reflow(panels: &[PanelId], area: Rect, mode: LayoutMode) -> Self {
         let n = panels.len();
         if n == 0 || area.width == 0 || area.height == 0 {

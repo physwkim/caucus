@@ -2,7 +2,7 @@
 //!
 //! Owns the crossterm terminal lifecycle and the ratatui event loop:
 //!
-//! 1. enter raw mode + the alternate screen behind a [`TerminalGuard`] that
+//! 1. enter raw mode + the alternate screen behind a `TerminalGuard` that
 //!    restores the terminal on *any* exit path, including a panic;
 //! 2. build the [`Multiplexer`], spawn the main worker panel (+ any `--roles`);
 //! 3. loop: poll crossterm input → route via `input/`; drain each panel's PTY

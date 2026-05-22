@@ -5,7 +5,7 @@
 //! either `Active` or `Closed`.
 //!
 //! **Invariant I-1** (`docs/design.md` §12): every session state transition
-//! goes through [`transition`]. The `Session.state` field is `pub(crate)`;
+//! goes through `transition`. The `Session.state` field is `pub(crate)`;
 //! external crates cannot mutate it.
 
 use std::path::PathBuf;
@@ -81,7 +81,7 @@ impl Session {
         }
     }
 
-    /// Current state. Read-only accessor; mutation goes through [`transition`].
+    /// Current state. Read-only accessor; mutation goes through `transition`.
     pub fn state(&self) -> SessionState {
         self.state
     }

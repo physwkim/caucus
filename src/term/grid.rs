@@ -5,7 +5,7 @@
 //! sink that interprets escape sequences into cell state.
 //!
 //! **Invariant** (`docs/design.md` §9.1): the grid is mutated only by PTY
-//! bytes fed through [`Grid::advance`]. No module pokes cells directly.
+//! bytes fed through `Grid::advance`. No module pokes cells directly.
 //!
 //! Implemented against caucus's own [`Cell`] / [`Grid`] types, using
 //! `zellij-server/src/panes/grid.rs` as a semantic reference (design.md §0 #3).
@@ -50,7 +50,7 @@ pub struct Cell {
     /// `9..=16` the bright variants (SGR 90-97); `17..=255` a direct 256-colour
     /// palette index from `38;5;n` (truncated to a [`u8`]). True-colour
     /// (`38;2;r;g;b`) is approximated to the nearest palette slot — see
-    /// [`Grid::apply_sgr`].
+    /// `Grid::apply_sgr`.
     pub fg: u8,
     /// Packed SGR background colour index (0 = default). Same encoding as
     /// [`Cell::fg`].

@@ -33,7 +33,7 @@ const LIVENESS_FAILURES_TO_EXIT: u32 = 2;
 /// current-thread runtime would deadlock.
 ///
 /// Exits when *either* stdin reaches EOF (the parent agent closed the pipe) or
-/// the caucus control socket becomes unreachable ([`await_caucus_gone`]). The
+/// the caucus control socket becomes unreachable (`await_caucus_gone`). The
 /// second path matters because the parent agent can be a Claude Code
 /// daemon-held *spare* that outlives the caucus session that spawned it: its
 /// stdin never closes, so without the liveness probe this server would leak

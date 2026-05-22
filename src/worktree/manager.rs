@@ -4,7 +4,7 @@
 //! and check out a fresh branch off the current `HEAD` (or an explicit base).
 //!
 //! **Invariant I-3** (`docs/design.md` §12): worktree *creation* is owned by
-//! [`create`]; *deletion* goes through [`crate::worktree::cleanup`].
+//! `create`; *deletion* goes through [`crate::worktree::cleanup`].
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

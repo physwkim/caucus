@@ -4,7 +4,7 @@
 //! area. The real lifecycle lives here, at the panel level.
 //!
 //! **Invariant I-5** (`docs/design.md` §12): panels are created/destroyed only
-//! by [`spawn`] / [`kill`], and panel state transitions only by [`transition`].
+//! by [`spawn`] / `kill`, and panel state transitions only by `transition`.
 
 use std::path::PathBuf;
 
@@ -51,7 +51,7 @@ impl PanelState {
 
 /// One panel: a PTY-backed cell of the caucus screen.
 ///
-/// `state` is `pub(crate)` so only [`transition`] can change it (Invariant
+/// `state` is `pub(crate)` so only `transition` can change it (Invariant
 /// I-5). The grid is mutated only by PTY bytes (Invariant on `term::Grid`).
 pub struct Panel {
     pub id: PanelId,
@@ -72,7 +72,7 @@ pub struct Panel {
 }
 
 impl Panel {
-    /// Current panel state. Mutation goes through [`transition`].
+    /// Current panel state. Mutation goes through `transition`.
     pub fn state(&self) -> PanelState {
         self.state
     }
