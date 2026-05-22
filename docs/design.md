@@ -336,7 +336,13 @@ agent가 한 턴을 마쳤음을 caucus가 *라이브로* 아는 메커니즘. �
 caucus는 기동 시 unix domain socket을 연다:
 `<repo>/.caucus/sessions/<session_id>/caucus.sock`. 패널을 spawn할 때 caucus는
 그 agent 프로세스에 env를 주입한다 — `CAUCUS_SESSION_ID`, `CAUCUS_PANEL_ID`,
-`CAUCUS_SOCK`.
+`CAUCUS_SOCK`, `CAUCUS_SESSION_DIR`.
+
+`CAUCUS_SESSION_DIR`는 세션 저장 루트 `<repo>/.caucus/sessions/<session_id>/`
+(`Session::root_dir`)를 가리킨다 — 모든 패널이 닿을 수 있는 공유 경로다.
+`worktree=true` 패널의 cwd는 격리된 워크트리라 다른 패널이 만든 파일이 보이지
+않는데, 이 경로는 워크트리 밖이라 항상 공유된다. 그래서 패널 간 핸드오프
+산출물(예: reviewer가 쓰고 fixer가 읽는 리뷰 문서)을 두는 자리로 쓴다.
 
 ### 7.2 작성 주체
 **Claude `Stop` hook**. caucus는 이 hook을 `caucus init --install-hook`으로

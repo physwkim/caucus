@@ -35,6 +35,13 @@ pub struct SpawnRequest {
     /// rather than `$HOME`. Empty `PathBuf` means "unset" (test/default), which
     /// leaves the cwd unspecified.
     pub repo_root: PathBuf,
+    /// Session-scoped storage root (`<repo>/.caucus/sessions/<id>/`,
+    /// `Session::root_dir`). Injected into the agent as `CAUCUS_SESSION_DIR`:
+    /// a shared path every panel can reach — even a `worktree=true` panel,
+    /// whose cwd is an isolated worktree — for handoff artifacts (e.g. a
+    /// review doc passed between a reviewer and a fixer). Empty `PathBuf` means
+    /// "unset" (test/default), which omits the var (mirrors `repo_root`).
+    pub session_dir: PathBuf,
     /// Path to the caucus turn-signal socket for this session
     /// (`docs/design.md` §7.1). Injected into the agent as `CAUCUS_SOCK`.
     /// `None` when no socket is wired (e.g. unit tests).
@@ -76,6 +83,7 @@ impl Default for SpawnRequest {
             model_override: None,
             worktree_path: None,
             repo_root: PathBuf::new(),
+            session_dir: PathBuf::new(),
             sock_path: None,
             skip_permissions: false,
             mcp_config_path: None,
@@ -146,6 +154,14 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
     env.insert("CAUCUS_PANEL_ID".to_string(), panel_id.to_string());
     if let Some(sock) = &request.sock_path {
         env.insert("CAUCUS_SOCK".to_string(), sock.display().to_string());
+    }
+    // A guaranteed-shared path for inter-panel handoff artifacts, reachable
+    // even from an isolated worktree cwd. Empty means "unset" (test/default).
+    if !request.session_dir.as_os_str().is_empty() {
+        env.insert(
+            "CAUCUS_SESSION_DIR".to_string(),
+            request.session_dir.display().to_string(),
+        );
     }
 
     // A panel runs in its worktree if it has one, otherwise the session repo
@@ -489,6 +505,7 @@ mod tests {
             role: role(),
             agent_name: "x".into(),
             sock_path: Some(sock.clone()),
+            session_dir: PathBuf::from("/repo/.caucus/sessions/S1"),
             ..SpawnRequest::default()
         };
         let panel_id = PanelId::new();
@@ -505,6 +522,23 @@ mod tests {
             cmd.env.get("CAUCUS_SOCK").map(String::as_str),
             Some("/tmp/caucus.sock")
         );
+        assert_eq!(
+            cmd.env.get("CAUCUS_SESSION_DIR").map(String::as_str),
+            Some("/repo/.caucus/sessions/S1")
+        );
+    }
+
+    #[test]
+    fn caucus_session_dir_omitted_when_unset() {
+        // Empty session_dir (test/default) must not inject the var, mirroring
+        // how an empty repo_root leaves the cwd unset.
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "x".into(),
+            ..SpawnRequest::default()
+        };
+        let cmd = build_command(&req, PanelId::new());
+        assert!(!cmd.env.contains_key("CAUCUS_SESSION_DIR"));
     }
 
     #[test]
