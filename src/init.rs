@@ -143,7 +143,7 @@ fn install_claude_hook(hook_script: &Path) -> Result<HookInstall> {
     // one), then wire the current one — so a prior `sentinel-stop` is replaced,
     // not left alongside a dead duplicate.
     let migrated = prune_stale_caucus_hooks(&mut settings, &hook_command) > 0;
-    merge_stop_hook(&mut settings, &hook_command);
+    merge_stop_hook(&mut settings, &hook_command)?;
     let serialized = serde_json::to_string_pretty(&settings)?;
     std::fs::write(&settings_path, serialized)
         .with_context(|| format!("write {}", settings_path.display()))?;
@@ -233,20 +233,29 @@ fn collect_strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
 
 /// Append the caucus Stop-hook entry into `settings.hooks.Stop`, creating the
 /// intermediate objects/arrays as needed and preserving any existing hooks.
-fn merge_stop_hook(settings: &mut serde_json::Value, hook_command: &str) {
+///
+/// `~/.claude/settings.json` is user-editable, so its shape cannot be assumed.
+/// A root or `hooks` value that is present but not a JSON object is a
+/// malformed settings file: coercing it would silently discard the user's
+/// entire configuration (root) or every hook (`hooks`), so we error out and
+/// leave the file untouched rather than destroy it. A non-array `Stop` is the
+/// one shape we replace, since it can hold at most one stale event entry.
+fn merge_stop_hook(settings: &mut serde_json::Value, hook_command: &str) -> Result<()> {
     let entry = serde_json::json!({
         "hooks": [
             { "type": "command", "command": hook_command }
         ]
     });
 
-    let obj = settings
-        .as_object_mut()
-        .expect("settings root is a JSON object");
+    let obj = settings.as_object_mut().context(
+        "~/.claude/settings.json root is not a JSON object; \
+         fix or remove the file, then re-run `caucus init --install-hook`",
+    )?;
     let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
-    let hooks_obj = hooks
-        .as_object_mut()
-        .expect("hooks is a JSON object after init");
+    let hooks_obj = hooks.as_object_mut().context(
+        "~/.claude/settings.json `hooks` is not a JSON object; \
+         fix or remove it, then re-run `caucus init --install-hook`",
+    )?;
     let stop = hooks_obj
         .entry("Stop")
         .or_insert_with(|| serde_json::json!([]));
@@ -256,6 +265,7 @@ fn merge_stop_hook(settings: &mut serde_json::Value, hook_command: &str) {
         // A non-array `Stop` value is replaced with a fresh array.
         *stop = serde_json::json!([entry]);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -294,7 +304,7 @@ mod tests {
     #[test]
     fn merge_stop_hook_into_empty_settings() {
         let mut settings = serde_json::json!({});
-        merge_stop_hook(&mut settings, TURN_SIGNAL);
+        merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap();
         assert!(current_hook_present(&settings, TURN_SIGNAL));
         // The hook command must be absolute, not a relative path.
         let cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
@@ -310,9 +320,51 @@ mod tests {
                 "Stop": [{ "hooks": [{ "type": "command", "command": "/other" }] }]
             }
         });
-        merge_stop_hook(&mut settings, TURN_SIGNAL);
+        merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap();
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2, "existing hook kept, caucus hook appended");
+        assert!(current_hook_present(&settings, TURN_SIGNAL));
+    }
+
+    #[test]
+    fn merge_stop_hook_errors_on_non_object_root() {
+        // A hand-edited settings.json whose root is an array or scalar must
+        // surface a clear error, not panic — and must not be overwritten.
+        for mut settings in [serde_json::json!([1, 2, 3]), serde_json::json!("oops")] {
+            let before = settings.clone();
+            let err = merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap_err();
+            assert!(
+                err.to_string().contains("root is not a JSON object"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(settings, before, "malformed root left untouched");
+        }
+    }
+
+    #[test]
+    fn merge_stop_hook_errors_on_non_object_hooks() {
+        // `"hooks": []` is the plausible hand-edit that previously panicked:
+        // `or_insert_with` returns the existing array, `.as_object_mut()` is
+        // None. It must now error and preserve the user's existing hooks value.
+        for hooks in [serde_json::json!([]), serde_json::json!("x")] {
+            let mut settings = serde_json::json!({ "hooks": hooks });
+            let before = settings.clone();
+            let err = merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap_err();
+            assert!(
+                err.to_string().contains("`hooks` is not a JSON object"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(settings, before, "malformed hooks left untouched");
+        }
+    }
+
+    #[test]
+    fn merge_stop_hook_replaces_a_non_array_stop() {
+        // A non-array `Stop` is the one shape we coerce (it can hold at most
+        // one stale entry): replaced with a fresh array carrying the hook.
+        let mut settings = serde_json::json!({ "hooks": { "Stop": "garbage" } });
+        merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap();
+        assert!(settings["hooks"]["Stop"].is_array());
         assert!(current_hook_present(&settings, TURN_SIGNAL));
     }
 
@@ -377,7 +429,7 @@ mod tests {
 
         // After the prune, merging the current hook yields a clean single
         // caucus hook — no stacked duplicate.
-        merge_stop_hook(&mut settings, TURN_SIGNAL);
+        merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap();
         assert!(current_hook_present(&settings, TURN_SIGNAL));
     }
 
