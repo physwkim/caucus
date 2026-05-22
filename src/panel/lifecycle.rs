@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::agent::spawn::{self, SpawnRequest};
-use crate::pty::{Pty, PtyError};
+use crate::agent::spawn::SpawnRequest;
+use crate::pty::{Pty, PtyCommand, PtyError};
 use crate::render::Rect;
 use crate::session::id::{AgentId, PanelId};
 use crate::term::{Grid, OutputCapture};
@@ -217,15 +217,17 @@ pub(crate) fn transition(panel: &mut Panel, to: PanelState) -> Result<(), Illega
 
 /// Single owner of panel creation (Invariant I-5).
 ///
-/// Builds the backend CLI command from `request` (`agent::spawn::build_command`),
-/// opens a PTY sized to `rect`'s interior, and creates a grid + capture to
-/// match. The returned panel starts in `Spawning`; the caller transitions it
-/// to `Working` once a prompt is delivered.
+/// Opens a PTY sized to `rect`'s interior running the prebuilt `command`
+/// (built once by `agent::spawn::spawn`, whose `panel_id` this must match),
+/// and creates a grid + capture to match. The returned panel starts in
+/// `Spawning`; the caller transitions it to `Working` once a prompt is
+/// delivered.
 ///
 /// `agent_id` ties the panel to the [`crate::agent::AgentManifest`] the caller
 /// persists; `panel_id` must equal the manifest's `panel_id`.
 pub(crate) fn spawn(
     request: &SpawnRequest,
+    command: PtyCommand,
     panel_id: PanelId,
     agent_id: AgentId,
     rect: Rect,
@@ -234,7 +236,6 @@ pub(crate) fn spawn(
     let cols = inner.width.max(MIN_GRID_COLS);
     let rows = inner.height.max(MIN_GRID_ROWS);
 
-    let command = spawn::build_command(request, panel_id);
     let pty = Pty::spawn(&command, cols, rows).map_err(|e| PanelError::Spawn(e.to_string()))?;
     let grid = Grid::new(cols as usize, rows as usize);
 

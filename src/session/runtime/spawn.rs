@@ -186,8 +186,13 @@ impl Multiplexer {
         let provisional = Layout::reflow(&ids, self.area, self.layout_mode);
         let rect = provisional.rect_of(outcome.panel_id).unwrap_or(self.area);
 
-        let mut panel =
-            lifecycle::spawn(&request, outcome.panel_id, outcome.manifest.agent_id, rect)?;
+        let mut panel = lifecycle::spawn(
+            &request,
+            outcome.command,
+            outcome.panel_id,
+            outcome.manifest.agent_id,
+            rect,
+        )?;
         let panel_id = panel.id;
         // Turn-segmented capture spills to `<session>/panels/<panel>.log`
         // (`docs/design.md` §8.5).
