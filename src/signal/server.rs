@@ -39,7 +39,11 @@ pub struct SignalServer {
 impl SignalServer {
     /// Bind the unix-domain socket at `sock_path` and spawn the accept loop.
     ///
-    /// Path shape: `<repo>/.caucus/sessions/<session_id>/caucus.sock`.
+    /// `sock_path` is caller-supplied: `runtime::socket_path` picks a
+    /// `SUN_LEN`-safe name in the system temp dir (a `docs/design.md` §7.1
+    /// session-dir path easily overruns the ~104-byte OS cap) and conveys it to
+    /// agents via the `CAUCUS_SOCK` env var — the location is an internal
+    /// detail, not a fixed path shape.
     ///
     /// The spawned accept loop holds the `UnixListener` for the lifetime of
     /// the process; closing the returned [`SignalServer`]'s receiver does not
