@@ -84,6 +84,17 @@ impl ControlServer {
     }
 }
 
+impl Drop for ControlServer {
+    /// Remove the bound socket file on shutdown. `bind` only clears a *stale*
+    /// file at startup, so without this every `caucus` run left its
+    /// `caucus-<id>-ctl.sock` behind in the temp dir — they accumulate by the
+    /// hundreds. The accept-loop task is torn down with the tokio runtime at
+    /// process exit; unlinking the path here just stops new connects.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
+}
+
 /// Accept connections forever, one task per connection.
 async fn accept_loop(listener: UnixListener, tx: mpsc::UnboundedSender<ControlJob>) {
     loop {
@@ -159,6 +170,19 @@ mod tests {
     use super::*;
     use crate::mcp::control_client::roundtrip;
     use crate::session::id::PanelId;
+
+    /// Dropping the server removes its socket file, so it does not accumulate
+    /// in the temp dir across runs.
+    #[tokio::test]
+    async fn drop_removes_the_socket_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        {
+            let _server = ControlServer::bind(&sock).unwrap();
+            assert!(sock.exists(), "bind creates the socket");
+        }
+        assert!(!sock.exists(), "drop removes the socket");
+    }
 
     /// A request written to the socket reaches the job channel, and a reply
     /// sent on the job's oneshot makes it back to the client.

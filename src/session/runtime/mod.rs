@@ -248,7 +248,11 @@ mod tests {
     #[tokio::test]
     async fn new_creates_session_dirs_and_socket() {
         let tmp = TempDir::new().unwrap();
-        let mux = mux(&tmp);
+        let session = Session::new("test", tmp.path().to_path_buf());
+        let config = Config::load(tmp.path()).unwrap();
+        // Hold the signal server handle: the turn-signal socket exists only
+        // while it is alive (removed on drop — see `SignalServer`'s Drop).
+        let (mux, _signal, _control) = Multiplexer::new(session, config, area()).unwrap();
         assert!(mux.session.root_dir.join("agents").is_dir());
         assert!(mux.session.root_dir.join("panels").is_dir());
         assert!(mux.sock_path().exists());

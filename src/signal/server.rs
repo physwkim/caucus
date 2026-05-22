@@ -70,6 +70,16 @@ impl SignalServer {
     }
 }
 
+impl Drop for SignalServer {
+    /// Remove the bound socket file on shutdown. As with the control socket,
+    /// `bind` only clears a stale file at startup, so each run otherwise left
+    /// its `caucus-<id>.sock` behind in the temp dir. The accept-loop task is
+    /// torn down with the tokio runtime at process exit.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
+}
+
 /// Accept connections forever, handling each on its own task so a slow or
 /// stalled client never blocks other agents' turn signals.
 ///
@@ -163,6 +173,19 @@ mod tests {
         let sig = ingest(&line).unwrap();
         assert_eq!(sig.kind, TurnKind::Stop);
         assert_eq!(sig.last_message.as_deref(), Some("done"));
+    }
+
+    /// Dropping the server removes its socket file, so it does not accumulate
+    /// in the temp dir across runs.
+    #[tokio::test]
+    async fn drop_removes_the_socket_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("caucus.sock");
+        {
+            let _server = SignalServer::bind(&sock).unwrap();
+            assert!(sock.exists(), "bind creates the socket");
+        }
+        assert!(!sock.exists(), "drop removes the socket");
     }
 
     /// A raw newline-delimited JSON write reaches the server's channel.
