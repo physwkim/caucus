@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::render::LayoutMode;
 use crate::role::spec::AgentCli;
@@ -122,8 +123,16 @@ pub fn discover(repo: &Path) -> Vec<SessionRecord> {
         if !path.is_dir() {
             continue;
         }
-        if let Ok(record) = SessionRecord::read(&path) {
-            found.push(record);
+        match SessionRecord::read(&path) {
+            Ok(record) => found.push(record),
+            // A directory without a `session.json` is simply not a session
+            // dir — silent. A present-but-unreadable record is corruption the
+            // user is silently losing on `resume`; surface it so they know
+            // that session was dropped, not absent.
+            Err(SessionRecordError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                warn!(dir = %path.display(), error = %err, "skipping unreadable session record");
+            }
         }
     }
     found.sort_by(|a, b| b.created_at.cmp(&a.created_at));
