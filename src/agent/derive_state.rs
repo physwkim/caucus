@@ -258,22 +258,59 @@ mod tests {
         );
     }
 
+    /// Every `LaneFailureClass` maps onto its `DerivedState` via `blocker_state`
+    /// — enumerated in full so a newly added failure class fails to compile here
+    /// until it is listed (and thus checked). `BackgroundJob`, `Transport`,
+    /// `PromptDelivery`, and `Unknown` had no prior coverage.
     #[test]
-    fn blocker_maps_to_blocked_variant() {
-        let merge = LaneEventBlocker::new(LaneFailureClass::MergeConflict, "conflict in foo.rs");
+    fn blocker_maps_every_failure_class() {
+        use LaneFailureClass::*;
+        let cases = [
+            (PermissionPrompt, DerivedState::BlockedPermissionPrompt),
+            (MergeConflict, DerivedState::BlockedMergeConflict),
+            (BackgroundJob, DerivedState::BlockedBackgroundJob),
+            (McpHandshake, DerivedState::DegradedMcp),
+            (Transport, DerivedState::InterruptedTransport),
+            // No dedicated state surface — treated as transport-interrupted so
+            // the main worker still sees a non-Idle panel.
+            (PromptDelivery, DerivedState::InterruptedTransport),
+            (Unknown, DerivedState::InterruptedTransport),
+        ];
+        for (class, expected) in cases {
+            let blk = LaneEventBlocker::new(class, "detail");
+            assert_eq!(
+                derive_agent_state("live", None, None, Some(&blk), None),
+                expected,
+                "failure class {class:?} must map to {expected:?}"
+            );
+        }
+    }
+
+    /// A `failed` status with no blocker or hint is transport-interrupted (the
+    /// `match status` `"failed"` arm) — the path `record_*` takes when an
+    /// agent's process is flagged failed rather than cleanly exited.
+    #[test]
+    fn failed_status_is_interrupted_transport() {
         assert_eq!(
-            derive_agent_state("live", None, None, Some(&merge), None),
-            DerivedState::BlockedMergeConflict
+            derive_agent_state("failed", None, None, None, None),
+            DerivedState::InterruptedTransport
         );
-        let mcp = LaneEventBlocker::new(LaneFailureClass::McpHandshake, "handshake failed");
-        assert_eq!(
-            derive_agent_state("live", None, None, Some(&mcp), None),
-            DerivedState::DegradedMcp
+    }
+
+    /// `failed` is weighed before a turn signal: a stale `Stop` signal must not
+    /// surface a failed agent as `Idle`.
+    #[test]
+    fn failed_status_beats_a_turn_signal() {
+        let sig = TurnSignal::now(
+            crate::session::id::SessionId::new(),
+            crate::session::id::PanelId::new(),
+            crate::signal::TurnKind::Stop,
+            Some("done".into()),
+            serde_json::Value::Null,
         );
-        let perm = LaneEventBlocker::new(LaneFailureClass::PermissionPrompt, "y/n");
         assert_eq!(
-            derive_agent_state("live", None, None, Some(&perm), None),
-            DerivedState::BlockedPermissionPrompt
+            derive_agent_state("failed", Some(&sig), None, None, None),
+            DerivedState::InterruptedTransport
         );
     }
 

@@ -473,6 +473,126 @@ mod tests {
         assert_eq!(manifest.derived_state(), DerivedState::InterruptedTransport);
     }
 
+    /// A `tool_blocked` turn signal records a `PermissionPrompt` blocker and
+    /// lands the agent in `BlockedPermissionPrompt` — the mid-turn permission
+    /// stop, distinct from the `error` kind (transport-interrupted).
+    #[test]
+    fn record_turn_completed_tool_blocked_kind_is_blocked_permission_prompt() {
+        use crate::agent::lane_event::LaneFailureClass;
+        use crate::signal::{TurnKind, TurnSignal};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            None,
+        );
+        let signal = TurnSignal::now(
+            manifest.session_id,
+            manifest.panel_id,
+            TurnKind::ToolBlocked,
+            None,
+            serde_json::Value::Null,
+        );
+        record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
+        assert_eq!(
+            manifest.derived_state(),
+            DerivedState::BlockedPermissionPrompt
+        );
+        let blocker = manifest
+            .current_blocker
+            .as_ref()
+            .expect("a tool_blocked signal must record a blocker");
+        assert_eq!(blocker.failure_class, LaneFailureClass::PermissionPrompt);
+    }
+
+    /// `render_md` emits every optional field that is set (model / worktree /
+    /// exited_at / error) and a label for each lane-event kind. Exercises the
+    /// conditional branches and `event_label`'s formatting arms, which the
+    /// roundtrip test (single field) did not reach.
+    #[test]
+    fn render_md_emits_optional_fields_and_every_event_label() {
+        use crate::agent::lane_event::LaneFailureClass;
+        use crate::agent::provenance::LaneCommitProvenance;
+        let mut m = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            Some("opus".into()),
+        );
+        m.worktree_path = Some(PathBuf::from("/tmp/wt/backend-1"));
+        m.error = Some("pipe broke".into());
+        m.status = AgentStatus::Exited;
+        m.exited_at = Some(Utc::now());
+        // One event of every kind beyond the `Started` that `new` seeds, so
+        // every `event_label` arm renders.
+        for kind in [
+            LaneEventKind::PromptDelivered,
+            LaneEventKind::TurnCompleted,
+            LaneEventKind::Blocked {
+                blocker: LaneEventBlocker::new(LaneFailureClass::MergeConflict, "conflict in a.rs"),
+            },
+            LaneEventKind::Failed {
+                blocker: LaneEventBlocker::new(LaneFailureClass::Transport, "pipe"),
+            },
+            LaneEventKind::Finished {
+                detail: "done".into(),
+            },
+            LaneEventKind::CommitCreated {
+                provenance: LaneCommitProvenance {
+                    commit: "abc1234".into(),
+                    branch: "feat/x".into(),
+                    worktree: None,
+                    canonical_commit: None,
+                    superseded_by: None,
+                    lineage: vec![],
+                },
+            },
+            LaneEventKind::WorktreeCreated {
+                path: PathBuf::from("/tmp/wt/backend-1"),
+            },
+            LaneEventKind::WorktreeRemoved {
+                path: PathBuf::from("/tmp/wt/backend-1"),
+            },
+        ] {
+            m.lane_events.push(LaneEvent::now(kind));
+        }
+
+        let md = render_md(&m);
+        // Optional field branches.
+        for needle in [
+            "- model: opus",
+            "- worktree: /tmp/wt/backend-1",
+            "- status: Exited",
+            "- exited_at:",
+            "## error",
+            "pipe broke",
+        ] {
+            assert!(md.contains(needle), "render_md missing {needle:?}:\n{md}");
+        }
+        // Every event_label arm.
+        for needle in [
+            "started",
+            "prompt_delivered",
+            "turn_completed",
+            "blocked (MergeConflict: conflict in a.rs)",
+            "failed (Transport: pipe)",
+            "finished (done)",
+            "commit_created (abc1234)",
+            "worktree_created (/tmp/wt/backend-1)",
+            "worktree_removed (/tmp/wt/backend-1)",
+        ] {
+            assert!(
+                md.contains(needle),
+                "render_md missing label {needle:?}:\n{md}"
+            );
+        }
+    }
+
     #[test]
     fn record_exited_is_terminal() {
         let tmp = TempDir::new().unwrap();
