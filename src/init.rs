@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::hook::{current_hook_present, is_caucus_hook_command};
+
 /// The Stop-hook script body (`docs/design.md` §7.3). `CAUCUS_*` env vars are
 /// injected by caucus when it spawns the panel; the Claude hook payload
 /// arrives on stdin and is forwarded by `caucus signal post`.
@@ -155,27 +157,6 @@ fn install_claude_hook(hook_script: &Path) -> Result<HookInstall> {
     })
 }
 
-/// Whether the *current* caucus hook (`hook_command`, the exact `turn-signal`
-/// path) is already wired into `settings.hooks.Stop`. Exact-match, not a loose
-/// "mentions caucus" — so a stale caucus hook never masquerades as the current
-/// one (the bug that blocked migration).
-fn current_hook_present(settings: &serde_json::Value, hook_command: &str) -> bool {
-    stop_strings(settings)
-        .into_iter()
-        .any(|s| s == hook_command)
-}
-
-/// Whether a Stop-hook `command` belongs to caucus: it runs one of caucus's
-/// hook scripts (`.../.caucus/bin/...`) or a caucus signal subcommand. This is
-/// caucus-specific — it does *not* match an unrelated command that merely has
-/// "caucus" somewhere in its path — so migration prunes only caucus's own
-/// hooks and leaves third-party Stop hooks alone.
-fn is_caucus_hook_command(cmd: &str) -> bool {
-    cmd.contains("/.caucus/bin/")
-        || cmd.contains("caucus signal post")
-        || cmd.contains("caucus sentinel")
-}
-
 /// Remove every *stale* caucus Stop hook — a caucus hook command that is not
 /// the current `hook_command` — from `settings.hooks.Stop`, preserving all
 /// other hooks. Matcher groups left with no hooks are dropped. Returns how
@@ -208,27 +189,6 @@ fn prune_stale_caucus_hooks(settings: &mut serde_json::Value, hook_command: &str
             .is_none_or(|a| !a.is_empty())
     });
     removed
-}
-
-/// Every string under `settings.hooks.Stop`, gathered recursively so command
-/// strings are found regardless of the exact nesting Claude uses (matcher
-/// group → `hooks` → `command`).
-fn stop_strings(settings: &serde_json::Value) -> Vec<&str> {
-    let mut out = Vec::new();
-    if let Some(stop) = settings.get("hooks").and_then(|h| h.get("Stop")) {
-        collect_strings(stop, &mut out);
-    }
-    out
-}
-
-/// Recursively push every string value in `v` onto `out`.
-fn collect_strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
-    match v {
-        serde_json::Value::String(s) => out.push(s),
-        serde_json::Value::Array(items) => items.iter().for_each(|i| collect_strings(i, out)),
-        serde_json::Value::Object(map) => map.values().for_each(|i| collect_strings(i, out)),
-        _ => {}
-    }
 }
 
 /// Append the caucus Stop-hook entry into `settings.hooks.Stop`, creating the
@@ -366,37 +326,6 @@ mod tests {
         merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap();
         assert!(settings["hooks"]["Stop"].is_array());
         assert!(current_hook_present(&settings, TURN_SIGNAL));
-    }
-
-    #[test]
-    fn current_hook_present_is_exact_match_not_substring() {
-        // The current hook is wired → present.
-        let with = serde_json::json!({
-            "hooks": { "Stop": [{ "hooks": [{ "command": TURN_SIGNAL }] }] }
-        });
-        assert!(current_hook_present(&with, TURN_SIGNAL));
-        let without = serde_json::json!({ "hooks": { "Stop": [] } });
-        assert!(!current_hook_present(&without, TURN_SIGNAL));
-        // A *stale* caucus hook must NOT count as the current one — this exact
-        // confusion (any "caucus" mention satisfies the check) is the bug that
-        // blocked migration off sentinel-stop.
-        let stale = serde_json::json!({
-            "hooks": { "Stop": [{ "hooks": [{ "command": SENTINEL_STOP }] }] }
-        });
-        assert!(!current_hook_present(&stale, TURN_SIGNAL));
-    }
-
-    #[test]
-    fn is_caucus_hook_command_matches_caucus_only() {
-        assert!(is_caucus_hook_command(TURN_SIGNAL));
-        assert!(is_caucus_hook_command(SENTINEL_STOP));
-        assert!(is_caucus_hook_command("caucus signal post --kind stop"));
-        assert!(is_caucus_hook_command("/usr/bin/caucus sentinel write"));
-        // A third-party Stop hook must not be mistaken for caucus's own.
-        assert!(!is_caucus_hook_command(
-            "/Users/me/codes/claude-config/hooks/no-deferral-guard.py"
-        ));
-        assert!(!is_caucus_hook_command("/usr/bin/true"));
     }
 
     #[test]

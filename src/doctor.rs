@@ -182,7 +182,7 @@ fn stop_hook_check() -> Check {
         }
     };
     let installed = match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(v) => hook_present(&v),
+        Ok(v) => crate::hook::caucus_stop_hook_installed(&v),
         Err(err) => {
             return Check {
                 name,
@@ -208,25 +208,8 @@ fn stop_hook_check() -> Check {
     }
 }
 
-/// Whether a Claude settings JSON value contains a `Stop` hook that invokes
-/// the caucus turn-signal script. Looks for `hooks.Stop` and a `caucus`
-/// reference in any command string under it.
-fn hook_present(settings: &serde_json::Value) -> bool {
-    let Some(stop) = settings.get("hooks").and_then(|h| h.get("Stop")) else {
-        return false;
-    };
-    json_contains_caucus(stop)
-}
-
-/// Recursively scan a JSON value for a string mentioning `caucus`.
-fn json_contains_caucus(v: &serde_json::Value) -> bool {
-    match v {
-        serde_json::Value::String(s) => s.contains("caucus"),
-        serde_json::Value::Array(items) => items.iter().any(json_contains_caucus),
-        serde_json::Value::Object(map) => map.values().any(json_contains_caucus),
-        _ => false,
-    }
-}
+// Hook detection lives in `crate::hook` — the single owner shared with
+// `crate::init`, so neither drifts back to a loose "mentions caucus" match.
 
 #[cfg(test)]
 mod tests {
@@ -257,26 +240,6 @@ mod tests {
                 "missing doctor check: {expected}"
             );
         }
-    }
-
-    #[test]
-    fn hook_present_detects_caucus_stop_hook() {
-        let v = serde_json::json!({
-            "hooks": {
-                "Stop": [
-                    { "hooks": [{ "type": "command", "command": ".caucus/bin/turn-signal" }] }
-                ]
-            }
-        });
-        assert!(hook_present(&v));
-    }
-
-    #[test]
-    fn hook_present_false_without_stop_or_caucus() {
-        assert!(!hook_present(&serde_json::json!({ "hooks": {} })));
-        assert!(!hook_present(&serde_json::json!({
-            "hooks": { "Stop": [{ "command": "/usr/bin/other" }] }
-        })));
     }
 
     #[test]
