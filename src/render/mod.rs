@@ -412,7 +412,7 @@ fn cell_style(cell: &crate::term::Cell) -> Style {
 fn palette_color(idx: u8) -> Option<Color> {
     match idx {
         0 => None,
-        1 => Some(Color::Red),
+        1 => Some(Color::Black),
         2 => Some(Color::Red),
         3 => Some(Color::Green),
         4 => Some(Color::Yellow),
@@ -420,7 +420,7 @@ fn palette_color(idx: u8) -> Option<Color> {
         6 => Some(Color::Magenta),
         7 => Some(Color::Cyan),
         8 => Some(Color::Gray),
-        9 => Some(Color::Black),
+        9 => Some(Color::DarkGray),
         10 => Some(Color::LightRed),
         11 => Some(Color::LightGreen),
         12 => Some(Color::LightYellow),
@@ -782,6 +782,34 @@ mod tests {
         let panels = vec![PanelId::new(), PanelId::new()];
         let layout = Layout::reflow(&panels, area(), LayoutMode::Tiled);
         assert_eq!(layout.slots.len(), 2);
+    }
+
+    #[test]
+    fn palette_color_maps_the_standard_ansi_block() {
+        // The grid encodes SGR 30..=37 as index 1..=8 and SGR 90..=97 as
+        // index 9..=16 (`term::grid` apply_sgr). So index 1 = SGR 30 = black
+        // and index 9 = SGR 90 = bright-black; the mapping must follow that.
+        assert_eq!(palette_color(0), None, "0 is default (terminal decides)");
+        assert_eq!(palette_color(1), Some(Color::Black), "SGR 30 → black");
+        assert_eq!(palette_color(2), Some(Color::Red), "SGR 31 → red");
+        assert_eq!(palette_color(3), Some(Color::Green));
+        assert_eq!(palette_color(4), Some(Color::Yellow));
+        assert_eq!(palette_color(5), Some(Color::Blue));
+        assert_eq!(palette_color(6), Some(Color::Magenta));
+        assert_eq!(palette_color(7), Some(Color::Cyan));
+        assert_eq!(palette_color(8), Some(Color::Gray), "SGR 37 → white/gray");
+        assert_eq!(
+            palette_color(9),
+            Some(Color::DarkGray),
+            "SGR 90 → bright-black (visible, not pure black)"
+        );
+        assert_eq!(palette_color(10), Some(Color::LightRed));
+        assert_eq!(
+            palette_color(16),
+            Some(Color::White),
+            "SGR 97 → bright white"
+        );
+        assert_eq!(palette_color(200), Some(Color::Indexed(200)));
     }
 
     #[test]
