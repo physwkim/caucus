@@ -227,6 +227,10 @@ The embedded roles are read-only defaults; override per-project in
 sub-agent the main worker spawns for parallel work. The remaining roles are
 optional specialist hints — use them when a sub-task clearly calls for one.
 
+For a worked orchestration pattern — a continuous review → fix → regression
+loop driven by `main` over a durable review doc — see
+[`docs/review-loop.md`](./docs/review-loop.md).
+
 Cost tiers reflect each role's cognitive load: Opus where shaping decisions
 and finding subtle issues matters, Sonnet where executing a defined plan
 suffices, Haiku where the work is mechanical. The default-model column uses
