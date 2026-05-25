@@ -52,6 +52,17 @@ pub(super) struct PendingRound {
     /// barrier. A panel settles for the round only once it is idle *and* its
     /// queue is empty; a panel with no entry here settles on its first idle.
     backlog: HashMap<PanelId, VecDeque<String>>,
+    /// Per-panel outputs of each *finished* turn, captured in `read_mode` by
+    /// [`Multiplexer::feed_round_backlog`] the moment the panel goes idle and is
+    /// about to be fed its next backlog task — i.e. the output of the turn that
+    /// just ended (the pre-backlog work, then each prior backlog task). Captured
+    /// while the panel is still idle so a `since_last_turn` read covers the
+    /// finished turn before the next task reopens it. Without this the delivered
+    /// report would show only the panel's *final* turn, hiding the earlier tasks
+    /// of a multi-task backlog; [`Multiplexer::assemble_round_report`] emits
+    /// these ahead of the final live read. Empty for a panel that ran a single
+    /// task (no backlog feed ever happened).
+    captured: HashMap<PanelId, Vec<String>>,
     /// How each panel's result is read for the delivered report.
     pub(super) read_mode: ReadPanelMode,
     /// Wall-clock instant past which the round is delivered regardless of
@@ -98,6 +109,7 @@ impl Multiplexer {
         self.pending_rounds.push(PendingRound {
             panels,
             backlog,
+            captured: HashMap::new(),
             read_mode: read_mode.unwrap_or(ReadPanelMode::LastMessage),
             fallback_deadline: Instant::now() + Duration::from_secs(budget),
         });
@@ -144,7 +156,8 @@ impl Multiplexer {
                 // Due, gate open, nothing delivered yet this tick: assemble +
                 // inject into the main panel, then drop the round.
                 Some(main_id) if due && deliverable && !delivered => {
-                    let report = self.assemble_round_report(&round.panels, round.read_mode);
+                    let report =
+                        self.assemble_round_report(&round.panels, round.read_mode, &round.captured);
                     if let Err(err) = McpToolSurface::send_keys(self, main_id, &report, true) {
                         warn!(error = %err, "round delivery to main panel failed");
                     }
@@ -175,12 +188,19 @@ impl Multiplexer {
     /// front to be retried next tick rather than silently dropped. Feeding is
     /// not gated by [`Multiplexer::main_deliverable`]: keeping a worker busy is
     /// independent of the main panel's state.
+    ///
+    /// Just before each next task is sent — while the panel is still idle — the
+    /// finished turn's output is read in `read_mode` and, on a confirmed send,
+    /// pushed to `round.captured`. This is what lets the delivered report carry
+    /// every backlog task's result rather than only the panel's final turn (see
+    /// [`Multiplexer::assemble_round_report`]); the capture and the queue pop are
+    /// committed together so a failed send re-reads and retries both next tick.
     fn feed_round_backlog(&mut self, round: &mut PendingRound) {
         // Decide every feed first (borrows only `round` + reads `self.panels`),
         // then deliver (mut-borrows `self`), so the two borrows never overlap.
         // The front is cloned, not popped, here — it is consumed only on a
         // confirmed send below.
-        let mut feeds: Vec<(PanelId, String)> = Vec::new();
+        let mut feeds: Vec<(PanelId, String, String)> = Vec::new();
         for &id in &round.panels {
             let idle = self
                 .panels
@@ -191,18 +211,30 @@ impl Multiplexer {
                 continue;
             }
             if let Some(task) = round.backlog.get(&id).and_then(VecDeque::front) {
-                feeds.push((id, task.clone()));
+                let task = task.clone();
+                // Capture the just-finished turn *now*, while the panel is
+                // still idle — the send below opens a new turn and (for
+                // `SinceLastTurn`) would otherwise overwrite it. Committed to
+                // `round.captured` only on a confirmed send.
+                let done = self
+                    .read_panel(id, round.read_mode)
+                    .unwrap_or_else(|e| format!("(could not read panel: {e})"));
+                feeds.push((id, task, done));
             }
         }
-        for (id, task) in feeds {
+        for (id, task, done) in feeds {
             match McpToolSurface::send_keys(self, id, &task, true) {
                 // Delivered: consume the task (still the queue's front, single
-                // tick, nothing else mutates the queue between collect + here).
+                // tick, nothing else mutates the queue between collect + here)
+                // and record the finished turn's output so the delivered report
+                // carries every task's result, not only the last.
                 Ok(()) => {
                     round.backlog.get_mut(&id).and_then(VecDeque::pop_front);
+                    round.captured.entry(id).or_default().push(done);
                 }
-                // Delivery failed: leave the task at the front; the panel is
-                // still idle, so the next tick retries it.
+                // Delivery failed: leave the task at the front and capture
+                // nothing; the panel is still idle, so the next tick re-reads
+                // and retries.
                 Err(err) => warn!(error = %err, panel = %id, "round backlog feed failed"),
             }
         }
@@ -427,12 +459,22 @@ impl Multiplexer {
     }
 
     /// Assemble a round's delivery message: a self-describing block per panel
-    /// — role + current state, plus its result read via `read_mode` (settled
-    /// panels) or an "unfinished" marker (a panel still `working` when the
-    /// fallback deadline forced delivery). A panel id that no longer exists is
-    /// reported as gone. This is the text injected into the main worker's
-    /// panel as a fresh turn.
-    fn assemble_round_report(&self, panels: &[PanelId], read_mode: ReadPanelMode) -> String {
+    /// — role + current state, plus its result(s). A panel that ran a single
+    /// task contributes that one output read via `read_mode`; a panel that ran
+    /// a multi-task `backlog` contributes every finished turn — the outputs
+    /// captured in `captured` (each prior turn, in feed order) followed by its
+    /// final turn read live — under `### task N` headers so the main worker can
+    /// tell them apart. A panel still `working` when the fallback deadline
+    /// forced delivery contributes whatever it already finished (its captured
+    /// turns) plus an "unfinished" marker, never a live read of a mid-turn
+    /// panel. A panel id that no longer exists is reported as gone. This is the
+    /// text injected into the main worker's panel as a fresh turn.
+    fn assemble_round_report(
+        &self,
+        panels: &[PanelId],
+        read_mode: ReadPanelMode,
+        captured: &HashMap<PanelId, Vec<String>>,
+    ) -> String {
         let all_settled = self.wait_panels_settled(panels);
         let mut out = format!(
             "[caucus] Round complete — {} panel(s){}.\n",
@@ -454,21 +496,40 @@ impl Multiplexer {
                 panel.role,
                 state.label()
             ));
-            if matches!(state, PanelState::Working | PanelState::Spawning) {
-                out.push_str("⏳ still working — did not finish within the fallback window.\n");
-                continue;
-            }
-            let body = self
-                .read_panel(id, read_mode)
-                .unwrap_or_else(|e| format!("(could not read panel: {e})"));
-            let body = body.trim();
-            out.push_str(if body.is_empty() {
-                "(no output captured)\n"
-            } else {
-                body
+
+            // Every finished backlog turn, in feed order, captured the moment
+            // before its successor was fed.
+            let done = captured.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+            // A settled panel adds its final turn (read live) after the
+            // captured turns; a still-working panel contributes only what it
+            // already finished, then the unfinished marker below — never a
+            // live read of a mid-turn panel.
+            let still_working = matches!(state, PanelState::Working | PanelState::Spawning);
+            let final_body = (!still_working).then(|| {
+                self.read_panel(id, read_mode)
+                    .unwrap_or_else(|e| format!("(could not read panel: {e})"))
             });
-            if !body.is_empty() {
-                out.push('\n');
+
+            // One output stays header-less, identical to the pre-backlog
+            // report; two or more get `### task N` headers.
+            let total = done.len() + final_body.is_some() as usize;
+            for (i, body) in done.iter().chain(final_body.as_ref()).enumerate() {
+                if total > 1 {
+                    out.push_str(&format!("\n### task {}\n", i + 1));
+                }
+                let body = body.trim();
+                out.push_str(if body.is_empty() {
+                    "(no output captured)\n"
+                } else {
+                    body
+                });
+                if !body.is_empty() {
+                    out.push('\n');
+                }
+            }
+
+            if still_working {
+                out.push_str("⏳ still working — did not finish within the fallback window.\n");
             }
         }
         out
@@ -625,7 +686,8 @@ mod tests {
         let mux = mux(&tmp);
         let ghost = PanelId::new();
 
-        let report = mux.assemble_round_report(&[ghost], ReadPanelMode::LastMessage);
+        let report =
+            mux.assemble_round_report(&[ghost], ReadPanelMode::LastMessage, &HashMap::new());
         assert!(report.contains("Round complete"), "report: {report}");
         assert!(
             report.contains("gone"),
@@ -651,10 +713,87 @@ mod tests {
             PanelState::Working,
         );
 
-        let report = mux.assemble_round_report(&[sub], ReadPanelMode::LastMessage);
+        let report = mux.assemble_round_report(&[sub], ReadPanelMode::LastMessage, &HashMap::new());
         assert!(
             report.contains("still working"),
             "a Working panel must be marked unfinished: {report}"
+        );
+
+        mux.shutdown();
+    }
+
+    /// `assemble_round_report` emits a `### task N` section for every captured
+    /// turn followed by the panel's final live read — so a multi-task backlog
+    /// delivers all of its intermediate outputs, not only the last. Boundary:
+    /// two captured turns + the live final read → three numbered sections, each
+    /// captured body present in the report.
+    ///
+    /// Spawning a panel needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn assemble_round_report_emits_a_section_per_captured_task() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Some(sub) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+
+        // Two finished turns already captured; the settled panel adds a third
+        // (its final turn, read live) when the report is assembled.
+        let captured = HashMap::from([(
+            sub,
+            vec![
+                "output of task one".to_string(),
+                "output of task two".to_string(),
+            ],
+        )]);
+        let report = mux.assemble_round_report(&[sub], ReadPanelMode::LastMessage, &captured);
+
+        assert!(
+            report.contains("### task 1"),
+            "first captured turn header missing: {report}"
+        );
+        assert!(
+            report.contains("### task 2"),
+            "second captured turn header missing: {report}"
+        );
+        assert!(
+            report.contains("### task 3"),
+            "final live-read turn header missing: {report}"
+        );
+        assert!(
+            report.contains("output of task one"),
+            "first captured body missing: {report}"
+        );
+        assert!(
+            report.contains("output of task two"),
+            "second captured body missing: {report}"
+        );
+
+        mux.shutdown();
+    }
+
+    /// A single-output panel (no backlog → empty `captured`) keeps the original
+    /// header-less report shape: `### task N` sections appear only when there is
+    /// more than one output to disambiguate. Backward-compat boundary against
+    /// the multi-task case above.
+    ///
+    /// Spawning a panel needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn assemble_round_report_omits_task_headers_for_a_single_output() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Some(sub) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+
+        let report = mux.assemble_round_report(&[sub], ReadPanelMode::LastMessage, &HashMap::new());
+        assert!(
+            !report.contains("### task"),
+            "a single-output panel must not get task headers: {report}"
         );
 
         mux.shutdown();
@@ -890,6 +1029,92 @@ mod tests {
             mux.panels().iter().find(|p| p.id == main).unwrap().state(),
             PanelState::Working,
             "delivery injects the round report into the main panel",
+        );
+
+        mux.shutdown();
+    }
+
+    /// Each backlog feed captures the just-finished turn into
+    /// `PendingRound::captured`, growing it by exactly one per fed task, while
+    /// the final (queue-empty) settle captures nothing — that last turn is read
+    /// live by `assemble_round_report`. The accumulation that lets the delivered
+    /// report carry every task's result, tested at its boundaries.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn feed_round_backlog_captures_each_finished_turn() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let session_id = mux.session.id;
+
+        let Some(main) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+        let Some(sub) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+
+        // Two queued tasks; generous fallback so only the backlog drives it.
+        mux.register_round(
+            vec![sub],
+            None,
+            Some(3600),
+            Some(HashMap::from([(
+                sub,
+                vec!["task-1".to_string(), "task-2".to_string()],
+            )])),
+        );
+
+        // First feed: idle sub with task-1 queued → captures the pre-backlog turn.
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.pending_rounds[0].captured.get(&sub).map(Vec::len),
+            Some(1),
+            "the first feed must capture exactly one finished turn",
+        );
+
+        // Settle, then second feed: captures task-1's output.
+        mux.handle_signal(TurnSignal::now(
+            session_id,
+            sub,
+            crate::signal::TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        ));
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.pending_rounds[0].captured.get(&sub).map(Vec::len),
+            Some(2),
+            "the second feed must capture a second finished turn",
+        );
+
+        // Settle with the queue now drained. Hold delivery (compose grace) so
+        // the round stays pending and we can prove the final settle captures
+        // nothing — the last turn is left for the live read.
+        mux.handle_signal(TurnSignal::now(
+            session_id,
+            sub,
+            crate::signal::TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        ));
+        mux.main_compose_since = Some(Instant::now());
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.pending_rounds[0].captured.get(&sub).map(Vec::len),
+            Some(2),
+            "the queue-empty settle must not capture — the last turn is read live",
+        );
+
+        // Release the hold: the drained round now delivers to the idle main.
+        mux.main_compose_since = None;
+        mux.poll_pending_rounds();
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "the drained round must deliver once the compose hold clears",
         );
 
         mux.shutdown();
