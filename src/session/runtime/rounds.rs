@@ -27,6 +27,11 @@ const ROUND_FALLBACK_MAX_SECS: u64 = 3600;
 /// round into a half-typed line) is the priority.
 const COMPOSE_GRACE: Duration = Duration::from_secs(5);
 
+/// Minimum gap between stranded-main nudges ([`Multiplexer::poll_stranded_main`]).
+/// A main worker that keeps going idle without registering a round is prodded
+/// at most this often, so the safety net never floods its context every tick.
+const STRANDED_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// A round caucus is watching on the main worker's behalf
 /// ([`Multiplexer::poll_pending_rounds`]).
 ///
@@ -222,6 +227,86 @@ impl Multiplexer {
             .main_compose_since
             .is_none_or(|t| Instant::now().duration_since(t) >= COMPOSE_GRACE);
         main_idle && quiet
+    }
+
+    /// Nudge the main worker when it has gone idle while sub-panels still run
+    /// but **no** round is registered to ever wake it — the stranded-main
+    /// safety net. Called once per event-loop tick, after round delivery.
+    ///
+    /// caucus's only caucus→main pushes ([`Multiplexer::poll_pending_rounds`],
+    /// [`Multiplexer::poll_round_selection_prompts`]) both require a registered
+    /// round. If the main worker broadcasts/spawns work and ends its turn
+    /// *without* calling `register_round`, no round exists, so nothing ever
+    /// re-prompts it: it sits idle forever while the sub-panels work. This is
+    /// the uniform guard for that gap — independent of how the work was
+    /// dispatched (broadcast, per-panel `send_keys`, or `spawn_role`) — telling
+    /// main its panels are still working and it must register a round (or act),
+    /// because caucus cannot push their results back without one.
+    ///
+    /// Stranded ⟺ main exists and is `Idle`, `pending_rounds` is empty (a
+    /// pending round *is* a wake path), and ≥1 non-main panel is
+    /// `Working`/`Spawning`. Fires only while stranded, the shared
+    /// deliverability gate is open ([`Multiplexer::main_deliverable`]), and at
+    /// least `STRANDED_NUDGE_COOLDOWN` has passed since the last nudge. The
+    /// `main_stranded_last_nudge` latch is cleared the instant main is no longer
+    /// stranded, so a fresh stranding re-arms without waiting out the cooldown.
+    pub fn poll_stranded_main(&mut self) {
+        let Some(main_id) = self.main_panel_id else {
+            return;
+        };
+        // A pending round is itself a wake path; with one queued, main is not
+        // stranded — round delivery (or its fallback) will re-prompt it.
+        let working: Vec<PanelId> = if self.pending_rounds.is_empty() {
+            self.panels
+                .iter()
+                .filter(|p| {
+                    p.id != main_id
+                        && matches!(p.state(), PanelState::Working | PanelState::Spawning)
+                })
+                .map(|p| p.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if working.is_empty() {
+            // Not stranded (round queued, or nothing else running): re-arm.
+            self.main_stranded_last_nudge = None;
+            return;
+        }
+        // Gate closed (main not idle, or user mid-compose): hold the latch so
+        // the cooldown keeps counting; do not nudge into a busy/typed-on main.
+        if !self.main_deliverable() {
+            return;
+        }
+        if let Some(t) = self.main_stranded_last_nudge
+            && Instant::now().duration_since(t) < STRANDED_NUDGE_COOLDOWN
+        {
+            return;
+        }
+
+        let mut notice = String::from(
+            "[caucus] You are idle with no round registered, but these panels \
+             are still working:\n",
+        );
+        for &id in &working {
+            let role = self
+                .panels
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.role.clone())
+                .unwrap_or_default();
+            notice.push_str(&format!("  - {id} (role: {role})\n"));
+        }
+        notice.push_str(
+            "caucus can only push their results back to you through a round. \
+             Call register_round on these panel ids and end your turn; caucus \
+             re-prompts you when they settle. (Without a round there is no \
+             wake-up path — you stay idle indefinitely.)",
+        );
+        if let Err(err) = McpToolSurface::send_keys(self, main_id, &notice, true) {
+            warn!(error = %err, "stranded-main nudge to main panel failed");
+        }
+        self.main_stranded_last_nudge = Some(Instant::now());
     }
 
     /// Announce to the main worker when a panel in a pending round has stopped
@@ -829,6 +914,186 @@ mod tests {
             PanelState::Idle,
         );
         Some(id)
+    }
+
+    /// The stranded-main nudge: main idle, a sub-panel still `Working`, and no
+    /// round registered → caucus prods main (flipping it to `Working`, the
+    /// injected turn) and arms the cooldown latch. This is the only wake path
+    /// when the main worker forgot to call `register_round`.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn poll_stranded_main_nudges_idle_main_with_working_sub_and_no_round() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Some(main) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+
+        // A sub-panel left `Working`, and deliberately no round registered.
+        let Ok(sub) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.note_prompt_delivered(sub);
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == sub).unwrap().state(),
+            PanelState::Working,
+        );
+        assert!(mux.pending_rounds.is_empty());
+
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "stranded main must be nudged (its panel flips to Working)",
+        );
+        assert!(
+            mux.main_stranded_last_nudge.is_some(),
+            "nudging must arm the cooldown latch",
+        );
+
+        mux.shutdown();
+    }
+
+    /// A pending round is itself a wake path, so a main idle with a `Working`
+    /// sub is *not* stranded while a round is queued — no nudge fires and the
+    /// round stays queued for [`Multiplexer::poll_pending_rounds`] to deliver.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn poll_stranded_main_silent_when_a_round_is_pending() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Some(main) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+
+        let Ok(sub) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.note_prompt_delivered(sub);
+        mux.register_round(vec![sub], None, Some(600), None);
+
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "a queued round is a wake path: main must not be nudged",
+        );
+        assert_eq!(mux.pending_rounds.len(), 1, "the round stays queued");
+        assert!(
+            mux.main_stranded_last_nudge.is_none(),
+            "latch stays disarmed"
+        );
+
+        mux.shutdown();
+    }
+
+    /// With every non-main panel settled, main is idle by choice, not stranded:
+    /// no nudge fires and the latch is (re-)disarmed for a future stranding.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn poll_stranded_main_silent_when_nothing_else_working() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Some(main) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+        let Some(_sub) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        // Pre-arm the latch to prove a non-stranded poll clears it.
+        mux.main_stranded_last_nudge = Some(Instant::now());
+
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "no working sub: main must not be nudged",
+        );
+        assert!(
+            mux.main_stranded_last_nudge.is_none(),
+            "a non-stranded poll must re-arm (clear) the latch",
+        );
+
+        mux.shutdown();
+    }
+
+    /// The cooldown: once nudged, a main that goes idle again while still
+    /// stranded is not re-nudged until `STRANDED_NUDGE_COOLDOWN` elapses;
+    /// after it does, the nudge fires again.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn poll_stranded_main_respects_cooldown_then_renudges() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let session_id = mux.session.id;
+
+        let Some(main) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+        let Ok(sub) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.note_prompt_delivered(sub);
+
+        // First nudge fires and flips main to Working.
+        mux.poll_stranded_main();
+        let armed = mux.main_stranded_last_nudge;
+        assert!(armed.is_some());
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+        );
+
+        // Main returns to Idle (still stranded), but within the cooldown: no
+        // second nudge — main stays Idle and the latch is unchanged.
+        mux.handle_signal(TurnSignal::now(
+            session_id,
+            main,
+            crate::signal::TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        ));
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "within cooldown the stranded main must not be re-nudged",
+        );
+        assert_eq!(
+            mux.main_stranded_last_nudge, armed,
+            "a suppressed nudge must not bump the latch",
+        );
+
+        // Backdate the latch past the cooldown: the nudge fires again.
+        mux.main_stranded_last_nudge =
+            Some(Instant::now() - STRANDED_NUDGE_COOLDOWN - Duration::from_secs(1));
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "past the cooldown a still-stranded main is re-nudged",
+        );
+
+        mux.shutdown();
     }
 
     /// A live selection menu overlays `AwaitingSelection` onto an otherwise

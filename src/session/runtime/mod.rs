@@ -90,6 +90,15 @@ pub struct Multiplexer {
     /// an entry is dropped when its panel leaves the menu, and replaced when
     /// the menu's content changes.
     notified_menus: HashMap<PanelId, u64>,
+    /// Instant of the last stranded-main nudge, or `None` while not stranded.
+    /// caucus's only caucus→main pushes require a registered round; if the
+    /// main worker ends its turn without one while sub-panels still run, no
+    /// path ever re-prompts it. [`Multiplexer::poll_stranded_main`] prods it,
+    /// rate-limited by this latch (`STRANDED_NUDGE_COOLDOWN`) so a main that
+    /// keeps idling without registering a round is nudged periodically, never
+    /// every tick. Cleared the moment main is no longer stranded, so a fresh
+    /// stranding re-arms immediately.
+    main_stranded_last_nudge: Option<Instant>,
     /// Panel arrangement mode for [`Layout::reflow`] — cycled by `Ctrl-A Space`.
     layout_mode: LayoutMode,
     /// When `Some` and the id is still live, the layout shows only that panel
@@ -158,6 +167,7 @@ impl Multiplexer {
                 main_panel_id: None,
                 main_compose_since: None,
                 notified_menus: HashMap::new(),
+                main_stranded_last_nudge: None,
                 layout_mode: LayoutMode::default(),
                 zoom: None,
                 show_transcript: false,

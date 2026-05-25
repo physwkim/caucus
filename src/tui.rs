@@ -314,11 +314,18 @@ async fn event_loop(
         //    inject them into the main worker's panel (the caucus→main push).
         mux.poll_pending_rounds();
 
+        // 7. Stranded-main guard — if the main worker went idle with no round
+        //    registered while sub-panels still run, nothing above can ever
+        //    re-prompt it (both pushes need a round). Nudge it. Runs last: it
+        //    only fires when `pending_rounds` is empty, so it never competes
+        //    with steps 5–6 for the one-push-per-tick gate.
+        mux.poll_stranded_main();
+
         if mux.should_quit() {
             break;
         }
 
-        // 7. Redraw on the tick.
+        // 8. Redraw on the tick.
         if last_draw.elapsed() >= TICK {
             draw(&mut terminal, &mux)?;
             last_draw = Instant::now();
