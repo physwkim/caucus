@@ -154,6 +154,7 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
      broadcast(panels=[<worker-1>,<worker-2>,<worker-3>], text="<공통 안건>", enter=true)
      (패널별로 다른 sub-task면 send_keys를 패널마다)
      register_round(panels=[<worker-1>,<worker-2>,<worker-3>])
+     (조기 완료 워커를 계속 돌리려면 backlog={<panel>:[후속 task,...]}도 함께 — 아래 **백로그** 참조)
    register_round는 즉시 반환한다 — 블로킹도 timeout 대기도 없다. main worker는
    턴을 끝내고 자유로워진다.
 
@@ -175,6 +176,18 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
      - 병합 완료  → 결과를 종합해 사용자에게 보고
      - 막힘      → 사용자에게 보고
 ```
+
+**백로그(조기 완료 워커 연속)**: `register_round`에 패널별 후속 task 큐
+`backlog={<panel>:["task1","task2",...]}`를 함께 넘기면, 그 패널은 idle이 될
+때마다 큐의 다음 task를 받아(`feed_round_backlog`) 다시 Working으로 돌아간다 —
+일찍 끝난 워커가 barrier에서 놀지 않고 자기 백로그를 계속 처리한다. 패널이
+라운드에 대해 settle하는 건 idle이고 *큐까지 빈* 순간뿐이다(백로그 없는 패널은
+첫 idle에 settle — 기존 단일 task 동작). 등록 시 라운드에 없는 패널의 큐와 빈
+큐는 버려진다. 큐의 task를 보내기 직전(패널이 아직 idle일 때) caucus가 막 끝난
+턴의 출력을 `read_mode`로 캡처해 둔다 — 전달 보고서가 마지막 턴만이 아니라 모든
+task 산출물을 담도록. settle해 전달될 때는 캡처분 + 최종 턴 라이브 read가 함께
+`### task N` 섹션으로 main에 주입된다(단일 task면 헤더 없이 기존과 동일; fallback
+시 미완 패널은 끝낸 task들 + "still working" 마커).
 
 **선택 프롬프트 엣지**: 라운드 패널의 sub-agent가 턴을 끝내지 않고 대화형
 선택 메뉴(AskUserQuestion 류)에서 멈추면 turn signal이 안 와 라운드가 settle하지
