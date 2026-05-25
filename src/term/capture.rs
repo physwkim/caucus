@@ -124,17 +124,15 @@ impl OutputCapture {
             // Borrow the oldest without removing it yet, so a write failure
             // does not drop unspilled bytes.
             let oldest = &self.turns[0];
-            match self.log_path.as_deref() {
-                Some(path) => {
-                    if write_turn(path, oldest).is_err() {
-                        // Leave it in memory; retry on the next end_turn.
-                        break;
-                    }
-                }
-                None => {
-                    // No log configured: still evict to honour the memory
-                    // bound, but history before the ring is then unrecoverable.
-                }
+            // Spill to disk when a log is configured; a write failure stops
+            // this call and leaves the turn in memory (no bytes lost — the
+            // next end_turn retries). With no log configured the turn is still
+            // evicted below to honour the memory bound, though history before
+            // the ring is then unrecoverable.
+            if let Some(path) = self.log_path.as_deref()
+                && write_turn(path, oldest).is_err()
+            {
+                break;
             }
             self.turns.remove(0);
             self.spilled_turns += 1;
