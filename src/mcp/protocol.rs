@@ -12,6 +12,8 @@
 //! [`crate::mcp::control_server`] event-loop integration trivial — one queued
 //! op, one reply.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::role::spec::AgentCli;
@@ -69,6 +71,13 @@ pub enum ControlRequest {
     /// turn and is re-prompted by caucus on completion (no blocking, no
     /// timeout-shaped wait). `read_mode` selects what each panel's result is
     /// read as on delivery (default `last_message`).
+    ///
+    /// `backlog` is an optional per-panel task queue keyed by panel id: while
+    /// the round runs, a panel that goes idle with tasks still queued is fed
+    /// its next task (so an early finisher keeps working instead of idling
+    /// until the barrier); the panel settles for the round only once it is
+    /// idle *and* its queue is empty. A panel absent from `backlog` settles on
+    /// its first idle, the original one-task-per-panel behaviour.
     /// (`crate::session::runtime::Multiplexer::poll_pending_rounds`).
     RegisterRound {
         panels: Vec<PanelId>,
@@ -76,6 +85,8 @@ pub enum ControlRequest {
         read_mode: Option<ReadPanelMode>,
         #[serde(default)]
         fallback_secs: Option<u64>,
+        #[serde(default)]
+        backlog: Option<HashMap<PanelId, Vec<String>>>,
     },
     /// Read the interactive selection menu shown in a panel (if any) as
     /// readable text. Answered with a [`ControlResponse::Panel`].
@@ -190,10 +201,15 @@ mod tests {
 
     #[test]
     fn register_round_round_trips() {
+        let panel = PanelId::new();
         let req = ControlRequest::RegisterRound {
-            panels: vec![PanelId::new(), PanelId::new()],
+            panels: vec![panel, PanelId::new()],
             read_mode: Some(ReadPanelMode::SinceLastTurn),
             fallback_secs: Some(120),
+            backlog: Some(HashMap::from([(
+                panel,
+                vec!["CA-SR-2".to_string(), "CA-SR-3".to_string()],
+            )])),
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains("\"op\":\"register_round\""));
@@ -203,7 +219,7 @@ mod tests {
 
     #[test]
     fn register_round_optional_fields_default_to_none() {
-        // `read_mode` and `fallback_secs` default to None when omitted.
+        // `read_mode`, `fallback_secs`, and `backlog` default to None when omitted.
         let id = PanelId::new();
         let req: ControlRequest =
             serde_json::from_str(&format!(r#"{{"op":"register_round","panels":["{id}"]}}"#))
@@ -214,6 +230,7 @@ mod tests {
                 panels: vec![id],
                 read_mode: None,
                 fallback_secs: None,
+                backlog: None,
             }
         );
     }

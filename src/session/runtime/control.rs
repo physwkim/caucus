@@ -58,7 +58,8 @@ impl Multiplexer {
                 panels,
                 read_mode,
                 fallback_secs,
-            } => self.register_round(panels, read_mode, fallback_secs),
+                backlog,
+            } => self.register_round(panels, read_mode, fallback_secs, backlog),
             ControlRequest::ReadMenu { panel } => match self.read_menu(panel) {
                 Ok(text) => ControlResponse::Panel { text },
                 Err(err) => ControlResponse::error(err),

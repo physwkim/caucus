@@ -4,7 +4,7 @@ use crate::mcp::protocol::ControlResponse;
 use crate::mcp::{McpToolSurface, ReadPanelMode};
 use crate::panel::lifecycle::{Panel, PanelState};
 use crate::session::id::PanelId;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -40,6 +40,13 @@ pub(super) struct PendingRound {
     /// Panel ids in the round. Ids that no longer exist count as settled
     /// (see [`Multiplexer::wait_panels_settled`]).
     panels: Vec<PanelId>,
+    /// Per-panel follow-up task queue. A round panel that goes idle with a
+    /// non-empty queue is fed its next task (popped front) by
+    /// [`Multiplexer::feed_round_backlog`], flipping it back to `Working` — so
+    /// an early finisher keeps working its backlog instead of idling until the
+    /// barrier. A panel settles for the round only once it is idle *and* its
+    /// queue is empty; a panel with no entry here settles on its first idle.
+    backlog: HashMap<PanelId, VecDeque<String>>,
     /// How each panel's result is read for the delivered report.
     pub(super) read_mode: ReadPanelMode,
     /// Wall-clock instant past which the round is delivered regardless of
@@ -57,18 +64,35 @@ impl Multiplexer {
     /// already-settled round — delivery is decided uniformly by
     /// [`Multiplexer::poll_pending_rounds`] (which also gates on the main panel
     /// being idle), so the registration path has exactly one shape.
+    ///
+    /// `backlog` is an optional per-panel task queue: a panel listed here is
+    /// fed its next task on each idle (keeping an early finisher busy) and
+    /// settles only once its queue drains; a panel absent from `backlog`
+    /// settles on its first idle, the original one-task behaviour. Entries for
+    /// panels not in `panels` and empty queues are dropped at registration, so
+    /// `backlog` only ever holds work that can actually be fed.
     pub(crate) fn register_round(
         &mut self,
         panels: Vec<PanelId>,
         read_mode: Option<ReadPanelMode>,
         fallback_secs: Option<u64>,
+        backlog: Option<HashMap<PanelId, Vec<String>>>,
     ) -> ControlResponse {
         let budget = fallback_secs
             .unwrap_or(ROUND_FALLBACK_DEFAULT_SECS)
             .clamp(1, ROUND_FALLBACK_MAX_SECS);
+        let backlog = backlog
+            .unwrap_or_default()
+            .into_iter()
+            // Only queue work for panels actually in the round, and drop empty
+            // queues so the feed/settle check never sees a vacuous entry.
+            .filter(|(id, tasks)| panels.contains(id) && !tasks.is_empty())
+            .map(|(id, tasks)| (id, VecDeque::from(tasks)))
+            .collect();
         let ack = self.panel_snapshot(&panels);
         self.pending_rounds.push(PendingRound {
             panels,
+            backlog,
             read_mode: read_mode.unwrap_or(ReadPanelMode::LastMessage),
             fallback_deadline: Instant::now() + Duration::from_secs(budget),
         });
@@ -87,6 +111,12 @@ impl Multiplexer {
     /// injection flips the main panel to `Working`, so any other due round
     /// naturally holds until the main worker is idle again. A due round with
     /// no main panel to deliver to is dropped (it would otherwise be stranded).
+    ///
+    /// Before the due-check, each round's backlog is fed
+    /// ([`Multiplexer::feed_round_backlog`]): a panel that finished early with
+    /// queued tasks is handed its next task and flips back to `Working`, so it
+    /// is not yet settled and the round is not yet due — the early finisher
+    /// keeps working its backlog instead of idling at the barrier.
     pub fn poll_pending_rounds(&mut self) {
         if self.pending_rounds.is_empty() {
             return;
@@ -99,7 +129,11 @@ impl Multiplexer {
         let deliverable = self.main_deliverable();
 
         let mut delivered = false;
-        for round in rounds {
+        for mut round in rounds {
+            // Keep early finishers busy: hand any idle round-panel its next
+            // queued task before judging the round done. A fed panel flips to
+            // `Working`, so `wait_panels_settled` sees it as unfinished.
+            self.feed_round_backlog(&mut round);
             let due = now >= round.fallback_deadline || self.wait_panels_settled(&round.panels);
             match main_id {
                 // Due, gate open, nothing delivered yet this tick: assemble +
@@ -116,6 +150,55 @@ impl Multiplexer {
                 // Not due, gate closed, or already delivered one this tick:
                 // keep it for a later tick.
                 _ => self.pending_rounds.push(round),
+            }
+        }
+    }
+
+    /// Hand each cleanly-idle round panel its next backlog task, keeping an
+    /// early finisher busy instead of idling at the barrier. Called once per
+    /// round per tick from [`Multiplexer::poll_pending_rounds`], before the
+    /// due-check.
+    ///
+    /// Only a panel in coarse `Idle` is fed — never one that is `Working` or
+    /// still `Spawning`. A panel stopped on a selection menu is excluded for
+    /// free: a chooser fires no `Stop` hook, so such a panel stays coarse
+    /// `Working` (and [`Multiplexer::poll_round_selection_prompts`] routes it to
+    /// the main worker instead). The next task is delivered with `enter`, which
+    /// flips the panel back to `Working` (so it is no longer settled); an empty
+    /// queue is left in place and the panel settles. The queue is popped only after
+    /// the send actually succeeds, so a failed delivery leaves the task at the
+    /// front to be retried next tick rather than silently dropped. Feeding is
+    /// not gated by [`Multiplexer::main_deliverable`]: keeping a worker busy is
+    /// independent of the main panel's state.
+    fn feed_round_backlog(&mut self, round: &mut PendingRound) {
+        // Decide every feed first (borrows only `round` + reads `self.panels`),
+        // then deliver (mut-borrows `self`), so the two borrows never overlap.
+        // The front is cloned, not popped, here — it is consumed only on a
+        // confirmed send below.
+        let mut feeds: Vec<(PanelId, String)> = Vec::new();
+        for &id in &round.panels {
+            let idle = self
+                .panels
+                .iter()
+                .find(|p| p.id == id)
+                .is_some_and(|p| p.state() == PanelState::Idle);
+            if !idle {
+                continue;
+            }
+            if let Some(task) = round.backlog.get(&id).and_then(VecDeque::front) {
+                feeds.push((id, task.clone()));
+            }
+        }
+        for (id, task) in feeds {
+            match McpToolSurface::send_keys(self, id, &task, true) {
+                // Delivered: consume the task (still the queue's front, single
+                // tick, nothing else mutates the queue between collect + here).
+                Ok(()) => {
+                    round.backlog.get_mut(&id).and_then(VecDeque::pop_front);
+                }
+                // Delivery failed: leave the task at the front; the panel is
+                // still idle, so the next tick retries it.
+                Err(err) => warn!(error = %err, panel = %id, "round backlog feed failed"),
             }
         }
     }
@@ -401,13 +484,52 @@ mod tests {
         let mut mux = mux(&tmp);
         let ghost = PanelId::new();
 
-        let ack = mux.register_round(vec![ghost], None, Some(60));
+        let ack = mux.register_round(vec![ghost], None, Some(60), None);
         match ack {
             ControlResponse::Panels { panels } => assert!(panels.is_empty()),
             other => panic!("expected an immediate Panels ack, got {other:?}"),
         }
         assert_eq!(mux.pending_rounds.len(), 1, "round must be stashed");
         assert_eq!(mux.pending_rounds[0].read_mode, ReadPanelMode::LastMessage);
+    }
+
+    /// `register_round` stashes a backlog only for panels actually in the round
+    /// and drops empty queues, so the feed/settle check never sees a vacuous
+    /// entry: a queue for a stray (non-round) panel and an empty queue are both
+    /// discarded at registration.
+    #[tokio::test]
+    async fn register_round_keeps_backlog_only_for_round_panels_and_drops_empty() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let keep = PanelId::new();
+        let empty = PanelId::new();
+        let stray = PanelId::new();
+
+        mux.register_round(
+            vec![keep, empty],
+            None,
+            Some(600),
+            Some(HashMap::from([
+                (keep, vec!["t1".to_string(), "t2".to_string()]),
+                (empty, vec![]),                // in round but no work → dropped
+                (stray, vec!["x".to_string()]), // has work but not in round → dropped
+            ])),
+        );
+
+        let backlog = &mux.pending_rounds[0].backlog;
+        assert_eq!(
+            backlog.len(),
+            1,
+            "only the in-round non-empty queue survives"
+        );
+        assert_eq!(
+            backlog
+                .get(&keep)
+                .map(|q| q.iter().cloned().collect::<Vec<_>>()),
+            Some(vec!["t1".to_string(), "t2".to_string()]),
+        );
+        assert!(!backlog.contains_key(&empty), "empty queue must be dropped");
+        assert!(!backlog.contains_key(&stray), "stray panel must be dropped");
     }
 
     /// `assemble_round_report` reports an id that no longer exists as gone
@@ -462,7 +584,7 @@ mod tests {
         let mut mux = mux(&tmp);
         assert!(mux.main_panel_id.is_none());
 
-        mux.register_round(vec![PanelId::new()], None, Some(600));
+        mux.register_round(vec![PanelId::new()], None, Some(600), None);
         assert_eq!(mux.pending_rounds.len(), 1);
 
         mux.poll_pending_rounds();
@@ -495,7 +617,7 @@ mod tests {
 
         // A round on a non-existent id is due immediately (a missing id counts
         // as settled). Killing main clears the id, so the next poll drops it.
-        mux.register_round(vec![PanelId::new()], None, Some(600));
+        mux.register_round(vec![PanelId::new()], None, Some(600), None);
         mux.kill_panel(main).unwrap();
         assert!(
             mux.main_panel_id.is_none(),
@@ -520,7 +642,7 @@ mod tests {
         let mut mux = mux(&tmp);
         mux.main_panel_id = Some(PanelId::new());
 
-        mux.register_round(vec![PanelId::new()], None, Some(600));
+        mux.register_round(vec![PanelId::new()], None, Some(600), None);
         mux.poll_pending_rounds();
         assert_eq!(
             mux.pending_rounds.len(),
@@ -568,7 +690,7 @@ mod tests {
             return;
         };
         mux.note_prompt_delivered(sub);
-        mux.register_round(vec![sub], None, Some(600));
+        mux.register_round(vec![sub], None, Some(600), None);
 
         // Sub still working -> round held.
         mux.poll_pending_rounds();
@@ -610,6 +732,103 @@ mod tests {
         );
 
         mux.shutdown();
+    }
+
+    /// A round panel with a backlog is fed its next task on idle (flipping it
+    /// back to `Working`, so the round is *not* due), and settles — letting the
+    /// round deliver to main — only once its queue drains. The end-to-end
+    /// early-finisher loop: keep working the backlog instead of idling at the
+    /// barrier.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn poll_pending_rounds_feeds_backlog_then_settles_when_drained() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let session_id = mux.session.id;
+
+        let Some(main) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+        let Some(sub) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+
+        // One queued task for the sub; generous fallback so only the backlog,
+        // not the deadline, drives the round.
+        mux.register_round(
+            vec![sub],
+            None,
+            Some(3600),
+            Some(HashMap::from([(sub, vec!["only-task".to_string()])])),
+        );
+
+        // Sub is idle with a task queued: the poll feeds it (→ Working), so the
+        // round is not yet due and stays pending; the queue is now empty.
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == sub).unwrap().state(),
+            PanelState::Working,
+            "an idle sub with a queued task must be fed (flips to Working)",
+        );
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "round held while the sub works"
+        );
+        assert!(
+            mux.pending_rounds[0]
+                .backlog
+                .get(&sub)
+                .is_none_or(VecDeque::is_empty),
+            "the fed task must be consumed from the queue",
+        );
+
+        // Sub finishes its backlog task → idle with an empty queue → settles,
+        // so the round becomes due and delivers to the idle main panel.
+        mux.handle_signal(TurnSignal::now(
+            session_id,
+            sub,
+            crate::signal::TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        ));
+        mux.poll_pending_rounds();
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "with the queue drained the round must deliver, not re-feed",
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "delivery injects the round report into the main panel",
+        );
+
+        mux.shutdown();
+    }
+
+    /// Drive a freshly spawned panel to `Idle` (Spawning → Working → Idle) by
+    /// marking its prompt delivered then handing it a `Stop` turn signal — the
+    /// settle path the stranded-main tests share. Returns the panel id.
+    fn spawn_idle(mux: &mut Multiplexer, role: &str) -> Option<PanelId> {
+        let id = mux.spawn_panel(role, None, None, None).ok()?;
+        let session_id = mux.session.id;
+        mux.note_prompt_delivered(id);
+        mux.handle_signal(TurnSignal::now(
+            session_id,
+            id,
+            crate::signal::TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        ));
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == id).unwrap().state(),
+            PanelState::Idle,
+        );
+        Some(id)
     }
 
     /// A live selection menu overlays `AwaitingSelection` onto an otherwise

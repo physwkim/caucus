@@ -255,7 +255,11 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                           their assembled results to you as a new message. \
                           Returns immediately — after calling this, end your \
                           turn; caucus re-prompts you when the round completes. \
-                          Do NOT sleep-poll list_panels.",
+                          Do NOT sleep-poll list_panels. Use `backlog` to keep \
+                          a panel busy across several tasks: caucus feeds it the \
+                          next queued task each time it goes idle, so an early \
+                          finisher never sits idle, and the panel settles only \
+                          once its queue drains.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -275,6 +279,20 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                         "description": "Safety-net seconds: if the panels never \
                                         all settle, caucus delivers a partial \
                                         report after this (default 600, max 3600)."
+                    },
+                    "backlog": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "description": "Optional per-panel follow-up queue, keyed \
+                                        by panel id (ULID) → ordered list of task \
+                                        prompts. caucus feeds a panel its next \
+                                        task whenever it goes idle; the panel \
+                                        settles only once its queue is empty. A \
+                                        panel omitted here settles on its first \
+                                        idle (one task)."
                     }
                 },
                 "required": ["panels"]

@@ -239,10 +239,39 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                     })?),
                     None => None,
                 };
+            let backlog = match args.get("backlog") {
+                Some(v) => {
+                    let obj = v.as_object().ok_or_else(|| {
+                        "`backlog` must be an object mapping panel id → array of task strings"
+                            .to_string()
+                    })?;
+                    let mut map = std::collections::HashMap::with_capacity(obj.len());
+                    for (key, tasks) in obj {
+                        let id = key
+                            .parse::<PanelId>()
+                            .map_err(|e| format!("invalid backlog panel id `{key}`: {e}"))?;
+                        let arr = tasks.as_array().ok_or_else(|| {
+                            format!("`backlog[{key}]` must be an array of task strings")
+                        })?;
+                        let tasks = arr
+                            .iter()
+                            .map(|t| {
+                                t.as_str().map(str::to_string).ok_or_else(|| {
+                                    format!("`backlog[{key}]` entries must be strings")
+                                })
+                            })
+                            .collect::<std::result::Result<Vec<String>, String>>()?;
+                        map.insert(id, tasks);
+                    }
+                    Some(map)
+                }
+                None => None,
+            };
             Ok(ControlRequest::RegisterRound {
                 panels,
                 read_mode,
                 fallback_secs,
+                backlog,
             })
         }
         "read_menu" => Ok(ControlRequest::ReadMenu {
@@ -451,6 +480,7 @@ mod tests {
                 panels: vec![a, b],
                 read_mode: Some(super::super::ReadPanelMode::SinceLastTurn),
                 fallback_secs: Some(90),
+                backlog: None,
             }
         );
     }
@@ -465,6 +495,32 @@ mod tests {
                 panels: vec![a],
                 read_mode: None,
                 fallback_secs: None,
+                backlog: None,
+            }
+        );
+    }
+
+    #[test]
+    fn build_register_round_parses_backlog() {
+        let a = PanelId::new();
+        let req = build_request(
+            "register_round",
+            &json!({
+                "panels": [a.to_string()],
+                "backlog": { a.to_string(): ["CA-SR-2", "CA-SR-3"] }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::RegisterRound {
+                panels: vec![a],
+                read_mode: None,
+                fallback_secs: None,
+                backlog: Some(std::collections::HashMap::from([(
+                    a,
+                    vec!["CA-SR-2".to_string(), "CA-SR-3".to_string()],
+                )])),
             }
         );
     }
@@ -479,6 +535,28 @@ mod tests {
     fn build_register_round_rejects_bad_panel_id() {
         let err = build_request("register_round", &json!({"panels": ["not-a-ulid"]})).unwrap_err();
         assert!(err.contains("invalid panel id"));
+    }
+
+    #[test]
+    fn build_register_round_rejects_bad_backlog() {
+        let a = PanelId::new();
+        // A backlog whose entries are not string arrays is rejected.
+        let err = build_request(
+            "register_round",
+            &json!({"panels": [a.to_string()], "backlog": {a.to_string(): "not-an-array"}}),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("must be an array of task strings"),
+            "got: {err}"
+        );
+        // A backlog keyed by a non-ulid is rejected.
+        let err = build_request(
+            "register_round",
+            &json!({"panels": [a.to_string()], "backlog": {"not-a-ulid": ["x"]}}),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid backlog panel id"), "got: {err}");
     }
 
     #[test]
