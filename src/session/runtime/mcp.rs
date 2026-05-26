@@ -3,6 +3,8 @@ use crate::mcp::{McpError, McpToolSurface, PanelSummary, ReadPanelMode};
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
 use crate::worktree::cleanup::CleanupJob;
+use std::time::{Duration, Instant};
+use tracing::warn;
 
 /// The main worker's MCP tool surface, backed by the live panel registry
 /// (`docs/design.md` §0 #4). Every method runs on the multiplexer's own
@@ -15,19 +17,25 @@ impl McpToolSurface for Multiplexer {
             .iter_mut()
             .find(|p| p.id == panel)
             .ok_or(McpError::NoSuchPanel(panel))?;
-        // Frame the prompt for the agent's input mode: when it has enabled
-        // bracketed paste, deliver `text` as a real paste so the submitting
-        // `\r` is seen as a discrete keypress (and any newline *inside* the
-        // text does not submit early) — see `encode_input`.
-        let bytes = encode_input(text.as_bytes(), enter, p.grid().bracketed_paste());
-        p.write_input(&bytes)
+        // Frame the prompt for the agent's input mode (see `plan_delivery`).
+        let plan = plan_delivery(text.as_bytes(), enter, p.grid().bracketed_paste());
+        p.write_input(&plan.bytes)
             .map_err(|e| McpError::Tool(format!("send_keys: {e}")))?;
 
         // Delivering a prompt opens a capture turn and flips the panel to
         // `Working` (`docs/design.md` §4) — only when the line is submitted,
-        // since a partial line is not yet a turn.
+        // since a partial line is not yet a turn. The commitment is made here
+        // even when the submit is deferred: caucus has decided to submit, and
+        // the deferral is only the mechanical separation the agent needs to
+        // accept the Enter.
         if enter {
             self.note_prompt_delivered(panel);
+        }
+        // A bracketed paste's submitting `\r` was held out of the burst — it
+        // must land as a discrete keypress once the agent has ingested the
+        // paste, or it is swallowed during the `[Pasted text #N]` commit.
+        if plan.defer_submit {
+            self.enqueue_submit(panel);
         }
         Ok(())
     }
@@ -201,41 +209,122 @@ impl McpToolSurface for Multiplexer {
     }
 }
 
-/// Bytes to write to a panel's PTY to deliver `text` and, when `enter`,
-/// submit it.
+/// How long to hold a bracketed paste's submitting Enter before delivering it
+/// as a discrete keypress ([`Multiplexer::poll_pending_submits`]).
+///
+/// The agent reads its PTY in its own loop; this gap guarantees the held-back
+/// `\r` arrives in a *separate* read cycle, well after the agent has processed
+/// the paste and committed its `[Pasted text #N]` placeholder, so the Enter is
+/// seen as a submit rather than swallowed during the commit. Comfortably above
+/// the agent's paste-processing latency yet imperceptible to the user.
+const SUBMIT_DELAY: Duration = Duration::from_millis(100);
+
+/// A submitting Enter held back from a bracketed paste, waiting to be delivered
+/// as a discrete keypress (see [`Multiplexer::pending_submits`]).
+pub(crate) struct PendingSubmit {
+    /// Panel the held-back `\r` is destined for.
+    panel: PanelId,
+    /// Earliest instant the `\r` may be written — `now + SUBMIT_DELAY` at
+    /// enqueue time.
+    due: Instant,
+}
+
+/// How `send_keys` should deliver `text` to a panel's PTY, framed for the
+/// agent's input mode.
+struct Delivery {
+    /// Bytes to write to the PTY now.
+    bytes: Vec<u8>,
+    /// When true the submitting `\r` was deliberately *omitted* from `bytes`
+    /// and must be delivered separately on a later tick (see `plan_delivery`).
+    defer_submit: bool,
+}
+
+/// Decide how to deliver `text` (and, when `enter`, submit it) for the agent's
+/// input mode.
 ///
 /// A TUI agent (e.g. Claude Code) that has enabled bracketed-paste mode
-/// (`CSI ?2004h`) treats a multi-byte input burst as a *paste*: a `\r` carried
-/// inside the burst is inserted into the prompt buffer as a literal newline
-/// instead of submitting the line — the "Enter doesn't go through, but caucus
-/// thinks it did" bug. Delivering `text` as a *proper* bracketed paste
-/// (`ESC[200~` … `ESC[201~`) and placing the submitting `\r` **after** the
-/// paste-end marker makes the agent insert the text verbatim (multi-line safe,
-/// so a multi-line round report no longer submits at its first newline) and
-/// then see the trailing `\r` as a discrete keypress that submits. The
-/// paste-end marker delimits the paste explicitly, so this is robust in a
-/// single burst — no inter-write timing gap is needed.
+/// (`CSI ?2004h`) treats a multi-byte input burst as a *paste*. Two failures
+/// follow if the submitting `\r` rides along in that burst:
 ///
-/// When `bracketed` is false the agent has not enabled the mode, so the
-/// markers would land as literal `[200~`/`[201~` garbage; fall back to the raw
-/// `text` (+ `\r`). An empty `text` is never wrapped — a bare Enter is just
-/// `\r`.
-fn encode_input(text: &[u8], enter: bool, bracketed: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len() + 14);
+/// * a `\r` *inside* the `ESC[200~` … `ESC[201~` markers is inserted as a
+///   literal newline (a multi-line report would submit at its first line); and
+/// * a `\r` placed *after* the paste-end marker in the *same* write is still
+///   swallowed when the agent commits a large paste to a `[Pasted text #N]`
+///   placeholder — the Enter is consumed during that transition instead of
+///   submitting. This is a race (it fires only for pastes big enough to become
+///   a placeholder, and only when the agent is mid-commit), which is exactly
+///   the "Enter didn't go through, but caucus already flipped the panel to
+///   Working" symptom: the prompt sits unsent, no Stop signal ever fires.
+///
+/// So when the agent has bracketed paste on and there is text to submit, this
+/// returns only the paste (`ESC[200~` … `ESC[201~`, no `\r`) and sets
+/// `defer_submit`: `send_keys` holds the `\r` and
+/// [`Multiplexer::poll_pending_submits`] writes it as a discrete keypress a
+/// tick later, after the agent has ingested the paste.
+///
+/// When `bracketed` is false the agent has not enabled the mode (the markers
+/// would land as literal `[200~`/`[201~` garbage) and when `text` is empty
+/// there is nothing to paste (a bare Enter), so in both cases the `\r` is
+/// written inline — there is no paste mode to absorb it — and no submit is
+/// deferred.
+fn plan_delivery(text: &[u8], enter: bool, bracketed: bool) -> Delivery {
     if bracketed && !text.is_empty() {
-        out.extend_from_slice(b"\x1b[200~");
-        out.extend_from_slice(text);
-        out.extend_from_slice(b"\x1b[201~");
+        let mut bytes = Vec::with_capacity(text.len() + 12);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(text);
+        bytes.extend_from_slice(b"\x1b[201~");
+        // The submitting `\r` is held back and delivered as a discrete
+        // keypress — never inline with the paste.
+        Delivery {
+            bytes,
+            defer_submit: enter,
+        }
     } else {
-        out.extend_from_slice(text);
+        let mut bytes = text.to_vec();
+        if enter {
+            bytes.push(b'\r');
+        }
+        Delivery {
+            bytes,
+            defer_submit: false,
+        }
     }
-    if enter {
-        out.push(b'\r');
-    }
-    out
 }
 
 impl Multiplexer {
+    /// Record a deferred submit for `panel`: its held-back `\r` becomes
+    /// writable after [`SUBMIT_DELAY`]. Replaces any pending submit already
+    /// queued for the same panel (the latest paste wins) so a panel never
+    /// accrues stale Enters.
+    fn enqueue_submit(&mut self, panel: PanelId) {
+        let due = Instant::now() + SUBMIT_DELAY;
+        match self.pending_submits.iter_mut().find(|s| s.panel == panel) {
+            Some(s) => s.due = due,
+            None => self.pending_submits.push(PendingSubmit { panel, due }),
+        }
+    }
+
+    /// Flush every deferred submit whose delay has elapsed: write the held-back
+    /// `\r` as a discrete keypress to its panel. Called once per event-loop
+    /// tick. A submit whose panel has been killed is dropped (the panel can no
+    /// longer accept input).
+    pub(crate) fn poll_pending_submits(&mut self) {
+        let now = Instant::now();
+        let mut still_pending = Vec::with_capacity(self.pending_submits.len());
+        for s in std::mem::take(&mut self.pending_submits) {
+            if s.due > now {
+                still_pending.push(s);
+                continue;
+            }
+            if let Some(p) = self.panels.iter_mut().find(|p| p.id == s.panel) {
+                if let Err(e) = p.write_input(b"\r") {
+                    warn!(panel = %s.panel, error = %e, "deferred submit write failed");
+                }
+            }
+        }
+        self.pending_submits = still_pending;
+    }
+
     /// Render a detected [`crate::term::Menu`] as readable text for the main
     /// worker: the question, the numbered options (the highlighted one marked),
     /// and how to answer.
@@ -281,47 +370,113 @@ impl Multiplexer {
 mod tests {
     use super::*;
 
-    /// `encode_input` frames a prompt for the agent's input mode — bracketed
-    /// when the agent enabled `?2004h`, raw otherwise — per boundary.
+    use crate::session::runtime::test_support::*;
+    use tempfile::TempDir;
+
+    /// Bracketed + submit: the paste carries the text with NO trailing `\r`
+    /// (the submit is held back, never inline with the paste), and
+    /// `defer_submit` is set so `send_keys` queues the discrete Enter.
     #[test]
-    fn encode_input_wraps_a_paste_with_enter_after_the_marker() {
-        // Bracketed + submit: text inside the paste, the submitting `\r` AFTER
-        // the paste-end marker so it is a discrete keypress, not absorbed.
-        assert_eq!(
-            encode_input(b"hello", true, true),
-            b"\x1b[200~hello\x1b[201~\r",
+    fn plan_delivery_pastes_without_an_inline_submit() {
+        let plan = plan_delivery(b"hello", true, true);
+        assert_eq!(plan.bytes, b"\x1b[200~hello\x1b[201~");
+        assert!(
+            plan.defer_submit,
+            "bracketed + enter must defer the submitting \\r"
         );
     }
 
     #[test]
-    fn encode_input_paste_keeps_internal_newlines_inside_the_markers() {
+    fn plan_delivery_paste_keeps_internal_newlines_inside_the_markers() {
         // A multi-line report: the internal newline stays *inside* the paste
-        // (does not submit early); only the trailing `\r` is outside.
-        assert_eq!(
-            encode_input(b"line1\nline2", true, true),
-            b"\x1b[200~line1\nline2\x1b[201~\r",
+        // (does not submit early), and still no trailing `\r` — the submit is
+        // deferred, not appended.
+        let plan = plan_delivery(b"line1\nline2", true, true);
+        assert_eq!(plan.bytes, b"\x1b[200~line1\nline2\x1b[201~");
+        assert!(plan.defer_submit);
+    }
+
+    #[test]
+    fn plan_delivery_bracketed_without_enter_pastes_and_defers_nothing() {
+        let plan = plan_delivery(b"hi", false, true);
+        assert_eq!(plan.bytes, b"\x1b[200~hi\x1b[201~");
+        assert!(!plan.defer_submit, "no enter requested → nothing to defer");
+    }
+
+    #[test]
+    fn plan_delivery_unbracketed_is_raw_text_plus_inline_cr() {
+        // Agent without `?2004`: markers would be literal garbage and there is
+        // no paste mode to absorb the `\r`, so it rides inline and is not
+        // deferred.
+        let submit = plan_delivery(b"hello", true, false);
+        assert_eq!(submit.bytes, b"hello\r");
+        assert!(!submit.defer_submit);
+        let no_submit = plan_delivery(b"hello", false, false);
+        assert_eq!(no_submit.bytes, b"hello");
+        assert!(!no_submit.defer_submit);
+    }
+
+    #[test]
+    fn plan_delivery_empty_text_is_a_bare_inline_enter_never_deferred() {
+        // A bare Enter (e.g. confirming) is just `\r`, never empty paste markers
+        // and never deferred — there is no paste for it to be swallowed by.
+        for bracketed in [true, false] {
+            let plan = plan_delivery(b"", true, bracketed);
+            assert_eq!(plan.bytes, b"\r", "bracketed={bracketed}");
+            assert!(!plan.defer_submit, "bracketed={bracketed}");
+        }
+        let none = plan_delivery(b"", false, true);
+        assert_eq!(none.bytes, b"");
+        assert!(!none.defer_submit);
+    }
+
+    /// `enqueue_submit` keeps a single pending Enter per panel: a re-paste
+    /// before the first flush updates the existing entry's deadline rather than
+    /// stacking a second `\r` that would double-submit.
+    #[tokio::test]
+    async fn enqueue_submit_dedups_per_panel() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let panel = PanelId::new();
+
+        mux.enqueue_submit(panel);
+        let first_due = mux.pending_submits[0].due;
+        assert_eq!(mux.pending_submits.len(), 1);
+
+        mux.enqueue_submit(panel);
+        assert_eq!(mux.pending_submits.len(), 1, "same panel must not stack");
+        assert!(
+            mux.pending_submits[0].due >= first_due,
+            "re-enqueue pushes the deadline out, it does not add a second submit"
         );
     }
 
-    #[test]
-    fn encode_input_bracketed_without_enter_has_no_trailing_cr() {
-        assert_eq!(encode_input(b"hi", false, true), b"\x1b[200~hi\x1b[201~");
-    }
+    /// `poll_pending_submits` retains a submit whose delay has not yet elapsed,
+    /// and removes one that is due — here the due one's panel does not exist
+    /// (killed), so it is dropped without a write.
+    #[tokio::test]
+    async fn poll_pending_submits_retains_not_yet_due_and_drops_due() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let due_panel = PanelId::new();
+        let pending_panel = PanelId::new();
+        mux.pending_submits.push(PendingSubmit {
+            panel: due_panel,
+            due: Instant::now() - Duration::from_millis(1),
+        });
+        mux.pending_submits.push(PendingSubmit {
+            panel: pending_panel,
+            due: Instant::now() + Duration::from_secs(60),
+        });
 
-    #[test]
-    fn encode_input_unbracketed_is_raw_text_plus_cr() {
-        // Agent without `?2004`: markers would be literal garbage, so fall back
-        // to raw text + `\r`.
-        assert_eq!(encode_input(b"hello", true, false), b"hello\r");
-        assert_eq!(encode_input(b"hello", false, false), b"hello");
-    }
+        mux.poll_pending_submits();
 
-    #[test]
-    fn encode_input_empty_text_is_a_bare_enter_never_wrapped() {
-        // A bare Enter (e.g. confirming) is just `\r`, never empty paste markers.
-        assert_eq!(encode_input(b"", true, true), b"\r");
-        assert_eq!(encode_input(b"", true, false), b"\r");
-        assert_eq!(encode_input(b"", false, true), b"");
+        assert_eq!(
+            mux.pending_submits.len(),
+            1,
+            "the due submit is flushed/dropped, the not-yet-due one stays"
+        );
+        assert_eq!(mux.pending_submits[0].panel, pending_panel);
     }
 
     /// `menu_nav_bytes` emits the right count + direction of arrow keys, then

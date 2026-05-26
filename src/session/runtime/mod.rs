@@ -36,6 +36,7 @@ mod rounds;
 mod scroll;
 mod spawn;
 
+use self::mcp::PendingSubmit;
 use self::rounds::PendingRound;
 pub(crate) use self::scroll::ScrollState;
 
@@ -70,6 +71,12 @@ pub struct Multiplexer {
     /// Rounds caucus is watching to deliver to the main worker
     /// ([`Multiplexer::poll_pending_rounds`]).
     pending_rounds: Vec<PendingRound>,
+    /// Submitting Enters held back from bracketed pastes until the agent has
+    /// ingested the paste. A bracketed-paste agent (Claude Code) that commits a
+    /// large paste to a `[Pasted text #N]` placeholder swallows a `\r` arriving
+    /// in the *same* PTY burst, so the submit is delivered as a discrete
+    /// keypress on a later tick ([`Multiplexer::poll_pending_submits`]).
+    pending_submits: Vec<PendingSubmit>,
     /// The main worker panel — the round-delivery target. Set when the main
     /// panel is spawned; `None` before then.
     main_panel_id: Option<PanelId>,
@@ -164,6 +171,7 @@ impl Multiplexer {
                 quit: false,
                 role_counts: HashMap::new(),
                 pending_rounds: Vec::new(),
+                pending_submits: Vec::new(),
                 main_panel_id: None,
                 main_compose_since: None,
                 notified_menus: HashMap::new(),

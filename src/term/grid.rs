@@ -132,7 +132,7 @@ pub struct Grid {
     /// does not affect the scraped cell grid — it is a queryable hint for the
     /// *input* path: `send_keys` frames a multi-byte prompt as a real
     /// bracketed paste so the agent does not absorb the submitting `\r` as a
-    /// literal newline (`session::runtime::mcp::encode_input`).
+    /// literal newline (`session::runtime::mcp::plan_delivery`).
     bracketed_paste: bool,
 }
 
@@ -200,7 +200,7 @@ impl Grid {
 
     /// Whether the agent has enabled bracketed-paste mode (`CSI ?2004h`). The
     /// input path consults this to frame a programmatic prompt as a real
-    /// bracketed paste; see `session::runtime::mcp::encode_input`.
+    /// bracketed paste; see `session::runtime::mcp::plan_delivery`.
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
     }

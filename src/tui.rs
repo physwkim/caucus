@@ -302,6 +302,12 @@ async fn event_loop(
         // 4. PTY pump — drain every panel into its grid + capture, reap exits.
         mux.pump_all();
 
+        // 4b. Deferred submits — a bracketed paste's submitting Enter is held
+        //     out of the paste burst (the agent swallows a `\r` while it commits
+        //     a `[Pasted text #N]` placeholder) and written here as a discrete
+        //     keypress once its delay has elapsed, a tick after the paste landed.
+        mux.poll_pending_submits();
+
         // 5. Selection prompts — if a panel in a pending round has stopped on
         //    an interactive chooser (no Stop hook fires, so its round never
         //    settles), announce it to the main worker so it can answer and let
