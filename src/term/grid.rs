@@ -48,9 +48,12 @@ pub struct Cell {
     ///
     /// Encoding: `0` default; `1..=8` the standard ANSI colours (SGR 30-37);
     /// `9..=16` the bright variants (SGR 90-97); `17..=255` a direct 256-colour
-    /// palette index from `38;5;n` (truncated to a [`u8`]). True-colour
-    /// (`38;2;r;g;b`) is approximated to the nearest palette slot — see
-    /// `Grid::apply_sgr`.
+    /// palette index. The extended paths funnel through one encoding:
+    /// `38;5;n` and true-colour (`38;2;r;g;b`, approximated to the nearest
+    /// palette slot via `rgb_to_256`) are folded by `xterm_to_field` so a raw
+    /// xterm index in `0..=16` maps onto the same `1..=16` ANSI slots the named
+    /// path uses — otherwise the two meanings collide and dark text renders
+    /// white (see `xterm_to_field`).
     pub fg: u8,
     /// Packed SGR background colour index (0 = default). Same encoding as
     /// [`Cell::fg`].
@@ -542,7 +545,7 @@ impl Grid {
                         match mode {
                             5 => {
                                 let n = flat.get(i + 2).copied().unwrap_or(0);
-                                let v = (n.min(255)) as u8;
+                                let v = xterm_to_field((n.min(255)) as u8);
                                 if is_fg {
                                     self.pen.fg = v;
                                 } else {
@@ -554,7 +557,7 @@ impl Grid {
                                 let r = flat.get(i + 2).copied().unwrap_or(0);
                                 let g = flat.get(i + 3).copied().unwrap_or(0);
                                 let b = flat.get(i + 4).copied().unwrap_or(0);
-                                let v = rgb_to_256(r as u8, g as u8, b as u8);
+                                let v = xterm_to_field(rgb_to_256(r as u8, g as u8, b as u8));
                                 if is_fg {
                                     self.pen.fg = v;
                                 } else {
@@ -890,6 +893,31 @@ fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
         }
     };
     (16 + 36 * q(r) + 6 * q(g) + q(b)) as u8
+}
+
+/// Fold a raw xterm-256 palette index into the caucus [`Cell`] colour encoding
+/// so the extended-colour paths (`38;5;n`, `38;2;r;g;b`) agree with the
+/// SGR-named path (`30..=37` / `90..=97`).
+///
+/// Without this the field carried two incompatible meanings in `0..=16`: the
+/// named path stores the 16 ANSI colours shifted up to `1..=16` (`0` = the
+/// terminal default), while the extended path stored raw xterm indices. The
+/// collision rendered dark text invisible — `rgb_to_256` returns `16` (the
+/// colour cube's black corner) for near-black truecolour, and field value `16`
+/// is [`crate::render`]'s *bright white*, so a dark glyph on a light diff
+/// background drew white-on-white.
+///
+/// * xterm `0..=15` (the 16 ANSI colours) → caucus `1..=16`.
+/// * xterm `16` (cube black) has no distinct caucus slot; it is visually black,
+///   so it folds onto ANSI black (`1`) rather than the bright-white slot.
+/// * xterm `17..=255` (extended cube + grey ramp) are stored verbatim and
+///   rendered through `Color::Indexed`.
+fn xterm_to_field(n: u8) -> u8 {
+    match n {
+        0..=15 => n + 1,
+        16 => 1,
+        _ => n,
+    }
 }
 
 /// `vte::Perform` implementation: the parsed-op → cell-state machine.
@@ -1324,6 +1352,54 @@ mod tests {
         g.advance(b"\x1b[48;2;255;255;255mB");
         // Pure white truecolor snaps to 231 in the grey-ramp branch.
         assert_eq!(g.cell(0, 1).unwrap().bg, 231);
+    }
+
+    /// `xterm_to_field` folds raw xterm-256 indices into the caucus field
+    /// encoding so the extended-colour paths agree with the SGR-named path.
+    #[test]
+    fn xterm_to_field_folds_the_low_palette_into_the_ansi_slots() {
+        // The 16 ANSI colours shift up by one (matching `30..=37` / `90..=97`).
+        assert_eq!(xterm_to_field(0), 1, "xterm black -> ANSI black slot");
+        assert_eq!(xterm_to_field(7), 8);
+        assert_eq!(xterm_to_field(8), 9, "xterm bright-black -> bright slot");
+        assert_eq!(xterm_to_field(15), 16, "xterm bright-white -> bright white");
+        // Cube black folds onto ANSI black, not the bright-white slot (16).
+        assert_eq!(xterm_to_field(16), 1, "cube black must not become white");
+        // The extended cube + grey ramp pass through verbatim.
+        assert_eq!(xterm_to_field(17), 17);
+        assert_eq!(xterm_to_field(231), 231);
+        assert_eq!(xterm_to_field(254), 254);
+    }
+
+    /// Regression: dark text must not render white. A near-black true-colour
+    /// foreground used to snap to xterm cube index 16 and land on the field
+    /// value the renderer treats as bright white, so dark code on a light diff
+    /// background drew white-on-white. It must now fold onto the ANSI black
+    /// slot (`1`), and an explicit `38;5;0` black must stay black, not default.
+    #[test]
+    fn dark_extended_foreground_does_not_fold_to_white() {
+        let mut g = Grid::new(20, 3);
+
+        // Near-black true-colour (channels < 8 -> rgb_to_256 returns 16) must
+        // not stay at field 16, which the renderer treats as bright white.
+        g.advance(b"\x1b[38;2;5;5;5mA");
+        let fg = g.cell(0, 0).unwrap().fg;
+        assert_eq!(
+            fg, 1,
+            "near-black truecolor must fold to ANSI black, got {fg}"
+        );
+
+        // `38;5;16` (cube black) likewise.
+        g.advance(b"\x1b[38;5;16mB");
+        assert_eq!(g.cell(0, 1).unwrap().fg, 1);
+
+        // `38;5;0` is an explicit black, distinct from the default (0).
+        g.advance(b"\x1b[38;5;0mC");
+        assert_eq!(
+            g.cell(0, 2).unwrap().fg,
+            1,
+            "explicit xterm black must stay black, not the terminal default"
+        );
     }
 
     #[test]
