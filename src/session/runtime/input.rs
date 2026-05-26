@@ -50,12 +50,17 @@ impl Multiplexer {
             CaucusCommand::Quit => self.quit = true,
             CaucusCommand::FocusNext => self.cycle_focus(1),
             CaucusCommand::FocusPrev => self.cycle_focus(-1),
+            CaucusCommand::FocusDir(dir) => self.focus_dir(dir),
+            CaucusCommand::ResizeDir(dir) => self.resize_focused(dir),
             CaucusCommand::ToggleZoom => self.toggle_zoom(),
             CaucusCommand::MovePanelEarlier => self.move_panel(-1),
             CaucusCommand::MovePanelLater => self.move_panel(1),
+            CaucusCommand::CloseFocused => self.arm_close_confirm(),
+            CaucusCommand::ConfirmClose => self.confirm_close(),
+            CaucusCommand::CancelClose => self.cancel_close(),
             CaucusCommand::CycleLayout => {
                 self.layout_mode = self.layout_mode.next();
-                self.reflow();
+                self.rebuild_layout_tree();
                 // The record carries `layout_mode` and the panel order.
                 self.persist_record();
             }
@@ -246,5 +251,48 @@ mod tests {
         assert!(!mux.should_quit());
         mux.apply_command(CaucusCommand::Quit);
         assert!(mux.should_quit());
+    }
+
+    /// `CloseFocused` on the main worker panel is refused — main is protected,
+    /// so no confirm is armed.
+    #[tokio::test]
+    async fn close_focused_protects_the_main_panel() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = PanelId::new();
+        mux.main_panel_id = Some(main);
+        mux.focus.set_focus(Some(main));
+
+        mux.apply_command(CaucusCommand::CloseFocused);
+        assert!(
+            mux.pending_close().is_none(),
+            "closing the main panel must be refused"
+        );
+    }
+
+    /// `CloseFocused` on a non-main panel arms the confirm for that panel.
+    #[tokio::test]
+    async fn close_focused_arms_confirm_for_a_non_main_panel() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        mux.main_panel_id = Some(PanelId::new());
+        let target = PanelId::new();
+        mux.focus.set_focus(Some(target));
+
+        mux.apply_command(CaucusCommand::CloseFocused);
+        assert_eq!(mux.pending_close(), Some(target));
+
+        // Cancelling clears the pending close, leaving the panel alone.
+        mux.apply_command(CaucusCommand::CancelClose);
+        assert!(mux.pending_close().is_none());
+    }
+
+    /// `CloseFocused` with no focused panel is a no-op (no panic, no arm).
+    #[tokio::test]
+    async fn close_focused_with_no_focus_is_a_noop() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        mux.apply_command(CaucusCommand::CloseFocused);
+        assert!(mux.pending_close().is_none());
     }
 }

@@ -418,6 +418,61 @@ mod tests {
     }
 
     #[test]
+    fn resize_storm_does_not_panic_or_underflow() {
+        // Real-scenario regression: a display sleep/wake (external monitor
+        // hot-plug, screen unlock) makes the terminal emit a burst of
+        // `Event::Resize` at wildly varying — including degenerate and huge —
+        // dimensions before settling. Drive the real PTY + grid resize path
+        // through that storm and assert it never panics, never underflows,
+        // and always lands a grid clamped to the minimum interior. This rules
+        // out a resize-arithmetic panic as the cause of the wake-time death;
+        // the actual fault is upstream (a transient `terminal::size()` failure
+        // surfaced as a fatal `event::poll`/`read` error).
+        let mut p = cat_panel();
+        // x/y vary too: a multi-display reflow shifts the origin, not just the
+        // extent. Includes 0×0, 1×1, sub-border slivers, a 4K-class extent
+        // (a 3840px display at a tiny font is still well under 1000 cols), a
+        // garbage-large glitch value (u16::MAX — clamped by the grid's upper
+        // bound, so this iteration is instant rather than an OOM), and the
+        // eventual settle back to a normal terminal.
+        let storm: [(u16, u16, u16, u16); 12] = [
+            (0, 0, 0, 0),
+            (0, 0, 1, 1),
+            (0, 0, 2, 2),
+            (0, 0, 1, 50),
+            (0, 0, 50, 1),
+            (0, 0, 8, 2),
+            (10, 5, 9, 3),
+            (0, 0, 1000, 300),
+            (0, 0, 1920, 480),
+            (0, 0, u16::MAX, u16::MAX),
+            (0, 0, 3, 3),
+            (0, 0, 120, 40),
+        ];
+        for (x, y, width, height) in storm {
+            p.resize(Rect {
+                x,
+                y,
+                width,
+                height,
+            })
+            .unwrap();
+            let (cols, rows) = p.grid().size();
+            assert!(
+                cols >= MIN_GRID_COLS as usize && rows >= MIN_GRID_ROWS as usize,
+                "grid clamped below minimum after resize to {width}x{height}: got {cols}x{rows}"
+            );
+            assert!(
+                cols <= Grid::MAX_COLS && rows <= Grid::MAX_ROWS,
+                "grid exceeded the maximum after resize to {width}x{height}: got {cols}x{rows}"
+            );
+        }
+        // Settled at 120x40 -> interior 118x38.
+        assert_eq!(p.grid().size(), (118, 38));
+        kill(&mut p).unwrap();
+    }
+
+    #[test]
     fn spawn_request_round_trips_role_name() {
         // `spawn` reads the role name onto the panel; verify the field wiring
         // without needing a real agent binary by checking the request shape.

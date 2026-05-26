@@ -28,6 +28,9 @@ use crate::session::runtime::ScrollState;
 use crate::term::Grid;
 use crate::term::grid::attr;
 
+mod tree;
+pub use tree::LayoutTree;
+
 /// A rectangle of the terminal, in cells.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Rect {
@@ -275,6 +278,78 @@ fn split(start: u16, total: u16, parts: usize) -> Vec<(u16, u16)> {
         offset += len;
     }
     out
+}
+
+/// A screen direction for spatial focus navigation (`Ctrl-A` + arrow).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// The panel nearest to `from` in screen direction `dir`, among `candidates`
+/// (each a panel id with its current slot rect) — the target for `Ctrl-A` +
+/// arrow directional focus navigation.
+///
+/// A candidate qualifies when its center lies strictly in `dir` of `from`'s
+/// center. Among qualifying candidates the sort key is, in order: whether its
+/// *perpendicular* span overlaps `from` (a panel sharing rows when moving
+/// left/right is preferred, so in a grid the move lands on the tile directly
+/// beside rather than a diagonal one), then the smallest travel-direction
+/// distance, then the smallest perpendicular offset. Returns `None` when
+/// nothing lies in that direction.
+pub fn nearest_in_direction(
+    from: Rect,
+    candidates: impl IntoIterator<Item = (PanelId, Rect)>,
+    dir: Direction,
+) -> Option<PanelId> {
+    let fcx = from.x as i32 + from.width as i32 / 2;
+    let fcy = from.y as i32 + from.height as i32 / 2;
+    let mut best: Option<(PanelId, (u8, i64, i64))> = None;
+    for (id, r) in candidates {
+        let cx = r.x as i32 + r.width as i32 / 2;
+        let cy = r.y as i32 + r.height as i32 / 2;
+        let (primary, perp, overlaps) = match dir {
+            Direction::Right => (
+                cx - fcx,
+                (cy - fcy).abs(),
+                ranges_overlap(from.y, from.height, r.y, r.height),
+            ),
+            Direction::Left => (
+                fcx - cx,
+                (cy - fcy).abs(),
+                ranges_overlap(from.y, from.height, r.y, r.height),
+            ),
+            Direction::Down => (
+                cy - fcy,
+                (cx - fcx).abs(),
+                ranges_overlap(from.x, from.width, r.x, r.width),
+            ),
+            Direction::Up => (
+                fcy - cy,
+                (cx - fcx).abs(),
+                ranges_overlap(from.x, from.width, r.x, r.width),
+            ),
+        };
+        if primary <= 0 {
+            continue; // not in this direction
+        }
+        let key = (u8::from(!overlaps), primary as i64, perp as i64);
+        match &best {
+            Some((_, bk)) if *bk <= key => {}
+            _ => best = Some((id, key)),
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+/// Whether the half-open intervals `[a, a+alen)` and `[b, b+blen)` overlap.
+/// Computed in `u32` so a slot at the far edge of a large terminal cannot
+/// overflow the `u16` sum.
+fn ranges_overlap(a: u16, alen: u16, b: u16, blen: u16) -> bool {
+    (a as u32) < (b as u32 + blen as u32) && (b as u32) < (a as u32 + alen as u32)
 }
 
 /// Draw the full caucus screen: every panel's grid into its [`Layout`] slot,
@@ -913,6 +988,128 @@ mod tests {
                 .slots
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn nearest_in_direction_walks_a_2x2_grid() {
+        // A 2x2 grid over the 80x24 area.
+        let tl = (
+            PanelId::new(),
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 12,
+            },
+        );
+        let tr = (
+            PanelId::new(),
+            Rect {
+                x: 40,
+                y: 0,
+                width: 40,
+                height: 12,
+            },
+        );
+        let bl = (
+            PanelId::new(),
+            Rect {
+                x: 0,
+                y: 12,
+                width: 40,
+                height: 12,
+            },
+        );
+        let br = (
+            PanelId::new(),
+            Rect {
+                x: 40,
+                y: 12,
+                width: 40,
+                height: 12,
+            },
+        );
+        let all = [tl, tr, bl, br];
+        let others = |exclude: PanelId| {
+            all.iter()
+                .filter(move |(id, _)| *id != exclude)
+                .map(|&(id, r)| (id, r))
+                .collect::<Vec<_>>()
+        };
+
+        // From top-left: right -> top-right, down -> bottom-left; up/left empty.
+        assert_eq!(
+            nearest_in_direction(tl.1, others(tl.0), Direction::Right),
+            Some(tr.0)
+        );
+        assert_eq!(
+            nearest_in_direction(tl.1, others(tl.0), Direction::Down),
+            Some(bl.0)
+        );
+        assert_eq!(
+            nearest_in_direction(tl.1, others(tl.0), Direction::Up),
+            None
+        );
+        assert_eq!(
+            nearest_in_direction(tl.1, others(tl.0), Direction::Left),
+            None
+        );
+
+        // From bottom-right: up -> top-right, left -> bottom-left.
+        assert_eq!(
+            nearest_in_direction(br.1, others(br.0), Direction::Up),
+            Some(tr.0)
+        );
+        assert_eq!(
+            nearest_in_direction(br.1, others(br.0), Direction::Left),
+            Some(bl.0)
+        );
+    }
+
+    #[test]
+    fn nearest_in_direction_prefers_a_perpendicularly_overlapping_panel() {
+        // Moving right from `from`, two candidates lie to the right: `aligned`
+        // shares rows (overlaps), `diagonal` is lower and slightly nearer in x.
+        // The overlapping one wins so the move stays in the same band.
+        let from = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let aligned = (
+            PanelId::new(),
+            Rect {
+                x: 30,
+                y: 0,
+                width: 20,
+                height: 10,
+            },
+        );
+        let diagonal = (
+            PanelId::new(),
+            Rect {
+                x: 25,
+                y: 30,
+                width: 20,
+                height: 10,
+            },
+        );
+        assert_eq!(
+            nearest_in_direction(from, [aligned, diagonal], Direction::Right),
+            Some(aligned.0)
+        );
+    }
+
+    #[test]
+    fn nearest_in_direction_empty_candidates_is_none() {
+        let from = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        assert_eq!(nearest_in_direction(from, [], Direction::Up), None);
     }
 
     #[test]

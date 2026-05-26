@@ -168,10 +168,22 @@ impl Grid {
     /// Default scrollback depth (rows).
     pub const DEFAULT_SCROLLBACK: usize = 10_000;
 
+    /// Hard upper bound on viewport dimensions. The grid allocates
+    /// `cols * rows` cells, so an unbounded size would let a garbage-large
+    /// `TIOCGWINSZ` report — a display glitch or a wake-time size query
+    /// returning nonsense — make `resize` fill tens of gigabytes of blank
+    /// cells and OOM-kill caucus. A real terminal is far smaller (a 4K display
+    /// at a tiny font is ~1000 cols), so this only ever clamps nonsense, never
+    /// a legitimate size. Enforced in both `new` and `resize`, the two
+    /// cell-allocating entry points, so the bound holds by construction for
+    /// every caller.
+    pub const MAX_COLS: usize = 2000;
+    pub const MAX_ROWS: usize = 1000;
+
     /// Build a blank grid sized `cols x rows`.
     pub fn new(cols: usize, rows: usize) -> Self {
-        let rows = rows.max(1);
-        let cols = cols.max(1);
+        let rows = rows.clamp(1, Self::MAX_ROWS);
+        let cols = cols.clamp(1, Self::MAX_COLS);
         Self {
             cols,
             rows,
@@ -280,8 +292,8 @@ impl Grid {
     /// the bottom. Hard-wrapped logical lines are **not** re-joined or
     /// re-split — a line that wrapped at the old width keeps its old break.
     pub(crate) fn resize(&mut self, cols: usize, rows: usize) {
-        let cols = cols.max(1);
-        let rows = rows.max(1);
+        let cols = cols.clamp(1, Self::MAX_COLS);
+        let rows = rows.clamp(1, Self::MAX_ROWS);
         if cols == self.cols && rows == self.rows {
             return;
         }
@@ -1442,6 +1454,26 @@ mod tests {
         g.resize(10, 2);
         assert_eq!(g.size(), (10, 2));
         assert_eq!(g.row_text(0), "abc       ");
+    }
+
+    #[test]
+    fn resize_clamps_dimensions_to_the_maximum() {
+        // A garbage-large size report (a display glitch / wake-time
+        // `TIOCGWINSZ` returning nonsense) must not make the grid allocate
+        // `cols * rows` cells unbounded. The grid caps both dimensions, so the
+        // allocation stays bounded — this test completes instantly instead of
+        // OOM-zeroing tens of gigabytes of blank cells.
+        let mut g = Grid::new(80, 24);
+        g.resize(usize::MAX, usize::MAX);
+        assert_eq!(g.size(), (Grid::MAX_COLS, Grid::MAX_ROWS));
+    }
+
+    #[test]
+    fn new_clamps_dimensions_to_the_maximum() {
+        // Same ceiling enforced at construction, so even a panel spawned while
+        // a bogus size is in effect cannot allocate an unbounded grid.
+        let g = Grid::new(usize::MAX, usize::MAX);
+        assert_eq!(g.size(), (Grid::MAX_COLS, Grid::MAX_ROWS));
     }
 
     #[test]

@@ -14,12 +14,15 @@
 //!
 //! | Key                       | Action                                  |
 //! |---------------------------|-----------------------------------------|
-//! | `Ctrl-A` then `n` / `→`   | focus the next panel                    |
-//! | `Ctrl-A` then `p` / `←`   | focus the previous panel                |
+//! | `Ctrl-A` then `n`         | focus the next panel (cycle order)      |
+//! | `Ctrl-A` then `p`         | focus the previous panel (cycle order)  |
+//! | `Ctrl-A` then `↑↓←→`      | focus the panel in that direction       |
+//! | `Ctrl-A` then `Ctrl-↑↓←→` | resize the focused panel (tmux-style)   |
 //! | `Ctrl-A` then `q`         | quit caucus                             |
 //! | `Ctrl-A` then `z`         | toggle zoom on the focused panel        |
 //! | `Ctrl-A` then `<`         | move the focused panel one step earlier |
 //! | `Ctrl-A` then `>`         | move the focused panel one step later   |
+//! | `Ctrl-A` then `x`         | close the focused panel (y/n confirm)   |
 //! | `Ctrl-A` then `Space`     | cycle the layout arrangement mode       |
 //! | `Ctrl-A` then `t`         | toggle the transcript overlay           |
 //! | `Esc` (overlay open)      | hide the transcript overlay             |
@@ -37,6 +40,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::render::Direction;
 use crate::session::id::PanelId;
 
 /// The reserved prefix key chord (`Ctrl-A`).
@@ -57,10 +61,17 @@ pub enum InputAction {
 /// caucus-level commands triggered by reserved key chords.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CaucusCommand {
-    /// Move focus to the next panel.
+    /// Move focus to the next panel (linear cycle order).
     FocusNext,
-    /// Move focus to the previous panel.
+    /// Move focus to the previous panel (linear cycle order).
     FocusPrev,
+    /// Move focus to the panel geometrically in the given screen direction
+    /// (`Ctrl-A` + arrow) — tmux-style directional navigation.
+    FocusDir(Direction),
+    /// Resize the focused panel one step in the given screen direction
+    /// (`Ctrl-A` + `Ctrl`-arrow): grow it toward `Right`/`Down`, shrink it on
+    /// `Left`/`Up` — tmux-style pane resize.
+    ResizeDir(Direction),
     /// Quit caucus.
     Quit,
     /// Toggle full-screen zoom on the focused panel.
@@ -69,6 +80,13 @@ pub enum CaucusCommand {
     MovePanelEarlier,
     /// Move the focused panel one step later in the panel order.
     MovePanelLater,
+    /// Close the focused panel (`Ctrl-A x`) — arms a y/n confirm prompt. The
+    /// main worker panel is protected and cannot be closed.
+    CloseFocused,
+    /// Confirm the pending panel close (`y` while the confirm prompt is open).
+    ConfirmClose,
+    /// Cancel the pending panel close (`n`/`Esc`/`Ctrl-C` while it is open).
+    CancelClose,
     /// Cycle the arrangement mode (`Tiled` → `EvenHorizontal` → ...).
     CycleLayout,
     /// Toggle the read-only transcript overlay.
@@ -108,6 +126,10 @@ pub struct FocusRouter {
     /// drive scrolling and are *captured* — every key is consumed by the
     /// pager and none reach the focused panel's PTY.
     scroll_open: bool,
+    /// `true` while the close-panel confirm prompt is open. Modal like the
+    /// pager: `y` confirms, `n`/`Esc`/`Ctrl-C` cancels, every other key is
+    /// swallowed and never reaches the focused panel's PTY.
+    confirm_open: bool,
 }
 
 impl FocusRouter {
@@ -144,6 +166,13 @@ impl FocusRouter {
         self.scroll_open = open;
     }
 
+    /// Tell the router whether the close-panel confirm prompt is open — when
+    /// open, [`FocusRouter::route`] captures every key (`y` confirms,
+    /// `n`/`Esc`/`Ctrl-C` cancels, all others are swallowed).
+    pub fn set_confirm_open(&mut self, open: bool) {
+        self.confirm_open = open;
+    }
+
     /// Route a key event to an [`InputAction`].
     ///
     /// When the prefix is armed the key selects a [`CaucusCommand`]; an
@@ -151,6 +180,15 @@ impl FocusRouter {
     /// either way). Otherwise the key is encoded to terminal bytes and
     /// forwarded to the focused panel.
     pub fn route(&mut self, key: KeyEvent) -> InputAction {
+        // The close-panel confirm prompt is modal and takes precedence over
+        // everything (including the prefix): `y` confirms, `n`/`Esc`/`Ctrl-C`
+        // cancels, every other key is swallowed so a stray keystroke can
+        // neither confirm a destructive close nor leak to the panel.
+        if self.confirm_open {
+            return confirm_command(&key)
+                .map(InputAction::Caucus)
+                .unwrap_or(InputAction::Ignore);
+        }
         // While the scrollback pager is open it is fully modal: it captures
         // every key. Navigation keys scroll it; `Esc`/`q` close it; all other
         // keys are swallowed and never reach the focused panel's PTY (unlike
@@ -195,13 +233,25 @@ impl FocusRouter {
                 None => InputAction::Ignore,
             };
         }
+        // Arrows are directional (tmux-style). A bare arrow moves focus to the
+        // panel in that screen direction; holding `Ctrl` resizes the focused
+        // panel toward it instead. n/p remain the linear focus cycle.
+        if let Some(dir) = arrow_direction(key.code) {
+            let cmd = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                CaucusCommand::ResizeDir(dir)
+            } else {
+                CaucusCommand::FocusDir(dir)
+            };
+            return InputAction::Caucus(cmd);
+        }
         match key.code {
-            KeyCode::Char('n') | KeyCode::Right => InputAction::Caucus(CaucusCommand::FocusNext),
-            KeyCode::Char('p') | KeyCode::Left => InputAction::Caucus(CaucusCommand::FocusPrev),
+            KeyCode::Char('n') => InputAction::Caucus(CaucusCommand::FocusNext),
+            KeyCode::Char('p') => InputAction::Caucus(CaucusCommand::FocusPrev),
             KeyCode::Char('q') => InputAction::Caucus(CaucusCommand::Quit),
             KeyCode::Char('z') => InputAction::Caucus(CaucusCommand::ToggleZoom),
             KeyCode::Char('<') => InputAction::Caucus(CaucusCommand::MovePanelEarlier),
             KeyCode::Char('>') => InputAction::Caucus(CaucusCommand::MovePanelLater),
+            KeyCode::Char('x') => InputAction::Caucus(CaucusCommand::CloseFocused),
             KeyCode::Char(' ') => InputAction::Caucus(CaucusCommand::CycleLayout),
             KeyCode::Char('t') => InputAction::Caucus(CaucusCommand::ToggleTranscript),
             KeyCode::Char('[') => InputAction::Caucus(CaucusCommand::EnterScroll),
@@ -225,6 +275,33 @@ fn scroll_command(key: &KeyEvent) -> Option<CaucusCommand> {
         KeyCode::Home | KeyCode::Char('g') => Some(CaucusCommand::ScrollTop),
         KeyCode::End | KeyCode::Char('G') => Some(CaucusCommand::ScrollBottom),
         KeyCode::Esc | KeyCode::Char('q') => Some(CaucusCommand::ExitScroll),
+        _ => None,
+    }
+}
+
+/// Map a key to a close-confirm command while the confirm prompt is open.
+/// `y` confirms; `n`/`Esc`/`Ctrl-C` cancels; every other key returns `None`
+/// and is swallowed (so a stray keystroke cannot confirm a destructive close).
+fn confirm_command(key: &KeyEvent) -> Option<CaucusCommand> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        return Some(CaucusCommand::CancelClose);
+    }
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => Some(CaucusCommand::ConfirmClose),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(CaucusCommand::CancelClose),
+        _ => None,
+    }
+}
+
+/// Map an arrow key code to its [`Direction`], or `None` for any other key.
+/// Shared by the prefixed focus-move (bare arrow) and resize (`Ctrl`-arrow)
+/// bindings so both stay in lock-step.
+fn arrow_direction(code: KeyCode) -> Option<Direction> {
+    match code {
+        KeyCode::Up => Some(Direction::Up),
+        KeyCode::Down => Some(Direction::Down),
+        KeyCode::Left => Some(Direction::Left),
+        KeyCode::Right => Some(Direction::Right),
         _ => None,
     }
 }
@@ -408,6 +485,49 @@ mod tests {
     }
 
     #[test]
+    fn prefix_then_arrows_are_directional_focus() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        let cases = [
+            (KeyCode::Up, Direction::Up),
+            (KeyCode::Down, Direction::Down),
+            (KeyCode::Left, Direction::Left),
+            (KeyCode::Right, Direction::Right),
+        ];
+        for (code, dir) in cases {
+            router.route(ctrl('a'));
+            match router.route(key(code)) {
+                InputAction::Caucus(CaucusCommand::FocusDir(d)) => {
+                    assert_eq!(d, dir, "arrow {code:?} should map to {dir:?}")
+                }
+                other => panic!("expected FocusDir({dir:?}) for {code:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_then_ctrl_arrows_are_directional_resize() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        let cases = [
+            (KeyCode::Up, Direction::Up),
+            (KeyCode::Down, Direction::Down),
+            (KeyCode::Left, Direction::Left),
+            (KeyCode::Right, Direction::Right),
+        ];
+        for (code, dir) in cases {
+            router.route(ctrl('a'));
+            let arrow = KeyEvent::new(code, KeyModifiers::CONTROL);
+            match router.route(arrow) {
+                InputAction::Caucus(CaucusCommand::ResizeDir(d)) => {
+                    assert_eq!(d, dir, "Ctrl-{code:?} should resize {dir:?}")
+                }
+                other => panic!("expected ResizeDir({dir:?}) for Ctrl-{code:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn prefix_then_q_is_quit() {
         let mut router = FocusRouter::new();
         router.set_focus(Some(PanelId::new()));
@@ -532,6 +652,68 @@ mod tests {
             router.route(key(KeyCode::Char('['))),
             InputAction::Caucus(CaucusCommand::EnterScroll)
         ));
+    }
+
+    #[test]
+    fn prefix_then_x_is_close_focused() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.route(ctrl('a'));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('x'))),
+            InputAction::Caucus(CaucusCommand::CloseFocused)
+        ));
+    }
+
+    #[test]
+    fn confirm_prompt_captures_y_n_esc_and_swallows_other_keys() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.set_confirm_open(true);
+
+        // `y`/`Y` confirm.
+        assert!(matches!(
+            router.route(key(KeyCode::Char('y'))),
+            InputAction::Caucus(CaucusCommand::ConfirmClose)
+        ));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('Y'))),
+            InputAction::Caucus(CaucusCommand::ConfirmClose)
+        ));
+        // `n`/`Esc`/`Ctrl-C` cancel.
+        assert!(matches!(
+            router.route(key(KeyCode::Char('n'))),
+            InputAction::Caucus(CaucusCommand::CancelClose)
+        ));
+        assert!(matches!(
+            router.route(key(KeyCode::Esc)),
+            InputAction::Caucus(CaucusCommand::CancelClose)
+        ));
+        assert!(matches!(
+            router.route(ctrl('c')),
+            InputAction::Caucus(CaucusCommand::CancelClose)
+        ));
+        // Every other key is swallowed — it must not reach the panel, and a
+        // stray keystroke must not confirm the destructive close.
+        assert!(matches!(
+            router.route(key(KeyCode::Char('a'))),
+            InputAction::Ignore
+        ));
+        assert!(matches!(
+            router.route(key(KeyCode::Enter)),
+            InputAction::Ignore
+        ));
+    }
+
+    #[test]
+    fn confirm_prompt_takes_precedence_over_the_prefix() {
+        // While the confirm is open, even `Ctrl-A` is swallowed — the prompt
+        // is modal, so the prefix cannot arm underneath it.
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.set_confirm_open(true);
+        assert!(matches!(router.route(ctrl('a')), InputAction::Ignore));
+        assert!(!router.prefix_armed());
     }
 
     #[test]

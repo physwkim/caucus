@@ -221,7 +221,7 @@ impl Multiplexer {
         if self.focus.focused().is_none() {
             self.focus.set_focus(Some(panel_id));
         }
-        self.reflow();
+        self.rebuild_layout_tree();
         Ok(panel_id)
     }
 
@@ -271,9 +271,44 @@ impl Multiplexer {
             let next = self.panels.get(idx).or_else(|| self.panels.last());
             self.focus.set_focus(next.map(|p| p.id));
         }
-        self.reflow();
+        self.rebuild_layout_tree();
         self.persist_record();
         Ok(())
+    }
+
+    /// Arm the close-panel confirm prompt (`Ctrl-A x`) for the focused panel.
+    ///
+    /// The main worker panel is protected — it owns the MCP control channel and
+    /// is the round-delivery target, so closing it is disallowed and the
+    /// request is a no-op. With no focused panel it is also a no-op.
+    pub(crate) fn arm_close_confirm(&mut self) {
+        let Some(focused) = self.focus.focused() else {
+            return;
+        };
+        if Some(focused) == self.main_panel_id {
+            warn!(panel = %focused, "refusing to close the main worker panel");
+            return;
+        }
+        self.pending_close = Some(focused);
+        self.focus.set_confirm_open(true);
+    }
+
+    /// Confirm the pending close: kill the panel through [`Multiplexer::kill_panel`]
+    /// (the single owner of panel destruction, Invariant I-5) and dismiss the
+    /// prompt. The prompt is always dismissed, even if the kill fails.
+    pub(crate) fn confirm_close(&mut self) {
+        self.focus.set_confirm_open(false);
+        if let Some(id) = self.pending_close.take() {
+            if let Err(err) = self.kill_panel(id) {
+                warn!(panel = %id, error = %err, "close-panel failed");
+            }
+        }
+    }
+
+    /// Cancel the pending close: dismiss the prompt, keep the panel.
+    pub(crate) fn cancel_close(&mut self) {
+        self.pending_close = None;
+        self.focus.set_confirm_open(false);
     }
 
     /// Create an execute-phase worktree for a `spawn_role(worktree=true)` call

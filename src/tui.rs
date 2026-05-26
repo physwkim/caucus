@@ -37,6 +37,52 @@ use crate::session::state::Session;
 /// Event-loop redraw period — ~60 Hz.
 const TICK: Duration = Duration::from_millis(16);
 
+/// How many *consecutive* terminal-I/O errors end the session. A display
+/// sleep/wake or screen unlock makes crossterm briefly fail `event::poll` /
+/// `event::read` / a `draw` — most often because its `SIGWINCH` handler calls
+/// `terminal::size()`, which can transiently fail mid-transition (the
+/// `TIOCGWINSZ` ioctl errors and the `tput` fallback fails) and surface as an
+/// `Err` out of `poll`/`read`. Such an error is recoverable: the very next
+/// idle poll succeeds and clears the streak. Only a terminal that fails this
+/// many times back-to-back — genuinely gone (parent closed, SSH dropped) —
+/// trips the budget, and even then the loop breaks to the orderly `shutdown`
+/// path rather than letting the error `?`-propagate (which skips `shutdown`
+/// and lets every child panel's PTY drop SIGHUP the agents at once).
+const MAX_CONSECUTIVE_TERMINAL_ERRORS: u32 = 256;
+
+/// Slept after a terminal-I/O error before retrying, so a persistently broken
+/// terminal cannot hot-spin the loop (a failing `poll` returns immediately,
+/// with no timeout wait). With the budget above this caps the give-up latency
+/// at a few seconds of *continuous* failure.
+const TERMINAL_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Consecutive terminal-I/O error tracker for the event loop. Absorbs the
+/// transient `poll`/`read`/`draw` failures a display wake/unlock produces while
+/// still ending the session — through the orderly shutdown path — when the
+/// terminal is genuinely gone. Any successful terminal interaction clears the
+/// streak, so only *uninterrupted* failure trips it.
+struct TerminalErrorBudget {
+    consecutive: u32,
+}
+
+impl TerminalErrorBudget {
+    fn new() -> Self {
+        Self { consecutive: 0 }
+    }
+
+    /// Record a successful terminal interaction — clears the streak.
+    fn ok(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Record a terminal error. Returns `true` when the consecutive-error
+    /// budget is exhausted and the loop must break to orderly shutdown.
+    fn fail(&mut self) -> bool {
+        self.consecutive += 1;
+        self.consecutive >= MAX_CONSECUTIVE_TERMINAL_ERRORS
+    }
+}
+
 /// RAII guard that restores the terminal: leaves the alternate screen and
 /// disables raw mode on drop, so caucus never leaves the user's terminal in
 /// a broken state — even if the event loop panics.
@@ -271,14 +317,24 @@ async fn event_loop(
     mut control_server: crate::mcp::control_server::ControlServer,
 ) -> Result<()> {
     let mut last_draw = Instant::now();
+    let mut term_errors = TerminalErrorBudget::new();
     loop {
-        // 1. Input — poll without blocking the pump/redraw cadence.
-        if event::poll(Duration::from_millis(4)).context("poll terminal events")? {
-            match event::read().context("read terminal event")? {
-                Event::Key(key) if key.kind == event::KeyEventKind::Press => {
+        // 1. Input — poll without blocking the pump/redraw cadence. A poll/read
+        //    error here is recoverable: a display wake/unlock makes crossterm
+        //    briefly fail `terminal::size()` inside its SIGWINCH handler, which
+        //    surfaces as an `Err` out of `poll`/`read`. Absorb it and keep the
+        //    session alive (the next idle poll clears the streak). Only a
+        //    terminal failing continuously ends the loop — and then via the
+        //    orderly shutdown below, never a `?` that would skip it and let the
+        //    panel PTYs drop-SIGHUP every agent at once.
+        match event::poll(Duration::from_millis(4)) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) if key.kind == event::KeyEventKind::Press => {
+                    term_errors.ok();
                     mux.handle_key(key);
                 }
-                Event::Resize(w, h) => {
+                Ok(Event::Resize(w, h)) => {
+                    term_errors.ok();
                     let _ = mux.resize(body_area(Rect {
                         x: 0,
                         y: 0,
@@ -286,7 +342,24 @@ async fn event_loop(
                         height: h,
                     }));
                 }
-                _ => {}
+                Ok(_) => term_errors.ok(),
+                Err(e) => {
+                    warn!(error = %e, "terminal read error; continuing");
+                    if term_errors.fail() {
+                        warn!("terminal unrecoverable after repeated read errors; shutting down");
+                        break;
+                    }
+                    std::thread::sleep(TERMINAL_ERROR_BACKOFF);
+                }
+            },
+            Ok(false) => term_errors.ok(),
+            Err(e) => {
+                warn!(error = %e, "terminal poll error; continuing");
+                if term_errors.fail() {
+                    warn!("terminal unrecoverable after repeated poll errors; shutting down");
+                    break;
+                }
+                std::thread::sleep(TERMINAL_ERROR_BACKOFF);
             }
         }
 
@@ -331,9 +404,22 @@ async fn event_loop(
             break;
         }
 
-        // 8. Redraw on the tick.
+        // 8. Redraw on the tick. A draw failure is treated like a poll/read
+        //    error — recoverable, counted against the same budget — so a
+        //    transient write hiccup during a display wake does not tear the
+        //    session down. The TICK gate already paces this, so no extra
+        //    backoff is needed on the error path.
         if last_draw.elapsed() >= TICK {
-            draw(&mut terminal, &mux)?;
+            match draw(&mut terminal, &mux) {
+                Ok(()) => term_errors.ok(),
+                Err(e) => {
+                    warn!(error = %e, "terminal draw error; continuing");
+                    if term_errors.fail() {
+                        warn!("terminal unrecoverable after repeated draw errors; shutting down");
+                        break;
+                    }
+                }
+            }
             last_draw = Instant::now();
         }
     }
@@ -413,6 +499,17 @@ fn status_line(mux: &Multiplexer) -> String {
         .and_then(|id| mux.panels().iter().find(|p| p.id == id))
         .map(|p| format!("{} ({})", p.role, p.state_label()))
         .unwrap_or_else(|| "none".into());
+    // The close-panel confirm is modal and destructive — it supersedes every
+    // other status hint until answered.
+    if let Some(id) = mux.pending_close() {
+        let role = mux
+            .panels()
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.role.as_str())
+            .unwrap_or("panel");
+        return format!(" caucus · close panel '{role}'?   y = close · n/Esc = cancel");
+    }
     let prefix = if mux.prefix_armed() { "  [PREFIX]" } else { "" };
     let zoom = if mux.zoomed().is_some() {
         "  [ZOOM]"
@@ -432,7 +529,7 @@ fn status_line(mux: &Multiplexer) -> String {
     }
     format!(
         " caucus · {} panel(s) · focus: {} · layout: {} · \
-         Ctrl-A then n/p focus, z zoom, </> move, Space layout, t transcript, [ scroll, q quit{}{}{}",
+         Ctrl-A then n/p/arrows focus, Ctrl-arrows resize, z zoom, </> move, x close, Space layout, t transcript, [ scroll, q quit{}{}{}",
         mux.panels().len(),
         focused,
         mux.layout_mode().label(),
@@ -440,4 +537,49 @@ fn status_line(mux: &Multiplexer) -> String {
         transcript,
         prefix
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_absorbs_isolated_errors_reset_by_success() {
+        // The real wake scenario: SIGWINCH-driven `terminal::size()` failures
+        // interspersed with the normal stream of successful idle polls. Each
+        // success clears the streak, so no number of *isolated* errors ever
+        // ends the session.
+        let mut b = TerminalErrorBudget::new();
+        for _ in 0..(MAX_CONSECUTIVE_TERMINAL_ERRORS * 4) {
+            assert!(!b.fail(), "an error followed by success must not trip");
+            b.ok();
+        }
+    }
+
+    #[test]
+    fn budget_trips_only_after_max_consecutive_errors() {
+        // A genuinely dead terminal: errors back-to-back with no success
+        // between. The budget absorbs the first MAX-1 and trips on the MAX-th,
+        // sending the loop to orderly shutdown rather than a fatal `?`.
+        let mut b = TerminalErrorBudget::new();
+        for _ in 0..(MAX_CONSECUTIVE_TERMINAL_ERRORS - 1) {
+            assert!(!b.fail());
+        }
+        assert!(b.fail());
+    }
+
+    #[test]
+    fn budget_streak_resets_before_the_limit() {
+        // A near-miss burst that recovers: one success before the limit resets
+        // the streak, so the next run again needs the full budget to trip.
+        let mut b = TerminalErrorBudget::new();
+        for _ in 0..(MAX_CONSECUTIVE_TERMINAL_ERRORS - 1) {
+            assert!(!b.fail());
+        }
+        b.ok();
+        for _ in 0..(MAX_CONSECUTIVE_TERMINAL_ERRORS - 1) {
+            assert!(!b.fail());
+        }
+        assert!(b.fail());
+    }
 }

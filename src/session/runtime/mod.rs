@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::input::FocusRouter;
 use crate::mcp::control_server::ControlServer;
 use crate::panel::lifecycle::Panel;
-use crate::render::{Layout, LayoutMode, Rect};
+use crate::render::{Layout, LayoutMode, LayoutTree, Rect};
 use crate::session::id::PanelId;
 use crate::session::state::Session;
 use crate::signal::server::SignalServer;
@@ -51,8 +51,18 @@ pub struct Multiplexer {
     /// Per-panel agent manifest, keyed by panel id. Mutated only via
     /// `agent::manifest::write`.
     manifests: HashMap<PanelId, AgentManifest>,
-    /// Current screen layout. Recomputed on every spawn/kill/resize.
+    /// Current screen layout — the projection of [`Multiplexer::layout_tree`]
+    /// onto [`Multiplexer::area`] (or a single full-area slot while zoomed),
+    /// recomputed on every spawn/kill/resize/move.
     layout: Layout,
+    /// The live binary space-partition behind the tiling. Rebuilt from the
+    /// `layout_mode` preset + panel order on every structural change
+    /// ([`Multiplexer::rebuild_layout_tree`]); `Ctrl-A Ctrl-arrow`
+    /// ([`Multiplexer::resize_focused`]) perturbs its split ratios in place so
+    /// a manual resize survives terminal resizes but resets on the next
+    /// spawn/kill/move/mode switch (tmux `select-layout` semantics). `None`
+    /// until the first panel is spawned.
+    layout_tree: Option<LayoutTree>,
     /// Input focus + reserved-prefix state.
     focus: FocusRouter,
     /// Worktree cleanup queue (serial, off the UI path).
@@ -77,6 +87,12 @@ pub struct Multiplexer {
     /// in the *same* PTY burst, so the submit is delivered as a discrete
     /// keypress on a later tick ([`Multiplexer::poll_pending_submits`]).
     pending_submits: Vec<PendingSubmit>,
+    /// The panel awaiting a close confirmation (`Ctrl-A x`), or `None`. While
+    /// `Some`, the close-confirm prompt is drawn and the focus router captures
+    /// keys ([`crate::input::FocusRouter::set_confirm_open`]): `y` kills the
+    /// panel via [`Multiplexer::kill_panel`], `n`/`Esc` clears it. The main
+    /// worker panel is never placed here — it is protected from closing.
+    pending_close: Option<PanelId>,
     /// The main worker panel — the round-delivery target. Set when the main
     /// panel is spawned; `None` before then.
     main_panel_id: Option<PanelId>,
@@ -163,6 +179,7 @@ impl Multiplexer {
                 panels: Vec::new(),
                 manifests: HashMap::new(),
                 layout: Layout::default(),
+                layout_tree: None,
                 focus: FocusRouter::new(),
                 cleanup,
                 sock_path,
@@ -172,6 +189,7 @@ impl Multiplexer {
                 role_counts: HashMap::new(),
                 pending_rounds: Vec::new(),
                 pending_submits: Vec::new(),
+                pending_close: None,
                 main_panel_id: None,
                 main_compose_since: None,
                 notified_menus: HashMap::new(),
@@ -225,6 +243,12 @@ impl Multiplexer {
     /// Whether the read-only transcript overlay is currently shown.
     pub fn show_transcript(&self) -> bool {
         self.show_transcript
+    }
+
+    /// The panel awaiting a close confirmation (`Ctrl-A x`), if the prompt is
+    /// open — drives the confirm prompt drawn in the status bar.
+    pub fn pending_close(&self) -> Option<PanelId> {
+        self.pending_close
     }
 }
 
