@@ -43,7 +43,7 @@ const STRANDED_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
 /// push that the pull-only MCP transport cannot do.
 pub(super) struct PendingRound {
     /// Panel ids in the round. Ids that no longer exist count as settled
-    /// (see [`Multiplexer::wait_panels_settled`]).
+    /// (see [`Multiplexer::round_settled`]).
     panels: Vec<PanelId>,
     /// Per-panel follow-up task queue. A round panel that goes idle with a
     /// non-empty queue is fed its next task (popped front) by
@@ -129,11 +129,13 @@ impl Multiplexer {
     /// naturally holds until the main worker is idle again. A due round with
     /// no main panel to deliver to is dropped (it would otherwise be stranded).
     ///
-    /// Before the due-check, each round's backlog is fed
+    /// Before the due-check, each non-expired round's backlog is fed
     /// ([`Multiplexer::feed_round_backlog`]): a panel that finished early with
     /// queued tasks is handed its next task and flips back to `Working`, so it
     /// is not yet settled and the round is not yet due — the early finisher
-    /// keeps working its backlog instead of idling at the barrier.
+    /// keeps working its backlog instead of idling at the barrier. Once the
+    /// fallback deadline has passed, no new backlog work starts; the round
+    /// delivers the partial report.
     pub fn poll_pending_rounds(&mut self) {
         if self.pending_rounds.is_empty() {
             return;
@@ -147,17 +149,21 @@ impl Multiplexer {
 
         let mut delivered = false;
         for mut round in rounds {
-            // Keep early finishers busy: hand any idle round-panel its next
-            // queued task before judging the round done. A fed panel flips to
-            // `Working`, so `wait_panels_settled` sees it as unfinished.
-            self.feed_round_backlog(&mut round);
-            let due = now >= round.fallback_deadline || self.wait_panels_settled(&round.panels);
+            let fallback_due = now >= round.fallback_deadline;
+            if !fallback_due {
+                // Keep early finishers busy: hand any idle round-panel its
+                // next queued task before judging the round done. Once the
+                // fallback deadline has fired, do not start more queued work:
+                // the deadline means deliver the partial report now.
+                self.feed_round_backlog(&mut round);
+            }
+            let all_settled = self.round_settled(&round);
+            let due = fallback_due || all_settled;
             match main_id {
                 // Due, gate open, nothing delivered yet this tick: assemble +
                 // inject into the main panel, then drop the round.
                 Some(main_id) if due && deliverable && !delivered => {
-                    let report =
-                        self.assemble_round_report(&round.panels, round.read_mode, &round.captured);
+                    let report = self.assemble_round_report(&round, all_settled);
                     if let Err(err) = McpToolSurface::send_keys(self, main_id, &report, true) {
                         warn!(error = %err, "round delivery to main panel failed");
                     }
@@ -170,6 +176,21 @@ impl Multiplexer {
                 _ => self.pending_rounds.push(round),
             }
         }
+    }
+
+    /// Whether every panel in `round` has settled *and* any per-panel backlog
+    /// has drained. A missing panel counts as settled: there is no live worker
+    /// left to feed, even if a stale backlog entry exists for that id.
+    fn round_settled(&self, round: &PendingRound) -> bool {
+        if !self.wait_panels_settled(&round.panels) {
+            return false;
+        }
+        round.panels.iter().all(|id| {
+            if !self.panels.iter().any(|p| p.id == *id) {
+                return true;
+            }
+            round.backlog.get(id).is_none_or(VecDeque::is_empty)
+        })
     }
 
     /// Hand each cleanly-idle round panel its next backlog task, keeping an
@@ -469,23 +490,17 @@ impl Multiplexer {
     /// turns) plus an "unfinished" marker, never a live read of a mid-turn
     /// panel. A panel id that no longer exists is reported as gone. This is the
     /// text injected into the main worker's panel as a fresh turn.
-    fn assemble_round_report(
-        &self,
-        panels: &[PanelId],
-        read_mode: ReadPanelMode,
-        captured: &HashMap<PanelId, Vec<String>>,
-    ) -> String {
-        let all_settled = self.wait_panels_settled(panels);
+    fn assemble_round_report(&self, round: &PendingRound, all_settled: bool) -> String {
         let mut out = format!(
             "[caucus] Round complete — {} panel(s){}.\n",
-            panels.len(),
+            round.panels.len(),
             if all_settled {
                 ""
             } else {
                 " (fallback deadline reached; some panels did not finish)"
             }
         );
-        for &id in panels {
+        for &id in &round.panels {
             let Some(panel) = self.panels.iter().find(|p| p.id == id) else {
                 out.push_str(&format!("\n## panel {id} — gone (killed)\n"));
                 continue;
@@ -499,14 +514,14 @@ impl Multiplexer {
 
             // Every finished backlog turn, in feed order, captured the moment
             // before its successor was fed.
-            let done = captured.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+            let done = round.captured.get(&id).map(Vec::as_slice).unwrap_or(&[]);
             // A settled panel adds its final turn (read live) after the
             // captured turns; a still-working panel contributes only what it
             // already finished, then the unfinished marker below — never a
             // live read of a mid-turn panel.
             let still_working = matches!(state, PanelState::Working | PanelState::Spawning);
             let final_body = (!still_working).then(|| {
-                self.read_panel(id, read_mode)
+                self.read_panel(id, round.read_mode)
                     .unwrap_or_else(|e| format!("(could not read panel: {e})"))
             });
 
@@ -530,6 +545,13 @@ impl Multiplexer {
 
             if still_working {
                 out.push_str("⏳ still working — did not finish within the fallback window.\n");
+            }
+            if let Some(pending) = round.backlog.get(&id).map(VecDeque::len)
+                && pending > 0
+            {
+                out.push_str(&format!(
+                    "⏳ {pending} queued backlog task(s) were not run before the fallback window closed.\n"
+                ));
             }
         }
         out
@@ -616,9 +638,48 @@ impl Multiplexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::panel::lifecycle::Panel;
+    use crate::pty::{Pty, PtyCommand};
+    use crate::session::id::AgentId;
     use crate::session::runtime::test_support::*;
     use crate::signal::TurnSignal;
+    use crate::term::{Grid, OutputCapture};
     use tempfile::TempDir;
+
+    fn pending_round(
+        panels: Vec<PanelId>,
+        read_mode: ReadPanelMode,
+        captured: HashMap<PanelId, Vec<String>>,
+        backlog: HashMap<PanelId, VecDeque<String>>,
+    ) -> PendingRound {
+        PendingRound {
+            panels,
+            backlog,
+            captured,
+            read_mode,
+            fallback_deadline: Instant::now() + Duration::from_secs(600),
+        }
+    }
+
+    /// Insert a hermetic `/bin/cat` panel directly into the mux so round
+    /// scheduler tests do not depend on a real agent CLI being installed.
+    fn push_cat_panel(mux: &mut Multiplexer, role: &str, state: PanelState) -> PanelId {
+        let id = PanelId::new();
+        let inner = area().inner();
+        let pty = Pty::spawn(&PtyCommand::new("/bin/cat"), inner.width, inner.height).unwrap();
+        mux.panels.push(Panel {
+            id,
+            role: role.to_string(),
+            agent_id: AgentId::new(),
+            state,
+            worktree_path: None,
+            pty,
+            grid: Grid::new(inner.width as usize, inner.height as usize),
+            capture: OutputCapture::new(),
+        });
+        mux.rebuild_layout_tree();
+        id
+    }
 
     /// `register_round` acks immediately with a panel snapshot and stashes a
     /// `PendingRound` — it never blocks. An unknown id is omitted from the ack
@@ -686,8 +747,13 @@ mod tests {
         let mux = mux(&tmp);
         let ghost = PanelId::new();
 
-        let report =
-            mux.assemble_round_report(&[ghost], ReadPanelMode::LastMessage, &HashMap::new());
+        let round = pending_round(
+            vec![ghost],
+            ReadPanelMode::LastMessage,
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let report = mux.assemble_round_report(&round, true);
         assert!(report.contains("Round complete"), "report: {report}");
         assert!(
             report.contains("gone"),
@@ -713,7 +779,13 @@ mod tests {
             PanelState::Working,
         );
 
-        let report = mux.assemble_round_report(&[sub], ReadPanelMode::LastMessage, &HashMap::new());
+        let round = pending_round(
+            vec![sub],
+            ReadPanelMode::LastMessage,
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let report = mux.assemble_round_report(&round, false);
         assert!(
             report.contains("still working"),
             "a Working panel must be marked unfinished: {report}"
@@ -748,7 +820,13 @@ mod tests {
                 "output of task two".to_string(),
             ],
         )]);
-        let report = mux.assemble_round_report(&[sub], ReadPanelMode::LastMessage, &captured);
+        let round = pending_round(
+            vec![sub],
+            ReadPanelMode::LastMessage,
+            captured,
+            HashMap::new(),
+        );
+        let report = mux.assemble_round_report(&round, true);
 
         assert!(
             report.contains("### task 1"),
@@ -790,7 +868,13 @@ mod tests {
             return;
         };
 
-        let report = mux.assemble_round_report(&[sub], ReadPanelMode::LastMessage, &HashMap::new());
+        let round = pending_round(
+            vec![sub],
+            ReadPanelMode::LastMessage,
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let report = mux.assemble_round_report(&round, true);
         assert!(
             !report.contains("### task"),
             "a single-output panel must not get task headers: {report}"
@@ -1115,6 +1199,72 @@ mod tests {
         assert!(
             mux.pending_rounds.is_empty(),
             "the drained round must deliver once the compose hold clears",
+        );
+
+        mux.shutdown();
+    }
+
+    /// An idle panel with queued backlog is not settled yet. The queue must
+    /// drain before round delivery; otherwise a failed or skipped feed could
+    /// report a round complete while work remains queued.
+    #[tokio::test]
+    async fn round_settled_requires_live_panel_backlog_to_drain() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+        let mut round = pending_round(
+            vec![sub],
+            ReadPanelMode::LastMessage,
+            HashMap::new(),
+            HashMap::from([(sub, VecDeque::from(["queued".to_string()]))]),
+        );
+
+        assert!(
+            !mux.round_settled(&round),
+            "an idle panel with queued backlog is not settled"
+        );
+
+        round.backlog.get_mut(&sub).unwrap().clear();
+        assert!(mux.round_settled(&round), "draining the queue settles it");
+
+        mux.shutdown();
+    }
+
+    /// Once the fallback deadline has fired, polling must deliver the partial
+    /// report instead of starting another queued backlog task. Before this
+    /// guard, an idle panel at the deadline was fed first, flipping it back to
+    /// `Working` even though the round was already due by timeout.
+    #[tokio::test]
+    async fn poll_pending_rounds_does_not_feed_backlog_after_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        mux.register_round(
+            vec![sub],
+            None,
+            Some(3600),
+            Some(HashMap::from([(sub, vec!["late task".to_string()])])),
+        );
+        mux.pending_rounds[0].fallback_deadline = Instant::now() - Duration::from_secs(1);
+
+        mux.poll_pending_rounds();
+
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "fallback-due round should be delivered and dropped"
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == sub).unwrap().state(),
+            PanelState::Idle,
+            "fallback delivery must not start another queued backlog task"
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "delivery injects the partial report into the main panel"
         );
 
         mux.shutdown();
