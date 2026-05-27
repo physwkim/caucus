@@ -32,7 +32,7 @@ use crate::config::Config;
 use crate::render::{self, Rect};
 use crate::role::spec::AgentCli;
 use crate::session::Multiplexer;
-use crate::session::record::SessionRecord;
+use crate::session::record::{PanelRecord, SessionRecord};
 use crate::session::state::Session;
 
 /// Event-loop redraw period — ~60 Hz.
@@ -231,18 +231,24 @@ fn spawn_fresh_roster(
 
 /// Recreate every panel of a persisted session in `order_index` order.
 ///
-/// The `order_index == 0` panel is the main worker (always spawned first on a
-/// fresh launch); it resumes through `spawn_main_panel_resume` so its claude
-/// reloads the caucus MCP server. Worktree panels re-attach a worktree on
-/// their persisted branch; if the branch is gone the panel spawns fresh
-/// (no worktree, no `--resume`). The layout mode is restored last.
+/// The panel marked `is_main` is the main worker and resumes through
+/// `spawn_main_panel_resume` so its agent reloads the caucus MCP server. Legacy
+/// records without an explicit marker fall back to `order_index == 0`. Worktree
+/// panels re-attach a worktree on their persisted branch; if the branch is gone
+/// the panel spawns fresh (no worktree, no `--resume`). The layout mode is
+/// restored last.
 fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
     let bin = caucus_bin();
     let mut panels = record.panels.clone();
     panels.sort_by_key(|p| p.order_index);
+    let has_explicit_main = panels.iter().any(|p| p.is_main);
+    let mut restored_main = false;
 
     for panel in &panels {
-        let is_main = panel.order_index == 0;
+        let is_main = should_restore_panel_as_main(panel, has_explicit_main, restored_main);
+        if is_main {
+            restored_main = true;
+        }
 
         // A worktree-backed panel: re-attach a worktree on its persisted
         // branch. The directory was removed on the prior shutdown; the branch
@@ -299,6 +305,23 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
     mux.set_layout_mode(record.layout_mode);
     mux.persist_record();
     Ok(())
+}
+
+/// Whether `panel` should be restored as the main worker. New records carry an
+/// explicit `is_main` marker; old records did not, so the first ordered panel
+/// remains the compatibility fallback. `restored_main` makes corrupted records
+/// with multiple markers restore only the first marked panel as main.
+fn should_restore_panel_as_main(
+    panel: &PanelRecord,
+    has_explicit_main: bool,
+    restored_main: bool,
+) -> bool {
+    !restored_main
+        && if has_explicit_main {
+            panel.is_main
+        } else {
+            panel.order_index == 0
+        }
 }
 
 /// Worktree directory for a resumed panel under `<repo>/.caucus/worktrees/`.
@@ -558,6 +581,7 @@ fn status_line(mux: &Multiplexer) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::record::PanelRecord;
 
     #[test]
     fn budget_absorbs_isolated_errors_reset_by_success() {
@@ -597,5 +621,33 @@ mod tests {
             assert!(!b.fail());
         }
         assert!(b.fail());
+    }
+
+    fn panel_record(order_index: usize, is_main: bool) -> PanelRecord {
+        PanelRecord {
+            role: format!("role-{order_index}"),
+            agent_cli: AgentCli::Claude,
+            model: None,
+            order_index,
+            is_main,
+            worktree_branch: None,
+            claude_session_id: None,
+        }
+    }
+
+    #[test]
+    fn restore_main_selection_prefers_explicit_marker_over_order() {
+        let first = panel_record(0, false);
+        let second = panel_record(1, true);
+        assert!(!should_restore_panel_as_main(&first, true, false));
+        assert!(should_restore_panel_as_main(&second, true, false));
+    }
+
+    #[test]
+    fn restore_main_selection_falls_back_for_legacy_records() {
+        let first = panel_record(0, false);
+        let second = panel_record(1, false);
+        assert!(should_restore_panel_as_main(&first, false, false));
+        assert!(!should_restore_panel_as_main(&second, false, true));
     }
 }

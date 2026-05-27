@@ -35,6 +35,11 @@ pub struct PanelRecord {
     pub model: Option<String>,
     /// Position in the panel/focus-cycle order — panels resume in this order.
     pub order_index: usize,
+    /// Whether this panel was the main worker. Persisted independently from
+    /// `order_index` so moving panels in the UI cannot reassign the main role
+    /// on resume. Old records omit this and fall back to `order_index == 0`.
+    #[serde(default)]
+    pub is_main: bool,
     /// Git branch of the panel's worktree, if it had one. The branch persists
     /// across shutdown (it holds the agent's commits); resume re-attaches a
     /// worktree on it via `crate::worktree::manager::attach`.
@@ -156,6 +161,7 @@ mod tests {
                     agent_cli: AgentCli::Claude,
                     model: None,
                     order_index: 0,
+                    is_main: true,
                     worktree_branch: None,
                     claude_session_id: Some("conv-abc".into()),
                 },
@@ -164,6 +170,7 @@ mod tests {
                     agent_cli: AgentCli::Codex,
                     model: Some("gpt-5".into()),
                     order_index: 1,
+                    is_main: false,
                     worktree_branch: Some("caucus/s1/backend".into()),
                     claude_session_id: None,
                 },
@@ -244,6 +251,7 @@ mod tests {
         let pr: PanelRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(pr.role, "reviewer");
         assert_eq!(pr.order_index, 2);
+        assert!(!pr.is_main);
         assert!(pr.model.is_none());
         assert!(pr.worktree_branch.is_none());
         assert!(pr.claude_session_id.is_none());

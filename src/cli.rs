@@ -524,6 +524,7 @@ mod tests {
                 agent_cli: AgentCli::Claude,
                 model: None,
                 order_index: 0,
+                is_main: true,
                 worktree_branch: None,
                 claude_session_id: Some("conv-1".into()),
             }],

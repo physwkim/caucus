@@ -19,6 +19,7 @@ impl Multiplexer {
                     agent_cli: manifest.map(|m| m.agent_cli).unwrap_or(AgentCli::Claude),
                     model: manifest.and_then(|m| m.model.clone()),
                     order_index: idx,
+                    is_main: self.main_panel_id == Some(panel.id),
                     worktree_branch: self.worktree_branches.get(&panel.id).cloned(),
                     claude_session_id: manifest
                         .and_then(|m| m.claude_session_id().map(str::to_string)),
@@ -101,9 +102,31 @@ impl Multiplexer {
 mod tests {
     use crate::input::CaucusCommand;
     use crate::mcp::protocol::{ControlRequest, ControlResponse};
+    use crate::panel::lifecycle::{Panel, PanelState};
+    use crate::pty::{Pty, PtyCommand};
     use crate::render::LayoutMode;
+    use crate::session::id::AgentId;
     use crate::session::runtime::test_support::*;
+    use crate::term::{Grid, OutputCapture};
     use tempfile::TempDir;
+
+    fn push_cat_panel(mux: &mut super::Multiplexer, role: &str) -> crate::session::PanelId {
+        let id = crate::session::PanelId::new();
+        let inner = area().inner();
+        let pty = Pty::spawn(&PtyCommand::new("/bin/cat"), inner.width, inner.height).unwrap();
+        mux.panels.push(Panel {
+            id,
+            role: role.to_string(),
+            agent_id: AgentId::new(),
+            state: PanelState::Idle,
+            worktree_path: None,
+            pty,
+            grid: Grid::new(inner.width as usize, inner.height as usize),
+            capture: OutputCapture::new(),
+        });
+        mux.rebuild_layout_tree();
+        id
+    }
 
     /// The multiplexer writes `session.json` on `shutdown`, and the record
     /// round-trips back through `SessionRecord::read`.
@@ -134,6 +157,32 @@ mod tests {
         mux.apply_command(CaucusCommand::CycleLayout);
         let record = SessionRecord::read(&root).expect("session.json written");
         assert_eq!(record.layout_mode, LayoutMode::EvenHorizontal);
+    }
+
+    /// The main worker identity is persisted independently from panel order:
+    /// moving the main panel later must not make panel 0 become main on resume.
+    #[tokio::test]
+    async fn build_record_marks_main_independent_of_order_index() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let other = push_cat_panel(&mut mux, "worker");
+        let main = push_cat_panel(&mut mux, "main");
+        mux.main_panel_id = Some(main);
+
+        let record = mux.build_record();
+        assert_eq!(record.panels[0].order_index, 0);
+        assert_eq!(record.panels[0].role, "worker");
+        assert_ne!(other, main);
+        assert!(
+            !record.panels[0].is_main,
+            "panel 0 must not become main just because it is first"
+        );
+        assert!(
+            record.panels[1].is_main,
+            "the main marker must follow main_panel_id, not order_index"
+        );
+
+        mux.shutdown();
     }
 
     /// `shutdown` must remove worktrees synchronously — the async cleanup
