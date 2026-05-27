@@ -42,10 +42,7 @@ impl Multiplexer {
             .lines()
             .map(str::to_string)
             .collect();
-        // Body height = whole screen minus the pager's border (2) + title (1)
-        // + status (1). Approximate; the render layer re-clamps to the real
-        // height, and `offset` clamps against this `page` consistently.
-        let page = (self.area.height as usize).saturating_sub(4).max(1);
+        let page = pager_page_height(self.area);
         // Open at the bottom (newest), like tmux copy-mode entry.
         let offset = lines.len().saturating_sub(page);
         self.show_transcript = false;
@@ -90,6 +87,16 @@ impl Multiplexer {
             };
         }
     }
+}
+
+/// Visible body rows in the scrollback pager for a multiplexer body area.
+///
+/// [`Multiplexer::area`] excludes the one-line status bar, while
+/// `draw_scroll_pager` receives the full terminal frame, insets the popup by
+/// two rows at the top/bottom, then subtracts the border. Therefore:
+/// `(area.height + status) - popup_inset(4) - border(2) = area.height - 5`.
+fn pager_page_height(area: Rect) -> usize {
+    (area.height as usize).saturating_sub(5).max(1)
 }
 
 #[cfg(test)]
@@ -164,6 +171,24 @@ mod tests {
         assert_eq!(mux.scroll_state().unwrap().offset, 0);
         mux.apply_command(CaucusCommand::ScrollDown);
         assert_eq!(mux.scroll_state().unwrap().offset, 0);
+    }
+
+    /// The pager opens at the bottom by computing `offset = lines.len() -
+    /// page`; `page` must match the renderer's actual inner popup height. The
+    /// multiplexer area excludes the status row, while rendering insets the
+    /// full frame by two rows and subtracts a border: body height 39 (40-row
+    /// terminal minus status) leaves 34 visible pager rows.
+    #[test]
+    fn pager_page_height_matches_the_rendered_popup_body() {
+        assert_eq!(
+            pager_page_height(Rect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 39,
+            }),
+            34
+        );
     }
 
     /// `ExitScroll` clears the pager state.
