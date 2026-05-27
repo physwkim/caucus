@@ -1,7 +1,8 @@
 //! `git worktree add` driver (`docs/design.md` §5).
 //!
-//! Worktree directories live under `<repo>/.caucus/worktrees/<session>-<role>-NN/`
-//! and check out a fresh branch off the current `HEAD` (or an explicit base).
+//! Worktree directories live under
+//! `<repo>/.caucus/worktrees/<session>-<role-stem>-NN/` and check out a fresh
+//! branch off the current `HEAD` (or an explicit base).
 //!
 //! **Invariant I-3** (`docs/design.md` §12): worktree *creation* is owned by
 //! `create`; *deletion* goes through [`crate::worktree::cleanup`].
@@ -19,7 +20,7 @@ pub struct WorktreeRequest {
     pub repo_root: PathBuf,
     pub session_id: SessionId,
     pub role: String,
-    /// Branch to create. `None` defaults to `caucus/<session>/<role>`.
+    /// Branch to create. `None` defaults to `caucus/<session>/<role-stem>`.
     pub branch: Option<String>,
     /// Base ref for the new branch. `None` means current `HEAD`.
     pub base_ref: Option<String>,
@@ -60,7 +61,7 @@ impl WorktreeRequest {
         let leaf = self
             .name_override
             .clone()
-            .unwrap_or_else(|| format!("{}-{}", self.session_id, self.role));
+            .unwrap_or_else(|| format!("{}-{}", self.session_id, role_worktree_stem(&self.role)));
         self.repo_root.join(".caucus").join("worktrees").join(leaf)
     }
 
@@ -70,10 +71,63 @@ impl WorktreeRequest {
             format!(
                 "caucus/{session}/{role}",
                 session = short_session(self.session_id),
-                role = self.role
+                role = role_worktree_stem(&self.role)
             )
         })
     }
+}
+
+/// Filesystem/git-ref-safe slug for a free-form role label.
+///
+/// Role names are display labels and can contain spaces, punctuation, or
+/// slashes. Worktree paths and branch components need a narrower alphabet, so
+/// the worktree owner converts labels once at the path/ref boundary.
+pub(crate) fn role_slug(role: &str) -> String {
+    const MAX: usize = 48;
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in role.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if !out.is_empty() && !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+        } else {
+            out.push(mapped);
+            last_dash = false;
+        }
+        if out.len() >= MAX {
+            break;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "role".to_string()
+    } else {
+        out
+    }
+}
+
+/// Collision-resistant path/ref stem for a role label. The slug keeps names
+/// readable, and the stable hash keeps labels with the same slug distinct.
+pub(crate) fn role_worktree_stem(role: &str) -> String {
+    format!("{}-{:08x}", role_slug(role), stable_role_hash(role))
+}
+
+fn stable_role_hash(role: &str) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    for byte in role.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 fn short_session(id: SessionId) -> String {
@@ -211,11 +265,10 @@ mod tests {
         };
         let p = req.default_path();
         assert_eq!(p.parent().unwrap(), Path::new("/repo/.caucus/worktrees"));
+        let file_name = p.file_name().unwrap().to_string_lossy();
         assert!(
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with("-backend")
+            file_name.starts_with(&format!("{}-backend-", req.session_id)),
+            "file name: {file_name}"
         );
     }
 
@@ -231,7 +284,7 @@ mod tests {
         };
         let b = req.default_branch();
         assert!(b.starts_with("caucus/"));
-        assert!(b.ends_with("/reviewer"));
+        assert!(b.contains("/reviewer-"), "branch: {b}");
     }
 
     #[test]
@@ -245,6 +298,41 @@ mod tests {
             name_override: None,
         };
         assert_eq!(req.default_branch(), "feature/x");
+    }
+
+    #[test]
+    fn role_slug_sanitizes_free_form_labels() {
+        assert_eq!(role_slug("Perf Profiler: QA/2"), "perf-profiler-qa-2");
+        assert_eq!(role_slug(".hidden"), "hidden");
+        assert_eq!(role_slug("!!!"), "role");
+    }
+
+    #[test]
+    fn default_branch_uses_a_git_ref_safe_role_slug() {
+        let req = WorktreeRequest {
+            repo_root: PathBuf::from("/repo"),
+            session_id: SessionId::new(),
+            role: "Perf Profiler: QA/2".into(),
+            branch: None,
+            base_ref: None,
+            name_override: None,
+        };
+        let branch = req.default_branch();
+        assert!(branch.contains("/perf-profiler-qa-2-"), "branch: {branch}");
+        assert!(
+            std::process::Command::new("git")
+                .args(["check-ref-format", &format!("refs/heads/{branch}")])
+                .status()
+                .unwrap()
+                .success(),
+            "branch must be accepted by git check-ref-format: {branch}"
+        );
+    }
+
+    #[test]
+    fn role_worktree_stem_distinguishes_slug_collisions() {
+        assert_eq!(role_slug("a b"), role_slug("a:b"));
+        assert_ne!(role_worktree_stem("a b"), role_worktree_stem("a:b"));
     }
 
     /// `attach` re-adds a worktree on an *existing* branch — the resume path.

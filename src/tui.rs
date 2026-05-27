@@ -342,7 +342,8 @@ fn resume_worktree_path(
         .collect();
     repo.join(".caucus").join("worktrees").join(format!(
         "{suffix}-{}-resume{}",
-        panel.role, panel.order_index
+        crate::worktree::manager::role_slug(&panel.role),
+        panel.order_index
     ))
 }
 

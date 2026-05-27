@@ -7,7 +7,9 @@ use crate::render::Layout;
 use crate::role::spec::{AgentCli, RoleSpec};
 use crate::session::id::PanelId;
 use crate::worktree::cleanup::CleanupJob;
-use crate::worktree::manager::{WorktreeHandle, WorktreeRequest, create as create_worktree};
+use crate::worktree::manager::{
+    WorktreeHandle, WorktreeRequest, create as create_worktree, role_worktree_stem,
+};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tracing::warn;
@@ -428,19 +430,26 @@ impl Multiplexer {
     /// fast subprocess); the event loop calls it directly on its own thread —
     /// no async bridging, so no nested-runtime panic.
     pub(crate) fn create_role_worktree(&self, role: &str) -> Result<WorktreeHandle, McpError> {
+        let next = self.role_counts.get(role).copied().unwrap_or(0) + 1;
+        let stem = role_worktree_stem(role);
         let req = WorktreeRequest {
             repo_root: self.session.repo_path.clone(),
             session_id: self.session.id,
             role: role.to_string(),
-            branch: None,
+            branch: Some(format!(
+                "caucus/{}/{}-{}",
+                session_suffix(&self.session),
+                stem,
+                next
+            )),
             base_ref: None,
             // Disambiguate concurrent worktrees for the same role with the
             // per-role spawn counter.
             name_override: Some(format!(
                 "{}-{}-{}",
                 session_suffix(&self.session),
-                role,
-                self.role_counts.get(role).copied().unwrap_or(0) + 1,
+                stem,
+                next,
             )),
         };
         create_worktree(&req).map_err(|err| McpError::Tool(format!("worktree create: {err}")))
@@ -547,5 +556,55 @@ mod tests {
             !spec.allows_task(),
             "a free-form role must not grant the Task tool (Invariant I-7)"
         );
+    }
+
+    /// `spawn_role(worktree=true)` accepts free-form role labels: the visible
+    /// role keeps its original text, while the git branch/path use a safe slug
+    /// and a per-role counter so repeated worktree spawns do not collide.
+    #[tokio::test]
+    async fn create_role_worktree_sanitizes_labels_and_uses_unique_branches() {
+        let tmp = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(tmp.path())
+                .args(args)
+                .output()
+                .expect("run git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "caucus-test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        let mut mux = mux(&tmp);
+        let role = "Perf Profiler: QA/2";
+        let first = mux.create_role_worktree(role).unwrap();
+        mux.role_counts.insert(role.to_string(), 1);
+        let second = mux.create_role_worktree(role).unwrap();
+
+        assert!(first.path.to_string_lossy().contains("perf-profiler-qa-2-"));
+        assert!(
+            second
+                .path
+                .to_string_lossy()
+                .contains("perf-profiler-qa-2-")
+        );
+        assert!(first.path.to_string_lossy().ends_with("-1"));
+        assert!(second.path.to_string_lossy().ends_with("-2"));
+        assert!(first.branch.contains("/perf-profiler-qa-2-"));
+        assert!(second.branch.contains("/perf-profiler-qa-2-"));
+        assert!(first.branch.ends_with("-1"));
+        assert!(second.branch.ends_with("-2"));
+        assert_ne!(first.branch, second.branch);
+
+        let summary =
+            crate::worktree::cleanup::run_blocking(&crate::worktree::cleanup::CleanupJob {
+                repo_root: tmp.path().to_path_buf(),
+                worktree_paths: vec![first.path, second.path],
+                branches_to_delete: vec![first.branch, second.branch],
+                done: None,
+            });
+        assert!(summary.failed_worktrees.is_empty(), "{summary:?}");
+        assert!(summary.failed_branches.is_empty(), "{summary:?}");
     }
 }
