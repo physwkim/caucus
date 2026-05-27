@@ -46,6 +46,19 @@ Free-form roles: the main worker is no longer limited to a fixed roster.
   write failure logs a warning and the panel still launches). Honours
   `CODEX_HOME` when set.
 
+### Fixed
+
+- **Codex panels now report turn completion, so the main worker wakes on time.**
+  caucus detected the end of a turn only through claude's `Stop` hook; codex has
+  no such hook, so a codex panel sat in `working` forever after its first prompt
+  and a registered round settled only at its (long) fallback deadline — then
+  misreported the finished panel as *"still working."* caucus now registers
+  `caucus signal codex-notify` as codex's `notify` program (`-c notify=[...]`,
+  injected for every codex panel); codex invokes it on `agent-turn-complete` with
+  the event JSON, and it posts the same `Stop` turn-signal claude's hook posts,
+  so both backends settle a panel through one owner. The grid-hint path that was
+  intended for this (`GridHint::PromptReady`) was never wired and is unchanged.
+
 ### Removed
 
 - **Dropped the `gemini` backend.** The Gemini CLI is no longer a supported

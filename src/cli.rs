@@ -109,6 +109,26 @@ pub enum SignalCommand {
         #[arg(long, value_enum, default_value = "stop")]
         kind: SignalKindArg,
     },
+    /// Post a turn signal from codex's `notify` program. codex has no `Stop`
+    /// hook; it invokes this on `agent-turn-complete`, appending the event JSON
+    /// as the final positional argument (not stdin, unlike the claude hook).
+    /// Only an `agent-turn-complete` event posts a `Stop` signal; any other
+    /// event is a no-op, so codex's other notifications never spuriously settle
+    /// a panel. Registered via `-c notify=[...]` at spawn, not invoked by hand.
+    CodexNotify {
+        /// Path to the caucus turn-signal socket.
+        #[arg(long)]
+        sock: PathBuf,
+        /// Session id (`CAUCUS_SESSION_ID`).
+        #[arg(long)]
+        session: String,
+        /// Panel id (`CAUCUS_PANEL_ID`).
+        #[arg(long)]
+        panel: String,
+        /// The notify event JSON codex appends as the final argument. Absent
+        /// (or unparseable) is a no-op rather than an error.
+        payload: Option<String>,
+    },
 }
 
 /// CLI spelling of [`TurnKind`].
@@ -270,6 +290,19 @@ fn run_signal(cmd: SignalCommand) -> Result<ExitCode> {
             let panel_id = PanelId::from_str(&panel)
                 .with_context(|| format!("invalid --panel id '{panel}'"))?;
             crate::signal::post::run(&sock, session_id, panel_id, kind.into())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        SignalCommand::CodexNotify {
+            sock,
+            session,
+            panel,
+            payload,
+        } => {
+            let session_id = SessionId::from_str(&session)
+                .with_context(|| format!("invalid --session id '{session}'"))?;
+            let panel_id = PanelId::from_str(&panel)
+                .with_context(|| format!("invalid --panel id '{panel}'"))?;
+            crate::signal::post::run_codex_notify(&sock, session_id, panel_id, payload.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
     }

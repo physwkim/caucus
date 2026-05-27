@@ -27,6 +27,28 @@ pub struct CaucusMcp {
     pub control_sock: PathBuf,
 }
 
+/// codex turn-completion wiring for one panel.
+///
+/// codex has no equivalent of claude's `Stop` hook (the turn-signal mechanism
+/// in `docs/design.md` §7), so without this a codex panel never reports its
+/// turn as done: caucus would keep it `Working` forever and a registered round
+/// would settle only at its fallback deadline. codex *does* invoke a `notify`
+/// program on `agent-turn-complete`, passing the event JSON as a trailing
+/// argument (verified empirically — `-c notify=[...]` is honoured in the
+/// interactive TUI mode caucus drives over a PTY). caucus registers
+/// `caucus signal codex-notify` as that program, baking this panel's signal
+/// socket, session, and panel id into the argv so the short-lived notify
+/// process can post the *same* `TurnSignal{Stop}` the claude Stop hook posts —
+/// landing both backends on one turn-completion owner (`handle_signal`). Set
+/// for every codex panel (`build_command`); unused by the claude backend.
+#[derive(Debug, Clone)]
+pub struct CodexNotify {
+    pub caucus_bin: PathBuf,
+    pub signal_sock: PathBuf,
+    pub session_id: SessionId,
+    pub panel_id: PanelId,
+}
+
 /// A request to spawn one agent into a new panel.
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
@@ -182,13 +204,29 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
         // system-prompt *flag*, but its `-c instructions=<text>` config override
         // sets the agent's base instructions, so the role prompt is injected
         // that way (`codex_args`).
-        AgentCli::Codex => codex_args(
-            &request.role,
-            model.as_deref(),
-            request.skip_permissions,
-            request.system_prompt.as_deref(),
-            request.caucus_mcp.as_ref(),
-        ),
+        AgentCli::Codex => {
+            // Every codex panel needs turn-completion wiring (codex has no
+            // Stop hook): register `caucus signal codex-notify` as codex's
+            // `notify` program, baking in this panel's signal socket / session
+            // / panel id. Skipped only when no signal socket is wired (unit
+            // tests) — then the panel relies on the round fallback as before.
+            // The notify program is this exact running caucus binary
+            // (`current_exe`, the same path `tui::caucus_bin` resolves).
+            let notify = request.sock_path.as_ref().map(|sock| CodexNotify {
+                caucus_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caucus")),
+                signal_sock: sock.clone(),
+                session_id: request.session_id,
+                panel_id,
+            });
+            codex_args(
+                &request.role,
+                model.as_deref(),
+                request.skip_permissions,
+                request.system_prompt.as_deref(),
+                request.caucus_mcp.as_ref(),
+                notify.as_ref(),
+            )
+        }
     };
 
     let mut env: HashMap<String, String> = HashMap::new();
@@ -275,9 +313,10 @@ fn claude_args(
 /// ids), the role's system prompt as `-c instructions=<text>` (codex's base
 /// instructions config override — it has no `--append-system-prompt` flag),
 /// the caucus MCP server as `-c mcp_servers.caucus.*` for the main worker panel
-/// (codex has no `--mcp-config`), and either
-/// `--dangerously-bypass-approvals-and-sandbox` or a `--sandbox` level coarsely
-/// matching the role's permission mode.
+/// (codex has no `--mcp-config`), the turn-completion `notify` program as
+/// `-c notify=[...]` (codex's stand-in for claude's missing Stop hook —
+/// [`CodexNotify`]), and either `--dangerously-bypass-approvals-and-sandbox` or
+/// a `--sandbox` level coarsely matching the role's permission mode.
 ///
 /// The instructions value is passed raw (no TOML quoting): codex parses a
 /// `-c` value as TOML and falls back to the literal string when that fails, so
@@ -289,6 +328,7 @@ fn codex_args(
     skip_permissions: bool,
     system_prompt: Option<&str>,
     caucus_mcp: Option<&CaucusMcp>,
+    notify: Option<&CodexNotify>,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     if let Some(m) = model {
@@ -319,6 +359,25 @@ fn codex_args(
         server_args.push(mcp.control_sock.as_os_str());
         server_args.push("\"]");
         args.push(server_args);
+    }
+    // Turn-completion signalling: codex invokes this `notify` program on
+    // `agent-turn-complete` with the event JSON appended as a final argument.
+    // `caucus signal codex-notify` parses that JSON and posts the same
+    // `TurnSignal{Stop}` claude's Stop hook posts, so a codex panel settles to
+    // `Idle` the moment its turn ends (see [`CodexNotify`]). The program path
+    // and args are TOML strings; codex parses the `-c` value as a TOML array.
+    if let Some(n) = notify {
+        args.push("-c".into());
+        let mut v = OsString::from("notify=[\"");
+        v.push(n.caucus_bin.as_os_str());
+        v.push("\",\"signal\",\"codex-notify\",\"--sock\",\"");
+        v.push(n.signal_sock.as_os_str());
+        v.push("\",\"--session\",\"");
+        v.push(n.session_id.to_string());
+        v.push("\",\"--panel\",\"");
+        v.push(n.panel_id.to_string());
+        v.push("\"]");
+        args.push(v);
     }
     if skip_permissions {
         args.push("--dangerously-bypass-approvals-and-sandbox".into());
@@ -579,6 +638,64 @@ mod tests {
         };
         let args = args_of(&build_command(&req, PanelId::new()));
         assert!(!args.iter().any(|a| a.starts_with("mcp_servers.caucus")));
+    }
+
+    /// Every codex panel gets turn-completion wiring: codex has no Stop hook,
+    /// so caucus registers `caucus signal codex-notify` as codex's `notify`
+    /// program via `-c notify=[...]`, baking in the panel's signal socket,
+    /// session, and panel id. This is what lets a codex panel settle to `Idle`
+    /// when its turn ends instead of hanging `Working` until the round fallback.
+    #[test]
+    fn codex_argv_registers_the_turn_completion_notify() {
+        let mut r = role();
+        r.agent_cli = AgentCli::Codex;
+        r.model = None;
+        let req = SpawnRequest {
+            role: r,
+            agent_name: "reviewer-r1".into(),
+            sock_path: Some(PathBuf::from("/repo/.caucus/sessions/S1/caucus.sock")),
+            ..SpawnRequest::default()
+        };
+        let panel = PanelId::new();
+        let args = args_of(&build_command(&req, panel));
+        let notify = args
+            .windows(2)
+            .find(|w| w[0] == "-c" && w[1].starts_with("notify=["))
+            .map(|w| w[1].clone())
+            .expect("codex argv must register a notify program");
+        assert!(
+            notify.contains("\",\"signal\",\"codex-notify\","),
+            "notify must invoke `caucus signal codex-notify`: {notify}"
+        );
+        assert!(
+            notify.contains("\"--sock\",\"/repo/.caucus/sessions/S1/caucus.sock\""),
+            "notify must carry the signal socket: {notify}"
+        );
+        assert!(
+            notify.contains(&format!("\"--session\",\"{}\"", req.session_id)),
+            "notify must carry the session id: {notify}"
+        );
+        assert!(
+            notify.contains(&format!("\"--panel\",\"{panel}\"")),
+            "notify must carry this panel's id: {notify}"
+        );
+    }
+
+    /// With no signal socket wired (the default/unit-test `SpawnRequest`), codex
+    /// carries no `notify` registration — the panel falls back to the round
+    /// fallback timer, exactly as before this wiring existed.
+    #[test]
+    fn codex_argv_omits_notify_without_a_signal_socket() {
+        let mut r = role();
+        r.agent_cli = AgentCli::Codex;
+        r.model = None;
+        let req = SpawnRequest {
+            role: r,
+            agent_name: "reviewer-r1".into(),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(!args.iter().any(|a| a.starts_with("notify=[")));
     }
 
     #[test]
