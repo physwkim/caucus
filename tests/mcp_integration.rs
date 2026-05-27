@@ -231,6 +231,7 @@ async fn main_spawns_an_architect_and_three_reviewers() {
             worktree: false,
             model: None,
             agent_cli: None,
+            prompt: None,
         }) {
             ControlResponse::Spawned { .. } => {}
             ControlResponse::Error { message } => {

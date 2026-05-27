@@ -1,9 +1,9 @@
 //! `caucus doctor` — environment + configuration health check
 //! (`docs/design.md` §10).
 //!
-//! Checks: `git`, the agent CLIs (`claude` / `codex` / `gemini`), the Stop
-//! hook installation, and every role's `allowed_tools` for the forbidden
-//! `Task` tool (Invariant I-7).
+//! Checks: `git`, the agent CLIs (`claude` / `codex`), the Stop hook
+//! installation, and every role's `allowed_tools` for the forbidden `Task`
+//! tool (Invariant I-7).
 
 use std::path::PathBuf;
 
@@ -53,7 +53,7 @@ impl Report {
 
 /// Run all environment + configuration checks for `config`.
 ///
-/// Probes `git` and the agent CLIs (`claude` / `codex` / `gemini`) on `PATH`,
+/// Probes `git` and the agent CLIs (`claude` / `codex`) on `PATH`,
 /// verifies the Claude `Stop` hook is installed in `~/.claude/settings.json`,
 /// and audits every role's `allowed_tools` for the forbidden `Task` tool
 /// (Invariant I-7).
@@ -78,11 +78,6 @@ pub fn run(config: &Config) -> Report {
         "codex",
         Severity::Warn,
         "needed for roles with `agent_cli = \"codex\"` (e.g. serious-reviewer)",
-    ));
-    report.checks.push(binary_check(
-        "gemini",
-        Severity::Warn,
-        "needed for roles with `agent_cli = \"gemini\"`",
     ));
 
     // Claude Stop hook — turn-completion signals depend on it (§7).
@@ -234,7 +229,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = Config::load(tmp.path()).unwrap();
         let report = run(&config);
-        for expected in ["git", "claude", "codex", "gemini", "claude-stop-hook"] {
+        for expected in ["git", "claude", "codex", "claude-stop-hook"] {
             assert!(
                 report.checks.iter().any(|c| c.name == expected),
                 "missing doctor check: {expected}"

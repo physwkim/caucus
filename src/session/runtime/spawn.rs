@@ -1,10 +1,10 @@
 use super::*;
 use crate::agent::manifest::{self};
-use crate::agent::spawn::SpawnRequest;
+use crate::agent::spawn::{CaucusMcp, SpawnRequest};
 use crate::mcp::McpError;
 use crate::panel::lifecycle;
 use crate::render::Layout;
-use crate::role::spec::AgentCli;
+use crate::role::spec::{AgentCli, RoleSpec};
 use crate::session::id::PanelId;
 use crate::worktree::cleanup::CleanupJob;
 use crate::worktree::manager::{WorktreeHandle, WorktreeRequest, create as create_worktree};
@@ -23,6 +23,15 @@ struct SpawnPanelOpts<'a> {
     worktree_branch: Option<String>,
     mcp_config_path: Option<PathBuf>,
     resume_session_id: Option<String>,
+    /// Inline system prompt for a free-form role (`docs/design.md` §6). When
+    /// `Some`, it *is* the role's instructions and replaces the spec's prompt
+    /// template; when `None`, the template is resolved as before.
+    inline_prompt: Option<String>,
+    /// caucus MCP server registration — set only for the main worker panel, so
+    /// a codex-backed main worker can drive the sub-agents (codex registers it
+    /// via `-c mcp_servers.caucus.*`; claude uses `mcp_config_path`). `None` for
+    /// every sub-agent panel.
+    caucus_mcp: Option<CaucusMcp>,
 }
 
 impl Multiplexer {
@@ -47,6 +56,8 @@ impl Multiplexer {
             worktree_branch: None,
             mcp_config_path: None,
             resume_session_id: None,
+            inline_prompt: None,
+            caucus_mcp: None,
         })?;
         self.persist_record();
         Ok(id)
@@ -54,55 +65,83 @@ impl Multiplexer {
 
     /// Spawn the main worker panel (`docs/design.md` §0 #4, #10).
     ///
-    /// Writes the caucus MCP config (`.mcp.json`) into the session root and
-    /// registers it with the main worker's Claude Code instance via
-    /// `--mcp-config`, so the main worker can drive the sub-agent panels
-    /// through the six caucus MCP tools. `caucus_bin` is the absolute path of
-    /// the running `caucus` binary so the `mcp-serve` child is the exact same
-    /// build.
+    /// `agent_cli` selects the main worker's backend — `None` or
+    /// `Some(Claude)` is the default Claude Code main worker; `Some(Codex)`
+    /// runs codex as the orchestrator. Either way the main worker is registered
+    /// with the caucus MCP server so it can drive the sub-agent panels through
+    /// the caucus MCP tools (claude via `--mcp-config`, codex via
+    /// `-c mcp_servers.caucus.*`). `caucus_bin` is the absolute path of the
+    /// running `caucus` binary so the `mcp-serve` child is the exact same build.
     pub fn spawn_main_panel(
         &mut self,
         role: &str,
         caucus_bin: &std::path::Path,
+        agent_cli: Option<AgentCli>,
     ) -> Result<PanelId> {
-        let id = self.spawn_main_panel_resume(role, caucus_bin, None)?;
+        let id = self.spawn_main_panel_resume(role, caucus_bin, None, agent_cli)?;
         self.persist_record();
         Ok(id)
     }
 
     /// Spawn the main worker panel, optionally resuming its prior Claude
-    /// conversation via `resume_session_id` (`caucus resume`). The record is
-    /// *not* persisted here — the resume path persists once, after the whole
+    /// conversation via `resume_session_id` (`caucus resume`). `agent_cli`
+    /// selects the backend (see [`Multiplexer::spawn_main_panel`]). The record
+    /// is *not* persisted here — the resume path persists once, after the whole
     /// roster is rebuilt.
     pub fn spawn_main_panel_resume(
         &mut self,
         role: &str,
         caucus_bin: &std::path::Path,
         resume_session_id: Option<String>,
+        agent_cli: Option<AgentCli>,
     ) -> Result<PanelId> {
-        let mcp_config = crate::mcp::serve::write_mcp_config(
-            &self.session.root_dir,
-            caucus_bin,
-            &self.control_sock_path,
-        )
-        .context("write main worker panel .mcp.json")?;
+        // The caucus MCP server registration — both backends need it, delivered
+        // through their own mechanism. codex consumes `caucus_mcp` directly;
+        // claude needs an on-disk `.mcp.json` it is pointed at with
+        // `--mcp-config`, so write that file only for a claude main worker (a
+        // codex main ignores it).
+        let caucus_mcp = CaucusMcp {
+            caucus_bin: caucus_bin.to_path_buf(),
+            control_sock: self.control_sock_path.clone(),
+        };
+        let mcp_config_path = if agent_cli == Some(AgentCli::Codex) {
+            None
+        } else {
+            Some(
+                crate::mcp::serve::write_mcp_config(
+                    &self.session.root_dir,
+                    caucus_bin,
+                    &self.control_sock_path,
+                )
+                .context("write main worker panel .mcp.json")?,
+            )
+        };
         let id = self.spawn_panel_inner(SpawnPanelOpts {
             role,
-            agent_cli: None,
+            agent_cli,
             model: None,
             worktree_path: None,
             worktree_branch: None,
-            mcp_config_path: Some(mcp_config),
+            mcp_config_path,
             resume_session_id,
+            inline_prompt: None,
+            caucus_mcp: Some(caucus_mcp),
         })?;
         // The main worker panel is caucus's round-delivery target.
         self.main_panel_id = Some(id);
         Ok(id)
     }
 
-    /// Spawn a panel restoring a prior agent — used by `caucus resume`. The
-    /// record is *not* persisted here; the resume path persists once after the
-    /// full roster is rebuilt.
+    /// Spawn a panel restoring a prior agent — used by `caucus resume` — or, on
+    /// the live `spawn_role` path, an ad-hoc panel carrying an inline system
+    /// prompt. The record is *not* persisted here; the resume path persists
+    /// once after the full roster is rebuilt.
+    ///
+    /// `inline_prompt`, when `Some`, becomes the role's system prompt and
+    /// replaces the spec's prompt template (`docs/design.md` §6); `None` keeps
+    /// the template-resolved prompt. The resume path passes `None` (a restored
+    /// agent keeps its preset role's prompt).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_panel_resume(
         &mut self,
         role: &str,
@@ -111,6 +150,7 @@ impl Multiplexer {
         worktree_path: Option<PathBuf>,
         worktree_branch: Option<String>,
         resume_session_id: Option<String>,
+        inline_prompt: Option<String>,
     ) -> Result<PanelId> {
         self.spawn_panel_inner(SpawnPanelOpts {
             role,
@@ -120,6 +160,8 @@ impl Multiplexer {
             worktree_branch,
             mcp_config_path: None,
             resume_session_id,
+            inline_prompt,
+            caucus_mcp: None,
         })
     }
 
@@ -134,26 +176,38 @@ impl Multiplexer {
             worktree_branch,
             mcp_config_path,
             resume_session_id,
+            inline_prompt,
+            caucus_mcp,
         } = opts;
-        let spec = self
-            .config
-            .roles
-            .get(role)
-            .with_context(|| format!("unknown role '{role}'"))?
-            .clone();
 
-        // Resolve the role's system prompt now (fallible I/O) so build_command
-        // stays infallible. Embedded defaults resolve without disk; a missing
-        // user template fails the spawn with a clear error rather than spawning
-        // an agent silently stripped of its role guidance.
-        let system_prompt =
-            crate::role::prompt::resolve(&spec.system_prompt_template, &self.session.repo_path)
-                .with_context(|| {
-                    format!(
-                        "resolve system prompt '{}' for role '{role}'",
-                        spec.system_prompt_template
-                    )
-                })?;
+        // `role` is a free-form label (`docs/design.md` §6): a known preset
+        // reuses its spec (tool allowlist + permission mode), any other name is
+        // an ad-hoc role built on the generic `worker` defaults under that
+        // label. So the main worker is never limited to the fixed roster — it
+        // names a role on the fly and defines it with an inline prompt.
+        let spec = match self.config.roles.get(role) {
+            Ok(s) => s.clone(),
+            Err(_) => self.generic_role_spec(role),
+        };
+
+        // The role's system prompt. An inline prompt (a free-form role's
+        // instructions) wins outright and replaces the template; otherwise the
+        // spec's template is resolved. Resolving is fallible I/O kept here so
+        // build_command stays infallible — embedded defaults resolve without
+        // disk; a missing user template fails the spawn with a clear error
+        // rather than spawning an agent silently stripped of its role guidance.
+        let system_prompt = match inline_prompt {
+            Some(p) => Some(p),
+            None => {
+                crate::role::prompt::resolve(&spec.system_prompt_template, &self.session.repo_path)
+                    .with_context(|| {
+                        format!(
+                            "resolve system prompt '{}' for role '{role}'",
+                            spec.system_prompt_template
+                        )
+                    })?
+            }
+        };
 
         let count = self.role_counts.entry(role.to_string()).or_insert(0);
         *count += 1;
@@ -175,6 +229,7 @@ impl Multiplexer {
             mcp_config_path,
             resume_session_id,
             system_prompt,
+            caucus_mcp,
         };
 
         // Provisional layout: compute the slot the new panel will occupy so
@@ -182,6 +237,26 @@ impl Multiplexer {
         let mut ids: Vec<PanelId> = self.panels.iter().map(|p| p.id).collect();
         let outcome = crate::agent::spawn::spawn(&request)
             .map_err(|e| anyhow::anyhow!("agent spawn: {e}"))?;
+
+        // codex stalls on its interactive "Do you trust this directory?" gate
+        // the first time it runs in a directory, before the agent turn caucus
+        // drives — nothing answers it and the panel hangs. Pre-grant trust for
+        // the panel's cwd in codex's config (the same entry codex persists on
+        // "Yes"; codex honors only its on-disk config, not a `-c` override).
+        // Best-effort: a failure must not fail the spawn — the panel still
+        // launches and the user can answer the gate by hand.
+        if request.effective_cli() == AgentCli::Codex {
+            if let Some(cwd) = outcome.command.cwd.as_deref() {
+                if let Err(err) = crate::agent::codex_trust::ensure_trusted(cwd) {
+                    warn!(
+                        cwd = %cwd.display(),
+                        error = %err,
+                        "codex directory-trust pre-grant failed; codex may stall on its trust gate"
+                    );
+                }
+            }
+        }
+
         ids.push(outcome.panel_id);
         let provisional = Layout::reflow(&ids, self.area, self.layout_mode);
         let rect = provisional.rect_of(outcome.panel_id).unwrap_or(self.area);
@@ -311,6 +386,40 @@ impl Multiplexer {
         self.focus.set_confirm_open(false);
     }
 
+    /// Spec for a free-form (non-preset) role label: the generic `worker`
+    /// defaults — tool allowlist, permission mode, default backend — under the
+    /// caller's `role` name (`docs/design.md` §6). The main worker pairs this
+    /// with an inline `prompt` to invent a role on the fly without it being in
+    /// any `roles.toml`.
+    ///
+    /// Derived from the live `worker` preset so a `roles.toml` override of
+    /// `worker` carries through; falls back to a built-in generic spec only if
+    /// `worker` was somehow removed from the registry (the embedded defaults
+    /// make that practically impossible, but the fallback keeps the free-form
+    /// path total — a label can never fail to resolve to a spec).
+    fn generic_role_spec(&self, role: &str) -> RoleSpec {
+        let mut spec = self
+            .config
+            .roles
+            .get("worker")
+            .cloned()
+            .unwrap_or_else(|_| RoleSpec {
+                name: role.to_string(),
+                description: "Ad-hoc sub-agent role.".to_string(),
+                allowed_tools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite"]
+                    .iter()
+                    .map(|t| (*t).to_string())
+                    .collect(),
+                permission_mode: "acceptEdits".to_string(),
+                system_prompt_template: "roles/worker.md".to_string(),
+                agent_cli: AgentCli::Claude,
+                model: Some("sonnet".to_string()),
+            });
+        // The label is the caller's, the defaults are worker's.
+        spec.name = role.to_string();
+        spec
+    }
+
     /// Create an execute-phase worktree for a `spawn_role(worktree=true)` call
     /// (`docs/design.md` §5). Single owner of worktree creation is
     /// `worktree::manager::create` (Invariant I-3).
@@ -345,9 +454,12 @@ mod tests {
     use tempfile::TempDir;
 
     /// `spawn_role(worktree=true)` must not leak the worktree when the panel
-    /// spawn fails. `create_role_worktree` does not validate the role, so an
-    /// unknown role creates the worktree and then fails in `spawn_panel` —
-    /// exactly the orphan path. The worktree must be enqueued for cleanup.
+    /// spawn fails. An unknown role no longer fails (it becomes an ad-hoc role
+    /// on the worker defaults), so the deterministic failure is a *known* role
+    /// whose `system_prompt_template` points at a missing user file:
+    /// `create_role_worktree` creates the worktree, then `resolve` fails in
+    /// `spawn_panel_inner` before any PTY launch — exactly the orphan path. The
+    /// worktree must be enqueued for cleanup.
     #[tokio::test]
     async fn spawn_role_failure_does_not_leak_the_worktree() {
         use std::time::Duration;
@@ -366,18 +478,33 @@ mod tests {
         git(&["config", "user.name", "caucus-test"]);
         git(&["commit", "--allow-empty", "-q", "-m", "init"]);
 
+        // A role whose system-prompt template is a non-embedded path that does
+        // not exist on disk — `resolve` returns Err, failing the spawn after the
+        // worktree is created.
+        std::fs::create_dir_all(tmp.path().join(".caucus")).unwrap();
+        std::fs::write(
+            tmp.path().join(".caucus").join("roles.toml"),
+            "[roles.bad-template]\n\
+             description = \"missing template\"\n\
+             allowed_tools = [\"Read\"]\n\
+             permission_mode = \"default\"\n\
+             system_prompt_template = \"roles/intentionally-missing.md\"\n",
+        )
+        .unwrap();
+
         let mut mux = mux(&tmp);
         let worktrees = tmp.path().join(".caucus").join("worktrees");
 
         let resp = mux.execute_control(ControlRequest::SpawnRole {
-            role: "no-such-role-xyz".into(),
+            role: "bad-template".into(),
             worktree: true,
             model: None,
             agent_cli: None,
+            prompt: None,
         });
         assert!(
             matches!(resp, ControlResponse::Error { .. }),
-            "unknown role must fail: {resp:?}"
+            "a missing prompt template must fail the spawn: {resp:?}"
         );
 
         // Cleanup is a serial async queue — poll for the orphan's removal.
@@ -395,5 +522,30 @@ mod tests {
         assert!(cleaned, "orphan worktree must be enqueued for cleanup");
 
         mux.shutdown();
+    }
+
+    /// A free-form (non-preset) role label resolves to the generic `worker`
+    /// defaults under that label — so the main worker can name a role caucus
+    /// has never heard of and pair it with an inline prompt.
+    #[tokio::test]
+    async fn generic_role_spec_uses_worker_defaults_under_the_caller_label() {
+        let tmp = TempDir::new().unwrap();
+        let mux = mux(&tmp);
+        let worker = mux.config.roles.get("worker").unwrap().clone();
+
+        let spec = mux.generic_role_spec("perf-profiler");
+        assert_eq!(spec.name, "perf-profiler", "keeps the caller's label");
+        assert_eq!(
+            spec.allowed_tools, worker.allowed_tools,
+            "inherits the worker tool allowlist"
+        );
+        assert_eq!(
+            spec.permission_mode, worker.permission_mode,
+            "inherits the worker permission mode"
+        );
+        assert!(
+            !spec.allows_task(),
+            "a free-form role must not grant the Task tool (Invariant I-7)"
+        );
     }
 }

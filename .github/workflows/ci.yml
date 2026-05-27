@@ -37,7 +37,7 @@ jobs:
         run: cargo build --workspace --verbose
 
       # The test suite is self-contained — it does not require the
-      # claude / codex / gemini agent CLIs on PATH (real-agent paths skip
-      # gracefully or use /bin/sh stand-ins). Only git is needed.
+      # claude / codex agent CLIs on PATH (real-agent paths skip gracefully
+      # or use /bin/sh stand-ins). Only git is needed.
       - name: Test
         run: cargo test --workspace --verbose

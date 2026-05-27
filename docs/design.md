@@ -13,12 +13,12 @@
 | 1 | 이름: `caucus`. 경로: `~/codes/caucus`. |
 | 2 | 실행 모델 = **caucus 자체 멀티플렉서**. 장기 실행 풀스크린 TUI 프로세스. agent는 caucus가 관리하는 **패널별 PTY**에서 도는 `claude` / `codex` CLI 프로세스. tmux / zellij 의존 없음 — 둘은 분석 레퍼런스(kodex 적재)일 뿐. |
 | 3 | VT 레이어 = **공개 크레이트** (경로 B-i): `vte`(escape-sequence 파서) + `portable-pty`(PTY 관리) + `ratatui`(패널 레이아웃·렌더). caucus가 직접 짜는 것은 grid `vte::Perform` 구현(~2-4k LOC) 하나뿐이며 zellij `zellij-server/src/panes/grid.rs`를 라인 단위 레퍼런스로 쓴다. zellij 크레이트 통째 vendor는 기각 — grid가 `output`/`tab`/`ui`/`route`/`screen`/`thread_bus` + `zellij-utils` ~140k LOC와 결합되어 깨끗한 추출 불가. |
-| 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버**의 10개 툴(`send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `register_round` / `read_menu` / `select_option`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. |
+| 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버**의 10개 툴(`send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `register_round` / `read_menu` / `select_option`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. main 백엔드 CLI는 `--agent-cli claude\|codex`로 선택한다(기본 `claude`). codex를 고르면 caucus MCP 서버를 `-c mcp_servers.caucus.command/args`로 등록한다 — codex에는 `--mcp-config`가 없고 `[mcp_servers.<name>]` config로만 MCP를 받기 때문(claude는 `--mcp-config`를 쓴다). 어느 백엔드든 동일한 10개 툴로 sub-agent를 지휘한다. |
 | 5 | 턴 완료 신호 = Claude `Stop` hook이 **caucus 실행 프로세스의 소켓에 post**한다. 파일 sentinel(`*.sentinel.json`) + 폴링 watcher는 폐기. |
 | 6 | "라운드" 개념은 유지하되 **라이브화** — 파일 안건 broadcast + `response-*.md` 수집 대신, CEO가 패널에 라이브로 키를 입력하고 §5의 턴 완료 신호로 라운드 진행을 판정한다. |
 | 7 | Role 정의: `~/.caucus/roles.toml` (전역) + `<repo>/.caucus/roles.toml` (프로젝트 오버라이드, 우선). |
 | 8 | 실행 단계 worktree per role 유지. Agent manifest 위치: `<repo>/.caucus/sessions/<session_id>/agents/<agent_id>.{md,json}`. `.gitignore`에 `.caucus/` 추가 권장. |
-| 9 | agent 백엔드 CLI = **다중**: `claude` / `codex` / `gemini` 등. role의 `agent_cli` 필드로 선택. main은 `spawn_role` 시 모델과 백엔드 CLI를 **자체 판단으로** 지정한다 — caucus 코어는 메커니즘만 제공하고 어떤 모델/CLI를 쓸지는 main의 판단. |
+| 9 | agent 백엔드 CLI = **다중**: `claude` / `codex`. role의 `agent_cli` 필드로 선택. main은 `spawn_role` 시 모델과 백엔드 CLI를 **자체 판단으로** 지정한다 — caucus 코어는 메커니즘만 제공하고 어떤 모델/CLI를 쓸지는 main의 판단. |
 | 10 | 패널은 **동적**. main이 `spawn_role` / `kill_panel` MCP 툴로 sub-agent 수를 늘이고 줄이며, caucus는 그때마다 레이아웃을 reflow한다. 고정 roster 가정 없음. |
 | 11 | caucus 패널은 **완전한 양방향 인터랙티브 터미널**. 단순 관찰·제어가 아니라, 로그인 / OAuth 디바이스 코드 / 기타 대화형 프롬프트를 사용자가 패널에 직접 입력하거나 main이 `send_keys`로 처리할 수 있다. PTY 입력은 완전 양방향. |
 | 12 | **토큰·효율 관리는 main의 자체 판단.** main은 패널별 토큰 사용량을 `read_panel`로 읽고, 필요 시 각 agent에 `/compact` · `/clear` 등 슬래시 커맨드를 `send_keys`로 보낸다. caucus 코어는 토큰 사용량을 노출만 하고 정책은 main이 결정한다. |
@@ -78,7 +78,7 @@ sync). 사용자는 main worker 패널과 대화하고, main worker는 작업을
 |---|---|
 | **Session** | caucus 멀티플렉서 한 인스턴스. 한 주제를 두고 도는 패널들의 집합. |
 | **Panel** | caucus 화면의 한 칸 = PTY 1개 + vte grid + 렌더 영역. tmux/zellij의 pane에 해당. |
-| **Agent** | 한 Panel에서 도는 `claude` / `codex` / `gemini` CLI 프로세스. 한 Role의 한 인스턴스. |
+| **Agent** | 한 Panel에서 도는 `claude` / `codex` CLI 프로세스. 한 Role의 한 인스턴스. |
 | **Role** | main / worker / architect / backend / reviewer 등. system prompt + tool allowlist + 기본 `model`·`agent_cli` 정의. |
 | **Main worker** | caucus 패널 중 하나에서 도는 주(主) Claude Code 에이전트. 사용자가 직접 대화한다. 간단한 일은 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 일은 MCP 툴로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO'를 대체. |
 | **Sub-agent** | main worker가 `spawn_role`로 띄운 워커 패널. 기본 role은 범용 `worker`이고 specialist role은 선택적 힌트(§0 #15). |
@@ -214,7 +214,7 @@ task 산출물을 담도록. settle해 전달될 때는 캡처분 + 최종 턴 �
      spawn_role(role="worker", worktree=true, model="sonnet")
    → caucus가:
      - <repo>/.caucus/worktrees/<session>-worker-NN/ worktree 생성
-     - 그 worktree를 cwd로 새 패널 spawn (agent_cli = claude/codex/gemini)
+     - 그 worktree를 cwd로 새 패널 spawn (agent_cli = claude/codex)
      - 레이아웃 reflow
      → 응답: {panel_id, worktree_path}
 
@@ -264,7 +264,7 @@ description = "Designs the approach, decomposes tasks, no code edits"
 allowed_tools = ["Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite"]
 permission_mode = "plan"
 system_prompt_template = "roles/architect.md"
-agent_cli = "claude"             # claude | codex | gemini  (생략 시 claude)
+agent_cli = "claude"             # claude | codex  (생략 시 claude)
 model = "opus"                   # CLI tier alias 또는 pinned 버전 (생략 시 CLI 기본)
 
 [roles.backend]
@@ -296,10 +296,20 @@ agent_cli = "codex"              # claude가 막히거나 rubber-stamp할 때 �
 backend / reviewer / qa / scribe / serious-reviewer)은 *선택적 specialist 힌트*로
 남는다 — sub-task가 명확히 그 전문성을 요구할 때만 쓴다.
 
+**Role은 닫힌 집합이 아니다 — free-form label이다.** `spawn_role`의 `role`은
+자유 문자열이다. 위 preset 이름이면 그 preset의 spec(tool allowlist /
+permission mode)을 재사용하고, 그 외의 어떤 label이든 generic `worker` defaults
+위에 그 label로 만든 ad-hoc role이 된다(`spawn_panel_inner` →
+`generic_role_spec`). 그래서 main worker는 고정 roster에 묶이지 않고 즉석에서
+role을 만들어 낸다 — 이름을 붙이고, inline `prompt`로 지시문을 직접 쓰고,
+model·backend를 스스로 고른다. 알 수 없는 role 이름은 더 이상 에러가 아니다
+(generic worker로 뜬다). `spawn_role(prompt=…)`로 넘긴 inline `prompt`는 그
+role의 system prompt가 되어 template을 대체한다(없으면 spec의 template을 해석).
+
 `agent_cli` 미지정 시 `claude`. `model` 미지정 시 해당 CLI 기본. main worker는
 `spawn_role` 호출 시 role의 기본 `model`·`agent_cli`를 무시하고 자체 판단으로
-덮어쓸 수 있다(§0 #9) — 예: 같은 `worker` role을 토큰 절약을 위해 `gemini`로,
-또는 어려운 라운드는 `opus`로.
+덮어쓸 수 있다(§0 #9) — 예: 같은 `worker` role을 교차검증엔 `codex`로, 또는
+어려운 라운드는 `opus`로.
 
 `<repo>/.caucus/roles.toml`로 프로젝트별 오버라이드 가능. 같은 role 이름이면 프로젝트가 우선.
 
@@ -338,13 +348,26 @@ You are a `reviewer` sub-agent in a caucus session.
 role-specific 가이드만 다름. 응답이 *자기 터미널*로 간다는 점이 구 모델(response
 파일)과의 핵심 차이다 — main worker가 `read_panel`로 직접 읽는다.
 
-**구현 노트.** 템플릿은 spawn 시 `crate::role::prompt::resolve`로 텍스트로
-해석되어 `claude --append-system-prompt <text>`로 주입된다(claude 기본 system
-prompt에 *덧붙임*). 기본 role 8종은 바이너리에 임베드(`include_str!`)되어 설치형
-caucus가 `roles/` 디렉터리 없이도 동작하고, 사용자 정의 template은 repo root
-기준 파일에서 읽는다(누락 시 spawn 에러로 surface). **codex/gemini는
-system-prompt 플래그가 없어 현재 주입되지 않는다** — 그 백엔드는 role prompt
-없이 뜨며 caucus가 경고를 남긴다(claude가 기본/주 경로).
+**구현 노트.** system prompt는 inline `prompt`(free-form role)거나, 없으면
+`crate::role::prompt::resolve`로 해석한 template 텍스트다. claude는
+`--append-system-prompt <text>`로 주입한다(claude 기본 system prompt에
+*덧붙임*). 기본 role 8종은 바이너리에 임베드(`include_str!`)되어 설치형 caucus가
+`roles/` 디렉터리 없이도 동작하고, 사용자 정의 template은 repo root 기준 파일에서
+읽는다(누락 시 spawn 에러로 surface). **codex는 `--append-system-prompt` 플래그가
+없어 `-c instructions=<text>` config override로 base instructions를 주입한다**
+(`-c` 값은 TOML 파싱 실패 시 raw 문자열로 떨어지므로 여러 줄 markdown role
+prompt도 그대로 들어간다, `agent::spawn::codex_args`).
+
+**codex 디렉터리 트러스트 사전 승인.** codex는 어떤 디렉터리에서 처음 실행될 때
+agent 턴 *전에* "Do you trust the contents of this directory?" 게이트를 띄운다.
+caucus는 codex를 비대화형으로 구동하므로 이걸 답할 주체가 없어 패널이 멈춘다.
+codex는 트러스트를 on-disk config(`$CODEX_HOME/config.toml`, 기본 `~/.codex/config.toml`)의
+`[projects."<path>"] trust_level = "trusted"`에서만 읽고 — 런타임 `-c` override는
+트러스트 결정에 **반영되지 않는다**(codex 0.133에서 검증: `-c`로는 게이트가 그대로
+뜸). 따라서 caucus는 codex 패널 launch 직전, 그 패널의 cwd(realpath — codex가
+canonical 경로로 매칭)에 대해 사용자가 "Yes"를 누를 때 codex가 쓰는 것과 동일한
+항목을 config에 보장한다(`agent::codex_trust::ensure_trusted`,
+`toml_edit`로 주석·다른 섹션 보존). best-effort이며 실패해도 spawn은 진행한다.
 
 ---
 
@@ -400,7 +423,7 @@ exec caucus signal post \
 
 `kind`: `stop | tool_blocked | error`.
 
-**Codex / Gemini 백엔드**: 동등한 turn-completion hook이 있으면 같은 스크립트를
+**Codex 백엔드**: 동등한 turn-completion hook이 있으면 같은 스크립트를
 재사용한다. hook을 노출하지 않는 백엔드는 caucus가 grid 관찰(agent 프롬프트 복귀
 패턴 매치)로 fallback한다 — §8.3. 휴리스틱이라 hook 경로보다 신뢰도가 낮다.
 
@@ -433,7 +456,7 @@ exec caucus signal post \
 }
 ```
 
-`tmux_pane_id` → `panel_id`로 교체, `agent_cli` 필드 추가(claude/codex/gemini).
+`tmux_pane_id` → `panel_id`로 교체, `agent_cli` 필드 추가(claude/codex).
 
 ### 8.2 LaneEvent 종류 (claw-code 차용 + caucus 확장)
 
@@ -485,7 +508,7 @@ main worker에 push 알림을 보낸다(라운드는 settle 못 하므로 — §
 이 §8.3 이름 그대로 `awaiting_selection` — 모든 state 문자열은 `DerivedState::as_str`(serde
 snake_case와 동일, 테스트로 고정)을 단일 소스로 쓴다.
 
-turn-completion hook이 없는 백엔드(codex/gemini가 hook 미지원 시): caucus가 grid
+turn-completion hook이 없는 백엔드(codex가 hook 미지원 시): caucus가 grid
 관찰로 `idle`을 판정한다 — agent 프롬프트 복귀 패턴 매치. 휴리스틱이므로 hook
 경로보다 신뢰도가 낮다.
 
@@ -574,7 +597,7 @@ caucus/
     ├── worktree/
     │   ├── manager.rs       (생성)
     │   └── cleanup.rs       (직렬 큐 + depth-desc 정렬, tokio::mpsc consumer)
-    └── doctor.rs            (git/claude/codex/gemini/hook + role allowlist `Task` 점검)
+    └── doctor.rs            (git/claude/codex/hook + role allowlist `Task` 점검)
 ```
 
 **폐기된 모듈**: `tmux/`(자체 멀티플렉서로 대체), `sentinel/`(turn-signal 소켓으로
@@ -665,7 +688,7 @@ caucus --roles architect,backend,reviewer
 caucus init [--install-hook]        # .caucus/ + bin/turn-signal 생성,
                                     # --install-hook 시 Claude Stop hook을
                                     # ~/.claude/settings.json에 merge
-caucus doctor                       # git/claude/codex/gemini/hook + role allowlist `Task` 점검
+caucus doctor                       # git/claude/codex/hook + role allowlist `Task` 점검
 caucus role list                    # 알려진 role 나열
 caucus role show <name>             # 한 role의 전체 spec 출력
 caucus sessions [--format json]     # resume 가능한 세션 나열 (최신순; §3.1)
@@ -821,7 +844,7 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 - main worker용 MCP 서버 — 10개 툴: `send_keys` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `list_panels` / `register_round` / `read_menu` / `select_option`
 - 레이아웃 제어 — `Ctrl-A` 프리픽스 키맵, 4종 레이아웃 모드 순환, transcript 오버레이 + 스크롤백 페이저(§9.2)
 - 세션 영속화 & resume — `session.json` 레코드, `caucus sessions` / `caucus resume`(§3.1)
-- agent 백엔드 다중화 — `claude` / `codex` / `gemini`, role별 `model`·`agent_cli` override, main worker 자체 판단 지정
+- agent 백엔드 다중화 — `claude` / `codex`, role별 `model`·`agent_cli` override, main worker 자체 판단 지정
 - Claude `Stop` hook → caucus 소켓 (턴 완료 라이브 신호)
 - 라이브화된 라운드 진행
 - 병렬 sub-agent worktree per agent

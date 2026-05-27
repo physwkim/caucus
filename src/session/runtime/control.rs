@@ -39,7 +39,14 @@ impl Multiplexer {
                 worktree,
                 model,
                 agent_cli,
-            } => match self.spawn_role(&role, worktree, model.as_deref(), agent_cli) {
+                prompt,
+            } => match self.spawn_role(
+                &role,
+                worktree,
+                model.as_deref(),
+                agent_cli,
+                prompt.as_deref(),
+            ) {
                 Ok(panel) => ControlResponse::Spawned { panel },
                 Err(err) => ControlResponse::error(err),
             },

@@ -161,6 +161,7 @@ mod tests {
             worktree: true,
             model: None,
             agent_cli: None,
+            prompt: None,
         });
         let panel_id = match resp {
             ControlResponse::Spawned { panel } => panel,

@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::Config;
 use crate::doctor::{self, Severity};
+use crate::role::spec::AgentCli;
 use crate::session::id::{PanelId, SessionId};
 use crate::signal::TurnKind;
 
@@ -33,6 +34,12 @@ pub struct Cli {
     /// worker panel. Only meaningful when launching the TUI.
     #[arg(long, value_delimiter = ',')]
     pub roles: Vec<String>,
+
+    /// Backend CLI for the main worker panel: `claude` (default) or `codex`.
+    /// Sub-agent backends are chosen per `spawn_role`, not by this flag. Only
+    /// meaningful when launching the TUI.
+    #[arg(long, value_enum)]
+    pub agent_cli: Option<AgentCli>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -150,7 +157,7 @@ pub fn run() -> ExitCode {
 /// Dispatch a parsed [`Cli`]. No subcommand launches the TUI.
 fn dispatch(cli: Cli) -> Result<ExitCode> {
     match cli.command {
-        None => run_tui(&cli.roles),
+        None => run_tui(&cli.roles, cli.agent_cli),
         Some(Command::Init { install_hook }) => run_init(install_hook),
         Some(Command::Doctor) => run_doctor(),
         Some(Command::Signal(cmd)) => run_signal(cmd),
@@ -178,12 +185,13 @@ fn repo_root() -> Result<PathBuf> {
 
 /// Launch the full-screen multiplexer TUI (`docs/design.md` §0 #2).
 ///
-/// Builds the session, spawns the main worker panel plus any `--roles`, and runs the
-/// ratatui event loop. When stdout is not a tty, [`crate::tui::run`] fails
-/// cleanly with a message rather than panicking.
-fn run_tui(roles: &[String]) -> Result<ExitCode> {
+/// Builds the session, spawns the main worker panel (on `main_cli`, default
+/// claude) plus any `--roles`, and runs the ratatui event loop. When stdout is
+/// not a tty, [`crate::tui::run`] fails cleanly with a message rather than
+/// panicking.
+fn run_tui(roles: &[String], main_cli: Option<AgentCli>) -> Result<ExitCode> {
     let repo = repo_root()?;
-    crate::tui::run(&repo, roles)?;
+    crate::tui::run(&repo, roles, main_cli)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -416,6 +424,21 @@ mod tests {
     fn roles_flag_splits_on_comma() {
         let cli = Cli::try_parse_from(["caucus", "--roles", "architect,backend"]).unwrap();
         assert_eq!(cli.roles, vec!["architect", "backend"]);
+    }
+
+    #[test]
+    fn agent_cli_flag_selects_the_main_worker_backend() {
+        // Omitted → None (the claude default is applied downstream).
+        let cli = Cli::try_parse_from(["caucus"]).unwrap();
+        assert_eq!(cli.agent_cli, None);
+        // `--agent-cli codex` selects codex.
+        let cli = Cli::try_parse_from(["caucus", "--agent-cli", "codex"]).unwrap();
+        assert_eq!(cli.agent_cli, Some(AgentCli::Codex));
+        // `--agent-cli claude` is accepted explicitly.
+        let cli = Cli::try_parse_from(["caucus", "--agent-cli", "claude"]).unwrap();
+        assert_eq!(cli.agent_cli, Some(AgentCli::Claude));
+        // An unknown backend is rejected.
+        assert!(Cli::try_parse_from(["caucus", "--agent-cli", "gemini"]).is_err());
     }
 
     #[test]

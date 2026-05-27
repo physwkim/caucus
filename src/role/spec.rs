@@ -4,8 +4,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Which agent CLI runs in the panel for a given role (`docs/design.md` §0 #9).
-/// Serialised lowercase so `roles.toml` reads `agent_cli = "claude"`.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize)]
+/// Serialised lowercase so `roles.toml` reads `agent_cli = "claude"`; the
+/// `clap::ValueEnum` derive renders the same lowercase spellings for the
+/// `caucus --agent-cli <claude|codex>` launch flag.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentCli {
     /// `claude` (Claude Code). Default when `agent_cli` is omitted.
@@ -13,17 +15,14 @@ pub enum AgentCli {
     Claude,
     /// `codex` (OpenAI Codex CLI). Useful as an adversarial second opinion.
     Codex,
-    /// `gemini` (Google Gemini CLI).
-    Gemini,
 }
 
 impl AgentCli {
-    /// Binary name to invoke. Both/all binaries are expected on `PATH`.
+    /// Binary name to invoke. Every binary is expected on `PATH`.
     pub fn binary(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Gemini => "gemini",
         }
     }
 }
@@ -98,8 +97,8 @@ mod tests {
     #[test]
     fn agent_cli_serde_is_lowercase() {
         assert_eq!(
-            serde_json::to_string(&AgentCli::Gemini).unwrap(),
-            "\"gemini\""
+            serde_json::to_string(&AgentCli::Codex).unwrap(),
+            "\"codex\""
         );
     }
 }

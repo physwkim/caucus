@@ -1,7 +1,8 @@
-//! Agent: a `claude` / `codex` / `gemini` process running in one panel — one
+//! Agent: a `claude` / `codex` process running in one panel — one
 //! instance of one role. Manifest, lane events, derived state, provenance.
 //! See `docs/design.md` §8.
 
+pub mod codex_trust;
 pub mod derive_state;
 pub mod lane_event;
 pub mod manifest;

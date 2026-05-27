@@ -81,6 +81,7 @@ impl McpToolSurface for Multiplexer {
         worktree: bool,
         model: Option<&str>,
         agent_cli: Option<AgentCli>,
+        prompt: Option<&str>,
     ) -> Result<PanelId, McpError> {
         let wt_handle = if worktree {
             Some(self.create_role_worktree(role)?)
@@ -90,7 +91,9 @@ impl McpToolSurface for Multiplexer {
         let worktree_path = wt_handle.as_ref().map(|h| h.path.clone());
         let worktree_branch = wt_handle.as_ref().map(|h| h.branch.clone());
         // `spawn_panel_resume` with no resume id is a plain spawn that also
-        // records the worktree branch (so `caucus resume` can re-attach it).
+        // records the worktree branch (so `caucus resume` can re-attach it). The
+        // inline `prompt`, when set, becomes the role's system prompt — the
+        // free-form-role path (`docs/design.md` §6).
         let spawned = self.spawn_panel_resume(
             role,
             agent_cli,
@@ -98,6 +101,7 @@ impl McpToolSurface for Multiplexer {
             worktree_path,
             worktree_branch,
             None,
+            prompt.map(str::to_string),
         );
         match spawned {
             Ok(id) => {

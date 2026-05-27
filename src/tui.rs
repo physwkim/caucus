@@ -30,6 +30,7 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::render::{self, Rect};
+use crate::role::spec::AgentCli;
 use crate::session::Multiplexer;
 use crate::session::record::SessionRecord;
 use crate::session::state::Session;
@@ -108,10 +109,11 @@ impl Drop for TerminalGuard {
 }
 
 /// Launch the multiplexer TUI in the git repo at `repo`, starting a main
-/// worker panel plus one panel per entry of `roles`.
+/// worker panel plus one panel per entry of `roles`. `main_cli` selects the
+/// main worker's backend (`None` → the default claude main worker).
 ///
 /// Fails cleanly (no panic) when stdout is not a terminal.
-pub fn run(repo: &std::path::Path, roles: &[String]) -> Result<()> {
+pub fn run(repo: &std::path::Path, roles: &[String], main_cli: Option<AgentCli>) -> Result<()> {
     require_tty()?;
     let config = Config::load(repo).context("load caucus configuration")?;
     let session = Session::new("caucus session", repo.to_path_buf());
@@ -123,7 +125,7 @@ pub fn run(repo: &std::path::Path, roles: &[String]) -> Result<()> {
     runtime.block_on(async move {
         let _guard = TerminalGuard::enter()?;
         let (terminal, mut mux, signal, control) = setup(config, session)?;
-        spawn_fresh_roster(&mut mux, &roles)?;
+        spawn_fresh_roster(&mut mux, &roles, main_cli)?;
         event_loop(terminal, mux, signal, control).await
     })
 }
@@ -209,9 +211,14 @@ fn caucus_bin() -> std::path::PathBuf {
 }
 
 /// Spawn a fresh roster: the main worker panel plus one panel per `roles`.
-fn spawn_fresh_roster(mux: &mut Multiplexer, roles: &[String]) -> Result<()> {
+/// `main_cli` selects the main worker's backend (`None` → claude default).
+fn spawn_fresh_roster(
+    mux: &mut Multiplexer,
+    roles: &[String],
+    main_cli: Option<AgentCli>,
+) -> Result<()> {
     let role = main_role(mux);
-    if let Err(err) = mux.spawn_main_panel(role, &caucus_bin()) {
+    if let Err(err) = mux.spawn_main_panel(role, &caucus_bin(), main_cli) {
         bail!("failed to spawn the main worker panel: {err:#}");
     }
     for role in roles {
@@ -260,7 +267,13 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
         };
 
         let result = if is_main {
-            mux.spawn_main_panel_resume(&panel.role, &bin, panel.claude_session_id.clone())
+            // Restore the main worker on its persisted backend (codex or claude).
+            mux.spawn_main_panel_resume(
+                &panel.role,
+                &bin,
+                panel.claude_session_id.clone(),
+                Some(panel.agent_cli),
+            )
         } else {
             mux.spawn_panel_resume(
                 &panel.role,
@@ -269,6 +282,9 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
                 worktree_path.as_ref().map(|(p, _)| p.clone()),
                 worktree_path.as_ref().map(|(_, b)| b.clone()),
                 panel.claude_session_id.clone(),
+                // A restored panel keeps its preset role's prompt template; the
+                // inline-prompt path is live `spawn_role` only.
+                None,
             )
         };
         if let Err(err) = result {

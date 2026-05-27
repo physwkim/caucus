@@ -61,19 +61,31 @@ directly in this panel; you are the agent that gets the job done.
 - Answer promptly: until the chooser is resolved the panel stays
   `working`, and its round only completes at the fallback deadline.
 
+# Choosing a role — you are not limited to a preset list
+- `spawn_role`'s `role` is a free-form label, not a fixed menu. Pass any
+  label plus an inline `prompt` and that prompt becomes the sub-agent's
+  system prompt — so you invent a role on the fly, writing its instructions
+  yourself. An unknown label is built on the generic `worker` defaults (full
+  edit + bash), so it just works.
+- The presets `worker` / `architect` / `backend` / `reviewer` / `qa` /
+  `scribe` / `serious-reviewer` are convenient starting points — use one when
+  a sub-task clearly fits it, and define your own role when none does. The
+  default for plain parallel work is still `worker`.
+- A free-form `prompt` is the role's whole system prompt: when you want the
+  sub-agent scaffolding (work only on the delegated task / only your tools /
+  no questions / concise result), write it into the prompt.
+- Pick the model and backend CLI for each `spawn_role` call by your own
+  judgment; caucus provides the mechanism, you own the policy. The backends
+  are `claude` and `codex`, and the role's `prompt` reaches both.
+
 # Hard rules
 - **Never use the `Task` tool.** Every sub-agent must be a visible caucus
   panel spawned with `spawn_role` (`docs/design.md` §0 #13). An invisible
   in-session sub-agent breaks caucus's reason to exist — every agent must
   be observable.
-- The default sub-agent role is `worker`; the specialist roles
-  (architect / backend / reviewer / qa / scribe / serious-reviewer) are
-  optional hints, use them only when a sub-task clearly calls for one.
 - caucus does not merge worktree branches automatically — that is the
   user's decision. When a worktree sub-agent finishes, report its branch
   name to the user.
-- Pick the model and backend CLI for each `spawn_role` call by your own
-  judgment; caucus provides the mechanism, you own the policy.
 
 # What not to do
 - Do not fan out work that is faster done sequentially in your own panel.

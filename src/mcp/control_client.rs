@@ -197,11 +197,16 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                 ),
                 None => None,
             };
+            let prompt = args
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             Ok(ControlRequest::SpawnRole {
                 role,
                 worktree,
                 model,
                 agent_cli,
+                prompt,
             })
         }
         "kill_panel" => Ok(ControlRequest::KillPanel {
@@ -445,6 +450,33 @@ mod tests {
                 worktree: true,
                 model: None,
                 agent_cli: Some(AgentCli::Codex),
+                prompt: None,
+            }
+        );
+    }
+
+    /// A free-form role: an arbitrary label plus the inline `prompt` that
+    /// becomes its system prompt is decoded off the MCP tool args.
+    #[test]
+    fn build_spawn_role_request_with_inline_prompt() {
+        let req = build_request(
+            "spawn_role",
+            &json!({
+                "role": "perf-profiler",
+                "model": "opus",
+                "agent_cli": "codex",
+                "prompt": "You profile hot paths and report findings."
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::SpawnRole {
+                role: "perf-profiler".into(),
+                worktree: false,
+                model: Some("opus".into()),
+                agent_cli: Some(AgentCli::Codex),
+                prompt: Some("You profile hot paths and report findings.".into()),
             }
         );
     }

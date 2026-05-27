@@ -6,13 +6,26 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use thiserror::Error;
-use tracing::warn;
 
 use crate::pty::PtyCommand;
 use crate::role::spec::{AgentCli, RoleSpec};
 use crate::session::id::{PanelId, SessionId};
 
 use super::manifest::AgentManifest;
+
+/// The caucus MCP server registration for the main worker panel: the absolute
+/// `caucus` binary and the control socket it serves on. The main worker drives
+/// the sub-agent panels through this server's tools (`spawn_role`, `list_panels`,
+/// ...). claude registers it via the written `.mcp.json` (`mcp_config_path`,
+/// `--mcp-config`); codex has no such flag, so its argv injects
+/// `-c mcp_servers.caucus.{command,args}` built from this. `None` for every
+/// non-main panel — a sub-agent is not an orchestrator and must not receive the
+/// caucus tool surface.
+#[derive(Debug, Clone)]
+pub struct CaucusMcp {
+    pub caucus_bin: PathBuf,
+    pub control_sock: PathBuf,
+}
 
 /// A request to spawn one agent into a new panel.
 #[derive(Debug, Clone)]
@@ -60,16 +73,20 @@ pub struct SpawnRequest {
     pub mcp_config_path: Option<PathBuf>,
     /// Claude Code conversation id to resume (`claude --resume <id>`). Set on
     /// the resume launch path so a relaunched agent continues its prior
-    /// conversation. Honoured only by the `claude` backend — codex/gemini have
-    /// no standard resume flag, so for those it is ignored and the agent
-    /// spawns fresh.
+    /// conversation. Honoured only by the `claude` backend — codex has no
+    /// standard resume flag, so for it the id is ignored and the agent spawns
+    /// fresh.
     pub resume_session_id: Option<String>,
-    /// The role's system-prompt text, already resolved from
-    /// `role.system_prompt_template` (`crate::role::prompt::resolve`). `None`
-    /// when the role configures no prompt. Injected via `claude
-    /// --append-system-prompt`; codex/gemini have no system-prompt flag, so for
-    /// those it is warned and dropped (`build_command`).
+    /// The role's system-prompt text — either an inline prompt from a free-form
+    /// `spawn_role` call or the text resolved from `role.system_prompt_template`
+    /// (`crate::role::prompt::resolve`). `None` when the role configures no
+    /// prompt. Injected via `claude --append-system-prompt` and via codex
+    /// `-c instructions=<text>` (`build_command`).
     pub system_prompt: Option<String>,
+    /// caucus MCP server registration — set only for the main worker panel (the
+    /// orchestrator). The codex backend consumes it via `-c mcp_servers.caucus.*`;
+    /// the claude backend uses `mcp_config_path` instead. `None` for sub-agents.
+    pub caucus_mcp: Option<CaucusMcp>,
 }
 
 impl Default for SpawnRequest {
@@ -96,6 +113,7 @@ impl Default for SpawnRequest {
             mcp_config_path: None,
             resume_session_id: None,
             system_prompt: None,
+            caucus_mcp: None,
         }
     }
 }
@@ -106,11 +124,21 @@ impl SpawnRequest {
         self.agent_cli_override.unwrap_or(self.role.agent_cli)
     }
 
-    /// Effective model (override beats role default).
+    /// Effective model. An explicit `model_override` always wins. Otherwise the
+    /// role's model applies — *unless* a CLI override switched the backend away
+    /// from the role's native `agent_cli`: a model id tuned for one backend
+    /// (e.g. a claude `opus`) is invalid for another (codex rejects claude ids),
+    /// so fall back to the new CLI's own default tier rather than leaking the
+    /// native model. This is what lets `--agent-cli codex` (or a codex
+    /// `spawn_role` override) reuse a claude-default role without erroring.
     pub fn effective_model(&self) -> Option<String> {
-        self.model_override
-            .clone()
-            .or_else(|| self.role.model.clone())
+        if let Some(m) = &self.model_override {
+            return Some(m.clone());
+        }
+        match self.agent_cli_override {
+            Some(cli) if cli != self.role.agent_cli => None,
+            _ => self.role.model.clone(),
+        }
     }
 }
 
@@ -133,8 +161,8 @@ pub struct SpawnOutcome {
 /// Build the [`PtyCommand`] that launches the backend CLI for `request`
 /// into the panel identified by `panel_id` (`docs/design.md` §5, §7.1).
 ///
-/// Branches on the effective [`AgentCli`]: `claude` / `codex` / `gemini` have
-/// distinct flag surfaces. The `CAUCUS_*` env vars (§7.1) are injected so the
+/// Branches on the effective [`AgentCli`]: `claude` / `codex` have distinct
+/// flag surfaces. The `CAUCUS_*` env vars (§7.1) are injected so the
 /// agent's turn-signal hook can post back to the caucus socket.
 pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCommand {
     let cli = request.effective_cli();
@@ -149,29 +177,18 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
             request.resume_session_id.as_deref(),
             request.system_prompt.as_deref(),
         ),
-        // codex/gemini have no standard resume flag — `resume_session_id` is
-        // intentionally ignored for them and the agent spawns fresh. They also
-        // have no system-prompt flag, so a resolved role prompt cannot be
-        // injected for those backends; warn and drop it rather than guess a
-        // flag (the agent still runs, prompt-less, as before this wiring).
-        AgentCli::Codex => {
-            if request.system_prompt.is_some() {
-                warn!(
-                    role = %request.role.name,
-                    "codex has no system-prompt flag; role system prompt is not injected for this backend"
-                );
-            }
-            codex_args(&request.role, model.as_deref(), request.skip_permissions)
-        }
-        AgentCli::Gemini => {
-            if request.system_prompt.is_some() {
-                warn!(
-                    role = %request.role.name,
-                    "gemini system-prompt injection is not wired; role system prompt is not injected for this backend"
-                );
-            }
-            gemini_args(&request.role, model.as_deref(), request.skip_permissions)
-        }
+        // codex has no standard resume flag — `resume_session_id` is
+        // intentionally ignored and the agent spawns fresh. It also has no
+        // system-prompt *flag*, but its `-c instructions=<text>` config override
+        // sets the agent's base instructions, so the role prompt is injected
+        // that way (`codex_args`).
+        AgentCli::Codex => codex_args(
+            &request.role,
+            model.as_deref(),
+            request.skip_permissions,
+            request.system_prompt.as_deref(),
+            request.caucus_mcp.as_ref(),
+        ),
     };
 
     let mut env: HashMap<String, String> = HashMap::new();
@@ -255,13 +272,53 @@ fn claude_args(
 }
 
 /// `codex` argv: `--model` (omitted when unset — codex rejects claude model
-/// ids), and either `--dangerously-bypass-approvals-and-sandbox` or a
-/// `--sandbox` level coarsely matching the role's permission mode.
-fn codex_args(role: &RoleSpec, model: Option<&str>, skip_permissions: bool) -> Vec<OsString> {
+/// ids), the role's system prompt as `-c instructions=<text>` (codex's base
+/// instructions config override — it has no `--append-system-prompt` flag),
+/// the caucus MCP server as `-c mcp_servers.caucus.*` for the main worker panel
+/// (codex has no `--mcp-config`), and either
+/// `--dangerously-bypass-approvals-and-sandbox` or a `--sandbox` level coarsely
+/// matching the role's permission mode.
+///
+/// The instructions value is passed raw (no TOML quoting): codex parses a
+/// `-c` value as TOML and falls back to the literal string when that fails, so
+/// a multi-line markdown role prompt lands verbatim as the agent's base
+/// instructions.
+fn codex_args(
+    role: &RoleSpec,
+    model: Option<&str>,
+    skip_permissions: bool,
+    system_prompt: Option<&str>,
+    caucus_mcp: Option<&CaucusMcp>,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     if let Some(m) = model {
         args.push("--model".into());
         args.push(m.into());
+    }
+    if let Some(prompt) = system_prompt {
+        args.push("-c".into());
+        let mut kv = OsString::from("instructions=");
+        kv.push(prompt);
+        args.push(kv);
+    }
+    // The main worker drives sub-agents through the caucus MCP server. codex
+    // has no `--mcp-config`; register it via config override, which codex
+    // *does* honour (verified: codex starts the server and discovers its tools,
+    // unlike the trust gate that ignores `-c`). The command path is quoted as a
+    // TOML string; the args are a TOML string array.
+    if let Some(mcp) = caucus_mcp {
+        args.push("-c".into());
+        let mut command = OsString::from("mcp_servers.caucus.command=\"");
+        command.push(mcp.caucus_bin.as_os_str());
+        command.push("\"");
+        args.push(command);
+
+        args.push("-c".into());
+        let mut server_args =
+            OsString::from("mcp_servers.caucus.args=[\"mcp-serve\", \"--control-sock\", \"");
+        server_args.push(mcp.control_sock.as_os_str());
+        server_args.push("\"]");
+        args.push(server_args);
     }
     if skip_permissions {
         args.push("--dangerously-bypass-approvals-and-sandbox".into());
@@ -275,21 +332,6 @@ fn codex_args(role: &RoleSpec, model: Option<&str>, skip_permissions: bool) -> V
         };
         args.push("--sandbox".into());
         args.push(sandbox.into());
-    }
-    args
-}
-
-/// `gemini` argv: `--model`, and `--yolo` for the skip-permissions flag.
-fn gemini_args(role: &RoleSpec, model: Option<&str>, skip_permissions: bool) -> Vec<OsString> {
-    let _ = role;
-    let mut args: Vec<OsString> = Vec::new();
-    if let Some(m) = model {
-        args.push("--model".into());
-        args.push(m.into());
-    }
-    if skip_permissions {
-        // gemini's "approve everything" flag.
-        args.push("--yolo".into());
     }
     args
 }
@@ -339,12 +381,12 @@ mod tests {
         let req = SpawnRequest {
             role: role(),
             agent_name: "reviewer-r1".into(),
-            agent_cli_override: Some(AgentCli::Gemini),
-            model_override: Some("flash".into()),
+            agent_cli_override: Some(AgentCli::Codex),
+            model_override: Some("o3".into()),
             ..SpawnRequest::default()
         };
-        assert_eq!(req.effective_cli(), AgentCli::Gemini);
-        assert_eq!(req.effective_model().as_deref(), Some("flash"));
+        assert_eq!(req.effective_cli(), AgentCli::Codex);
+        assert_eq!(req.effective_model().as_deref(), Some("o3"));
     }
 
     #[test]
@@ -355,6 +397,39 @@ mod tests {
             ..SpawnRequest::default()
         };
         assert_eq!(req.effective_cli(), AgentCli::Claude);
+        assert_eq!(req.effective_model().as_deref(), Some("opus"));
+    }
+
+    /// A CLI override that switches the backend away from the role's native
+    /// `agent_cli` drops the role's (native-tuned) model: a claude `opus` id
+    /// must not leak onto a codex invocation. This is what makes
+    /// `--agent-cli codex` reuse the claude-default `main` role without codex
+    /// rejecting the model.
+    #[test]
+    fn override_to_a_different_backend_drops_the_roles_native_model() {
+        let req = SpawnRequest {
+            role: role(), // claude + opus
+            agent_name: "main-1".into(),
+            agent_cli_override: Some(AgentCli::Codex),
+            ..SpawnRequest::default()
+        };
+        assert_eq!(req.effective_cli(), AgentCli::Codex);
+        assert_eq!(
+            req.effective_model(),
+            None,
+            "claude model must not leak onto a codex override"
+        );
+    }
+
+    /// An override matching the role's native backend keeps the role model.
+    #[test]
+    fn override_to_the_same_backend_keeps_the_role_model() {
+        let req = SpawnRequest {
+            role: role(), // claude + opus
+            agent_name: "x".into(),
+            agent_cli_override: Some(AgentCli::Claude),
+            ..SpawnRequest::default()
+        };
         assert_eq!(req.effective_model().as_deref(), Some("opus"));
     }
 
@@ -414,22 +489,96 @@ mod tests {
         assert!(!args.contains(&"--append-system-prompt".to_string()));
     }
 
-    /// codex has no system-prompt flag, so a resolved role prompt must not leak
-    /// into its argv (it is warned + dropped for that backend).
+    /// codex has no `--append-system-prompt` flag, so a resolved role prompt is
+    /// injected via the `-c instructions=<text>` config override instead — the
+    /// value passed raw (no TOML quoting) as one argv element.
     #[test]
-    fn codex_argv_does_not_carry_system_prompt() {
+    fn codex_argv_injects_system_prompt_as_instructions_config() {
         let mut r = role();
         r.agent_cli = AgentCli::Codex;
         r.model = None;
         let req = SpawnRequest {
             role: r,
             agent_name: "sr".into(),
-            system_prompt: Some("ROLE GUIDANCE".into()),
+            system_prompt: Some("ROLE GUIDANCE\nsecond line".into()),
             ..SpawnRequest::default()
         };
         let args = args_of(&build_command(&req, PanelId::new()));
+        // No claude flag leaks onto a codex invocation.
         assert!(!args.contains(&"--append-system-prompt".to_string()));
-        assert!(!args.contains(&"ROLE GUIDANCE".to_string()));
+        // The prompt rides as `-c instructions=<raw text>`.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "instructions=ROLE GUIDANCE\nsecond line"),
+            "codex argv must carry the role prompt via -c instructions=: {args:?}"
+        );
+    }
+
+    /// With no role prompt, codex carries no `-c instructions=` override.
+    #[test]
+    fn codex_argv_omits_instructions_when_no_system_prompt() {
+        let mut r = role();
+        r.agent_cli = AgentCli::Codex;
+        r.model = None;
+        let req = SpawnRequest {
+            role: r,
+            agent_name: "sr".into(),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(!args.iter().any(|a| a.starts_with("instructions=")));
+    }
+
+    /// A codex main worker panel (codex backend + `caucus_mcp` set) registers
+    /// the caucus MCP server via `-c mcp_servers.caucus.{command,args}` — codex
+    /// has no `--mcp-config`, so this is how it gains the tool surface to drive
+    /// sub-agents.
+    #[test]
+    fn codex_argv_registers_the_caucus_mcp_server() {
+        let mut r = role();
+        r.agent_cli = AgentCli::Codex;
+        r.model = None;
+        let req = SpawnRequest {
+            role: r,
+            agent_name: "main-1".into(),
+            caucus_mcp: Some(CaucusMcp {
+                caucus_bin: PathBuf::from("/usr/local/bin/caucus"),
+                control_sock: PathBuf::from("/repo/.caucus/sessions/S1/control.sock"),
+            }),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c"
+                    && w[1] == "mcp_servers.caucus.command=\"/usr/local/bin/caucus\""),
+            "codex must register the caucus server command: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "-c"
+                && w[1]
+                    == "mcp_servers.caucus.args=[\"mcp-serve\", \"--control-sock\", \
+                        \"/repo/.caucus/sessions/S1/control.sock\"]"),
+            "codex must register the caucus server args: {args:?}"
+        );
+        // No claude-only MCP flag leaks onto a codex invocation.
+        assert!(!args.contains(&"--mcp-config".to_string()));
+    }
+
+    /// A codex sub-agent (no `caucus_mcp`) carries no MCP registration — only
+    /// the main worker is an orchestrator.
+    #[test]
+    fn codex_argv_omits_mcp_when_not_the_main_panel() {
+        let mut r = role();
+        r.agent_cli = AgentCli::Codex;
+        r.model = None;
+        let req = SpawnRequest {
+            role: r,
+            agent_name: "reviewer-r1".into(),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(!args.iter().any(|a| a.starts_with("mcp_servers.caucus")));
     }
 
     #[test]
@@ -481,24 +630,6 @@ mod tests {
         let args = args_of(&cmd);
         assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(!args.contains(&"--sandbox".to_string()));
-    }
-
-    #[test]
-    fn gemini_argv_uses_yolo_for_skip_permissions() {
-        let mut r = role();
-        r.agent_cli = AgentCli::Gemini;
-        r.model = Some("flash".into());
-        let req = SpawnRequest {
-            role: r,
-            agent_name: "g".into(),
-            skip_permissions: true,
-            ..SpawnRequest::default()
-        };
-        let cmd = build_command(&req, PanelId::new());
-        assert_eq!(cmd.program, OsString::from("gemini"));
-        let args = args_of(&cmd);
-        assert!(args.windows(2).any(|w| w == ["--model", "flash"]));
-        assert!(args.contains(&"--yolo".to_string()));
     }
 
     #[test]
@@ -555,28 +686,26 @@ mod tests {
         assert!(!args_of(&cmd).contains(&"--resume".to_string()));
     }
 
-    /// codex/gemini have no standard resume flag — a set `resume_session_id`
-    /// must be ignored, not leaked onto their argv.
+    /// codex has no standard resume flag — a set `resume_session_id` must be
+    /// ignored, not leaked onto its argv.
     #[test]
-    fn codex_and_gemini_ignore_resume_session_id() {
-        for cli in [AgentCli::Codex, AgentCli::Gemini] {
-            let mut r = role();
-            r.agent_cli = cli;
-            r.model = None;
-            let req = SpawnRequest {
-                role: r,
-                agent_name: "x".into(),
-                resume_session_id: Some("conv-xyz".into()),
-                ..SpawnRequest::default()
-            };
-            let cmd = build_command(&req, PanelId::new());
-            let args = args_of(&cmd);
-            assert!(
-                !args.contains(&"--resume".to_string()),
-                "{cli:?} must ignore resume_session_id: {args:?}"
-            );
-            assert!(!args.contains(&"conv-xyz".to_string()));
-        }
+    fn codex_ignores_resume_session_id() {
+        let mut r = role();
+        r.agent_cli = AgentCli::Codex;
+        r.model = None;
+        let req = SpawnRequest {
+            role: r,
+            agent_name: "x".into(),
+            resume_session_id: Some("conv-xyz".into()),
+            ..SpawnRequest::default()
+        };
+        let cmd = build_command(&req, PanelId::new());
+        let args = args_of(&cmd);
+        assert!(
+            !args.contains(&"--resume".to_string()),
+            "codex must ignore resume_session_id: {args:?}"
+        );
+        assert!(!args.contains(&"conv-xyz".to_string()));
     }
 
     #[test]

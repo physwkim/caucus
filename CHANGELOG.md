@@ -5,6 +5,111 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [0.4.0] — 2026-05-27
+
+Free-form roles: the main worker is no longer limited to a fixed roster.
+
+### Added
+
+- **Selectable main-worker backend.** `caucus --agent-cli claude|codex` picks
+  the CLI that runs the main panel you talk to (default `claude`). A codex main
+  still orchestrates sub-agents: caucus registers its MCP control plane with
+  codex via `-c mcp_servers.caucus.command/args` (codex has no `--mcp-config`
+  flag and reads MCP servers only from `[mcp_servers.<name>]` config), so the
+  same ten control-plane tools are available regardless of backend. When the
+  flag switches the backend away from a role's native model, that role's model
+  is dropped rather than passed to the other CLI.
+- **Free-form sub-agent roles.** `spawn_role` now takes a free-form role
+  *label* plus an optional inline `prompt`. A known preset name reuses that
+  preset's tool allowlist and permission mode; any other label is an ad-hoc
+  role built on the generic `worker` defaults under that name. When `prompt`
+  is set it *is* the agent's system prompt (replacing the preset's template),
+  so the main worker invents a role on the fly — naming it, writing its
+  instructions, and picking its model and backend CLI by its own judgment.
+  An unknown role label no longer errors; it spawns a generic worker.
+
+### Changed
+
+- **Codex-backed roles now receive their system prompt**, injected via codex's
+  `-c instructions=<text>` base-instructions override (codex has no
+  `--append-system-prompt` flag). Previously the role prompt was dropped for
+  the codex backend; now both preset (`serious-reviewer`) and free-form
+  codex roles run with their instructions.
+- **Codex panels no longer stall on the directory-trust gate.** codex prompts
+  *"Do you trust the contents of this directory?"* before its first turn the
+  first time it runs in a directory; caucus drives codex non-interactively, so
+  nothing answered it and the panel hung. caucus now pre-grants trust for each
+  codex panel's cwd (`[projects."<realpath>"] trust_level = "trusted"`) in
+  codex's on-disk config — the same entry codex persists on "Yes". A runtime
+  `-c` override is not honored for the trust decision, so the on-disk entry is
+  required; the edit is format-preserving (`toml_edit`) and best-effort (a
+  write failure logs a warning and the panel still launches). Honours
+  `CODEX_HOME` when set.
+
+### Removed
+
+- **Dropped the `gemini` backend.** The Gemini CLI is no longer a supported
+  `agent_cli`: the `AgentCli::Gemini` variant, its argv builder, and the
+  `caucus doctor` gemini probe are gone, and the `spawn_role` `agent_cli` enum
+  is now `claude` | `codex`. A persisted `session.json` that pinned any panel
+  to `gemini` no longer deserializes, so `caucus sessions` skips that whole
+  session (logged as an unreadable record) and it cannot be resumed.
+
+## [0.3.1] — 2026-05-26
+
+### Fixed
+
+- Extended-colour (256-colour / truecolor) indices are folded into the ANSI
+  encoding, so dark text rendered through an agent CLI's palette stays legible
+  in caucus panels.
+
+## [0.3.0] — 2026-05-26
+
+Push-based rounds, an in-session scrollback pager, and sub-agent menu control.
+
+### Added
+
+- **Push-based round fan-in.** `register_round` replaces the old blocking
+  `wait_for_panels`: caucus watches the named panels and, once they all settle
+  (or `fallback_secs` elapses), assembles their results and pushes them to the
+  main worker as a fresh turn — so the main worker ends its turn instead of
+  sleep-polling. An optional per-panel `backlog` queue feeds an early finisher
+  its next task so it never idles at the barrier.
+- **Sub-agent selection menus.** `read_menu` / `select_option` let the main
+  worker read and answer an AskUserQuestion-style chooser shown in a sub-agent
+  panel; caucus detects a stuck `awaiting_selection` panel and notifies the
+  main worker so the round can settle.
+- **In-session scrollback pager** (`Ctrl-A [`): a tmux copy-mode-style view of
+  the focused panel's scrollback (the grid ring, up to 10,000 rows).
+- **Role system-prompt injection.** A role's prompt template is resolved at
+  spawn and injected into the `claude` backend via `--append-system-prompt`.
+- **Cross-panel handoffs.** `CAUCUS_SESSION_DIR` is injected into every panel —
+  a shared path reachable even from an isolated worktree cwd — for artifacts
+  passed between panels (e.g. a review doc).
+- **tmux-style panel reorder** — `Ctrl-A <` / `Ctrl-A >` move the focused panel
+  earlier / later in the arrangement.
+- **Resilient event loop** with a consecutive-error budget, and a screen-grid
+  clamp that bounds panel dimensions to a safe maximum.
+
+### Changed
+
+- The MCP tool surface is now ten tools: `wait_for_panels` is gone, replaced by
+  `register_round`, alongside the new `broadcast`, `read_menu`, and
+  `select_option`.
+- `src/runtime` is decomposed from one god-file into focused submodules
+  (control / input / layout / mcp / rounds / scroll / spawn / persist) with no
+  behaviour change.
+
+### Fixed
+
+- Prompts are delivered as bracketed paste with the submitting Enter deferred
+  as a discrete keypress, so multi-line prompts submit reliably.
+- Non-worktree panels run in the session repo root, not `$HOME`.
+- Control + turn-signal sockets are removed on shutdown; `caucus mcp-serve`
+  self-terminates when the main caucus process is gone.
+- `caucus init` errors instead of panicking on a malformed `settings.json`, and
+  migrates stale caucus Stop hooks rather than bailing.
+
 ## [0.2.0] — 2026-05-17
 
 The live-multiplexer rewrite. caucus pivots from an async tmux-based

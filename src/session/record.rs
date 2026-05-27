@@ -28,7 +28,7 @@ pub const SESSION_RECORD_FILE: &str = "session.json";
 pub struct PanelRecord {
     /// Role name (`architect`, `backend`, ...).
     pub role: String,
-    /// Backend CLI the panel ran (`claude` / `codex` / `gemini`).
+    /// Backend CLI the panel ran (`claude` / `codex`).
     pub agent_cli: AgentCli,
     /// Model override, if any.
     #[serde(default)]

@@ -48,8 +48,14 @@ pub enum ControlRequest {
     CtrlC { panel: PanelId },
     /// Read a panel's captured output in `mode`.
     ReadPanel { panel: PanelId, mode: ReadPanelMode },
-    /// Spawn a new panel for `role`. `worktree` requests an execute-phase
-    /// worktree; `model` / `agent_cli` are main worker overrides.
+    /// Spawn a new panel for `role`. `role` is a free-form label — a known
+    /// preset name (`worker`, `reviewer`, …) reuses that preset's tool
+    /// allowlist and permission mode, any other name is an ad-hoc role built on
+    /// the generic `worker` defaults. `worktree` requests an execute-phase
+    /// worktree; `model` / `agent_cli` are main worker overrides; `prompt` is an
+    /// inline system prompt that, when set, *is* the role's instructions
+    /// (replacing the preset's prompt template) — the mechanism by which the
+    /// main worker invents a role on the fly.
     SpawnRole {
         role: String,
         #[serde(default)]
@@ -58,6 +64,8 @@ pub enum ControlRequest {
         model: Option<String>,
         #[serde(default)]
         agent_cli: Option<AgentCli>,
+        #[serde(default)]
+        prompt: Option<String>,
     },
     /// Kill a panel; its worktree (if any) is enqueued for cleanup.
     KillPanel { panel: PanelId },
@@ -185,7 +193,7 @@ mod tests {
     #[test]
     fn spawn_role_defaults_are_optional() {
         // A minimal `spawn_role` request with only `role` parses (serde
-        // defaults fill worktree/model/agent_cli).
+        // defaults fill worktree/model/agent_cli/prompt).
         let req: ControlRequest =
             serde_json::from_str(r#"{"op":"spawn_role","role":"backend"}"#).unwrap();
         assert_eq!(
@@ -195,6 +203,27 @@ mod tests {
                 worktree: false,
                 model: None,
                 agent_cli: None,
+                prompt: None,
+            }
+        );
+    }
+
+    #[test]
+    fn spawn_role_carries_an_inline_prompt() {
+        // A free-form role: an arbitrary label plus the inline `prompt` that
+        // becomes its system prompt.
+        let req: ControlRequest = serde_json::from_str(
+            r#"{"op":"spawn_role","role":"perf-profiler","prompt":"You profile hot paths."}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::SpawnRole {
+                role: "perf-profiler".into(),
+                worktree: false,
+                model: None,
+                agent_cli: None,
+                prompt: Some("You profile hot paths.".into()),
             }
         );
     }

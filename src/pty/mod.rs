@@ -25,7 +25,7 @@ use thiserror::Error;
 /// How to launch the child process inside a PTY.
 #[derive(Debug, Clone)]
 pub struct PtyCommand {
-    /// Program to exec (e.g. `claude`, `codex`, `gemini`).
+    /// Program to exec (e.g. `claude`, `codex`).
     pub program: OsString,
     /// Arguments.
     pub args: Vec<OsString>,

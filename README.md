@@ -16,8 +16,8 @@ purpose-built for running a *team* of Claude Code / Codex agents on one
 problem. Each agent gets its own panel. You watch every agent's session
 live, side by side.
 
-One panel is the **main worker**: a Claude Code agent you talk to directly.
-It is not a passive boss — it does the work. You give it a task; it does the
+One panel is the **main worker**: a Claude Code (or, with `--agent-cli codex`,
+a Codex) agent you talk to directly. It is not a passive boss — it does the work. You give it a task; it does the
 small, sequential parts itself, and for work that parallelizes it spawns
 **sub-agent panels** and hands each a focused piece. The main worker is the
 intelligence; caucus is the frame that lets it reach into the sub-agents'
@@ -64,21 +64,24 @@ task, spawning sub-agent panels, and feeding each one its sub-task as real
 keystrokes.
 
 **Sub-agents are dynamic parallel workers.** The team is not a fixed roster
-of specialists. The main worker splits a task into sub-tasks and spawns as
-many homogeneous sub-agents as the work needs — the default sub-agent role
-is a generic `worker`; the specialist roles (`architect`, `backend`,
-`reviewer`, …) are optional hints. Each code-writing sub-agent gets its own
-git worktree, so parallel work stays isolated and the main worker merges the
-results. By its own judgment the main worker picks the model and backend CLI
-(`claude` / `codex` / `gemini`) per sub-agent, spawns and kills panels as the
-work demands — caucus reflows the layout — and watches per-panel token usage
-to send `/compact` or `/clear` when a context grows inefficient. caucus
-provides the mechanism; the main worker owns the policy.
+of specialists — not even a fixed set of *roles*. The main worker splits a
+task into sub-tasks and spawns as many sub-agents as the work needs, and it is
+**not limited to a preset role list**: `spawn_role` takes a free-form role
+*label* plus an optional inline `prompt`, so the main worker invents a role on
+the fly — naming it, writing its instructions, and choosing its model and
+backend CLI (`claude` / `codex`) entirely by its own judgment. The
+named presets (`worker`, `architect`, `backend`, `reviewer`, …) are convenient
+starting points; any other label is an ad-hoc role built on the generic
+`worker` defaults. Each code-writing sub-agent gets its own git worktree, so
+parallel work stays isolated and the main worker merges the results. It spawns
+and kills panels as the work demands — caucus reflows the layout — and watches
+per-panel token usage to send `/compact` or `/clear` when a context grows
+inefficient. caucus provides the mechanism; the main worker owns the policy.
 
 **Panels are fully interactive.** A caucus panel is a real bidirectional
 terminal, not a read-only view. You — or the main worker — can type into any
-panel, including driving interactive flows such as a `claude` / `gemini`
-login or an OAuth device-code prompt.
+panel, including driving interactive flows such as a `claude` login or an
+OAuth device-code prompt.
 
 **Turn completion is live.** Each agent's Claude `Stop` hook posts to a
 caucus socket the moment a turn ends — no polling, no sentinel files. The
@@ -134,10 +137,10 @@ calls them to spawn, drive, observe, and reap sub-agent panels:
 | `broadcast`       | Send the same text to several panels at once — a round's fan-out.         |
 | `ctrl_c`          | Send `Ctrl-C` (interrupt) to a panel.                                     |
 | `read_panel`      | Read a panel's captured output (modes below).                             |
-| `spawn_role`      | Spawn a new panel for a role; `worktree`, `model`, `agent_cli` overrides. |
+| `spawn_role`      | Spawn a sub-agent panel. `role` is a free-form label; an inline `prompt` becomes the role's instructions; `worktree` / `model` / `agent_cli` overrides. |
 | `kill_panel`      | Kill a panel; its worktree (if any) is enqueued for cleanup.              |
 | `list_panels`     | List every live panel with its role and derived state.                   |
-| `register_round`  | Register a round; caucus pushes the panels' results back when they settle (or `fallback_secs`). |
+| `register_round`  | Register a round; caucus pushes the panels' results back when they settle (or `fallback_secs`). A per-panel `backlog` queue keeps early finishers working until their tasks drain. |
 | `read_menu`       | Read a panel's interactive selection menu (question + numbered options).  |
 | `select_option`   | Answer a panel's selection menu by picking an option number.              |
 
@@ -163,6 +166,9 @@ main worker over MCP, not the CLI.
 caucus                              # launch the multiplexer TUI in the current git repo
 caucus --roles architect,backend,reviewer
                                     # launch with an initial panel roster
+caucus --agent-cli codex            # run the main worker on codex instead of
+                                    # claude (default); sub-agent backends are
+                                    # still chosen per spawn_role
 caucus init [--install-hook]        # create .caucus/ + bin/turn-signal;
                                     # --install-hook merges the Claude Stop hook
 caucus doctor                       # check git / agent CLIs / hook / role allowlists
@@ -202,14 +208,20 @@ Requirements:
 - git 2.20+
 - Claude Code CLI (`claude` 2.x) on `PATH`
 - Codex CLI (`codex`) on `PATH` — optional, for Codex-backed roles
-- Gemini CLI (`gemini`) on `PATH` — optional, for Gemini-backed roles
 - Rust 1.85+ (edition 2024)
 
 No tmux dependency — caucus is its own multiplexer.
 
 ## Roles
 
-The embedded roles are read-only defaults; override per-project in
+Roles are **presets, not a closed set.** The main worker is free to spawn an
+ad-hoc role — `spawn_role(role="<any label>", prompt="<its instructions>", …)`
+— and caucus builds it on the generic `worker` defaults (tool allowlist,
+permission mode) under that label, with the inline `prompt` as its system
+prompt. The presets below are the named starting points; reach for one when a
+sub-task clearly calls for it, and invent a role when none fits.
+
+The embedded presets are read-only defaults; override per-project in
 `<repo>/.caucus/roles.toml` or globally in `~/.caucus/roles.toml`:
 
 | Role               | Agent CLI | Default model | Tools                                                  | Permission mode |
@@ -224,8 +236,9 @@ The embedded roles are read-only defaults; override per-project in
 | `serious-reviewer` | codex     | (codex picks) | Read, Glob, Grep, Bash                                 | `default`       |
 
 `main` is the orchestrator panel you talk to; `worker` is the default
-sub-agent the main worker spawns for parallel work. The remaining roles are
-optional specialist hints — use them when a sub-task clearly calls for one.
+sub-agent the main worker spawns for parallel work. The remaining presets are
+optional specialist hints — use them when a sub-task clearly calls for one, or
+go off-list with a free-form role as above.
 
 For a worked orchestration pattern — a continuous review → fix → regression
 loop driven by `main` over a durable review doc — see
@@ -238,9 +251,15 @@ claude CLI tier *aliases* (`opus` / `sonnet` / `haiku`) so caucus follows the
 latest generation automatically; pin a version in `roles.toml` for
 reproducibility.
 
-System-prompt templates live under `roles/`. Each sub-agent role inherits the
+System-prompt templates live under `roles/`. Each preset role inherits the
 claw-code "4-constraint scaffolding" (delegated task / only tools / no
-questions / concise result).
+questions / concise result); a free-form role's inline `prompt` is its system
+prompt verbatim, so write that scaffolding into it when you want it.
+
+The system prompt reaches each backend differently: `claude` gets it via
+`--append-system-prompt`, and `codex` via its `-c instructions=…` base-
+instructions override — so a Codex-backed role (preset or free-form) also runs
+with its instructions.
 
 Every role's `allowed_tools` includes `mcp__kodex`: a sub-agent queries the
 kodex knowledge graph (`recall_for_task`) to self-serve codebase context — so

@@ -96,14 +96,19 @@ pub trait McpToolSurface {
     /// §8.5).
     fn read_panel(&self, panel: PanelId, mode: ReadPanelMode) -> Result<String, McpError>;
 
-    /// Spawn a new panel for `role`. `worktree` requests an execute-phase
-    /// worktree; `model`/`agent_cli` are main worker overrides (`docs/design.md` §5).
+    /// Spawn a new panel for `role`. `role` is a free-form label: a known
+    /// preset reuses that preset's tool allowlist and permission mode, any
+    /// other name is an ad-hoc role on the generic `worker` defaults.
+    /// `worktree` requests an execute-phase worktree; `model`/`agent_cli` are
+    /// main worker overrides; `prompt`, when set, is the role's system prompt
+    /// (replacing the preset's template) (`docs/design.md` §5, §6).
     fn spawn_role(
         &mut self,
         role: &str,
         worktree: bool,
         model: Option<&str>,
         agent_cli: Option<AgentCli>,
+        prompt: Option<&str>,
     ) -> Result<PanelId, McpError>;
 
     /// Kill a panel; its worktree (if any) is enqueued for cleanup.
@@ -209,13 +214,38 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "spawn_role",
-            description: "Spawn a new panel running the given role. worktree=true \
-                          gives the new agent a dedicated git worktree as its cwd. \
-                          model and agent_cli override the role defaults.",
+            description: "Spawn a new sub-agent panel. You are NOT limited to a \
+                          fixed roster: 'role' is a free-form label. A known \
+                          preset (worker, architect, backend, reviewer, qa, \
+                          scribe, serious-reviewer) reuses that preset's tool \
+                          allowlist + permission mode; any other label is an \
+                          ad-hoc role built on the generic worker defaults. To \
+                          invent a role, pass any label plus 'prompt' — that text \
+                          becomes the agent's system prompt (the role's \
+                          instructions), so you define the sub-agent's job, model, \
+                          and backend yourself. worktree=true gives a dedicated \
+                          git worktree; model and agent_cli override the defaults \
+                          (the 'prompt' reaches claude via --append-system-prompt \
+                          and codex via -c instructions=...).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "role": { "type": "string", "description": "Role name (e.g. backend)." },
+                    "role": {
+                        "type": "string",
+                        "description": "Free-form role label. A preset name \
+                                        (worker / architect / backend / reviewer / \
+                                        qa / scribe / serious-reviewer) reuses its \
+                                        tools + permission mode; any other name is \
+                                        a custom role on the worker defaults."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Inline system prompt — the role's \
+                                        instructions. When set it replaces the \
+                                        preset's prompt template, letting you \
+                                        define an ad-hoc role on the fly. Omit to \
+                                        use a preset's built-in prompt."
+                    },
                     "worktree": {
                         "type": "boolean",
                         "description": "Create a dedicated git worktree for the panel.",
@@ -224,7 +254,7 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                     "model": { "type": "string", "description": "Model override." },
                     "agent_cli": {
                         "type": "string",
-                        "enum": ["claude", "codex", "gemini"],
+                        "enum": ["claude", "codex"],
                         "description": "Backend CLI override."
                     }
                 },
