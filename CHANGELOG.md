@@ -5,6 +5,33 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [0.4.1] — 2026-05-27
+
+Patch release: turn-completion and rendering fixes on top of 0.4.0.
+
+### Fixed
+
+- **Codex panels now report turn completion, so the main worker wakes on time.**
+  caucus detected the end of a turn only through claude's `Stop` hook; codex has
+  no such hook, so a codex panel sat in `working` forever after its first prompt
+  and a registered round settled only at its (long) fallback deadline — then
+  misreported the finished panel as *"still working."* caucus now registers
+  `caucus signal codex-notify` as codex's `notify` program (`-c notify=[...]`,
+  injected for every codex panel); codex invokes it on `agent-turn-complete` with
+  the event JSON, and it posts the same `Stop` turn-signal claude's hook posts,
+  so both backends settle a panel through one owner. The grid-hint path that was
+  intended for this (`GridHint::PromptReady`) was never wired and is unchanged.
+- **Capture turns survive a second submit/selection in the same turn.** A submit
+  or selection response arriving while a panel was still `Working` could drop the
+  active output capture; the open capture turn is now preserved.
+- **Round backlog stops launching tasks after the fallback deadline.** Once a
+  round's fallback deadline passes no new backlog task is sent, and any queued
+  backlog must drain before the round settles.
+- **Scroll pager opens at the true bottom.** The pager page height was corrected
+  so opening at the bottom includes the newest retained line.
+- **Stale wide-glyph halves are cleared on overwrite**, preventing shifted
+  rendering when a wide cell is partially overwritten.
+
 ## [0.4.0] — 2026-05-27
 
 Free-form roles: the main worker is no longer limited to a fixed roster.
@@ -45,19 +72,6 @@ Free-form roles: the main worker is no longer limited to a fixed roster.
   required; the edit is format-preserving (`toml_edit`) and best-effort (a
   write failure logs a warning and the panel still launches). Honours
   `CODEX_HOME` when set.
-
-### Fixed
-
-- **Codex panels now report turn completion, so the main worker wakes on time.**
-  caucus detected the end of a turn only through claude's `Stop` hook; codex has
-  no such hook, so a codex panel sat in `working` forever after its first prompt
-  and a registered round settled only at its (long) fallback deadline — then
-  misreported the finished panel as *"still working."* caucus now registers
-  `caucus signal codex-notify` as codex's `notify` program (`-c notify=[...]`,
-  injected for every codex panel); codex invokes it on `agent-turn-complete` with
-  the event JSON, and it posts the same `Stop` turn-signal claude's hook posts,
-  so both backends settle a panel through one owner. The grid-hint path that was
-  intended for this (`GridHint::PromptReady`) was never wired and is unchanged.
 
 ### Removed
 
