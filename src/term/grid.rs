@@ -471,6 +471,9 @@ impl Grid {
         }
 
         let (row, col) = self.cursor;
+        for clear_col in col..(col + width).min(self.cols) {
+            self.clear_cell_for_write(row, clear_col);
+        }
         let idx = self.idx(row, col);
         self.viewport[idx] = Cell {
             ch: c,
@@ -497,6 +500,28 @@ impl Grid {
         } else {
             self.cursor.1 = col + advance;
         }
+    }
+
+    /// Clear the cell at `(row, col)` before overwriting it, also clearing any
+    /// adjacent half of a wide glyph that shares the cell. This keeps the
+    /// invariant that a trailing `'\0'` marker never survives without its lead
+    /// glyph (and a lead glyph never survives after its trailing half is
+    /// overwritten), so rendering cannot shift later cells left by skipping an
+    /// orphan marker.
+    fn clear_cell_for_write(&mut self, row: usize, col: usize) {
+        let blank = Cell::blank_with(&self.pen);
+        let idx = self.idx(row, col);
+        if self.viewport[idx].ch == '\0' && col > 0 {
+            let lead = self.idx(row, col - 1);
+            self.viewport[lead] = blank;
+        }
+        if col + 1 < self.cols {
+            let trail = self.idx(row, col + 1);
+            if self.viewport[trail].ch == '\0' {
+                self.viewport[trail] = blank;
+            }
+        }
+        self.viewport[idx] = blank;
     }
 
     /// Clamp `(row, col)` into the viewport and store as the cursor.
@@ -1417,6 +1442,40 @@ mod tests {
         assert_eq!(at(&g, 0, 1), '\0'); // trailing half
         assert_eq!(at(&g, 0, 2), 'x');
         assert_eq!(g.cursor(), (0, 3));
+    }
+
+    #[test]
+    fn overwriting_wide_glyph_cells_clears_the_other_half() {
+        let mut g = Grid::new(6, 2);
+        g.advance("한Z".as_bytes());
+
+        // Overwrite the lead cell with a narrow glyph. The trailing marker at
+        // col 1 must be cleared; otherwise row rendering skips it and shifts
+        // the later `Z` left by one column.
+        g.advance(b"\rX");
+        assert_eq!(at(&g, 0, 0), 'X');
+        assert_eq!(at(&g, 0, 1), ' ');
+        assert_eq!(at(&g, 0, 2), 'Z');
+        assert_eq!(g.row_text(0), "X Z   ");
+
+        // Overwrite a trailing-half cell. The lead glyph must be cleared too,
+        // leaving the replacement at its requested column.
+        let mut g = Grid::new(6, 2);
+        g.advance("한".as_bytes());
+        g.advance(b"\x1b[1;2HY");
+        assert_eq!(at(&g, 0, 0), ' ');
+        assert_eq!(at(&g, 0, 1), 'Y');
+        assert_eq!(g.row_text(0), " Y    ");
+
+        // A wide write that overlaps the lead cell of an existing wide glyph
+        // must clear that glyph's trailing marker as well.
+        let mut g = Grid::new(6, 2);
+        g.advance("a한".as_bytes());
+        g.advance(" \r界".as_bytes());
+        assert_eq!(at(&g, 0, 0), '界');
+        assert_eq!(at(&g, 0, 1), '\0');
+        assert_eq!(at(&g, 0, 2), ' ');
+        assert_eq!(g.row_text(0), "界    ");
     }
 
     #[test]
