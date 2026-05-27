@@ -83,6 +83,9 @@ impl OutputCapture {
 
     /// Open a new turn (called when a `PromptDelivered` lane event is emitted).
     pub(crate) fn begin_turn(&mut self) {
+        if self.open.is_some() {
+            return;
+        }
         let index = self.next_index();
         self.open = Some(TurnSegment {
             index,
@@ -199,6 +202,28 @@ mod tests {
         cap.end_turn();
         assert_eq!(cap.turns().len(), 1);
         assert_eq!(cap.since_last_turn(), b"working...");
+    }
+
+    #[test]
+    fn begin_turn_while_open_preserves_the_active_segment() {
+        let mut cap = OutputCapture::new();
+        cap.begin_turn();
+        cap.push(b"before interactive reply");
+
+        // A second submitted input can arrive while the panel is still in the
+        // same coarse Working turn (for example answering an in-turn
+        // selection prompt). It must not discard the bytes already captured
+        // for that turn.
+        cap.begin_turn();
+        cap.push(b" after reply");
+        cap.end_turn();
+
+        assert_eq!(cap.turns().len(), 1);
+        assert_eq!(
+            cap.turns()[0].bytes,
+            b"before interactive reply after reply"
+        );
+        assert_eq!(cap.turns()[0].index, 0);
     }
 
     #[test]
