@@ -13,8 +13,8 @@
 //! `caucus` is safe to invoke from a non-interactive context.
 
 use std::io::{self, Stdout};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -48,38 +48,147 @@ const TICK: Duration = Duration::from_millis(16);
 /// unavailable — the session itself is never ended by such an error.
 const TERMINAL_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
-/// Spawn a task that flips `terminate` when the controlling terminal hangs up
-/// (`SIGHUP` — window closed, parent process exited, SSH dropped). This is the
-/// *authoritative* "terminal is gone" signal, and the only thing besides an
-/// explicit user quit that ends the event loop.
+/// How long the controlling terminal must stay unreachable after a `SIGHUP`
+/// before the session is torn down. A genuine hangup never recovers, so the
+/// window only delays a real shutdown by ~1 s (the window is closed — nobody is
+/// watching); a spurious `SIGHUP` recovers on the very first probe and never
+/// reaches this. See [`spawn_hangup_listener`] / [`controlling_terminal_alive`].
+const HANGUP_CONFIRM_WINDOW: Duration = Duration::from_millis(1000);
+
+/// Spawn a task that sets `hangup` on every `SIGHUP` (window closed, parent
+/// process exited, SSH dropped — *or* a terminal emulator that delivers a
+/// `SIGHUP` across a macOS display wake while its window is still open).
 ///
-/// A display wake or a monitor/DPI switch — the WezTerm "window jumps back to
-/// the external monitor when it powers on" case — delivers only `SIGWINCH`
-/// (a resize), never `SIGHUP`. The old give-up heuristic counted the transient
-/// `terminal::size()` failures that switch produces (crossterm's `TIOCGWINSZ`
-/// has no `EINTR` retry, so a `SIGWINCH` storm makes every `size()` fail) and,
-/// because the failures arrive back-to-back with no successful idle poll
-/// between them to clear the streak, tripped after ~2.5 s and tore down a live
-/// session. Keying shutdown off `SIGHUP` instead means only a genuinely-gone
-/// terminal ends the loop, and it still ends through the orderly
-/// [`Multiplexer::shutdown`] path (persist record, kill panels, clean
-/// worktrees) rather than the kernel's default hard-kill on `SIGHUP`.
+/// `SIGHUP` is treated as a *trigger to verify*, not an authoritative verdict.
+/// The earlier design keyed shutdown directly off `SIGHUP` on the premise that
+/// a display wake delivers only `SIGWINCH`, never `SIGHUP`. That premise does
+/// not hold for WezTerm on macOS: it fires a real `SIGHUP` when the display
+/// powers back on, and trusting it tore down a live session (clean exit to the
+/// shell) — the same false-positive class as the old error-count give-up
+/// heuristic, just via a different signal. The loop instead confirms the
+/// terminal is genuinely gone (see [`controlling_terminal_alive`]) before
+/// ending through the orderly [`Multiplexer::shutdown`] path.
+///
+/// The flag is set (not consumed) here and `swap`-cleared by the loop, so
+/// several coalesced `SIGHUP`s collapse into one verification pass and each
+/// later wake re-arms it.
 #[cfg(unix)]
-fn spawn_terminate_listener(terminate: Arc<AtomicBool>) {
+fn spawn_hangup_listener(hangup: Arc<AtomicBool>) {
     use tokio::signal::unix::{SignalKind, signal};
     tokio::spawn(async move {
         let Ok(mut hup) = signal(SignalKind::hangup()) else {
             return;
         };
-        hup.recv().await;
-        terminate.store(true, Ordering::SeqCst);
+        while hup.recv().await.is_some() {
+            hangup.store(true, Ordering::SeqCst);
+        }
     });
 }
 
-/// Non-unix stub: there is no `SIGHUP`, so genuine terminal loss is left to the
-/// platform's default behaviour and the loop ends only on explicit quit.
+/// Non-unix stub: there is no `SIGHUP`, so the hangup path never arms.
 #[cfg(not(unix))]
-fn spawn_terminate_listener(_terminate: Arc<AtomicBool>) {}
+fn spawn_hangup_listener(_hangup: Arc<AtomicBool>) {}
+
+/// Whether this process still has a controlling terminal.
+///
+/// `open("/dev/tty")` succeeds iff the process has a controlling terminal; a
+/// genuine hangup (window closed, parent exited, SSH dropped) makes the kernel
+/// revoke it, after which the open fails (`ENXIO`). A spurious `SIGHUP` —
+/// WezTerm delivering one across a macOS display wake while the window is still
+/// open — leaves `/dev/tty` openable, so this cleanly tells the two apart.
+/// `EINTR` from a concurrent `SIGWINCH` (the same display event also resizes the
+/// window) is retried, so a signal storm is never mistaken for terminal loss.
+/// The handle is dropped immediately; the probe neither reads nor writes, and
+/// `/dev/tty` only ever refers to the *existing* controlling terminal, so it
+/// cannot acquire or change one.
+#[cfg(unix)]
+fn controlling_terminal_alive() -> bool {
+    use std::io::ErrorKind;
+    for _ in 0..16 {
+        match std::fs::OpenOptions::new().read(true).open("/dev/tty") {
+            Ok(_) => return true,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    // Persistent `EINTR` means signals are storming, not that the terminal is
+    // gone — treat as alive and let a later probe settle it.
+    true
+}
+
+/// Non-unix stub: the hangup path never runs, so liveness is moot.
+#[cfg(not(unix))]
+fn controlling_terminal_alive() -> bool {
+    true
+}
+
+/// What the event loop should do about a pending `SIGHUP`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HangupAction {
+    /// Terminal is still live — the `SIGHUP` was spurious; clear the suspicion
+    /// and keep the session running.
+    Survive,
+    /// Terminal has been unreachable for the whole confirm window — a genuine
+    /// hangup; end the session through the orderly shutdown path.
+    Confirm,
+    /// Terminal is currently unreachable but still within the window — keep
+    /// probing on the next tick.
+    Wait,
+}
+
+/// Classify a pending hangup. A live terminal always wins (`Survive`) so a
+/// spurious `SIGHUP` can never end the session; a terminal that stays
+/// unreachable for `window` is a genuine hangup (`Confirm`). Pure so the
+/// boundary behaviour is unit-tested without a real terminal.
+fn hangup_verdict(
+    terminal_alive: bool,
+    suspect_elapsed: Duration,
+    window: Duration,
+) -> HangupAction {
+    if terminal_alive {
+        HangupAction::Survive
+    } else if suspect_elapsed >= window {
+        HangupAction::Confirm
+    } else {
+        HangupAction::Wait
+    }
+}
+
+/// Install file logging at `<repo>/.caucus/caucus.log` plus a panic hook that
+/// records panics there too. This is the *only* place caucus installs a tracing
+/// subscriber — without it every `warn!`/`error!` in the event loop (terminal
+/// I/O errors, `SIGHUP` classification) goes nowhere, and a panic raised inside
+/// the alternate screen is lost to the cleared scrollback. Idempotent and
+/// best-effort: a second call or any setup failure is a silent no-op and never
+/// blocks the TUI from starting. `RUST_LOG` overrides the default filter.
+fn init_logging(repo: &std::path::Path) {
+    use tracing_subscriber::{EnvFilter, fmt};
+    let dir = repo.join(".caucus");
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("caucus.log"))
+    else {
+        return;
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("caucus=info"));
+    let installed = fmt()
+        .with_ansi(false)
+        .with_writer(Mutex::new(file))
+        .with_env_filter(filter)
+        .try_init()
+        .is_ok();
+    if installed {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            tracing::error!(panic = %info, %backtrace, "caucus panicked");
+            default(info);
+        }));
+    }
+}
 
 /// RAII guard that restores the terminal: leaves the alternate screen and
 /// disables raw mode on drop, so caucus never leaves the user's terminal in
@@ -116,6 +225,7 @@ pub fn run(
     main_cli: Option<AgentCli>,
     prefix: char,
 ) -> Result<()> {
+    init_logging(repo);
     require_tty()?;
     let config = Config::load(repo).context("load caucus configuration")?;
     let session = Session::new("caucus session", repo.to_path_buf());
@@ -150,6 +260,7 @@ pub fn run_resumed(
              run `caucus sessions` to list resumable sessions"
         )
     })?;
+    init_logging(repo);
     require_tty()?;
     let config = Config::load(repo).context("load caucus configuration")?;
     let session = Session::from_record(&record);
@@ -364,16 +475,46 @@ async fn event_loop(
     mut control_server: crate::mcp::control_server::ControlServer,
 ) -> Result<()> {
     let mut last_draw = Instant::now();
-    let terminate = Arc::new(AtomicBool::new(false));
-    spawn_terminate_listener(terminate.clone());
+    // `SIGHUP` is a *trigger to verify*, not a verdict. A genuine hangup (window
+    // closed, parent gone, SSH dropped) revokes the controlling terminal; a
+    // spurious one (WezTerm delivering `SIGHUP` across a macOS display wake while
+    // the window is still open) leaves it attached. The loop probes the terminal
+    // to tell them apart and ends the session only when it is confirmed gone for
+    // `HANGUP_CONFIRM_WINDOW` — so a display wake can no longer tear down a live
+    // session, while a real hangup still ends through the orderly shutdown path.
+    let hangup = Arc::new(AtomicBool::new(false));
+    spawn_hangup_listener(hangup.clone());
+    let mut hangup_suspect_since: Option<Instant> = None;
     loop {
-        // A genuine terminal hangup (window closed, parent gone, SSH dropped)
-        // is the only non-quit reason to end the loop. A monitor/DPI switch or
-        // display wake never sets this — it only produces the transient errors
-        // absorbed below.
-        if terminate.load(Ordering::SeqCst) {
-            warn!("controlling terminal hung up (SIGHUP); shutting down");
-            break;
+        // Begin — or restart — confirming a hangup whenever a `SIGHUP` arrives.
+        if hangup.swap(false, Ordering::SeqCst) {
+            hangup_suspect_since.get_or_insert_with(Instant::now);
+        }
+        if let Some(since) = hangup_suspect_since {
+            match hangup_verdict(
+                controlling_terminal_alive(),
+                since.elapsed(),
+                HANGUP_CONFIRM_WINDOW,
+            ) {
+                HangupAction::Survive => {
+                    warn!(
+                        "SIGHUP received but controlling terminal is still live; \
+                         ignoring as a spurious hangup (e.g. a display wake)"
+                    );
+                    hangup_suspect_since = None;
+                }
+                HangupAction::Confirm => {
+                    warn!(
+                        ?HANGUP_CONFIRM_WINDOW,
+                        "controlling terminal confirmed gone (SIGHUP, /dev/tty \
+                         unopenable for the confirm window); shutting down"
+                    );
+                    break;
+                }
+                // Within the confirm window and currently unreachable: keep
+                // looping and re-probe next tick.
+                HangupAction::Wait => {}
+            }
         }
 
         // 1. Input — poll without blocking the pump/redraw cadence. A poll/read
@@ -610,5 +751,48 @@ mod tests {
         let second = panel_record(1, false);
         assert!(should_restore_panel_as_main(&first, false, false));
         assert!(!should_restore_panel_as_main(&second, false, true));
+    }
+
+    // Boundary cases for the SIGHUP classifier (one per invariant boundary, not
+    // per scenario): a live terminal always survives; a dead terminal only
+    // confirms once the window has elapsed.
+    #[test]
+    fn hangup_verdict_live_terminal_always_survives() {
+        let w = Duration::from_millis(1000);
+        assert_eq!(
+            hangup_verdict(true, Duration::ZERO, w),
+            HangupAction::Survive
+        );
+        assert_eq!(hangup_verdict(true, w, w), HangupAction::Survive);
+        assert_eq!(hangup_verdict(true, w * 2, w), HangupAction::Survive);
+    }
+
+    #[test]
+    fn hangup_verdict_dead_within_window_waits() {
+        let w = Duration::from_millis(1000);
+        assert_eq!(hangup_verdict(false, Duration::ZERO, w), HangupAction::Wait);
+        assert_eq!(
+            hangup_verdict(false, w - Duration::from_millis(1), w),
+            HangupAction::Wait
+        );
+    }
+
+    #[test]
+    fn hangup_verdict_dead_past_window_confirms() {
+        // The boundary is inclusive: elapsed == window confirms.
+        let w = Duration::from_millis(1000);
+        assert_eq!(hangup_verdict(false, w, w), HangupAction::Confirm);
+        assert_eq!(hangup_verdict(false, w * 2, w), HangupAction::Confirm);
+    }
+
+    // A real controlling terminal is openable; the test harness inherits one
+    // under `cargo test` from a terminal. When it does not (CI with no tty),
+    // the probe returns `false` — either way it must not panic, and the result
+    // is a plain bool. This guards the probe against regressions in the retry
+    // loop / error mapping without asserting a tty is present.
+    #[cfg(unix)]
+    #[test]
+    fn controlling_terminal_probe_is_total() {
+        let _alive: bool = controlling_terminal_alive();
     }
 }
