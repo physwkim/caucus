@@ -117,7 +117,7 @@ fn mcp_serve_help_runs() {
 fn build_mux(tmp: &TempDir) -> (Multiplexer, caucus::mcp::control_server::ControlServer) {
     let session = Session::new("mcp-test", tmp.path().to_path_buf());
     let config = Config::load(tmp.path()).unwrap();
-    let (mux, _signal, control) = Multiplexer::new(session, config, area()).unwrap();
+    let (mux, _signal, control) = Multiplexer::new(session, config, area(), 'a').unwrap();
     (mux, control)
 }
 

@@ -89,10 +89,16 @@ main worker sees "that sub-agent finished its turn" immediately and reacts.
 
 ## Keymap
 
-caucus reserves a single prefix key, `Ctrl-A`, for its own commands. Every
-other keystroke — including `Ctrl-C` — is encoded to terminal bytes and
+caucus reserves a single prefix key, `Ctrl-A` by default, for its own commands.
+Every other keystroke — including `Ctrl-C` — is encoded to terminal bytes and
 forwarded verbatim to the focused panel's PTY, so an agent CLI sees a real
 terminal.
+
+The prefix is configurable, so it can dodge a collision with an outer
+multiplexer — for example a tmux remapped to `Ctrl-A`. Pass `--prefix b` or set
+`CAUCUS_PREFIX=b` to use `Ctrl-B` instead (any letter; a bare `b` or a
+`ctrl-b` / `^b` form both work). The table below shows the default; substitute
+your prefix for `Ctrl-A`.
 
 | Key                     | Action                                  |
 |-------------------------|-----------------------------------------|

@@ -110,7 +110,12 @@ impl Drop for TerminalGuard {
 /// main worker's backend (`None` → the default claude main worker).
 ///
 /// Fails cleanly (no panic) when stdout is not a terminal.
-pub fn run(repo: &std::path::Path, roles: &[String], main_cli: Option<AgentCli>) -> Result<()> {
+pub fn run(
+    repo: &std::path::Path,
+    roles: &[String],
+    main_cli: Option<AgentCli>,
+    prefix: char,
+) -> Result<()> {
     require_tty()?;
     let config = Config::load(repo).context("load caucus configuration")?;
     let session = Session::new("caucus session", repo.to_path_buf());
@@ -121,7 +126,7 @@ pub fn run(repo: &std::path::Path, roles: &[String], main_cli: Option<AgentCli>)
     let runtime = tokio::runtime::Runtime::new().context("start tokio runtime")?;
     runtime.block_on(async move {
         let _guard = TerminalGuard::enter()?;
-        let (terminal, mut mux, signal, control) = setup(config, session)?;
+        let (terminal, mut mux, signal, control) = setup(config, session, prefix)?;
         spawn_fresh_roster(&mut mux, &roles, main_cli)?;
         event_loop(terminal, mux, signal, control).await
     })
@@ -131,7 +136,11 @@ pub fn run(repo: &std::path::Path, roles: &[String], main_cli: Option<AgentCli>)
 /// (`caucus resume <id>`). Reads `<repo>/.caucus/sessions/<id>/session.json`,
 /// recreates every panel in `order_index` order, and restores the layout
 /// mode. Fails cleanly with a message when the record is missing or corrupt.
-pub fn run_resumed(repo: &std::path::Path, session_id: crate::session::SessionId) -> Result<()> {
+pub fn run_resumed(
+    repo: &std::path::Path,
+    session_id: crate::session::SessionId,
+    prefix: char,
+) -> Result<()> {
     // Resolve the record first — a missing/corrupt `session.json` fails with a
     // pointed message regardless of whether stdout is a tty.
     let record = SessionRecord::read_for_id(repo, session_id).with_context(|| {
@@ -148,7 +157,7 @@ pub fn run_resumed(repo: &std::path::Path, session_id: crate::session::SessionId
     let runtime = tokio::runtime::Runtime::new().context("start tokio runtime")?;
     runtime.block_on(async move {
         let _guard = TerminalGuard::enter()?;
-        let (terminal, mut mux, signal, control) = setup(config, session)?;
+        let (terminal, mut mux, signal, control) = setup(config, session, prefix)?;
         restore_roster(&mut mux, &record)?;
         event_loop(terminal, mux, signal, control).await
     })
@@ -174,6 +183,7 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 fn setup(
     config: Config,
     session: Session,
+    prefix: char,
 ) -> Result<(
     Term,
     Multiplexer,
@@ -186,7 +196,7 @@ fn setup(
     // Panels tile the *body* — the whole screen minus the one-row status bar.
     let area = body_area(whole_screen(&terminal)?);
     let (mux, signal_server, control_server) =
-        Multiplexer::new(session, config, area).context("build multiplexer")?;
+        Multiplexer::new(session, config, area, prefix).context("build multiplexer")?;
     Ok((terminal, mux, signal_server, control_server))
 }
 
@@ -556,9 +566,10 @@ fn status_line(mux: &Multiplexer) -> String {
         return " caucus · scrollback · ↑↓ k/j line · PgUp/PgDn page · g/G top/bottom · Esc/q exit"
             .to_string();
     }
+    let key = mux.prefix().to_ascii_uppercase();
     format!(
         " caucus · {} panel(s) · focus: {} · layout: {} · \
-         Ctrl-A then n/p/arrows focus, Ctrl-arrows resize, z zoom, </> move, x close, Space layout, t transcript, [ scroll, q quit{}{}{}",
+         Ctrl-{key} then n/p/arrows focus, Ctrl-arrows resize, z zoom, </> move, x close, Space layout, t transcript, [ scroll, q quit{}{}{}",
         mux.panels().len(),
         focused,
         mux.layout_mode().label(),

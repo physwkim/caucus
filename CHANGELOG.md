@@ -5,6 +5,34 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [0.5.0] — 2026-05-29
+
+Survives multi-monitor display switches, and lets you remap the prefix key.
+
+### Added
+
+- **Configurable prefix key.** The reserved prefix (still `Ctrl-A` by default)
+  can be remapped with `--prefix <letter>` or `CAUCUS_PREFIX=<letter>`, so it can
+  dodge a collision with an outer multiplexer — e.g. a tmux remapped to `Ctrl-A`.
+  `--prefix b` (or `CAUCUS_PREFIX=b`) reserves `Ctrl-B`; a bare letter or a
+  `ctrl-b` / `^b` form both parse, case-insensitively. The status-bar hint and
+  the literal-prefix passthrough (`prefix prefix` → one literal `Ctrl-<key>`
+  byte) follow the configured key. Applies to fresh launches and `resume`.
+
+### Fixed
+
+- **The TUI survives a monitor/DPI switch.** A WezTerm window moving between
+  displays of different DPI — e.g. the MacBook built-in panel handing off to an
+  external monitor as it powers on — fires a `SIGWINCH` storm. crossterm's
+  `terminal::size()` does the `TIOCGWINSZ` ioctl with no `EINTR` retry, so each
+  storm-interrupted call failed and surfaced as an error out of `event::poll`;
+  with the signal staying pending no successful idle poll ever cleared the
+  streak, and the consecutive-error give-up budget tripped after ~2.5 s and tore
+  down a live session (clean exit to the shell). caucus now treats every
+  terminal I/O error as transient and ends the session only on a genuine
+  `SIGHUP` (window closed, parent gone, SSH dropped), which a monitor switch
+  never sends — and still does so through the orderly shutdown path.
+
 ## [0.4.1] — 2026-05-27
 
 Patch release: turn-completion and rendering fixes on top of 0.4.0.

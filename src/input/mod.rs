@@ -7,10 +7,13 @@
 //!
 //! # Keymap
 //!
-//! caucus reserves a single **prefix key**, `Ctrl-A`, for its own commands.
-//! Every other keystroke — including `Ctrl-C` — is encoded to terminal bytes
-//! and forwarded verbatim to the focused panel's PTY, so an agent CLI sees a
-//! real terminal.
+//! caucus reserves a single **prefix key**, `Ctrl-A` by default, for its own
+//! commands. The prefix is configurable (`--prefix` / `CAUCUS_PREFIX`, see
+//! [`FocusRouter::with_prefix`]) so it can dodge a collision with an outer
+//! multiplexer — set `Ctrl-B` when tmux is remapped to `Ctrl-A`. The table
+//! below shows the default; substitute your prefix for `Ctrl-A`. Every other
+//! keystroke — including `Ctrl-C` — is encoded to terminal bytes and forwarded
+//! verbatim to the focused panel's PTY, so an agent CLI sees a real terminal.
 //!
 //! | Key                       | Action                                  |
 //! |---------------------------|-----------------------------------------|
@@ -43,7 +46,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::render::Direction;
 use crate::session::id::PanelId;
 
-/// The reserved prefix key chord (`Ctrl-A`).
+/// The default prefix letter — `Ctrl-A` — used when none is configured.
 const PREFIX_CHAR: char = 'a';
 
 /// Where a key event should go after focus routing.
@@ -113,8 +116,12 @@ pub enum CaucusCommand {
 
 /// Tracks which panel currently receives the user's keystrokes, plus whether
 /// the reserved prefix key is pending.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FocusRouter {
+    /// The reserved prefix letter — caucus commands are `Ctrl-<prefix>`
+    /// (default `'a'` → `Ctrl-A`). Configurable so it can dodge a collision
+    /// with an outer multiplexer (e.g. a tmux remapped to `Ctrl-A`).
+    prefix: char,
     /// The focused panel, if any panel exists.
     focused: Option<PanelId>,
     /// `true` after the prefix key was pressed and before the next key.
@@ -132,10 +139,41 @@ pub struct FocusRouter {
     confirm_open: bool,
 }
 
+impl Default for FocusRouter {
+    fn default() -> Self {
+        Self::with_prefix(PREFIX_CHAR)
+    }
+}
+
 impl FocusRouter {
-    /// A router with no panels yet.
+    /// A router with no panels yet, using the default `Ctrl-A` prefix.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A router reserving `Ctrl-<prefix>` (case-insensitive) for caucus
+    /// commands. `prefix` is the bare letter — `'b'` means `Ctrl-B`.
+    pub fn with_prefix(prefix: char) -> Self {
+        Self {
+            prefix,
+            focused: None,
+            prefix_armed: false,
+            transcript_open: false,
+            scroll_open: false,
+            confirm_open: false,
+        }
+    }
+
+    /// The reserved prefix letter — caucus commands are `Ctrl-<this>`.
+    pub fn prefix(&self) -> char {
+        self.prefix
+    }
+
+    /// Whether `key` is the reserved caucus prefix (`Ctrl-<prefix>`,
+    /// case-insensitive).
+    fn is_prefix(&self, key: &KeyEvent) -> bool {
+        key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&self.prefix))
     }
 
     /// The currently focused panel.
@@ -202,7 +240,7 @@ impl FocusRouter {
             self.prefix_armed = false;
             return self.route_prefixed(key);
         }
-        if is_prefix(&key) {
+        if self.is_prefix(&key) {
             self.prefix_armed = true;
             return InputAction::Ignore;
         }
@@ -223,12 +261,14 @@ impl FocusRouter {
 
     /// Interpret a key pressed *after* the prefix.
     fn route_prefixed(&self, key: KeyEvent) -> InputAction {
-        // `Ctrl-A Ctrl-A` forwards one literal prefix byte to the panel.
-        if is_prefix(&key) {
+        // `prefix prefix` forwards one literal prefix byte to the panel. The
+        // control code for `Ctrl-<letter>` is the letter with its top three
+        // bits cleared (`Ctrl-A` → 0x01, `Ctrl-B` → 0x02, ...).
+        if self.is_prefix(&key) {
             return match self.focused {
                 Some(panel) => InputAction::ToPanel {
                     panel,
-                    bytes: vec![0x01],
+                    bytes: vec![(self.prefix as u8) & 0x1f],
                 },
                 None => InputAction::Ignore,
             };
@@ -304,12 +344,6 @@ fn arrow_direction(code: KeyCode) -> Option<Direction> {
         KeyCode::Right => Some(Direction::Right),
         _ => None,
     }
-}
-
-/// Whether `key` is the reserved caucus prefix (`Ctrl-A`).
-fn is_prefix(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&PREFIX_CHAR))
 }
 
 /// Encode a crossterm [`KeyEvent`] into the byte sequence a terminal would
@@ -620,6 +654,41 @@ mod tests {
         match router.route(ctrl('a')) {
             InputAction::ToPanel { bytes, .. } => assert_eq!(bytes, vec![0x01]),
             other => panic!("expected literal Ctrl-A, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_configured_prefix_recognises_its_own_chord_only() {
+        // With the prefix set to Ctrl-B, Ctrl-B arms caucus and Ctrl-A is just
+        // a normal control byte forwarded to the panel (the tmux-collision fix).
+        let mut router = FocusRouter::with_prefix('b');
+        router.set_focus(Some(PanelId::new()));
+
+        // Ctrl-A is no longer the prefix: it forwards verbatim.
+        match router.route(ctrl('a')) {
+            InputAction::ToPanel { bytes, .. } => assert_eq!(bytes, vec![0x01]),
+            other => panic!("expected Ctrl-A forwarded, got {other:?}"),
+        }
+        assert!(!router.prefix_armed());
+
+        // Ctrl-B now arms the prefix and selects a caucus command.
+        assert!(matches!(router.route(ctrl('b')), InputAction::Ignore));
+        assert!(router.prefix_armed());
+        assert!(matches!(
+            router.route(key(KeyCode::Char('n'))),
+            InputAction::Caucus(CaucusCommand::FocusNext)
+        ));
+    }
+
+    #[test]
+    fn configured_prefix_doubled_forwards_its_own_literal_byte() {
+        // Ctrl-B Ctrl-B sends a literal Ctrl-B (0x02), not Ctrl-A (0x01).
+        let mut router = FocusRouter::with_prefix('b');
+        router.set_focus(Some(PanelId::new()));
+        router.route(ctrl('b'));
+        match router.route(ctrl('b')) {
+            InputAction::ToPanel { bytes, .. } => assert_eq!(bytes, vec![0x02]),
+            other => panic!("expected literal Ctrl-B (0x02), got {other:?}"),
         }
     }
 

@@ -41,8 +41,47 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub agent_cli: Option<AgentCli>,
 
+    /// caucus's reserved prefix key — `Ctrl-<letter>` selects caucus commands
+    /// (panel focus, zoom, layout, ...). Defaults to `a` (`Ctrl-A`). Set this
+    /// when `Ctrl-A` collides with an outer multiplexer — e.g. a tmux remapped
+    /// to `Ctrl-A`: `--prefix b` or `CAUCUS_PREFIX=b` reserves `Ctrl-B`
+    /// instead. Accepts a bare letter or a `ctrl-`/`c-`/`^` form. Only
+    /// meaningful when launching the TUI (fresh or `resume`).
+    #[arg(long, env = "CAUCUS_PREFIX", default_value = "a")]
+    pub prefix: PrefixKey,
+
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+/// The caucus prefix key, parsed from `--prefix` / `CAUCUS_PREFIX`. caucus
+/// reserves a `Ctrl-<letter>` chord; the wrapped value is that lowercase
+/// letter (e.g. `'b'` for `Ctrl-B`). A leading `ctrl-`, `ctrl+`, `c-`, or `^`
+/// is accepted and stripped, so `b`, `ctrl-b`, `C-b`, and `^b` all parse the
+/// same. Only ASCII letters are accepted — they are the keys that map cleanly
+/// to a `Ctrl` control code.
+#[derive(Debug, Clone, Copy)]
+pub struct PrefixKey(pub char);
+
+impl FromStr for PrefixKey {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let lowered = s.trim().to_ascii_lowercase();
+        let key = lowered
+            .strip_prefix("ctrl-")
+            .or_else(|| lowered.strip_prefix("ctrl+"))
+            .or_else(|| lowered.strip_prefix("c-"))
+            .or_else(|| lowered.strip_prefix('^'))
+            .unwrap_or(&lowered);
+        let mut chars = key.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) if c.is_ascii_alphabetic() => Ok(PrefixKey(c)),
+            _ => Err(format!(
+                "prefix must be a single Ctrl+<letter> key, e.g. `b` or `ctrl-b`; got `{s}`"
+            )),
+        }
+    }
 }
 
 /// Non-TUI subcommands.
@@ -176,15 +215,16 @@ pub fn run() -> ExitCode {
 
 /// Dispatch a parsed [`Cli`]. No subcommand launches the TUI.
 fn dispatch(cli: Cli) -> Result<ExitCode> {
+    let prefix = cli.prefix.0;
     match cli.command {
-        None => run_tui(&cli.roles, cli.agent_cli),
+        None => run_tui(&cli.roles, cli.agent_cli, prefix),
         Some(Command::Init { install_hook }) => run_init(install_hook),
         Some(Command::Doctor) => run_doctor(),
         Some(Command::Signal(cmd)) => run_signal(cmd),
         Some(Command::Role(cmd)) => run_role(cmd),
         Some(Command::McpServe { control_sock }) => run_mcp_serve(&control_sock),
         Some(Command::Sessions { format }) => run_sessions(format),
-        Some(Command::Resume { session_id }) => run_resume(&session_id),
+        Some(Command::Resume { session_id }) => run_resume(&session_id, prefix),
     }
 }
 
@@ -209,9 +249,9 @@ fn repo_root() -> Result<PathBuf> {
 /// claude) plus any `--roles`, and runs the ratatui event loop. When stdout is
 /// not a tty, [`crate::tui::run`] fails cleanly with a message rather than
 /// panicking.
-fn run_tui(roles: &[String], main_cli: Option<AgentCli>) -> Result<ExitCode> {
+fn run_tui(roles: &[String], main_cli: Option<AgentCli>, prefix: char) -> Result<ExitCode> {
     let repo = repo_root()?;
-    crate::tui::run(&repo, roles, main_cli)?;
+    crate::tui::run(&repo, roles, main_cli, prefix)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -390,11 +430,11 @@ fn humanize_age(d: chrono::Duration) -> String {
 }
 
 /// `caucus resume <session_id>` — relaunch the TUI restoring a session.
-fn run_resume(session_id: &str) -> Result<ExitCode> {
+fn run_resume(session_id: &str, prefix: char) -> Result<ExitCode> {
     let repo = repo_root()?;
     let id = SessionId::from_str(session_id)
         .with_context(|| format!("invalid session id '{session_id}'"))?;
-    crate::tui::run_resumed(&repo, id)?;
+    crate::tui::run_resumed(&repo, id, prefix)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -412,6 +452,47 @@ mod tests {
     fn no_subcommand_parses() {
         let cli = Cli::try_parse_from(["caucus"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn prefix_defaults_to_ctrl_a() {
+        let cli = Cli::try_parse_from(["caucus"]).unwrap();
+        assert_eq!(cli.prefix.0, 'a');
+    }
+
+    #[test]
+    fn prefix_flag_accepts_bare_letter_and_normalises_case() {
+        assert_eq!(
+            Cli::try_parse_from(["caucus", "--prefix", "B"])
+                .unwrap()
+                .prefix
+                .0,
+            'b'
+        );
+    }
+
+    #[test]
+    fn prefix_flag_accepts_ctrl_forms() {
+        for spec in ["ctrl-b", "ctrl+b", "C-b", "^b", " b "] {
+            assert_eq!(
+                Cli::try_parse_from(["caucus", "--prefix", spec])
+                    .unwrap()
+                    .prefix
+                    .0,
+                'b',
+                "spec `{spec}` should parse to 'b'"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_flag_rejects_non_letter_and_multi_char() {
+        for bad in ["", "1", "esc", "ab", "ctrl-1"] {
+            assert!(
+                Cli::try_parse_from(["caucus", "--prefix", bad]).is_err(),
+                "spec `{bad}` must be rejected"
+            );
+        }
     }
 
     #[test]

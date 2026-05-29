@@ -157,6 +157,7 @@ impl Multiplexer {
         session: Session,
         config: Config,
         area: Rect,
+        prefix: char,
     ) -> Result<(Self, SignalServer, ControlServer)> {
         std::fs::create_dir_all(session.root_dir.join("agents"))
             .with_context(|| format!("create {}", session.root_dir.display()))?;
@@ -180,7 +181,7 @@ impl Multiplexer {
                 manifests: HashMap::new(),
                 layout: Layout::default(),
                 layout_tree: None,
-                focus: FocusRouter::new(),
+                focus: FocusRouter::with_prefix(prefix),
                 cleanup,
                 sock_path,
                 control_sock_path,
@@ -218,6 +219,11 @@ impl Multiplexer {
     /// The current layout.
     pub fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    /// The reserved prefix letter — caucus commands are `Ctrl-<this>`.
+    pub fn prefix(&self) -> char {
+        self.focus.prefix()
     }
 
     /// The focused panel id, if any.
@@ -299,7 +305,7 @@ mod tests {
         let config = Config::load(tmp.path()).unwrap();
         // Hold the signal server handle: the turn-signal socket exists only
         // while it is alive (removed on drop — see `SignalServer`'s Drop).
-        let (mux, _signal, _control) = Multiplexer::new(session, config, area()).unwrap();
+        let (mux, _signal, _control) = Multiplexer::new(session, config, area(), 'a').unwrap();
         assert!(mux.session.root_dir.join("agents").is_dir());
         assert!(mux.session.root_dir.join("panels").is_dir());
         assert!(mux.sock_path().exists());
@@ -310,7 +316,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let session = Session::new("test", tmp.path().to_path_buf());
         let config = Config::load(tmp.path()).unwrap();
-        let (mux, _signal, control) = Multiplexer::new(session, config, area()).unwrap();
+        let (mux, _signal, control) = Multiplexer::new(session, config, area(), 'a').unwrap();
         // The control socket is distinct from the turn-signal socket and
         // exists on disk.
         assert!(control.sock_path().exists());
