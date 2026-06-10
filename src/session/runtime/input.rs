@@ -55,7 +55,7 @@ impl Multiplexer {
     /// paste burst. Without this the host terminal streams a paste key-by-key
     /// and every embedded newline (`\r`) is taken as a submit, so a multi-line
     /// paste fires the panel's prompt at its first line. Routed through the
-    /// same [`Multiplexer::deliver_text`] / `plan_delivery` framing the MCP
+    /// same `Multiplexer::deliver_text` / `plan_delivery` framing the MCP
     /// `send_keys` tool uses, with `enter = false`: a paste only *inserts* the
     /// text — the user presses Enter themselves when ready — so no submitting
     /// `\r` is appended or deferred and no turn is opened.

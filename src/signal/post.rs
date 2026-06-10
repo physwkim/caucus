@@ -9,7 +9,7 @@
 //! live (Invariant I-6's socket).
 //!
 //! codex has no `Stop` hook; instead it invokes a `notify` program on
-//! `agent-turn-complete`, passing the event JSON as an argument. [`run_codex_notify`]
+//! `agent-turn-complete`, passing the event JSON as an argument. `run_codex_notify`
 //! is that program's body — it posts the *same* `Stop` [`TurnSignal`], so both
 //! backends settle a panel through one turn-completion owner (`handle_signal`).
 

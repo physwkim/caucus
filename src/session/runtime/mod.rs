@@ -172,7 +172,7 @@ pub struct Multiplexer {
     /// Instant of the last child-liveness probe, or `None` before the first.
     /// [`Multiplexer::pump_all`] drains every PTY each tick for responsiveness
     /// but probes process liveness (a `try_wait`/`waitpid` syscall per panel)
-    /// only every [`LIVENESS_PROBE_INTERVAL`]: on the idle loop (~250 Hz) a
+    /// only every `LIVENESS_PROBE_INTERVAL`: on the idle loop (~250 Hz) a
     /// per-panel `waitpid` every tick is pure overhead, and a child exit may
     /// surface up to one interval late without any user-visible cost.
     last_liveness_probe: Option<Instant>,
@@ -327,18 +327,18 @@ impl Multiplexer {
         self.pending_close
     }
 
-    /// A hash of everything [`crate::tui::draw`] reads, so the event loop can
+    /// A hash of everything `tui::draw` reads, so the event loop can
     /// skip a redraw when nothing visible changed (the idle-CPU floor: an idle
     /// session otherwise repaints the whole screen every 16 ms `TICK`).
     ///
     /// The inputs partition cleanly by what can change them:
     /// - **PTY reads** bump each panel's grid `generation` (any byte ingest,
-    ///   including cursor moves — see [`crate::term::Grid::advance`]).
+    ///   including cursor moves — see `Grid::advance`).
     /// - **Spawn/kill** change the panel set (ids + count).
     /// - **Turn signals / exit reaping** change `state_label` and the
     ///   manifest-derived state.
     /// - **Keystrokes** change the view with no other counter, so they bump
-    ///   [`view_epoch`](Self::view_epoch) (focus, layout, zoom, scroll,
+    ///   `view_epoch` (focus, layout, zoom, scroll,
     ///   transcript, prefix hint, close-confirm).
     ///
     /// Per-panel and per-manifest contributions are XOR-folded so the

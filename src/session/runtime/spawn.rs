@@ -314,7 +314,7 @@ impl Multiplexer {
     /// worktree for cleanup, and reflow (`docs/design.md` §5).
     ///
     /// Single owner of panel destruction (Invariant I-5). The registry removal
-    /// itself lives in [`Multiplexer::detach_panel`]; `kill_panel` is the
+    /// itself lives in `Multiplexer::detach_panel`; `kill_panel` is the
     /// disposition that *deletes* the detached worktree. [`Multiplexer::restart_panel`]
     /// is the other disposition — it *reuses* the worktree in place.
     pub fn kill_panel(&mut self, panel_id: PanelId) -> Result<()> {

@@ -250,7 +250,7 @@ impl Drop for TerminalGuard {
 /// worker panel plus one panel per entry of `roles`. `main_cli` selects the
 /// main worker's backend (`None` → the default claude main worker). `topic` is
 /// the session's human label for `caucus sessions`; `None` falls back to
-/// [`default_topic`].
+/// `default_topic`.
 ///
 /// Fails cleanly (no panic) when stdout is not a terminal.
 pub fn run(

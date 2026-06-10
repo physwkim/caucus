@@ -222,7 +222,7 @@ impl OutputCapture {
     /// byte buffer through a throwaway grid. `render` does the actual replay
     /// (`session`'s `rendered_capture_text`); it runs only on a cache miss —
     /// the turn grew, its head was trimmed, the active turn changed, or `cols`
-    /// changed (see [`RenderCache`]).
+    /// changed (see `RenderCache`).
     pub fn rendered_since_last_turn(
         &self,
         cols: usize,

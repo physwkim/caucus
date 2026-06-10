@@ -374,7 +374,7 @@ impl Multiplexer {
     /// later tick rather than dropping it.
     ///
     /// Before the due-check, each non-expired round's backlog is fed
-    /// ([`Multiplexer::feed_round_backlog`]): a panel that finished early with
+    /// (`Multiplexer::feed_round_backlog`): a panel that finished early with
     /// queued tasks is handed its next task and flips back to `Working`, so it
     /// is not yet settled and the round is not yet due — the early finisher
     /// keeps working its backlog instead of idling at the barrier. Once the
@@ -609,7 +609,7 @@ impl Multiplexer {
     /// Deliver the resume notice (in-flight rounds dropped by the last restart)
     /// to the main worker once it is idle, then clear it. Mirrors
     /// [`Multiplexer::poll_stranded_main`]: one-shot, gated by
-    /// [`Multiplexer::main_deliverable`] so it never lands mid-compose, and the
+    /// `Multiplexer::main_deliverable` so it never lands mid-compose, and the
     /// push flips the main panel to `Working`, closing the gate for the tick.
     /// The notice is cleared only on a confirmed send, so a closed gate this
     /// tick simply retries next tick.
@@ -662,7 +662,7 @@ impl Multiplexer {
     /// queue is left in place and the panel settles. The queue is popped only after
     /// the send actually succeeds, so a failed delivery leaves the task at the
     /// front to be retried next tick rather than silently dropped. Feeding is
-    /// not gated by [`Multiplexer::main_deliverable`]: keeping a worker busy is
+    /// not gated by `Multiplexer::main_deliverable`: keeping a worker busy is
     /// independent of the main panel's state.
     ///
     /// Just before each next task is sent — while the panel is still idle — the
@@ -761,7 +761,7 @@ impl Multiplexer {
     /// Stranded ⟺ main exists and is `Idle`, `pending_rounds` is empty (a
     /// pending round *is* a wake path), and ≥1 non-main panel is
     /// `Working`/`Spawning`. Fires only while stranded, the shared
-    /// deliverability gate is open ([`Multiplexer::main_deliverable`]), and at
+    /// deliverability gate is open (`Multiplexer::main_deliverable`), and at
     /// least `STRANDED_NUDGE_COOLDOWN` has passed since the last nudge. The
     /// `main_stranded_last_nudge` latch is cleared the instant main is no longer
     /// stranded, so a fresh stranding re-arms without waiting out the cooldown.
@@ -826,7 +826,7 @@ impl Multiplexer {
 
     /// Announce to the main worker when a panel in a pending round has stopped
     /// on a prompt it cannot self-resolve — a selection menu or a raw `[y/n]`
-    /// yes/no prompt ([`BlockedPrompt`]). This is the caucus→main *blocked-panel*
+    /// yes/no prompt (`BlockedPrompt`). This is the caucus→main *blocked-panel*
     /// push.
     ///
     /// Neither kind fires a `Stop` hook, so the panel stays coarse `Working` and

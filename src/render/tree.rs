@@ -96,7 +96,7 @@ impl LayoutTree {
         }
     }
 
-    /// Resize the pane `leaf` one [`RESIZE_STEP`] in screen direction `dir`:
+    /// Resize the pane `leaf` one `RESIZE_STEP` in screen direction `dir`:
     /// grow it toward `dir` (`Right`/`Down`) or shrink it (`Left`/`Up`) by
     /// nudging the nearest ancestor split whose axis matches the motion.
     /// Returns whether `leaf` was found (false ⇒ no-op).

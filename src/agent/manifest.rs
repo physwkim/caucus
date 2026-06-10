@@ -3,7 +3,7 @@
 //! view.
 //!
 //! **Invariant I-2** (`docs/design.md` §12): all manifest mutation — LaneEvent
-//! append or status change — goes through [`write`]. External code does not
+//! append or status change — goes through `write()`. External code does not
 //! write the JSON directly.
 
 use std::path::{Path, PathBuf};
@@ -44,7 +44,7 @@ impl AgentStatus {
 /// Authoritative on-disk record for one agent (`docs/design.md` §8.1).
 ///
 /// Fields are `pub(crate)` so only this module can mutate them; external code
-/// reads via the accessors and mutates only through [`write`].
+/// reads via the accessors and mutates only through `write()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentManifest {
     pub agent_id: AgentId,
@@ -77,7 +77,7 @@ pub struct AgentManifest {
 
 impl AgentManifest {
     /// Allocate a fresh manifest in the `Live` / `Working` initial state.
-    /// Persist it via [`write`].
+    /// Persist it via `write()`.
     pub fn new(
         session_id: SessionId,
         panel_id: PanelId,
@@ -251,7 +251,7 @@ pub(crate) fn record_exited(
 }
 
 /// Atomic on-disk write of the JSON + Markdown pair. Module-private — callers
-/// go through [`write`].
+/// go through `write()`.
 fn to_disk(manifest: &AgentManifest, session_root: &Path) -> Result<(), ManifestError> {
     let path = AgentManifest::json_path(session_root, manifest.agent_id);
     if let Some(parent) = path.parent() {

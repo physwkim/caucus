@@ -103,8 +103,8 @@ impl Multiplexer {
     /// [`Multiplexer::execute_control`]. The one exception is
     /// `spawn_role(worktree=true)`: its `git worktree add` is slow enough to
     /// freeze the single-threaded loop, so it is deferred off-thread
-    /// ([`Multiplexer::begin_spawn_role_worktree`]) and its reply is sent later
-    /// from [`Multiplexer::poll_pending_spawns`]. `register_round` is
+    /// (`Multiplexer::begin_spawn_role_worktree`) and its reply is sent later
+    /// from `Multiplexer::poll_pending_spawns`. `register_round` is
     /// non-blocking in a different way: it acks now and the round is delivered
     /// later by the caucus→main push in [`Multiplexer::poll_pending_rounds`].
     pub fn drain_control(&mut self, server: &mut ControlServer) {

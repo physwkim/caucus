@@ -4,7 +4,7 @@
 //! area. The real lifecycle lives here, at the panel level.
 //!
 //! **Invariant I-5** (`docs/design.md` §12): panels are created/destroyed only
-//! by [`spawn`] / `kill`, and panel state transitions only by `transition`.
+//! by `spawn` / `kill`, and panel state transitions only by `transition`.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
