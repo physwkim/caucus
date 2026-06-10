@@ -1339,20 +1339,22 @@ impl Perform for Grid {
         };
         match code {
             b"0" | b"2" => {
-                // Set window/icon title.
-                if let Some(&title) = params.get(1) {
-                    self.title = Some(String::from_utf8_lossy(title).into_owned());
+                // Set window/icon title. The title may itself contain ';', which
+                // vte splits the OSC string on — so rejoin every param after the
+                // code rather than taking only the first (which would truncate
+                // the title at its first ';').
+                if params.len() > 1 {
+                    self.title = Some(osc_join(params, 1));
                 }
             }
             b"8" => {
-                // Hyperlink: `OSC 8 ; params ; URI ST`. params[2] is the URI;
-                // an empty URI closes the link.
-                match params.get(2) {
-                    Some(uri) if !uri.is_empty() => {
-                        self.hyperlink = Some(String::from_utf8_lossy(uri).into_owned());
-                    }
-                    _ => self.hyperlink = None,
-                }
+                // Hyperlink: `OSC 8 ; params ; URI ST`. The URI is everything
+                // after the second ';' and may legally contain ';' itself
+                // (query/matrix parameters), which vte splits on — so rejoin
+                // params[2..] rather than taking only params[2]. An empty URI
+                // closes the link.
+                let uri = osc_join(params, 2);
+                self.hyperlink = if uri.is_empty() { None } else { Some(uri) };
             }
             _ => {
                 // OSC 4 (palette), 52 (clipboard), 10/11 (default colours):
@@ -1360,6 +1362,26 @@ impl Perform for Grid {
             }
         }
     }
+}
+
+/// Rejoin OSC parameters from index `start` with the `;` the parser split on,
+/// recovering a field (title, hyperlink URI) that legally contains a semicolon.
+/// vte splits the whole OSC string on `;`, so a title `a;b` or a URI
+/// `https://h/p?x=1;y=2` arrives as several params; reading only the first
+/// truncates the field at its first `;`. Returns an empty string when `start`
+/// is past the end (no field present).
+fn osc_join(params: &[&[u8]], start: usize) -> String {
+    let Some(parts) = params.get(start..) else {
+        return String::new();
+    };
+    let mut joined = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            joined.push(b';');
+        }
+        joined.extend_from_slice(part);
+    }
+    String::from_utf8_lossy(&joined).into_owned()
 }
 
 #[cfg(test)]
@@ -1982,6 +2004,25 @@ mod tests {
         // Link closed by the trailing empty OSC 8.
         assert_eq!(g.hyperlink(), None);
         assert_eq!(at(&g, 0, 0), 'l');
+    }
+
+    #[test]
+    fn osc_title_keeps_an_embedded_semicolon() {
+        // vte splits the OSC string on ';', so a title containing ';' must be
+        // rejoined rather than truncated at the first one.
+        let mut g = Grid::new(40, 3);
+        g.advance(b"\x1b]2;branch: main; ahead 3\x07");
+        assert_eq!(g.title(), Some("branch: main; ahead 3"));
+    }
+
+    #[test]
+    fn osc_hyperlink_keeps_an_embedded_semicolon_in_the_uri() {
+        // A URI with query/matrix ';' separators must survive intact.
+        let mut g = Grid::new(40, 3);
+        g.advance(b"\x1b]8;;https://h/p?x=1;y=2\x07U\x1b]8;;\x07");
+        // The link is set across the glyph 'U', then closed.
+        g.advance(b"\x1b]8;;https://h/p?a=1;b=2\x07");
+        assert_eq!(g.hyperlink(), Some("https://h/p?a=1;b=2"));
     }
 
     #[test]
