@@ -596,6 +596,41 @@ impl Grid {
         self.viewport[idx] = blank;
     }
 
+    /// Re-establish the wide-glyph pairing invariant across `row`: a wide lead
+    /// (`width == 2`) is always immediately followed by its `'\0'` trailing
+    /// marker, and a `'\0'` marker always immediately follows a wide lead.
+    ///
+    /// The single owner of this invariant for the row-editing operations
+    /// (ICH/DCH/ECH/EL/ED). Those shift or blank a *sub-row* range whose
+    /// boundary can fall between a lead and its trailing half — shifting one
+    /// away from the other, or blanking only one — which would otherwise leave
+    /// an orphan that the renderer mis-columns (a lone `'\0'` is skipped, a lone
+    /// lead claims a column its partner no longer fills). One left-to-right pass
+    /// blanks any orphaned half; because a blanked lead can only orphan the
+    /// `'\0'` to its right (never a cell already visited) the single pass is
+    /// sufficient. The print path keeps the same invariant per-write via
+    /// [`Grid::clear_cell_for_write`].
+    fn heal_wide_pairs(&mut self, row: usize) {
+        let blank = Cell::blank_with(&self.pen);
+        let base = self.idx(row, 0);
+        for col in 0..self.cols {
+            let ch = self.viewport[base + col].ch;
+            if ch == '\0' {
+                // Trailing half: valid only when the previous cell is a wide lead.
+                let paired = col > 0 && self.viewport[base + col - 1].ch.width() == Some(2);
+                if !paired {
+                    self.viewport[base + col] = blank;
+                }
+            } else if ch.width() == Some(2) {
+                // Wide lead: valid only when its `'\0'` trailing half follows.
+                let paired = col + 1 < self.cols && self.viewport[base + col + 1].ch == '\0';
+                if !paired {
+                    self.viewport[base + col] = blank;
+                }
+            }
+        }
+    }
+
     /// Clamp `(row, col)` into the viewport and store as the cursor.
     fn move_to(&mut self, row: usize, col: usize) {
         self.cursor = (row.min(self.rows - 1), col.min(self.cols - 1));
@@ -727,6 +762,9 @@ impl Grid {
                 for c in &mut self.viewport[below..] {
                     *c = blank;
                 }
+                // Only the cursor row is partially erased — the rows below are
+                // fully blank — so a split pair can only survive there.
+                self.heal_wide_pairs(cr);
             }
             1 => {
                 // Start of screen through cursor (inclusive).
@@ -738,6 +776,7 @@ impl Grid {
                 for c in &mut self.viewport[above..end] {
                     *c = blank;
                 }
+                self.heal_wide_pairs(cr);
             }
             2 | 3 => {
                 for c in &mut self.viewport {
@@ -767,6 +806,7 @@ impl Grid {
         for c in &mut self.viewport[range] {
             *c = blank;
         }
+        self.heal_wide_pairs(cr);
         self.wrap_pending = false;
     }
 
@@ -823,6 +863,7 @@ impl Grid {
         for c in &mut self.viewport[cur..cur + n] {
             *c = blank;
         }
+        self.heal_wide_pairs(cr);
         self.wrap_pending = false;
     }
 
@@ -839,6 +880,7 @@ impl Grid {
         for c in &mut self.viewport[row_end - n..row_end] {
             *c = blank;
         }
+        self.heal_wide_pairs(cr);
         self.wrap_pending = false;
     }
 
@@ -851,6 +893,7 @@ impl Grid {
         for c in &mut self.viewport[cur..cur + n] {
             *c = blank;
         }
+        self.heal_wide_pairs(cr);
         self.wrap_pending = false;
     }
 
@@ -1751,6 +1794,94 @@ mod tests {
         assert_eq!(at(&g, 0, 1), '\0');
         assert_eq!(at(&g, 0, 2), ' ');
         assert_eq!(g.row_text(0), "界    ");
+    }
+
+    #[test]
+    fn erase_chars_does_not_orphan_a_wide_glyph_half() {
+        // ECH erasing the trailing half must also clear the lead, and vice
+        // versa — otherwise a lone lead or lone `'\0'` mis-columns the renderer.
+        let mut g = Grid::new(10, 1);
+        g.advance("AB한CD".as_bytes()); // 0:A 1:B 2:한 3:'\0' 4:C 5:D
+        g.advance(b"\x1b[1;4H\x1b[1X"); // cursor on the trailing half, erase 1 cell
+        assert_eq!(
+            at(&g, 0, 2),
+            ' ',
+            "lead cleared with its erased trailing half"
+        );
+        assert_eq!(at(&g, 0, 3), ' ');
+        assert_eq!(g.row_text(0), "AB  CD    ");
+
+        let mut g = Grid::new(10, 1);
+        g.advance("AB한CD".as_bytes());
+        g.advance(b"\x1b[1;3H\x1b[1X"); // cursor on the lead, erase 1 cell
+        assert_eq!(at(&g, 0, 2), ' ');
+        assert_eq!(
+            at(&g, 0, 3),
+            ' ',
+            "trailing half cleared with its erased lead"
+        );
+        assert_eq!(g.row_text(0), "AB  CD    ");
+    }
+
+    #[test]
+    fn delete_chars_does_not_orphan_a_wide_glyph_lead() {
+        // DCH shifting the trailing half off the lead must clear the lead.
+        let mut g = Grid::new(10, 1);
+        g.advance("한CD".as_bytes()); // 0:한 1:'\0' 2:C 3:D
+        g.advance(b"\x1b[1;2H\x1b[1P"); // cursor on the trailing half, delete 1 cell
+        assert_eq!(
+            at(&g, 0, 0),
+            ' ',
+            "orphaned lead cleared after its half shifted away"
+        );
+        assert_eq!(at(&g, 0, 1), 'C');
+        // col 0 stays a blank in place (the heal clears, it does not compact).
+        assert_eq!(g.row_text(0), " CD       ");
+    }
+
+    #[test]
+    fn insert_chars_does_not_orphan_either_wide_glyph_half() {
+        // ICH inserting between a lead and its trailing half splits the pair on
+        // both sides; both orphans must be cleared.
+        let mut g = Grid::new(10, 1);
+        g.advance("한CD".as_bytes()); // 0:한 1:'\0' 2:C 3:D
+        g.advance(b"\x1b[1;2H\x1b[1@"); // cursor on the trailing half, insert 1 blank
+        assert_eq!(
+            at(&g, 0, 0),
+            ' ',
+            "lead cleared: its trailing half shifted right"
+        );
+        assert_eq!(
+            at(&g, 0, 2),
+            ' ',
+            "shifted trailing half cleared: its lead is gone"
+        );
+        assert_eq!(at(&g, 0, 3), 'C');
+        assert_eq!(g.row_text(0), "   CD     ");
+    }
+
+    #[test]
+    fn erase_line_does_not_orphan_a_wide_glyph_half() {
+        // EL mode 0 (cursor..end) starting on the trailing half must clear the
+        // lead that survives just before the erased range.
+        let mut g = Grid::new(10, 1);
+        g.advance("AB한CD".as_bytes()); // 0:A 1:B 2:한 3:'\0' 4:C 5:D
+        g.advance(b"\x1b[1;4H\x1b[0K"); // cursor on the trailing half, erase to EOL
+        assert_eq!(at(&g, 0, 2), ' ', "orphaned lead cleared");
+        assert_eq!(g.row_text(0), "AB        ");
+    }
+
+    #[test]
+    fn erase_display_does_not_orphan_a_wide_glyph_half() {
+        // ED mode 1 (start..cursor inclusive) ending on the lead must clear the
+        // trailing half that survives just after the erased range.
+        let mut g = Grid::new(10, 1);
+        g.advance("한CD".as_bytes()); // 0:한 1:'\0' 2:C 3:D
+        g.advance(b"\x1b[1;1H\x1b[1J"); // cursor on the lead, erase to it inclusive
+        assert_eq!(at(&g, 0, 0), ' ');
+        assert_eq!(at(&g, 0, 1), ' ', "orphaned trailing half cleared");
+        assert_eq!(at(&g, 0, 2), 'C');
+        assert_eq!(g.row_text(0), "  CD      ");
     }
 
     #[test]
