@@ -8,10 +8,23 @@
 //! Memory ring + disk spill to
 //! `.caucus/sessions/<id>/panels/<panel_id>.log`.
 
+use std::cell::RefCell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+
+/// Memoized render of the most-recent turn, keyed so a cache hit is exact.
+/// The key is `(turn index, byte length, cols)`: within one turn the byte
+/// length only grows (or shrinks on a head trim), so it discriminates every
+/// state of that turn; across turns the index differs, so two different turns
+/// that happen to share a byte length never collide.
+struct RenderCache {
+    turn_index: Option<usize>,
+    byte_len: usize,
+    cols: usize,
+    text: String,
+}
 
 /// One captured turn: all output bytes between a `PromptDelivered` and the
 /// matching `TurnCompleted`.
@@ -48,6 +61,11 @@ pub struct OutputCapture {
     /// such boundary until it closes, so a panel firehosing output mid-turn
     /// could otherwise grow it without limit. See [`OutputCapture::push`].
     open_turn_byte_limit: usize,
+    /// Memoized render of the most-recent turn for
+    /// [`OutputCapture::rendered_since_last_turn`]. `RefCell` so the read path
+    /// stays `&self` (it shares the `read_panel` immutable-borrow signature)
+    /// while still filling the cache on a miss.
+    last_render: RefCell<Option<RenderCache>>,
 }
 
 impl OutputCapture {
@@ -69,6 +87,7 @@ impl OutputCapture {
             log_path: None,
             spilled_turns: 0,
             open_turn_byte_limit: Self::DEFAULT_OPEN_TURN_BYTES,
+            last_render: RefCell::new(None),
         }
     }
 
@@ -189,6 +208,42 @@ impl OutputCapture {
         }
     }
 
+    /// Render of the most-recent turn (the `since_last_turn` `read_panel` mode),
+    /// memoized so repeated reads of the same turn do not re-replay the whole
+    /// byte buffer through a throwaway grid. `render` does the actual replay
+    /// (`session`'s `rendered_capture_text`); it runs only on a cache miss —
+    /// the turn grew, its head was trimmed, the active turn changed, or `cols`
+    /// changed (see [`RenderCache`]).
+    pub fn rendered_since_last_turn(
+        &self,
+        cols: usize,
+        render: impl FnOnce(&[u8], usize) -> String,
+    ) -> String {
+        let bytes = self.since_last_turn();
+        let turn_index = self
+            .open
+            .as_ref()
+            .map(|t| t.index)
+            .or_else(|| self.turns.last().map(|t| t.index));
+
+        if let Some(c) = self.last_render.borrow().as_ref()
+            && c.turn_index == turn_index
+            && c.byte_len == bytes.len()
+            && c.cols == cols
+        {
+            return c.text.clone();
+        }
+
+        let text = render(bytes, cols);
+        *self.last_render.borrow_mut() = Some(RenderCache {
+            turn_index,
+            byte_len: bytes.len(),
+            cols,
+            text: text.clone(),
+        });
+        text
+    }
+
     /// All closed turns currently held in memory, oldest first.
     ///
     /// Turns older than this window have been spilled to [`OutputCapture::log_path`];
@@ -291,6 +346,49 @@ mod tests {
             tail.iter().all(|&b| b == b'B'),
             "the recent tail is kept and the head dropped"
         );
+    }
+
+    #[test]
+    fn since_last_turn_render_is_cached_until_content_changes() {
+        let mut cap = OutputCapture::new();
+        cap.begin_turn();
+        cap.push(b"hello");
+
+        let calls = std::cell::Cell::new(0u32);
+        let render = |b: &[u8], _c: usize| -> String {
+            calls.set(calls.get() + 1);
+            String::from_utf8_lossy(b).into_owned()
+        };
+
+        assert_eq!(cap.rendered_since_last_turn(80, render), "hello");
+        assert_eq!(cap.rendered_since_last_turn(80, render), "hello");
+        assert_eq!(calls.get(), 1, "the second read is served from the cache");
+
+        // Growth invalidates the cache.
+        cap.push(b" world");
+        assert_eq!(cap.rendered_since_last_turn(80, render), "hello world");
+        assert_eq!(calls.get(), 2, "new bytes re-render");
+
+        // A different width invalidates too.
+        let _ = cap.rendered_since_last_turn(40, render);
+        assert_eq!(calls.get(), 3, "a new cols re-renders");
+    }
+
+    #[test]
+    fn cached_render_does_not_leak_across_turns_of_equal_length() {
+        let mut cap = OutputCapture::new();
+        let render = |b: &[u8], _c: usize| String::from_utf8_lossy(b).into_owned();
+
+        cap.begin_turn();
+        cap.push(b"AAAAA"); // 5 bytes
+        assert_eq!(cap.rendered_since_last_turn(80, render), "AAAAA");
+        cap.end_turn();
+
+        // A new turn of the SAME byte length but different content must not
+        // serve the previous turn's cached render — the turn index discriminates.
+        cap.begin_turn();
+        cap.push(b"BBBBB"); // also 5 bytes
+        assert_eq!(cap.rendered_since_last_turn(80, render), "BBBBB");
     }
 
     #[test]

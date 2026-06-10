@@ -66,7 +66,9 @@ impl McpToolSurface for Multiplexer {
                 // readable text — the main worker never races the screen and
                 // is never handed raw escape sequences.
                 let (cols, _) = p.grid().size();
-                Self::rendered_capture_text(p.capture().since_last_turn(), cols)
+                // Memoized: a repeated read of the same turn skips the replay.
+                p.capture()
+                    .rendered_since_last_turn(cols, Self::rendered_capture_text)
             }
             ReadPanelMode::LastMessage => self
                 .manifests
