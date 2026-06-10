@@ -6,11 +6,21 @@
 //! directly.
 //!
 //! Layout: `Pty::spawn` opens a PTY pair, spawns the child on the slave,
-//! drops the slave, and starts a single reader thread that drains the master
-//! reader into an `mpsc` channel. `Pty::read` non-blockingly drains that
-//! channel; `Pty::write` feeds the master writer (`docs/design.md` §0 #11,
-//! the fully bidirectional input path); `Pty::kill` kills the child and
-//! joins the reader thread so no fd or thread leaks.
+//! drops the slave, and starts two threads: a *reader* thread draining the
+//! master reader into an `mpsc` channel, and a *writer* thread draining a
+//! second `mpsc` channel into the master writer. `Pty::read` non-blockingly
+//! drains the reader channel; `Pty::write` non-blockingly *enqueues* onto the
+//! writer channel (`docs/design.md` §0 #11, the fully bidirectional input
+//! path); `Pty::kill` kills the child and joins both threads so no fd or
+//! thread leaks.
+//!
+//! The writer thread exists so the blocking `write_all` to the PTY master
+//! happens off the caucus event-loop thread. An agent that has stopped reading
+//! its stdin (busy, hung, suspended) fills the kernel PTY input buffer; a
+//! synchronous `write_all` from the event loop would then block the entire
+//! multiplexer — no input, no pump, no redraw. With the writer thread, that
+//! block lands harmlessly in the per-panel writer thread while the event loop
+//! keeps ticking.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -72,6 +82,8 @@ pub enum PtyError {
     Spawn(String),
     #[error("pty io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("pty writer closed")]
+    WriterClosed,
 }
 
 /// One pseudo-terminal owning a child agent process (`docs/design.md` §9.1,
@@ -83,12 +95,17 @@ pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     /// The child agent process. `kill` tears it down.
     child: Box<dyn Child + Send + Sync>,
-    /// Writer half of the master — the input path (`docs/design.md` §0 #11).
-    writer: Box<dyn Write + Send>,
+    /// Sender to the writer thread (`docs/design.md` §0 #11). `write` enqueues
+    /// bytes here non-blockingly; the writer thread performs the blocking
+    /// `write_all` to the master off the event loop. `None` after `kill` (the
+    /// drop ends the writer thread).
+    writer_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Receiving end of the reader thread's channel; `read` drains it.
     rx: Receiver<Vec<u8>>,
     /// Join handle for the reader thread; `kill` joins it.
     reader: Option<JoinHandle<()>>,
+    /// Join handle for the writer thread; `kill` joins it.
+    writer: Option<JoinHandle<()>>,
 }
 
 impl Pty {
@@ -115,7 +132,7 @@ impl Pty {
         // it lets the reader see EOF when the child exits.
         drop(pair.slave);
 
-        let writer = pair
+        let mut writer = pair
             .master
             .take_writer()
             .map_err(|e| PtyError::Open(e.to_string()))?;
@@ -147,13 +164,32 @@ impl Pty {
             })
             .map_err(PtyError::Io)?;
 
+        // Writer thread: the blocking `write_all` to the master lives here, off
+        // the event loop. Drains the writer channel in order (single consumer →
+        // FIFO, so a paste body always precedes its later submitting Enter).
+        // Ends when the Sender is dropped (`kill`) or a write fails (child gone
+        // / PTY closed) — at which point a write blocked on a non-reading child
+        // unwinds via the broken-pipe error and the thread exits.
+        let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
+        let writer_thread = std::thread::Builder::new()
+            .name("caucus-pty-writer".to_string())
+            .spawn(move || {
+                while let Ok(chunk) = writer_rx.recv() {
+                    if writer.write_all(&chunk).is_err() || writer.flush().is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(PtyError::Io)?;
+
         Ok(Self {
             size,
             master: pair.master,
             child,
-            writer,
+            writer_tx: Some(writer_tx),
             rx,
             reader: Some(reader),
+            writer: Some(writer_thread),
         })
     }
 
@@ -179,12 +215,20 @@ impl Pty {
         Ok(out)
     }
 
-    /// Write input bytes to the PTY master — the fully bidirectional input
+    /// Enqueue input bytes for the PTY master — the fully bidirectional input
     /// path (`docs/design.md` §0 #11).
+    ///
+    /// Non-blocking: the bytes are handed to the per-panel writer thread, which
+    /// performs the blocking `write_all` off the event loop. `Ok` therefore
+    /// means "queued", not "delivered to the kernel" — the decoupling that
+    /// stops a non-reading agent from stalling the whole multiplexer. The only
+    /// error is [`PtyError::WriterClosed`]: the writer thread has gone (the PTY
+    /// was killed), i.e. the panel is dead.
     pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()?;
-        Ok(())
+        match &self.writer_tx {
+            Some(tx) => tx.send(bytes.to_vec()).map_err(|_| PtyError::WriterClosed),
+            None => Err(PtyError::WriterClosed),
+        }
     }
 
     /// Whether the child agent process is still running.
@@ -222,6 +266,14 @@ impl Pty {
         // second `kill` (or `kill` after natural exit) still tears down.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Drop the writer Sender so the writer thread's `recv` returns `Err`
+        // and it exits. If it was blocked in `write_all` on a non-reading
+        // child, the child kill above closed the PTY, so that write now fails
+        // and unwinds the thread — either way the join below completes.
+        self.writer_tx = None;
+        if let Some(handle) = self.writer.take() {
+            let _ = handle.join();
+        }
         if let Some(handle) = self.reader.take() {
             // Reader exits on EOF once the child's PTY fd is closed.
             let _ = handle.join();
@@ -325,6 +377,37 @@ mod tests {
         );
 
         pty.kill().unwrap();
+    }
+
+    #[test]
+    fn write_does_not_block_on_a_non_reading_child() {
+        // A child that never reads its stdin: a synchronous `write_all` to the
+        // PTY master blocks once the kernel input buffer fills. The writer
+        // thread makes `write` a non-blocking enqueue, so even a multi-megabyte
+        // write returns immediately — the event loop is never stalled by a
+        // wedged agent. This is the regression guard for that stall class.
+        let mut cmd = PtyCommand::new("/bin/sh");
+        cmd.args = vec!["-c".into(), "sleep 5".into()];
+        let mut pty = Pty::spawn(&cmd, 80, 24).unwrap();
+
+        let big = vec![b'x'; 1 << 20]; // 1 MiB — far over any PTY input buffer.
+        let start = Instant::now();
+        pty.write(&big).unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "write blocked for {elapsed:?}; it must enqueue and return at once"
+        );
+
+        pty.kill().unwrap();
+    }
+
+    #[test]
+    fn write_after_kill_reports_writer_closed() {
+        let cmd = PtyCommand::new("/bin/cat");
+        let mut pty = Pty::spawn(&cmd, 80, 24).unwrap();
+        pty.kill().unwrap();
+        assert!(matches!(pty.write(b"x"), Err(PtyError::WriterClosed)));
     }
 
     #[test]
