@@ -67,6 +67,14 @@ pub struct SessionRecord {
     /// Panels, in `order_index` order.
     #[serde(default)]
     pub panels: Vec<PanelRecord>,
+    /// Per-role spawn high-water mark (`role` → highest `<role>-N` index ever
+    /// assigned this session). Monotonic and never decremented, so it survives
+    /// killed panels. Resume restores it as a *floor* on the in-memory counter
+    /// so the next worktree branch index continues past every index ever used,
+    /// instead of restarting from 1 and colliding with a surviving branch.
+    /// Old records omit it (empty map → the pre-persist recount behaviour).
+    #[serde(default)]
+    pub role_counts: std::collections::HashMap<String, usize>,
 }
 
 /// Errors reading or writing a [`SessionRecord`].
@@ -182,6 +190,7 @@ mod tests {
                     claude_session_id: None,
                 },
             ],
+            role_counts: std::collections::HashMap::from([("backend".to_string(), 2)]),
         }
     }
 

@@ -748,6 +748,7 @@ mod tests {
                 worktree_branch: None,
                 claude_session_id: Some("conv-1".into()),
             }],
+            role_counts: std::collections::HashMap::new(),
         };
         let root = repo
             .join(".caucus")

@@ -33,6 +33,7 @@ impl Multiplexer {
             created_at: self.session.created_at,
             layout_mode: self.layout_mode,
             panels,
+            role_counts: self.role_counts.clone(),
         }
     }
 
@@ -186,6 +187,24 @@ mod tests {
         assert!(
             record.panels[1].is_main,
             "the main marker must follow main_panel_id, not order_index"
+        );
+
+        mux.shutdown();
+    }
+
+    /// `build_record` carries the per-role spawn high-water mark so resume can
+    /// restore it as a floor and not reuse a branch index after a kill.
+    #[tokio::test]
+    async fn build_record_persists_role_counts() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        mux.role_counts.insert("reviewer".to_string(), 3);
+
+        let record = mux.build_record();
+        assert_eq!(
+            record.role_counts.get("reviewer"),
+            Some(&3),
+            "the spawn high-water mark must persist into the record"
         );
 
         mux.shutdown();

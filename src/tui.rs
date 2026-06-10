@@ -485,6 +485,13 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
         }
     }
 
+    // Recounting the roster above only counts surviving panels, so the per-role
+    // spawn counter under-counts when a panel was killed mid-session. Raise it
+    // back to the persisted high-water mark before any further `spawn_role`, so
+    // the next `<role>-N` worktree branch index cannot collide with a surviving
+    // branch (and the re-persisted record below carries the true high-water).
+    mux.seed_role_counts_floor(&record.role_counts);
+
     // Restore the panel arrangement, then persist the rebuilt roster.
     mux.set_layout_mode(record.layout_mode);
     mux.persist_record();

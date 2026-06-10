@@ -154,6 +154,7 @@ mod tests {
             created_at: Utc::now() - age,
             layout_mode: LayoutMode::Tiled,
             panels: Vec::new(),
+            role_counts: std::collections::HashMap::new(),
         };
         rec.write(&session_root(repo, id)).unwrap();
         id

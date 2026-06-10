@@ -553,6 +553,23 @@ impl Multiplexer {
         }
     }
 
+    /// Raise the in-memory per-role spawn counter to a persisted high-water
+    /// `floor` on resume. After [`restore_roster`](crate::tui) recounts panels
+    /// from zero, `role_counts` reflects only the *surviving* panels — it
+    /// under-counts whenever a panel was killed mid-session (leaving an index
+    /// gap, or killing the highest index). Raising each role's counter to the
+    /// persisted high-water mark makes the next `<role>-N` worktree branch index
+    /// continue past every index ever assigned this session, so it cannot
+    /// collide with a surviving (or orphaned) branch. A `max`, so a missing or
+    /// pre-feature record (empty floor) degrades to the bare recount and never
+    /// *lowers* a live counter.
+    pub(crate) fn seed_role_counts_floor(&mut self, floor: &HashMap<String, usize>) {
+        for (role, &high_water) in floor {
+            let entry = self.role_counts.entry(role.clone()).or_insert(0);
+            *entry = (*entry).max(high_water);
+        }
+    }
+
     /// Create an execute-phase worktree for a `spawn_role(worktree=true)` call,
     /// synchronously (`docs/design.md` §5). Single owner of worktree creation is
     /// `worktree::manager::create` (Invariant I-3). Used by the synchronous
@@ -570,6 +587,7 @@ mod tests {
     use crate::mcp::protocol::{ControlRequest, ControlResponse};
     use crate::session::id::PanelId;
     use crate::session::runtime::test_support::*;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     /// `spawn_role(worktree=true)` must not leak the worktree when the panel
@@ -716,6 +734,51 @@ mod tests {
             });
         assert!(summary.failed_worktrees.is_empty(), "{summary:?}");
         assert!(summary.failed_branches.is_empty(), "{summary:?}");
+    }
+
+    /// On resume, recounting the roster only counts surviving panels, so the
+    /// per-role counter under-counts after a mid-session kill — the next branch
+    /// index would reuse a surviving branch. `seed_role_counts_floor` raises the
+    /// counter to the persisted high-water mark so the next index continues past
+    /// every index ever used. The floor is a `max` and never lowers a counter.
+    #[tokio::test]
+    async fn resume_floor_continues_branch_index_past_killed_panels() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let role = "reviewer";
+
+        // Post-recount counter on resume: two surviving panels (reviewer-1,
+        // reviewer-3 — reviewer-2 was killed), so the bare recount is 2 even
+        // though a reviewer-3 branch still exists.
+        // The branch is `caucus/<suffix>/<role-slug>-<hash>-<index>`; assert on
+        // the trailing `-<index>` the per-role counter drives.
+        mux.role_counts.insert(role.to_string(), 2);
+        let before = mux.role_worktree_request(role);
+        assert!(
+            before.branch.as_deref().unwrap().ends_with("-3"),
+            "without the floor the next index reuses the surviving reviewer-3 branch: {:?}",
+            before.branch
+        );
+
+        // The persisted high-water mark (reviewer-3 was spawned, then killed).
+        mux.seed_role_counts_floor(&HashMap::from([(role.to_string(), 3)]));
+        assert_eq!(mux.role_counts.get(role), Some(&3));
+        let after = mux.role_worktree_request(role);
+        assert!(
+            after.branch.as_deref().unwrap().ends_with("-4"),
+            "the floor advances the next index past every index ever used: {:?}",
+            after.branch
+        );
+
+        // A lower floor never lowers a live counter (it is a max).
+        mux.seed_role_counts_floor(&HashMap::from([(role.to_string(), 1)]));
+        assert_eq!(
+            mux.role_counts.get(role),
+            Some(&3),
+            "the floor is a max, never lowers a live counter"
+        );
+
+        mux.shutdown();
     }
 
     /// The main worker panel cannot be restarted — it is the caller and the
