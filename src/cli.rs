@@ -263,6 +263,29 @@ fn run_init(install_hook: bool) -> Result<ExitCode> {
     eprintln!("caucus init:");
     eprintln!("  .caucus dir:   {}", outcome.caucus_dir.display());
     eprintln!("  hook script:   {}", outcome.hook_script.display());
+    match &outcome.gitignore {
+        crate::init::GitignoreOutcome::Updated {
+            path,
+            created: true,
+        } => {
+            eprintln!(
+                "  .gitignore:    created {} ignoring .caucus/",
+                path.display()
+            );
+        }
+        crate::init::GitignoreOutcome::Updated {
+            path,
+            created: false,
+        } => {
+            eprintln!("  .gitignore:    added .caucus/ to {}", path.display());
+        }
+        crate::init::GitignoreOutcome::AlreadyIgnored { path } => {
+            eprintln!(
+                "  .gitignore:    .caucus/ already ignored in {} — no change",
+                path.display()
+            );
+        }
+    }
     match &outcome.hook_install {
         Some(crate::init::HookInstall::Merged {
             settings,

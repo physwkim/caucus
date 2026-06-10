@@ -45,21 +45,35 @@ pub enum HookInstall {
 }
 
 /// What `caucus init` did, for the human-readable report.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InitOutcome {
     /// The `.caucus/` directory created or confirmed.
     pub caucus_dir: PathBuf,
     /// The turn-signal hook script written.
     pub hook_script: PathBuf,
+    /// What happened to the project `.gitignore`.
+    pub gitignore: GitignoreOutcome,
     /// The Stop-hook install result, set when `--install-hook` ran.
     pub hook_install: Option<HookInstall>,
 }
 
+/// Result of ensuring `.caucus/` is ignored by the project `.gitignore`.
+#[derive(Debug)]
+pub enum GitignoreOutcome {
+    /// `.caucus/` was appended to (or, when `created`, the file written with)
+    /// `<repo>/.gitignore`.
+    Updated { path: PathBuf, created: bool },
+    /// `.caucus/` was already ignored — the file was left untouched.
+    AlreadyIgnored { path: PathBuf },
+}
+
 /// Run `caucus init` for the project rooted at `repo`.
 ///
-/// Always creates `<repo>/.caucus/` (plus `bin/`, `sessions/`) and writes
-/// `bin/turn-signal`. When `install_hook` is set, also merges the Stop hook
-/// into `~/.claude/settings.json`.
+/// Always creates `<repo>/.caucus/` (plus `bin/`, `sessions/`), writes
+/// `bin/turn-signal`, and ensures `<repo>/.gitignore` ignores `.caucus/` (the
+/// directory holds per-session worktrees, panel logs, and round reports — local
+/// state that must never be committed). When `install_hook` is set, also merges
+/// the Stop hook into `~/.claude/settings.json`.
 pub fn run(repo: &Path, install_hook: bool) -> Result<InitOutcome> {
     let caucus_dir = repo.join(".caucus");
     let bin_dir = caucus_dir.join("bin");
@@ -74,10 +88,13 @@ pub fn run(repo: &Path, install_hook: bool) -> Result<InitOutcome> {
     // relative to whatever directory a panel's agent happens to run in.
     let hook_script = hook_script.canonicalize().unwrap_or(hook_script);
 
+    let gitignore = ensure_gitignore(repo)?;
+
     let mut outcome = InitOutcome {
         caucus_dir,
         hook_script,
-        ..InitOutcome::default()
+        gitignore,
+        hook_install: None,
     };
 
     if install_hook {
@@ -85,6 +102,59 @@ pub fn run(repo: &Path, install_hook: bool) -> Result<InitOutcome> {
     }
 
     Ok(outcome)
+}
+
+/// The single `.gitignore` line `caucus init` ensures is present.
+const GITIGNORE_ENTRY: &str = ".caucus/";
+
+/// Ensure `<repo>/.gitignore` ignores `.caucus/`, idempotently.
+///
+/// Appends `.caucus/` (under a one-line comment) when missing, creating the
+/// file if absent; leaves the file untouched when `.caucus/` is already covered
+/// ([`gitignore_covers_caucus`]). Existing entries and the trailing-newline
+/// style of the file are preserved — a missing final newline is added before
+/// the appended block so the new entry lands on its own line.
+fn ensure_gitignore(repo: &Path) -> Result<GitignoreOutcome> {
+    let path = repo.join(".gitignore");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+
+    if existing.as_deref().is_some_and(gitignore_covers_caucus) {
+        return Ok(GitignoreOutcome::AlreadyIgnored { path });
+    }
+
+    let created = existing.is_none();
+    let mut content = existing.unwrap_or_default();
+    // Separate the appended block from prior content: close an unterminated
+    // final line, then leave one blank line before our comment.
+    if !content.is_empty() {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push('\n');
+    }
+    content.push_str("# caucus local session state (worktrees, panel logs, round reports)\n");
+    content.push_str(GITIGNORE_ENTRY);
+    content.push('\n');
+    std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+    Ok(GitignoreOutcome::Updated { path, created })
+}
+
+/// Whether `text` already ignores `.caucus/` at the repo root. Matches the
+/// common hand-written spellings — `.caucus` or `/.caucus`, with or without a
+/// trailing slash — ignoring blank lines, comments, and surrounding
+/// whitespace. A negation (`!.caucus/`) does not count as covering it.
+fn gitignore_covers_caucus(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        matches!(line.trim_end_matches('/'), ".caucus" | "/.caucus")
+    })
 }
 
 /// Write `content` to `path` and mark it executable (`0o755` on unix).
@@ -243,6 +313,76 @@ mod tests {
         assert!(body.contains("caucus signal post"));
         assert!(body.starts_with("#!/bin/sh"));
         assert!(outcome.hook_install.is_none());
+    }
+
+    #[test]
+    fn init_creates_gitignore_ignoring_caucus() {
+        let tmp = TempDir::new().unwrap();
+        let outcome = run(tmp.path(), false).unwrap();
+        match outcome.gitignore {
+            GitignoreOutcome::Updated { created, .. } => assert!(created, "file was absent"),
+            other => panic!("expected a created .gitignore, got {other:?}"),
+        }
+        let body = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(gitignore_covers_caucus(&body), "`.caucus/` is now ignored");
+    }
+
+    #[test]
+    fn ensure_gitignore_appends_without_clobbering_existing_entries() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".gitignore");
+        // No trailing newline — the appended block must not glue onto `target`.
+        std::fs::write(&path, "/target").unwrap();
+
+        let outcome = ensure_gitignore(tmp.path()).unwrap();
+        assert!(matches!(
+            outcome,
+            GitignoreOutcome::Updated { created: false, .. }
+        ));
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.lines().any(|l| l.trim() == "/target"), "kept /target");
+        assert!(gitignore_covers_caucus(&body), "added .caucus/");
+        // `/target` and `.caucus/` are on separate lines.
+        assert!(
+            !body.contains("/target.caucus"),
+            "entries not glued: {body:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_gitignore_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        // First run creates it; second must report AlreadyIgnored and not touch
+        // the file (no stacked duplicate entry).
+        ensure_gitignore(tmp.path()).unwrap();
+        let after_first = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+
+        let outcome = ensure_gitignore(tmp.path()).unwrap();
+        assert!(matches!(outcome, GitignoreOutcome::AlreadyIgnored { .. }));
+        let after_second = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "second run left the file untouched"
+        );
+    }
+
+    #[test]
+    fn gitignore_covers_caucus_recognizes_spellings() {
+        // Each of these counts as already-ignored.
+        for text in [
+            ".caucus/",
+            ".caucus",
+            "/.caucus/",
+            "/.caucus",
+            "foo\n.caucus/\nbar",
+        ] {
+            assert!(gitignore_covers_caucus(text), "should cover: {text:?}");
+        }
+        // These do not — a comment, a negation, and an unrelated entry.
+        for text in ["# .caucus/", "!.caucus/", ".caucusx", "caucus/", ""] {
+            assert!(!gitignore_covers_caucus(text), "should not cover: {text:?}");
+        }
     }
 
     #[cfg(unix)]
