@@ -382,6 +382,10 @@ impl Multiplexer {
             // prompt is a live-`spawn_role` concern only.
             None,
         )?;
+        // The fresh PTY carries a fresh PanelId, but the panel is the same
+        // logical round member. Re-key its membership so live rounds follow it
+        // to the new id instead of dropping it as a vanished panel.
+        self.remap_round_membership(panel_id, new_id);
         // `spawn_panel_resume` does not persist; persist the rebuilt roster now
         // that the replacement panel is live.
         self.persist_record();

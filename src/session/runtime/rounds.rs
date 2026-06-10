@@ -653,6 +653,32 @@ impl Multiplexer {
             })
     }
 
+    /// Re-key a panel's live round membership after [`Multiplexer::restart_panel`]
+    /// swaps its `PanelId` (a fresh PTY is a fresh id). The restarted panel is
+    /// the *same* logical round member — same role, same resumed conversation,
+    /// same worktree — so every pending round that referenced `old` must now
+    /// reference `new` across all three id-keyed fields (`panels`, `backlog`,
+    /// `captured`). Without this the round resolves `old` to a missing panel
+    /// (see [`Self::round_settled`]) and silently drops the member, settling
+    /// without its contribution. `restart_panel` is the only id-changing path:
+    /// every other spawn allocates a genuinely new panel, and `kill_panel`
+    /// detaches permanently with no replacement.
+    pub(super) fn remap_round_membership(&mut self, old: PanelId, new: PanelId) {
+        for round in &mut self.pending_rounds {
+            for id in &mut round.panels {
+                if *id == old {
+                    *id = new;
+                }
+            }
+            if let Some(backlog) = round.backlog.remove(&old) {
+                round.backlog.insert(new, backlog);
+            }
+            if let Some(captured) = round.captured.remove(&old) {
+                round.captured.insert(new, captured);
+            }
+        }
+    }
+
     /// Hand each cleanly-idle round panel its next backlog task, keeping an
     /// early finisher busy instead of idling at the barrier. Called once per
     /// round per tick from [`Multiplexer::poll_pending_rounds`], before the
@@ -2121,6 +2147,41 @@ mod tests {
         assert!(
             mux.round_settled(&round),
             "an exited panel with queued backlog settles — it can never drain"
+        );
+
+        mux.shutdown();
+    }
+
+    /// Restarting a round panel swaps its `PanelId` (fresh PTY = fresh id) but
+    /// keeps it the same logical member. `remap_round_membership` must re-key
+    /// the round's `panels`, `backlog`, and `captured` from the old id to the
+    /// new one; otherwise the round resolves the old id to a missing panel and
+    /// silently drops the member without its contribution.
+    #[tokio::test]
+    async fn restart_remaps_round_membership_to_the_new_panel_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let old = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+        let round = pending_round(
+            vec![old],
+            ReadPanelMode::LastMessage,
+            HashMap::from([(old, vec!["earlier turn".to_string()])]),
+            HashMap::from([(old, VecDeque::from(["queued".to_string()]))]),
+        );
+        mux.pending_rounds.push(round);
+
+        let new = PanelId::new();
+        mux.remap_round_membership(old, new);
+
+        let r = &mux.pending_rounds[0];
+        assert_eq!(r.panels, vec![new], "round member re-keyed to the new id");
+        assert!(
+            !r.backlog.contains_key(&old) && r.backlog.contains_key(&new),
+            "backlog re-keyed to the new id"
+        );
+        assert!(
+            !r.captured.contains_key(&old) && r.captured.contains_key(&new),
+            "captured turns re-keyed to the new id"
         );
 
         mux.shutdown();
