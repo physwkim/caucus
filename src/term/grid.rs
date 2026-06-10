@@ -591,33 +591,47 @@ impl Grid {
             self.pen = Pen::default();
             return;
         }
-        // Flatten into a single index stream so multi-arg colours
-        // (`38;5;n`, `38;2;r;g;b`) can be consumed across iterator items —
-        // without the per-escape heap `Vec` a `collect()` would allocate on
-        // every coloured glyph run. vte caps a CSI at 32 parameter values, so a
-        // fixed stack buffer holds any real SGR; an (impossible) overflow just
-        // stops flattening, which only drops trailing params.
-        let mut buf = [0u16; 32];
-        let mut len = 0usize;
-        'flatten: for sub in params.iter() {
-            for &v in sub {
-                if len == buf.len() {
-                    break 'flatten;
-                }
-                buf[len] = v;
-                len += 1;
+        // Each top-level parameter is one SGR carrying its own colon-separated
+        // sub-parameters (vte exposes them as the inner slice). The two are NOT
+        // interchangeable, so flattening them together is wrong: `4:3` (curly
+        // underline) would read as `4;3` = underline + italic, and `58:2:r:g:b`
+        // (underline colour) would leak its channels as bold/dim/italic. Walk
+        // the top-level parameters instead, resolving extended colours in either
+        // notation — colon keeps the whole colour in one parameter
+        // (`38:2:r:g:b`), semicolon spreads it across the following parameters
+        // (`38;2;r;g;b`). Collect into a stack buffer (vte caps a CSI at 32) so
+        // no per-glyph heap `Vec` is needed; an (impossible) overflow just drops
+        // trailing parameters.
+        let mut items: [&[u16]; 32] = [&[]; 32];
+        let mut count = 0usize;
+        for sub in params.iter() {
+            if count == items.len() {
+                break;
             }
+            items[count] = sub;
+            count += 1;
         }
-        let flat = &buf[..len];
+        let items = &items[..count];
+
         let mut i = 0;
-        while i < flat.len() {
-            let p = flat[i];
+        while i < items.len() {
+            let item = items[i];
+            let p = item.first().copied().unwrap_or(0);
             match p {
                 0 => self.pen = Pen::default(),
                 1 => self.pen.attrs |= attr::BOLD,
                 2 => self.pen.attrs |= attr::DIM,
                 3 => self.pen.attrs |= attr::ITALIC,
-                4 => self.pen.attrs |= attr::UNDERLINE,
+                // `4` = single underline; `4:n` selects a style where 0 turns it
+                // off and any other value is on. The cell model has a single
+                // underline bit, so every on-style collapses to it.
+                4 => {
+                    if item.get(1).copied() == Some(0) {
+                        self.pen.attrs &= !attr::UNDERLINE;
+                    } else {
+                        self.pen.attrs |= attr::UNDERLINE;
+                    }
+                }
                 7 => self.pen.attrs |= attr::REVERSE,
                 8 => self.pen.attrs |= attr::HIDDEN,
                 9 => self.pen.attrs |= attr::STRIKE,
@@ -633,34 +647,43 @@ impl Grid {
                 49 => self.pen.bg = 0,
                 90..=97 => self.pen.fg = (p - 90 + 9) as u8,
                 100..=107 => self.pen.bg = (p - 100 + 9) as u8,
-                38 | 48 => {
-                    let is_fg = p == 38;
-                    // `38;5;n` (256-colour) or `38;2;r;g;b` (true-colour).
-                    if let Some(&mode) = flat.get(i + 1) {
-                        match mode {
-                            5 => {
-                                let n = flat.get(i + 2).copied().unwrap_or(0);
-                                let v = xterm_to_field((n.min(255)) as u8);
-                                if is_fg {
-                                    self.pen.fg = v;
-                                } else {
-                                    self.pen.bg = v;
-                                }
+                // Extended colour: 38 = fg, 48 = bg, 58 = underline colour (the
+                // last is parsed only so its channels are consumed, then dropped
+                // — there is no underline-colour field).
+                38 | 48 | 58 => {
+                    let mut scratch = [0u16; 4];
+                    let sub: &[u16] = if item.len() >= 2 {
+                        // Colon form: the whole colour lives in this parameter,
+                        // after the leading 38/48/58.
+                        &item[1..]
+                    } else {
+                        // Semicolon form: mode then channels are the following
+                        // top-level parameters, one value each. Copy them out and
+                        // advance past them.
+                        let next = |k: usize| items.get(k).and_then(|s| s.first()).copied();
+                        match next(i + 1) {
+                            Some(5) => {
+                                scratch[0] = 5;
+                                scratch[1] = next(i + 2).unwrap_or(0);
                                 i += 2;
+                                &scratch[..2]
                             }
-                            2 => {
-                                let r = flat.get(i + 2).copied().unwrap_or(0);
-                                let g = flat.get(i + 3).copied().unwrap_or(0);
-                                let b = flat.get(i + 4).copied().unwrap_or(0);
-                                let v = xterm_to_field(rgb_to_256(r as u8, g as u8, b as u8));
-                                if is_fg {
-                                    self.pen.fg = v;
-                                } else {
-                                    self.pen.bg = v;
-                                }
+                            Some(2) => {
+                                scratch[0] = 2;
+                                scratch[1] = next(i + 2).unwrap_or(0);
+                                scratch[2] = next(i + 3).unwrap_or(0);
+                                scratch[3] = next(i + 4).unwrap_or(0);
                                 i += 4;
+                                &scratch[..4]
                             }
-                            _ => {}
+                            _ => &scratch[..0],
+                        }
+                    };
+                    if let Some(v) = extended_color_field(sub) {
+                        match p {
+                            38 => self.pen.fg = v,
+                            48 => self.pen.bg = v,
+                            _ => {} // 58 underline colour: consumed, not stored.
                         }
                     }
                 }
@@ -959,6 +982,31 @@ fn resize_row(row: &[Cell], cols: usize) -> Vec<Cell> {
     let mut out: Vec<Cell> = row.iter().take(cols).cloned().collect();
     out.resize(cols, Cell::default());
     out
+}
+
+/// Resolve an extended-colour SGR (`38`/`48`/`58`) to a [`Cell`] palette field.
+///
+/// `sub` is the parameter list after the leading `38`/`48`/`58`, mode first:
+/// `[5, n]` for 256-colour, or `[2, r, g, b]` / `[2, colorspace, r, g, b]` for
+/// true-colour (the ISO `38:2:cs:r:g:b` form carries a colourspace id this
+/// model ignores). Returns `None` for an unknown or truncated mode.
+fn extended_color_field(sub: &[u16]) -> Option<u8> {
+    match sub.first().copied()? {
+        5 => {
+            let n = sub.get(1).copied().unwrap_or(0).min(255) as u8;
+            Some(xterm_to_field(n))
+        }
+        2 => {
+            // Channels sit at the tail: indices 2,3,4 when a colourspace id
+            // precedes them (len >= 5), else 1,2,3.
+            let base = if sub.len() >= 5 { 2 } else { 1 };
+            let r = sub.get(base).copied().unwrap_or(0) as u8;
+            let g = sub.get(base + 1).copied().unwrap_or(0) as u8;
+            let b = sub.get(base + 2).copied().unwrap_or(0) as u8;
+            Some(xterm_to_field(rgb_to_256(r, g, b)))
+        }
+        _ => None,
+    }
 }
 
 /// Map a 24-bit RGB triple to the closest xterm 256-colour palette index.
@@ -1524,6 +1572,69 @@ mod tests {
         g.advance(b"\x1b[48;2;255;255;255mB");
         // Pure white truecolor snaps to 231 in the grey-ramp branch.
         assert_eq!(g.cell(0, 1).unwrap().bg, 231);
+    }
+
+    #[test]
+    fn sgr_colon_subparams_are_not_flattened_into_top_level() {
+        // `4:3` is a styled (curly) underline, NOT `4;3` = underline + italic.
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[4:3mX");
+        let x = g.cell(0, 0).unwrap();
+        assert_ne!(x.attrs & attr::UNDERLINE, 0, "4:3 must set underline");
+        assert_eq!(x.attrs & attr::ITALIC, 0, "4:3 must not read as italic");
+
+        // `4:0` turns underline off; `4` alone turns it on.
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[4mA\x1b[4:0mB");
+        assert_ne!(g.cell(0, 0).unwrap().attrs & attr::UNDERLINE, 0);
+        assert_eq!(g.cell(0, 1).unwrap().attrs & attr::UNDERLINE, 0);
+
+        // A colon underline immediately followed by a semicolon attribute: the
+        // attribute is its own SGR, and the colon style does not bleed into it.
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[4:3;1mX");
+        let x = g.cell(0, 0).unwrap();
+        assert_ne!(x.attrs & attr::UNDERLINE, 0);
+        assert_ne!(x.attrs & attr::BOLD, 0);
+        assert_eq!(x.attrs & attr::ITALIC, 0);
+    }
+
+    #[test]
+    fn sgr_colon_extended_color_matches_semicolon() {
+        // Colon 256-colour parses the same as the semicolon form.
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[38:5:200mA");
+        assert_eq!(g.cell(0, 0).unwrap().fg, 200);
+
+        // Colon true-colour, with and without the ISO colourspace id, must land
+        // on the same channels — the `::` colourspace slot must not shift r,g,b.
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[38:2:255:0:0mA");
+        g.advance(b"\x1b[38:2::255:0:0mB");
+        let a = g.cell(0, 0).unwrap().fg;
+        let b = g.cell(0, 1).unwrap().fg;
+        assert_eq!(a, b, "colourspace id must not shift the channels");
+        assert_eq!(a, xterm_to_field(rgb_to_256(255, 0, 0)));
+    }
+
+    #[test]
+    fn sgr_58_underline_color_does_not_leak_into_attrs() {
+        // 58 (underline colour) has no cell field; its channels must be consumed
+        // in both notations, not misread. `1;58:…;3` must leave only bold+italic.
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[1;58:2:255:0:0;3mX");
+        let x = g.cell(0, 0).unwrap();
+        assert_ne!(x.attrs & attr::BOLD, 0);
+        assert_ne!(x.attrs & attr::ITALIC, 0);
+        assert_eq!(x.attrs & attr::DIM, 0, "58's mode must not read as dim");
+        assert_eq!(x.attrs & attr::UNDERLINE, 0);
+
+        let mut g = Grid::new(20, 3);
+        g.advance(b"\x1b[1;58;2;255;0;0;3mY");
+        let y = g.cell(0, 0).unwrap();
+        assert_ne!(y.attrs & attr::BOLD, 0);
+        assert_ne!(y.attrs & attr::ITALIC, 0);
+        assert_eq!(y.attrs & attr::DIM, 0);
     }
 
     /// `xterm_to_field` folds raw xterm-256 indices into the caucus field
