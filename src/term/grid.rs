@@ -405,11 +405,17 @@ impl Grid {
         self.scrollback.push_back(row);
     }
 
-    /// Scroll the scroll-region up by one line. The line leaving the top of
-    /// the region enters scrollback **only** when the region starts at row 0
-    /// (a full-screen scroll); a partial region scroll discards it, matching
+    /// Scroll the scroll-region up by `n` lines. The lines leaving the top of
+    /// the region enter scrollback **only** when the region starts at row 0
+    /// (a full-screen scroll); a partial region scroll discards them, matching
     /// xterm.
-    fn scroll_up(&mut self) {
+    ///
+    /// The surviving rows shift up in a single `copy_within` (one memmove for
+    /// the whole region, not `n` × per-row copies), and the leaving row is
+    /// cloned **only** when it will actually be retained — a partial-region
+    /// scroll (`top != 0`) or a disabled scrollback (`scrollback_limit == 0`)
+    /// allocates nothing.
+    fn scroll_up(&mut self, n: usize) {
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
         if top >= bottom {
@@ -417,36 +423,51 @@ impl Grid {
             self.clear_row(top);
             return;
         }
-        let leaving: Vec<Cell> =
-            self.viewport[self.idx(top, 0)..self.idx(top, 0) + self.cols].to_vec();
-        for r in top..bottom {
-            let (dst_lo, dst_hi) = (self.idx(r, 0), self.idx(r, 0) + self.cols);
-            let src_lo = self.idx(r + 1, 0);
-            self.viewport
-                .copy_within(src_lo..src_lo + self.cols, dst_lo);
-            let _ = dst_hi;
+        let n = n.min(bottom - top + 1);
+        if n == 0 {
+            return;
         }
-        self.clear_row(bottom);
-        if top == 0 {
-            self.push_scrollback(leaving);
+        // Capture the rows leaving the top into scrollback, oldest first — but
+        // only when they will be kept (full-screen scroll, scrollback enabled).
+        if top == 0 && self.scrollback_limit > 0 {
+            for r in 0..n {
+                let lo = self.idx(r, 0);
+                let leaving = self.viewport[lo..lo + self.cols].to_vec();
+                self.push_scrollback(leaving);
+            }
+        }
+        // Shift the survivors up by `n` in one move, then blank the rows opened
+        // at the bottom margin.
+        let src = self.idx(top + n, 0);
+        let end = self.idx(bottom + 1, 0);
+        let dst = self.idx(top, 0);
+        self.viewport.copy_within(src..end, dst);
+        for r in (bottom + 1 - n)..(bottom + 1) {
+            self.clear_row(r);
         }
     }
 
-    /// Scroll the scroll-region down by one line (RI at the top margin).
-    fn scroll_down(&mut self) {
+    /// Scroll the scroll-region down by `n` lines (RI at the top margin / SD).
+    /// Rows pushed past the bottom margin are discarded; scroll-down never
+    /// feeds scrollback. The shift is a single `copy_within`.
+    fn scroll_down(&mut self, n: usize) {
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
         if top >= bottom {
             self.clear_row(top);
             return;
         }
-        for r in (top + 1..=bottom).rev() {
-            let dst_lo = self.idx(r, 0);
-            let src_lo = self.idx(r - 1, 0);
-            self.viewport
-                .copy_within(src_lo..src_lo + self.cols, dst_lo);
+        let n = n.min(bottom - top + 1);
+        if n == 0 {
+            return;
         }
-        self.clear_row(top);
+        let src = self.idx(top, 0);
+        let end = self.idx(bottom + 1 - n, 0);
+        let dst = self.idx(top + n, 0);
+        self.viewport.copy_within(src..end, dst);
+        for r in top..(top + n) {
+            self.clear_row(r);
+        }
     }
 
     /// Blank an entire viewport row with the current pen's background.
@@ -465,7 +486,7 @@ impl Grid {
     /// pass the bottom margin.
     fn line_feed(&mut self) {
         if self.cursor.0 == self.scroll_bottom {
-            self.scroll_up();
+            self.scroll_up(1);
         } else if self.cursor.0 + 1 < self.rows {
             self.cursor.0 += 1;
         }
@@ -1101,16 +1122,8 @@ impl Perform for Grid {
             '@' => self.insert_chars(n),
             'P' => self.delete_chars(n),
             'X' => self.erase_chars(n),
-            'S' => {
-                for _ in 0..n {
-                    self.scroll_up();
-                }
-            }
-            'T' => {
-                for _ in 0..n {
-                    self.scroll_down();
-                }
-            }
+            'S' => self.scroll_up(n),
+            'T' => self.scroll_down(n),
             'm' => self.apply_sgr(params),
             'r' => {
                 // DECSTBM — set top/bottom scroll margins.
@@ -1162,7 +1175,7 @@ impl Perform for Grid {
             b'M' => {
                 // RI — reverse index.
                 if self.cursor.0 == self.scroll_top {
-                    self.scroll_down();
+                    self.scroll_down(1);
                 } else if self.cursor.0 > 0 {
                     self.cursor.0 -= 1;
                 }
@@ -1344,6 +1357,51 @@ mod tests {
         assert_eq!(oldest.trim_end(), "6");
         let newest: String = sb[2].iter().map(|c| c.ch).collect();
         assert_eq!(newest.trim_end(), "8");
+    }
+
+    #[test]
+    fn scroll_up_n_batches_and_captures_each_leaving_row() {
+        // CSI 2 S scrolls the full-screen region up by two in one shot: the top
+        // two rows enter scrollback oldest-first, the survivors shift up, and
+        // the bottom two rows blank.
+        let mut g = Grid::new(5, 4);
+        g.advance(b"r0\r\nr1\r\nr2\r\nr3");
+        g.advance(b"\x1b[1;1H\x1b[2S"); // home, then scroll up 2
+        assert_eq!(g.row_text(0).trim_end(), "r2");
+        assert_eq!(g.row_text(1).trim_end(), "r3");
+        assert_eq!(g.row_text(2).trim(), "");
+        assert_eq!(g.row_text(3).trim(), "");
+        let sb: Vec<_> = g.scrollback().collect();
+        assert_eq!(sb.len(), 2, "both leaving rows captured");
+        let oldest: String = sb[0].iter().map(|c| c.ch).collect();
+        let newest: String = sb[1].iter().map(|c| c.ch).collect();
+        assert_eq!(oldest.trim_end(), "r0");
+        assert_eq!(newest.trim_end(), "r1");
+    }
+
+    #[test]
+    fn partial_region_scroll_up_does_not_feed_scrollback() {
+        // A DECSTBM-bounded region that does not start at row 0 discards the
+        // line leaving its top — and allocates no clone for it.
+        let mut g = Grid::new(5, 4);
+        g.advance(b"\x1b[2;4r"); // region rows 2..=4 (1-based) -> 1..=3
+        g.advance(b"\x1b[2;1Hr1\r\nr2\r\nr3"); // fill the region
+        g.advance(b"\x1b[4;1H\x1b[1S"); // cursor in region, scroll up 1
+        assert!(
+            g.scrollback().next().is_none(),
+            "partial-region scroll keeps nothing in scrollback"
+        );
+    }
+
+    #[test]
+    fn scroll_down_n_batches() {
+        let mut g = Grid::new(5, 4);
+        g.advance(b"r0\r\nr1\r\nr2\r\nr3");
+        g.advance(b"\x1b[1;1H\x1b[2T"); // home, scroll down 2
+        assert_eq!(g.row_text(0).trim(), "");
+        assert_eq!(g.row_text(1).trim(), "");
+        assert_eq!(g.row_text(2).trim_end(), "r0");
+        assert_eq!(g.row_text(3).trim_end(), "r1");
     }
 
     #[test]
