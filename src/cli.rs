@@ -50,6 +50,13 @@ pub struct Cli {
     #[arg(long, env = "CAUCUS_PREFIX", default_value = "a")]
     pub prefix: PrefixKey,
 
+    /// A short human label for this session, shown in `caucus sessions` so the
+    /// list distinguishes runs instead of reading "caucus session" for every
+    /// one. Omit to default to the repository's directory name. Only meaningful
+    /// when launching a fresh TUI (not `resume`, which keeps the saved topic).
+    #[arg(long)]
+    pub topic: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -217,7 +224,7 @@ pub fn run() -> ExitCode {
 fn dispatch(cli: Cli) -> Result<ExitCode> {
     let prefix = cli.prefix.0;
     match cli.command {
-        None => run_tui(&cli.roles, cli.agent_cli, prefix),
+        None => run_tui(&cli.roles, cli.agent_cli, prefix, cli.topic),
         Some(Command::Init { install_hook }) => run_init(install_hook),
         Some(Command::Doctor) => run_doctor(),
         Some(Command::Signal(cmd)) => run_signal(cmd),
@@ -249,9 +256,14 @@ fn repo_root() -> Result<PathBuf> {
 /// claude) plus any `--roles`, and runs the ratatui event loop. When stdout is
 /// not a tty, [`crate::tui::run`] fails cleanly with a message rather than
 /// panicking.
-fn run_tui(roles: &[String], main_cli: Option<AgentCli>, prefix: char) -> Result<ExitCode> {
+fn run_tui(
+    roles: &[String],
+    main_cli: Option<AgentCli>,
+    prefix: char,
+    topic: Option<String>,
+) -> Result<ExitCode> {
     let repo = repo_root()?;
-    crate::tui::run(&repo, roles, main_cli, prefix)?;
+    crate::tui::run(&repo, roles, main_cli, prefix, topic)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -561,6 +573,16 @@ mod tests {
     fn roles_flag_splits_on_comma() {
         let cli = Cli::try_parse_from(["caucus", "--roles", "architect,backend"]).unwrap();
         assert_eq!(cli.roles, vec!["architect", "backend"]);
+    }
+
+    #[test]
+    fn topic_flag_sets_the_session_label() {
+        // Omitted → None (the repo directory name is applied downstream).
+        let cli = Cli::try_parse_from(["caucus"]).unwrap();
+        assert_eq!(cli.topic, None);
+        // `--topic` carries a free-form label, spaces and all.
+        let cli = Cli::try_parse_from(["caucus", "--topic", "auth refactor"]).unwrap();
+        assert_eq!(cli.topic.as_deref(), Some("auth refactor"));
     }
 
     #[test]

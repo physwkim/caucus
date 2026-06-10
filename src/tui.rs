@@ -228,7 +228,9 @@ impl Drop for TerminalGuard {
 
 /// Launch the multiplexer TUI in the git repo at `repo`, starting a main
 /// worker panel plus one panel per entry of `roles`. `main_cli` selects the
-/// main worker's backend (`None` → the default claude main worker).
+/// main worker's backend (`None` → the default claude main worker). `topic` is
+/// the session's human label for `caucus sessions`; `None` falls back to
+/// [`default_topic`].
 ///
 /// Fails cleanly (no panic) when stdout is not a terminal.
 pub fn run(
@@ -236,11 +238,13 @@ pub fn run(
     roles: &[String],
     main_cli: Option<AgentCli>,
     prefix: char,
+    topic: Option<String>,
 ) -> Result<()> {
     init_logging(repo);
     require_tty()?;
     let config = Config::load(repo).context("load caucus configuration")?;
-    let session = Session::new("caucus session", repo.to_path_buf());
+    let topic = topic.unwrap_or_else(|| default_topic(repo));
+    let session = Session::new(topic, repo.to_path_buf());
     let roles = roles.to_vec();
 
     // A multi-thread runtime: the signal server and worktree cleanup queue
@@ -252,6 +256,17 @@ pub fn run(
         spawn_fresh_roster(&mut mux, &roles, main_cli)?;
         event_loop(terminal, mux, signal, control).await
     })
+}
+
+/// The session label used when `--topic` is omitted: the repository's directory
+/// name, so `caucus sessions` distinguishes projects instead of listing every
+/// session as a generic "caucus session". Falls back to that generic label only
+/// when the repo path has no final component (e.g. the filesystem root).
+fn default_topic(repo: &std::path::Path) -> String {
+    repo.file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "caucus session".to_string())
 }
 
 /// Launch the multiplexer TUI restoring a previously-persisted session
@@ -804,6 +819,16 @@ mod tests {
             worktree_branch: None,
             claude_session_id: None,
         }
+    }
+
+    #[test]
+    fn default_topic_is_the_repo_directory_name() {
+        assert_eq!(
+            default_topic(std::path::Path::new("/Users/me/codes/caucus")),
+            "caucus"
+        );
+        // No final component → the generic fallback rather than an empty label.
+        assert_eq!(default_topic(std::path::Path::new("/")), "caucus session");
     }
 
     #[test]

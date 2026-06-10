@@ -761,6 +761,8 @@ caucus                              # 풀스크린 멀티플렉서 TUI 기동 (�
                                     # main worker 패널 하나로 시작.
 caucus --roles architect,backend,reviewer
                                     # 기동 시 초기 패널 구성까지 (생략 시 main worker 패널만)
+caucus --topic "auth refactor"      # 세션 라벨 (caucus sessions 목록에 표시).
+                                    # 생략 시 repo 디렉터리 이름이 기본값 (§3.1)
 
 caucus init [--install-hook]        # .caucus/ + bin/turn-signal 생성,
                                     # --install-hook 시 Claude Stop hook을
