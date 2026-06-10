@@ -11,15 +11,10 @@ use tracing::warn;
 /// the event loop, never concurrently with `pump_all` (Invariant I-5).
 impl McpToolSurface for Multiplexer {
     fn send_keys(&mut self, panel: PanelId, text: &str, enter: bool) -> Result<(), McpError> {
-        let p = self
-            .panels
-            .iter_mut()
-            .find(|p| p.id == panel)
-            .ok_or(McpError::NoSuchPanel(panel))?;
-        // Frame the prompt for the agent's input mode (see `plan_delivery`).
-        let plan = plan_delivery(text.as_bytes(), enter, p.grid().bracketed_paste());
-        p.write_input(&plan.bytes)
-            .map_err(|e| McpError::Tool(format!("send_keys: {e}")))?;
+        // Frame + write through the shared delivery path (see `deliver_text` /
+        // `plan_delivery`): a bracketed paste's submitting `\r` is held out of
+        // the burst and delivered later as a discrete keypress.
+        self.deliver_text(panel, text, enter)?;
 
         // Delivering a prompt opens a capture turn and flips the panel to
         // `Working` (`docs/design.md` §4) — only when the line is submitted,
@@ -29,14 +24,6 @@ impl McpToolSurface for Multiplexer {
         // accept the Enter.
         if enter {
             self.note_prompt_delivered(panel);
-        }
-        // A bracketed paste's submitting `\r` was held out of the burst — it
-        // must land as a discrete keypress once the agent has ingested the
-        // paste, or it is swallowed during the `[Pasted text #N]` commit. The
-        // hold scales with the paste size (the commit it races is larger for a
-        // bigger paste), so the byte count is threaded through.
-        if plan.defer_submit {
-            self.enqueue_submit(panel, text.len());
         }
         Ok(())
     }
@@ -331,6 +318,39 @@ fn plan_delivery(text: &[u8], enter: bool, bracketed: bool) -> Delivery {
 }
 
 impl Multiplexer {
+    /// Frame `text` for `panel`'s input mode and write it to the PTY, holding
+    /// back the submitting `\r` when a bracketed paste would otherwise swallow
+    /// it (see [`plan_delivery`]). The single delivery path shared by the MCP
+    /// `send_keys` tool and a host-side paste ([`Multiplexer::handle_paste`]):
+    /// both must frame multi-line input as one bracketed paste rather than let
+    /// each embedded newline submit. The caller owns turn bookkeeping
+    /// (`note_prompt_delivered`) — this only writes the bytes and schedules the
+    /// deferred submit when one is needed.
+    pub(crate) fn deliver_text(
+        &mut self,
+        panel: PanelId,
+        text: &str,
+        enter: bool,
+    ) -> Result<(), McpError> {
+        let p = self
+            .panels
+            .iter_mut()
+            .find(|p| p.id == panel)
+            .ok_or(McpError::NoSuchPanel(panel))?;
+        let plan = plan_delivery(text.as_bytes(), enter, p.grid().bracketed_paste());
+        p.write_input(&plan.bytes)
+            .map_err(|e| McpError::Tool(format!("deliver_text: {e}")))?;
+        // A bracketed paste's submitting `\r` was held out of the burst — it
+        // must land as a discrete keypress once the agent has ingested the
+        // paste, or it is swallowed during the `[Pasted text #N]` commit. The
+        // hold scales with the paste size (the commit it races is larger for a
+        // bigger paste), so the byte count is threaded through.
+        if plan.defer_submit {
+            self.enqueue_submit(panel, text.len());
+        }
+        Ok(())
+    }
+
     /// Record a deferred submit for `panel`: its held-back `\r` becomes
     /// writable after [`submit_delay_for`]`(paste_len)` — the hold scales with
     /// the paste size. Replaces any pending submit already queued for the same

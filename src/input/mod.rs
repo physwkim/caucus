@@ -5,6 +5,12 @@
 //! type into a focused panel directly (logins, OAuth device codes, ...), and
 //! the main worker can drive any panel via the MCP `send_keys` tool.
 //!
+//! A host-side **paste** is delivered to the focused panel as one bracketed
+//! paste burst ([`FocusRouter::paste_target`] /
+//! [`crate::session::Multiplexer::handle_paste`]), not streamed key-by-key —
+//! so a multi-line paste inserts as one block instead of submitting at every
+//! embedded newline. It only inserts; the user presses `Enter` to submit.
+//!
 //! # Keymap
 //!
 //! caucus reserves a single **prefix key**, `Ctrl-A` by default, for its own
@@ -178,6 +184,20 @@ impl FocusRouter {
 
     /// The currently focused panel.
     pub fn focused(&self) -> Option<PanelId> {
+        self.focused
+    }
+
+    /// The panel a host-side paste should be delivered to, if any. A paste is
+    /// inserted into the focused panel exactly like typed input — but only when
+    /// no modal capture owns input: while the scrollback pager or the
+    /// close-panel confirm prompt is open, a paste is swallowed (returns `None`)
+    /// rather than injected behind the modal's back, matching how those modals
+    /// capture every key in [`FocusRouter::route`]. The read-only transcript
+    /// overlay passes input through, so it does not block a paste.
+    pub fn paste_target(&self) -> Option<PanelId> {
+        if self.scroll_open || self.confirm_open {
+            return None;
+        }
         self.focused
     }
 
@@ -572,6 +592,29 @@ mod tests {
             InputAction::ToPanel { bytes, .. } => assert_eq!(bytes, b"\r"),
             other => panic!("expected ToPanel, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn paste_target_is_focused_panel_unless_a_modal_captures() {
+        let mut router = FocusRouter::new();
+        // No focus → nowhere to paste.
+        assert_eq!(router.paste_target(), None);
+
+        let panel = PanelId::new();
+        router.set_focus(Some(panel));
+        assert_eq!(router.paste_target(), Some(panel));
+
+        // The scrollback pager and the close-confirm prompt are modal: each
+        // swallows a paste rather than injecting it behind the modal's back.
+        router.set_scroll_open(true);
+        assert_eq!(router.paste_target(), None, "scroll pager captures paste");
+        router.set_scroll_open(false);
+        assert_eq!(router.paste_target(), Some(panel));
+
+        router.set_confirm_open(true);
+        assert_eq!(router.paste_target(), None, "confirm prompt captures paste");
+        router.set_confirm_open(false);
+        assert_eq!(router.paste_target(), Some(panel));
     }
 
     #[test]

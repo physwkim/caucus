@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -204,10 +204,13 @@ fn init_logging(repo: &std::path::Path) {
 struct TerminalGuard;
 
 impl TerminalGuard {
-    /// Enter raw mode + the alternate screen.
+    /// Enter raw mode + the alternate screen, and enable bracketed paste so the
+    /// host terminal hands a paste to caucus as one [`Event::Paste`] burst
+    /// rather than streaming it key-by-key (which would submit at every embedded
+    /// newline — see [`Multiplexer::handle_paste`]).
     fn enter() -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
-        crossterm::execute!(io::stdout(), EnterAlternateScreen)
+        crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
             .context("enter alternate screen")?;
         Ok(Self)
     }
@@ -215,9 +218,10 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Best-effort restore: nothing useful to do if these fail during
-        // teardown, and a panic-in-drop would mask the original error.
-        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+        // Best-effort restore in reverse order of `enter`: nothing useful to do
+        // if these fail during teardown, and a panic-in-drop would mask the
+        // original error.
+        let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }
@@ -563,6 +567,12 @@ async fn event_loop(
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if key.kind == event::KeyEventKind::Press => {
                     mux.handle_key(key);
+                }
+                Ok(Event::Paste(text)) => {
+                    // A host-side bracketed paste: deliver it to the focused
+                    // panel as one paste burst instead of letting it stream
+                    // key-by-key and submit at every newline.
+                    mux.handle_paste(&text);
                 }
                 Ok(Event::Resize(w, h)) => {
                     let _ = mux.resize(body_area(Rect {

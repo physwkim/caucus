@@ -51,6 +51,34 @@ impl Multiplexer {
         }
     }
 
+    /// Deliver a host-side bracketed paste to the focused panel's PTY as one
+    /// paste burst. Without this the host terminal streams a paste key-by-key
+    /// and every embedded newline (`\r`) is taken as a submit, so a multi-line
+    /// paste fires the panel's prompt at its first line. Routed through the
+    /// same [`Multiplexer::deliver_text`] / `plan_delivery` framing the MCP
+    /// `send_keys` tool uses, with `enter = false`: a paste only *inserts* the
+    /// text — the user presses Enter themselves when ready — so no submitting
+    /// `\r` is appended or deferred and no turn is opened.
+    ///
+    /// Ignored when a modal (scrollback pager / close-confirm) owns input or no
+    /// panel is focused ([`crate::input::FocusRouter::paste_target`]).
+    pub fn handle_paste(&mut self, text: &str) {
+        let Some(panel) = self.focus.paste_target() else {
+            return;
+        };
+        // A paste changes the view and, on the main panel, is un-submitted
+        // composition — bump the view epoch for one frame of cursor feedback
+        // and arm the compose hold so a round delivery never lands mid-paste
+        // (mirrors the non-submit keystroke path in `handle_key`).
+        self.view_epoch = self.view_epoch.wrapping_add(1);
+        if Some(panel) == self.main_panel_id {
+            self.main_compose_since = Some(Instant::now());
+        }
+        if let Err(err) = self.deliver_text(panel, text, false) {
+            warn!(panel = %panel, error = %err, "panel paste write failed");
+        }
+    }
+
     /// Whether the reserved prefix key is armed (for a status hint).
     pub fn prefix_armed(&self) -> bool {
         self.focus.prefix_armed()
@@ -230,6 +258,83 @@ mod tests {
             mux.main_compose_since.is_none(),
             "submitting the main line must clear the compose hold"
         );
+    }
+
+    /// Insert a hermetic `/bin/cat` panel so paste tests do not depend on a
+    /// real agent CLI being installed.
+    fn push_cat_panel(mux: &mut Multiplexer, state: PanelState) -> PanelId {
+        use crate::pty::{Pty, PtyCommand};
+        use crate::session::id::AgentId;
+        use crate::term::{Grid, OutputCapture};
+        let id = PanelId::new();
+        let inner = area().inner();
+        let pty = Pty::spawn(&PtyCommand::new("/bin/cat"), inner.width, inner.height).unwrap();
+        mux.panels.push(lifecycle::Panel {
+            id,
+            role: "reviewer".to_string(),
+            agent_id: AgentId::new(),
+            state,
+            worktree_path: None,
+            pty,
+            grid: Grid::new(inner.width as usize, inner.height as usize),
+            capture: OutputCapture::new(),
+        });
+        mux.rebuild_layout_tree();
+        id
+    }
+
+    /// A host-side paste of a multi-line block is delivered to the focused
+    /// panel as composition — it arms the main compose hold but must NOT submit
+    /// (no `note_prompt_delivered`, so the panel stays `Idle`, not `Working`).
+    /// Before this fix the paste streamed key-by-key and each `\n` flipped the
+    /// panel to `Working`, firing the prompt at the first line.
+    #[tokio::test]
+    async fn handle_paste_delivers_to_focused_panel_without_submitting() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let panel = push_cat_panel(&mut mux, PanelState::Idle);
+        mux.main_panel_id = Some(panel);
+        mux.focus.set_focus(Some(panel));
+        assert!(mux.main_compose_since.is_none());
+
+        mux.handle_paste("line one\nline two\nline three");
+
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == panel).unwrap().state(),
+            PanelState::Idle,
+            "a paste must not submit — the panel stays Idle, never flipped to Working",
+        );
+        assert!(
+            mux.main_compose_since.is_some(),
+            "a paste into the main panel arms the compose hold (un-submitted composition)",
+        );
+
+        mux.shutdown();
+    }
+
+    /// A paste while a modal owns input (scrollback pager) is swallowed — it
+    /// must not reach the focused panel or arm the compose hold.
+    #[tokio::test]
+    async fn handle_paste_is_ignored_while_a_modal_captures_input() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let panel = push_cat_panel(&mut mux, PanelState::Idle);
+        mux.main_panel_id = Some(panel);
+        mux.focus.set_focus(Some(panel));
+        mux.focus.set_scroll_open(true);
+
+        mux.handle_paste("pasted while scrolling");
+
+        assert!(
+            mux.main_compose_since.is_none(),
+            "the scrollback pager must swallow a paste — no compose hold armed",
+        );
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == panel).unwrap().state(),
+            PanelState::Idle,
+        );
+
+        mux.shutdown();
     }
 
     /// A prompt delivered to a *non-main* panel (the usual MCP `send_keys`
