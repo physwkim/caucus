@@ -36,6 +36,11 @@ pub struct Settings {
     pub capture_turn_limit: usize,
     /// In-memory byte cap for a single open (in-progress) turn.
     pub capture_open_turn_bytes: usize,
+    /// Whether caucus captures the mouse (`docs/design.md` §1). On, the scroll
+    /// wheel drives the scrollback pager; off, the terminal keeps its native
+    /// mouse behaviour (drag-to-select / copy). Default on — set `mouse = false`
+    /// to keep native selection.
+    pub mouse: bool,
 }
 
 impl Default for Settings {
@@ -48,6 +53,7 @@ impl Default for Settings {
             round_fallback_secs: ROUND_FALLBACK_DEFAULT_SECS,
             capture_turn_limit: crate::term::OutputCapture::DEFAULT_TURN_LIMIT,
             capture_open_turn_bytes: crate::term::OutputCapture::DEFAULT_OPEN_TURN_BYTES,
+            mouse: true,
         }
     }
 }
@@ -87,6 +93,7 @@ struct SettingsOverrides {
     round_fallback_secs: Option<u64>,
     capture_turn_limit: Option<usize>,
     capture_open_turn_bytes: Option<usize>,
+    mouse: Option<bool>,
 }
 
 impl SettingsOverrides {
@@ -120,6 +127,7 @@ impl SettingsOverrides {
             capture_open_turn_bytes: other
                 .capture_open_turn_bytes
                 .or(self.capture_open_turn_bytes),
+            mouse: other.mouse.or(self.mouse),
         }
     }
 
@@ -142,6 +150,7 @@ impl SettingsOverrides {
                 .capture_open_turn_bytes
                 .unwrap_or(d.capture_open_turn_bytes)
                 .max(1),
+            mouse: self.mouse.unwrap_or(d.mouse),
         }
     }
 }
@@ -219,6 +228,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load(None, tmp.path()).unwrap().round_fallback_secs, 1);
+    }
+
+    #[test]
+    fn mouse_defaults_on_and_can_be_disabled() {
+        // Default is on — caucus captures the mouse for scrollback.
+        assert!(Settings::default().mouse);
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("settings.toml"),
+            "[settings]\nmouse = false\n",
+        )
+        .unwrap();
+        assert!(
+            !load(None, tmp.path()).unwrap().mouse,
+            "mouse = false keeps the terminal's native selection"
+        );
     }
 
     #[test]

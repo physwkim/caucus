@@ -39,6 +39,8 @@
 //! | (pager open) `↑↓ k j`     | scroll a line; `PgUp/PgDn` a page       |
 //! | (pager open) `g G Home End`| jump to oldest / newest line           |
 //! | (pager open) `Esc` / `q`  | exit the scrollback pager               |
+//! | scroll wheel up           | enter / page back the scrollback pager  |
+//! | scroll wheel down         | page forward in the pager (off at live) |
 //! | `Ctrl-A` then `Ctrl-A`    | send a literal `Ctrl-A` to the panel    |
 //! | any other key             | forwarded to the focused panel's PTY    |
 //! | `Ctrl-C`                  | forwarded to the focused panel (§0 #11) |

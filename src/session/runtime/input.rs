@@ -79,6 +79,49 @@ impl Multiplexer {
         }
     }
 
+    /// Apply a mouse event (`docs/design.md` §1). Only the scroll wheel is
+    /// acted on; it drives the scrollback pager. Delivered to the event loop
+    /// only when mouse capture is on (`[settings] mouse`).
+    ///
+    /// Scrolling up from the live view opens the pager on the focused panel —
+    /// tmux copy-mode-on-scroll entry — and once it is open the wheel pages the
+    /// frozen snapshot. Scrolling down at the live bottom is a no-op: nothing is
+    /// newer than the live view. Clicks, drags, and moves are ignored. While the
+    /// close-confirm prompt owns the screen the wheel is swallowed, matching the
+    /// keyboard router's modal capture.
+    pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crossterm::event::MouseEventKind;
+        /// Rows the wheel moves per notch — a few lines, like a terminal.
+        const WHEEL_STEP: isize = 3;
+
+        // The close-confirm prompt is modal: do not scroll a pager underneath it.
+        if self.pending_close().is_some() {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                // Entering scrollback from the live view; a no-op when no panel
+                // is focused (the pager stays closed and the next branch skips).
+                if self.scroll_state().is_none() {
+                    self.enter_scroll();
+                }
+                if self.scroll_state().is_some() {
+                    self.view_epoch = self.view_epoch.wrapping_add(1);
+                    self.scroll_by(-WHEEL_STEP);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                // Only meaningful inside the pager — at the live bottom there is
+                // nothing newer to reveal.
+                if self.scroll_state().is_some() {
+                    self.view_epoch = self.view_epoch.wrapping_add(1);
+                    self.scroll_by(WHEEL_STEP);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Whether the reserved prefix key is armed (for a status hint).
     pub fn prefix_armed(&self) -> bool {
         self.focus.prefix_armed()
@@ -331,6 +374,82 @@ mod tests {
         assert_eq!(
             mux.panels.iter().find(|p| p.id == panel).unwrap().state(),
             PanelState::Idle,
+        );
+
+        mux.shutdown();
+    }
+
+    /// The scroll wheel pages an open scrollback by `WHEEL_STEP` lines and
+    /// clamps at the bottom; a non-scroll mouse event and the close-confirm
+    /// modal both leave the pager untouched.
+    #[tokio::test]
+    async fn mouse_wheel_pages_the_scrollback_and_respects_the_confirm_modal() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let at = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        // 20 lines, page 4 → max offset 16. Start at the bottom (newest).
+        mux.scroll = Some(ScrollState {
+            role: "worker".to_string(),
+            lines: (0..20).map(|i| format!("l{i}")).collect(),
+            offset: 16,
+            page: 4,
+        });
+
+        // Wheel up moves toward older output by WHEEL_STEP (3).
+        mux.handle_mouse(at(MouseEventKind::ScrollUp));
+        assert_eq!(mux.scroll_state().unwrap().offset, 13);
+        // Wheel down moves back toward the newest.
+        mux.handle_mouse(at(MouseEventKind::ScrollDown));
+        assert_eq!(mux.scroll_state().unwrap().offset, 16);
+        // Down at the bottom clamps — never past the max.
+        mux.handle_mouse(at(MouseEventKind::ScrollDown));
+        assert_eq!(mux.scroll_state().unwrap().offset, 16);
+        // A non-scroll event (a click) is ignored.
+        mux.handle_mouse(at(MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(mux.scroll_state().unwrap().offset, 16);
+
+        // While the close-confirm prompt is up the wheel is swallowed.
+        mux.pending_close = Some(PanelId::new());
+        mux.handle_mouse(at(MouseEventKind::ScrollUp));
+        assert_eq!(
+            mux.scroll_state().unwrap().offset,
+            16,
+            "the confirm modal swallows the wheel"
+        );
+    }
+
+    /// Scrolling up from the live view opens the pager on the focused panel
+    /// (tmux copy-mode-on-scroll entry). With nothing focused it stays closed.
+    #[tokio::test]
+    async fn mouse_wheel_up_enters_scrollback_on_the_focused_panel() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let wheel_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        // Nothing focused → wheel up cannot open a pager (no panic).
+        mux.handle_mouse(wheel_up);
+        assert!(mux.scroll_state().is_none());
+
+        // Focus a panel → wheel up enters scrollback on it.
+        let panel = push_cat_panel(&mut mux, PanelState::Idle);
+        mux.focus.set_focus(Some(panel));
+        mux.handle_mouse(wheel_up);
+        assert!(
+            mux.scroll_state().is_some(),
+            "wheel up opens the pager from the live view"
         );
 
         mux.shutdown();

@@ -351,6 +351,8 @@ scrollback_lines        = 10000  # 패널별 스크롤백 깊이(행)
 round_fallback_secs     = 600    # 라운드 안전망 데드라인 기본값([1, 3600]로 clamp)
 capture_turn_limit      = 64     # 패널당 메모리에 유지하는 닫힌 턴 수
 capture_open_turn_bytes = 4194304 # 열린(진행 중) 턴 하나의 메모리 바이트 상한
+mouse                   = true   # 마우스 캡처: on이면 스크롤 휠로 스크롤백 페이저 조작,
+                                 # off면 터미널의 네이티브 드래그-선택/복사 유지
 ```
 
 `[settings]` 안의 오탈자 키는 무시되지 않고 거부된다(로드 에러).

@@ -18,7 +18,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -201,18 +204,32 @@ fn init_logging(repo: &std::path::Path) {
 /// RAII guard that restores the terminal: leaves the alternate screen and
 /// disables raw mode on drop, so caucus never leaves the user's terminal in
 /// a broken state — even if the event loop panics.
-struct TerminalGuard;
+struct TerminalGuard {
+    /// Whether this guard enabled mouse capture, so `Drop` disables exactly what
+    /// `enter` enabled — never emitting a `DisableMouseCapture` that the host
+    /// never saw enabled.
+    mouse: bool,
+}
 
 impl TerminalGuard {
     /// Enter raw mode + the alternate screen, and enable bracketed paste so the
     /// host terminal hands a paste to caucus as one [`Event::Paste`] burst
     /// rather than streaming it key-by-key (which would submit at every embedded
     /// newline — see [`Multiplexer::handle_paste`]).
-    fn enter() -> Result<Self> {
+    ///
+    /// When `mouse` is set (the `[settings] mouse` default), also capture the
+    /// mouse so the scroll wheel drives the scrollback pager
+    /// ([`Multiplexer::handle_mouse`]). Capture suppresses the terminal's native
+    /// drag-to-select, so it is left off when the setting is disabled.
+    fn enter(mouse: bool) -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
         crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
             .context("enter alternate screen")?;
-        Ok(Self)
+        if mouse {
+            crossterm::execute!(io::stdout(), EnableMouseCapture)
+                .context("enable mouse capture")?;
+        }
+        Ok(Self { mouse })
     }
 }
 
@@ -221,6 +238,9 @@ impl Drop for TerminalGuard {
         // Best-effort restore in reverse order of `enter`: nothing useful to do
         // if these fail during teardown, and a panic-in-drop would mask the
         // original error.
+        if self.mouse {
+            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
+        }
         let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
@@ -251,7 +271,7 @@ pub fn run(
     // run as tokio tasks alongside the (blocking) event loop.
     let runtime = tokio::runtime::Runtime::new().context("start tokio runtime")?;
     runtime.block_on(async move {
-        let _guard = TerminalGuard::enter()?;
+        let _guard = TerminalGuard::enter(config.settings.mouse)?;
         let (terminal, mut mux, signal, control) = setup(config, session, prefix)?;
         spawn_fresh_roster(&mut mux, &roles, main_cli)?;
         event_loop(terminal, mux, signal, control).await
@@ -294,7 +314,7 @@ pub fn run_resumed(
 
     let runtime = tokio::runtime::Runtime::new().context("start tokio runtime")?;
     runtime.block_on(async move {
-        let _guard = TerminalGuard::enter()?;
+        let _guard = TerminalGuard::enter(config.settings.mouse)?;
         let (terminal, mut mux, signal, control) = setup(config, session, prefix)?;
         restore_roster(&mut mux, &record)?;
         event_loop(terminal, mux, signal, control).await
@@ -588,6 +608,11 @@ async fn event_loop(
                     // panel as one paste burst instead of letting it stream
                     // key-by-key and submit at every newline.
                     mux.handle_paste(&text);
+                }
+                Ok(Event::Mouse(mouse)) => {
+                    // Only delivered when mouse capture is on (`[settings]
+                    // mouse`). The scroll wheel drives the scrollback pager.
+                    mux.handle_mouse(mouse);
                 }
                 Ok(Event::Resize(w, h)) => {
                     let _ = mux.resize(body_area(Rect {
