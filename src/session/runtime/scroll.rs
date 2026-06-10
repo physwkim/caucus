@@ -199,6 +199,27 @@ impl Multiplexer {
         self.focus.set_scroll_copying(false);
     }
 
+    /// Re-sync an open pager's page height to the current [`Self::area`].
+    ///
+    /// `page` is the scroll clamp window and the page-step. The renderer windows
+    /// the snapshot to the *live* area height (`draw_scroll_pager`), so a page
+    /// frozen at [`Self::enter_scroll`] desyncs scrolling from what is drawn the
+    /// moment the terminal resizes — a shrunk terminal makes the newest lines
+    /// unreachable, a grown one scrolls past the end into blank space. Called by
+    /// [`Multiplexer::resize`], the single owner of `area`, so the invariant
+    /// `page == pager_page_height(area)` holds for the whole open lifetime.
+    ///
+    /// The offset is re-clamped to the new last page: a grown terminal shrinks
+    /// the max offset, so a previously-valid offset could otherwise sit past it.
+    pub(crate) fn resync_pager_page(&mut self) {
+        let page = pager_page_height(self.area);
+        if let Some(state) = self.scroll.as_mut() {
+            state.page = page;
+            let max = state.lines.len().saturating_sub(page);
+            state.offset = state.offset.min(max);
+        }
+    }
+
     /// Scroll the pager by `delta` lines (negative = toward older output),
     /// clamped to `[0, lines.len() - page]`. No-op when the pager is closed.
     pub(crate) fn scroll_by(&mut self, delta: isize) {
@@ -494,6 +515,66 @@ mod tests {
                 height: 39,
             }),
             34
+        );
+    }
+
+    /// On a terminal resize the open pager's `page` (the scroll clamp + step)
+    /// must track the new area: the renderer windows to the live height, so a
+    /// page frozen at entry makes the newest lines unreachable when the terminal
+    /// shrinks and scrolls past the end when it grows. The offset is re-clamped
+    /// to the new last page.
+    #[tokio::test]
+    async fn resize_resyncs_the_open_pager_page_and_clamps_offset() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        // 60 lines; open the pager scrolled to the bottom for the initial area.
+        let lines: Vec<String> = (0..60).map(|i| format!("line {i}")).collect();
+        let start = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 25,
+        }; // page = 20
+        mux.area = start;
+        let start_page = pager_page_height(start);
+        assert_eq!(start_page, 20);
+        mux.scroll = Some(ScrollState::new(
+            "w".to_string(),
+            lines,
+            60 - start_page, // offset 40 — the bottom
+            start_page,
+        ));
+
+        // Shrink: page must shrink with the area so the clamp and the live
+        // render agree (max offset grows, newest lines stay reachable).
+        let small = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 12,
+        }; // page = 7
+        mux.resize(small).unwrap();
+        assert_eq!(
+            mux.scroll_state().unwrap().page,
+            7,
+            "page tracks the shrunk area"
+        );
+
+        // Grow: page grows, so the max offset shrinks (60 - 35 = 25); the
+        // bottom-parked offset 40 is clamped back to 25, not left in blank space.
+        let big = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 40,
+        }; // page = 35
+        mux.resize(big).unwrap();
+        let st = mux.scroll_state().unwrap();
+        assert_eq!(st.page, 35, "page tracks the grown area");
+        assert_eq!(
+            st.offset, 25,
+            "offset re-clamped to the new last page (60 - 35)"
         );
     }
 

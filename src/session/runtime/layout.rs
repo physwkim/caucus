@@ -8,6 +8,10 @@ impl Multiplexer {
     pub fn resize(&mut self, area: Rect) -> Result<()> {
         self.area = area;
         self.reflow();
+        // An open scrollback pager draws full-screen over the tiled view; keep
+        // its page height (scroll clamp + step) in sync with the new area, or
+        // scrolling desyncs from the live-windowed render.
+        self.resync_pager_page();
         Ok(())
     }
 
