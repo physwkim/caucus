@@ -109,6 +109,13 @@ pub struct Pty {
 }
 
 impl Pty {
+    /// Max chunks buffered between the reader thread and the event loop before
+    /// back-pressure kicks in. The event loop drains the whole queue every tick
+    /// (~4 ms), so this only fills when the loop stalls; at 8 KiB/chunk it caps
+    /// the per-panel read buffer at ~8 MiB instead of letting it grow without
+    /// bound when a panel firehoses output.
+    const READER_CHANNEL_BOUND: usize = 1024;
+
     /// Spawn `command` inside a fresh PTY sized `cols x rows`.
     ///
     /// Single owner of PTY creation (Invariant I-5).
@@ -142,7 +149,13 @@ impl Pty {
             .try_clone_reader()
             .map_err(|e| PtyError::Open(e.to_string()))?;
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        // Bounded so a panel firehosing output while the event loop is busy
+        // cannot grow this queue without limit. A full channel blocks the
+        // reader thread's `send`, which stops draining the PTY master — kernel
+        // back-pressure then stalls the child's writes until the event loop
+        // drains a tick later. Memory is capped at
+        // `READER_CHANNEL_BOUND × 8 KiB` per panel instead of unbounded.
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(Self::READER_CHANNEL_BOUND);
         let reader = std::thread::Builder::new()
             .name("caucus-pty-reader".to_string())
             .spawn(move || {
@@ -152,7 +165,8 @@ impl Pty {
                         // EOF: child closed the PTY. Stop the thread.
                         Ok(0) => break,
                         Ok(n) => {
-                            // Receiver dropped (Pty gone): nothing left to do.
+                            // Blocks when the queue is full (consumer behind);
+                            // an Err means the receiver dropped (Pty gone).
                             if tx.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
@@ -339,6 +353,33 @@ mod tests {
             text.contains("hi"),
             "expected child output 'hi', got {text:?}"
         );
+
+        pty.kill().unwrap();
+    }
+
+    #[test]
+    fn reader_channel_applies_backpressure_without_loss() {
+        // A child emits more than the reader channel can buffer
+        // (READER_CHANNEL_BOUND × 8 KiB ≈ 8 MiB). The reader thread blocks on a
+        // full queue and resumes as the consumer drains, so every byte still
+        // arrives — bounded memory, no loss, no deadlock. /dev/zero has no
+        // newlines, so PTY output processing cannot change the byte count.
+        const TOTAL: usize = 12 * 1024 * 1024; // > the ~8 MiB channel bound
+        let mut cmd = PtyCommand::new("/bin/sh");
+        cmd.args = vec!["-c".into(), format!("head -c {TOTAL} /dev/zero").into()];
+        let mut pty = Pty::spawn(&cmd, 80, 24).unwrap();
+
+        let mut got = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while got < TOTAL && Instant::now() < deadline {
+            let chunk = pty.read().unwrap();
+            if chunk.is_empty() {
+                std::thread::sleep(Duration::from_millis(5));
+            } else {
+                got += chunk.len();
+            }
+        }
+        assert_eq!(got, TOTAL, "every byte flows through the bounded channel");
 
         pty.kill().unwrap();
     }
