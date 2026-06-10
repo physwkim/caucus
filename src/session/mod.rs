@@ -10,5 +10,5 @@ pub mod state;
 
 pub use id::{AgentId, PanelId, RoundId, SessionId};
 pub use record::{PanelRecord, SessionRecord, SessionRecordError};
-pub use runtime::Multiplexer;
+pub use runtime::{LaunchMode, Multiplexer};
 pub use state::{Session, SessionState};

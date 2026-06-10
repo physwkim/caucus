@@ -193,12 +193,36 @@ pub struct Multiplexer {
     pending_clipboard: Option<String>,
 }
 
+/// Whether [`Multiplexer::new`] is opening a brand-new session or reopening a
+/// persisted one (`caucus resume`). The two intents differ at exactly one
+/// point — whether the session root directory may be *created*:
+///
+/// * `Fresh` allocates a new session, so it creates `<root>/`.
+/// * `Resume` reopens an existing one. It must NOT create `<root>/`: a missing
+///   root means the state was pruned by `caucus gc` (concurrently, or earlier),
+///   and recreating it would resurrect an empty session and silently proceed
+///   on lost pending-rounds / manifests / capture logs. Resume requires the
+///   root to already exist and fails cleanly otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// A new session — create the session root.
+    Fresh,
+    /// A resumed session — the root must already exist; never recreate it.
+    Resume,
+}
+
 impl Multiplexer {
     /// Build a multiplexer for `session`, binding the turn-signal socket and
     /// the MCP control socket (`docs/design.md` §0 #4).
     ///
-    /// The session root directory and its `agents/` + `panels/` subdirectories
-    /// are created here so manifest writes and capture spills have a home.
+    /// The lock is acquired *before* any directory is created so a resume can
+    /// never recreate (resurrect) a session root that `caucus gc` is pruning:
+    /// `gc` holds the same lock across its `remove_dir_all`, so either we win
+    /// the lock and it skips this session (raced), or it wins and our acquire
+    /// fails. `mode` decides whether the root may be created at all (see
+    /// [`LaunchMode`]). The `agents/` + `panels/` subdirectories are then
+    /// created under the held lock so manifest writes and capture spills have a
+    /// home.
     ///
     /// Returns the multiplexer plus the two socket servers the event loop
     /// drains: the [`SignalServer`] (turn signals) and the [`ControlServer`]
@@ -208,15 +232,35 @@ impl Multiplexer {
         config: Config,
         area: Rect,
         prefix: char,
+        mode: LaunchMode,
     ) -> Result<(Self, SignalServer, ControlServer)> {
-        std::fs::create_dir_all(session.root_dir.join("agents"))
-            .with_context(|| format!("create {}", session.root_dir.display()))?;
-        std::fs::create_dir_all(session.root_dir.join("panels"))?;
+        // The session root: `Fresh` creates it; `Resume` requires it to already
+        // exist and must never recreate it (that would resurrect a gc-pruned
+        // session — see `LaunchMode::Resume`).
+        match mode {
+            LaunchMode::Fresh => {
+                std::fs::create_dir_all(&session.root_dir)
+                    .with_context(|| format!("create {}", session.root_dir.display()))?;
+            }
+            LaunchMode::Resume if !session.root_dir.is_dir() => {
+                anyhow::bail!(
+                    "session {} state directory is gone ({}) — it was pruned by \
+                     `caucus gc`; there is nothing left to resume",
+                    session.id,
+                    session.root_dir.display(),
+                );
+            }
+            LaunchMode::Resume => {}
+        }
 
-        // Claim the session before binding its sockets: `SignalServer::bind`
-        // unlinks any existing socket, so acquiring the lock first means a
-        // second caucus refuses here instead of stealing the live owner's
-        // socket. The lock is held for the multiplexer's lifetime.
+        // Claim the session before creating subdirs or binding its sockets:
+        // `SignalServer::bind` unlinks any existing socket, so acquiring the
+        // lock first means a second caucus refuses here instead of stealing the
+        // live owner's socket. Acquiring before the subdir `create_dir_all`
+        // also keeps a racing `gc` from resurrecting the tree underneath us: the
+        // lock file lives inside `<root>`, so if `gc` already removed the root
+        // this acquire fails (its open hits `NotFound`) rather than rebuilding
+        // it. The lock is held for the multiplexer's lifetime.
         let session_lock = SessionLock::acquire(&session.root_dir).map_err(|err| match err {
             SessionLockError::AlreadyRunning { .. } => anyhow::anyhow!(
                 "session {} is already open in another caucus process; \
@@ -225,6 +269,10 @@ impl Multiplexer {
             ),
             other => anyhow::Error::new(other),
         })?;
+
+        std::fs::create_dir_all(session.root_dir.join("agents"))
+            .with_context(|| format!("create {}", session.root_dir.display()))?;
+        std::fs::create_dir_all(session.root_dir.join("panels"))?;
 
         let sock_path = socket_path(&session);
         let signal_server = SignalServer::bind(&sock_path)
@@ -415,7 +463,8 @@ mod tests {
         let config = Config::load(tmp.path()).unwrap();
         // Hold the signal server handle: the turn-signal socket exists only
         // while it is alive (removed on drop — see `SignalServer`'s Drop).
-        let (mux, _signal, _control) = Multiplexer::new(session, config, area(), 'a').unwrap();
+        let (mux, _signal, _control) =
+            Multiplexer::new(session, config, area(), 'a', LaunchMode::Fresh).unwrap();
         assert!(mux.session.root_dir.join("agents").is_dir());
         assert!(mux.session.root_dir.join("panels").is_dir());
         assert!(mux.sock_path().exists());
@@ -426,11 +475,56 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let session = Session::new("test", tmp.path().to_path_buf());
         let config = Config::load(tmp.path()).unwrap();
-        let (mux, _signal, control) = Multiplexer::new(session, config, area(), 'a').unwrap();
+        let (mux, _signal, control) =
+            Multiplexer::new(session, config, area(), 'a', LaunchMode::Fresh).unwrap();
         // The control socket is distinct from the turn-signal socket and
         // exists on disk.
         assert!(control.sock_path().exists());
         assert_ne!(control.sock_path(), mux.sock_path());
         assert_eq!(mux.control_sock_path(), control.sock_path());
+    }
+
+    /// `Resume` must never recreate a session root: a missing directory means
+    /// the state was pruned by `caucus gc`, so resuming would resurrect an
+    /// empty session and silently proceed on lost pending-rounds / manifests.
+    /// It fails cleanly and leaves the directory absent (no resurrection).
+    #[tokio::test]
+    async fn resume_on_a_pruned_root_fails_without_resurrecting() {
+        let tmp = TempDir::new().unwrap();
+        let session = Session::new("test", tmp.path().to_path_buf());
+        let root = session.root_dir.clone();
+        let config = Config::load(tmp.path()).unwrap();
+        // The session was never created (stand-in for a gc-pruned root).
+        assert!(!root.exists());
+
+        let err = match Multiplexer::new(session, config, area(), 'a', LaunchMode::Resume) {
+            Ok(_) => panic!("resuming a pruned session must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("pruned by `caucus gc`"),
+            "the error must name the gc prune, got: {err}"
+        );
+        assert!(
+            !root.exists(),
+            "a failed resume must not resurrect the session directory"
+        );
+    }
+
+    /// `Resume` on an existing root opens it in place (the normal resume path),
+    /// creating the `agents/` + `panels/` subdirs under the held lock.
+    #[tokio::test]
+    async fn resume_on_an_existing_root_opens_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let session = Session::new("test", tmp.path().to_path_buf());
+        let root = session.root_dir.clone();
+        let config = Config::load(tmp.path()).unwrap();
+        // Stand in for a persisted session whose root already exists.
+        std::fs::create_dir_all(&root).unwrap();
+
+        let (mux, _signal, _control) =
+            Multiplexer::new(session, config, area(), 'a', LaunchMode::Resume).unwrap();
+        assert!(mux.session.root_dir.join("agents").is_dir());
+        assert!(mux.session.root_dir.join("panels").is_dir());
     }
 }

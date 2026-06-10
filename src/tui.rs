@@ -36,9 +36,9 @@ use tracing::warn;
 use crate::config::Config;
 use crate::render::{self, Rect};
 use crate::role::spec::AgentCli;
-use crate::session::Multiplexer;
 use crate::session::record::{PanelRecord, SessionRecord};
 use crate::session::state::Session;
+use crate::session::{LaunchMode, Multiplexer};
 
 /// Event-loop redraw period — ~60 Hz. Paces the *fastest* redraw and the
 /// render-signature check; within a tick a frame is painted only when the
@@ -272,7 +272,8 @@ pub fn run(
     let runtime = tokio::runtime::Runtime::new().context("start tokio runtime")?;
     runtime.block_on(async move {
         let _guard = TerminalGuard::enter(config.settings.mouse)?;
-        let (terminal, mut mux, signal, control) = setup(config, session, prefix)?;
+        let (terminal, mut mux, signal, control) =
+            setup(config, session, prefix, LaunchMode::Fresh)?;
         spawn_fresh_roster(&mut mux, &roles, main_cli)?;
         event_loop(terminal, mux, signal, control).await
     })
@@ -315,7 +316,8 @@ pub fn run_resumed(
     let runtime = tokio::runtime::Runtime::new().context("start tokio runtime")?;
     runtime.block_on(async move {
         let _guard = TerminalGuard::enter(config.settings.mouse)?;
-        let (terminal, mut mux, signal, control) = setup(config, session, prefix)?;
+        let (terminal, mut mux, signal, control) =
+            setup(config, session, prefix, LaunchMode::Resume)?;
         restore_roster(&mut mux, &record)?;
         event_loop(terminal, mux, signal, control).await
     })
@@ -342,6 +344,7 @@ fn setup(
     config: Config,
     session: Session,
     prefix: char,
+    mode: LaunchMode,
 ) -> Result<(
     Term,
     Multiplexer,
@@ -354,7 +357,7 @@ fn setup(
     // Panels tile the *body* — the whole screen minus the one-row status bar.
     let area = body_area(whole_screen(&terminal)?);
     let (mux, signal_server, control_server) =
-        Multiplexer::new(session, config, area, prefix).context("build multiplexer")?;
+        Multiplexer::new(session, config, area, prefix, mode).context("build multiplexer")?;
     Ok((terminal, mux, signal_server, control_server))
 }
 

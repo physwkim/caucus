@@ -16,7 +16,8 @@ pub(crate) fn area() -> Rect {
 pub(crate) fn mux(tmp: &TempDir) -> Multiplexer {
     let session = Session::new("test", tmp.path().to_path_buf());
     let config = Config::load(tmp.path()).unwrap();
-    let (mux, _signal, _control) = Multiplexer::new(session, config, area(), 'a').unwrap();
+    let (mux, _signal, _control) =
+        Multiplexer::new(session, config, area(), 'a', LaunchMode::Fresh).unwrap();
     mux
 }
 

@@ -16,8 +16,8 @@ use caucus::config::Config;
 use caucus::mcp::protocol::{ControlRequest, ControlResponse};
 use caucus::mcp::{McpToolSurface, ReadPanelMode};
 use caucus::render::Rect;
-use caucus::session::Multiplexer;
 use caucus::session::state::Session;
+use caucus::session::{LaunchMode, Multiplexer};
 use tempfile::TempDir;
 
 /// Whole-screen rect for a test multiplexer.
@@ -121,7 +121,8 @@ fn mcp_serve_help_runs() {
 fn build_mux(tmp: &TempDir) -> (Multiplexer, caucus::mcp::control_server::ControlServer) {
     let session = Session::new("mcp-test", tmp.path().to_path_buf());
     let config = Config::load(tmp.path()).unwrap();
-    let (mux, _signal, control) = Multiplexer::new(session, config, area(), 'a').unwrap();
+    let (mux, _signal, control) =
+        Multiplexer::new(session, config, area(), 'a', LaunchMode::Fresh).unwrap();
     (mux, control)
 }
 
