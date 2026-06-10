@@ -233,6 +233,9 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
         "kill_panel" => Ok(ControlRequest::KillPanel {
             panel: panel(args)?,
         }),
+        "restart_panel" => Ok(ControlRequest::RestartPanel {
+            panel: panel(args)?,
+        }),
         "list_panels" => Ok(ControlRequest::ListPanels),
         "register_round" => {
             let raw = args
@@ -555,6 +558,13 @@ mod tests {
     fn build_request_rejects_bad_panel_id() {
         let err = build_request("ctrl_c", &json!({"panel": "not-a-ulid"})).unwrap_err();
         assert!(err.contains("invalid panel id"));
+    }
+
+    #[test]
+    fn build_restart_panel_request() {
+        let id = PanelId::new();
+        let req = build_request("restart_panel", &json!({"panel": id.to_string()})).unwrap();
+        assert_eq!(req, ControlRequest::RestartPanel { panel: id });
     }
 
     #[test]

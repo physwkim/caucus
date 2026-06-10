@@ -129,6 +129,16 @@ impl McpToolSurface for Multiplexer {
             .map_err(|e| McpError::Tool(format!("kill_panel: {e:#}")))
     }
 
+    fn restart_panel(&mut self, panel: PanelId) -> Result<PanelId, McpError> {
+        if !self.panels.iter().any(|p| p.id == panel) {
+            return Err(McpError::NoSuchPanel(panel));
+        }
+        // Delegate to the inherent restart path; a refused restart (the main
+        // panel) or a failed respawn surfaces as a tool error.
+        Multiplexer::restart_panel(self, panel)
+            .map_err(|e| McpError::Tool(format!("restart_panel: {e:#}")))
+    }
+
     fn list_panels(&self) -> Vec<PanelSummary> {
         self.panels
             .iter()

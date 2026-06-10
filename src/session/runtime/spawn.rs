@@ -36,6 +36,14 @@ struct SpawnPanelOpts<'a> {
     caucus_mcp: Option<CaucusMcp>,
 }
 
+/// The worktree a [`Multiplexer::detach_panel`] left behind, for the caller to
+/// dispose of: `kill_panel` enqueues it for deletion, `restart_panel` reuses it
+/// in place. `worktree_path` is `None` for a panel sharing the main checkout.
+struct DetachedPanel {
+    worktree_path: Option<PathBuf>,
+    worktree_branch: Option<String>,
+}
+
 impl Multiplexer {
     /// Spawn a panel for `role`, optionally with a CLI/model override and a
     /// pre-created worktree.
@@ -305,16 +313,17 @@ impl Multiplexer {
     /// Kill a panel: tear down the PTY, drop it from the registry, enqueue any
     /// worktree for cleanup, and reflow (`docs/design.md` §5).
     ///
-    /// Single owner of panel destruction (Invariant I-5).
+    /// Single owner of panel destruction (Invariant I-5). The registry removal
+    /// itself lives in [`Multiplexer::detach_panel`]; `kill_panel` is the
+    /// disposition that *deletes* the detached worktree. [`Multiplexer::restart_panel`]
+    /// is the other disposition — it *reuses* the worktree in place.
     pub fn kill_panel(&mut self, panel_id: PanelId) -> Result<()> {
-        let Some(idx) = self.panels.iter().position(|p| p.id == panel_id) else {
-            anyhow::bail!("no such panel: {panel_id}");
-        };
-        let mut panel = self.panels.remove(idx);
-        lifecycle::kill(&mut panel)?;
+        let detached = self.detach_panel(panel_id)?;
 
-        // Enqueue the worktree for serial cleanup (Invariant I-3).
-        if let Some(worktree) = panel.worktree_path.clone() {
+        // Enqueue the worktree for serial cleanup (Invariant I-3). The branch
+        // is kept (not in `branches_to_delete`) — `caucus resume` re-attaches a
+        // fresh worktree on it.
+        if let Some(worktree) = detached.worktree_path {
             let job = CleanupJob {
                 repo_root: self.session.repo_path.clone(),
                 worktree_paths: vec![worktree],
@@ -325,8 +334,83 @@ impl Multiplexer {
                 warn!(panel = %panel_id, "worktree cleanup queue closed");
             }
         }
+        Ok(())
+    }
+
+    /// Restart a sub-agent panel in place: tear it down and spawn a fresh agent
+    /// that *resumes* the same conversation (`claude_session_id`) in the same
+    /// worktree, under the same role / model / backend. Returns the NEW panel
+    /// id (a fresh PTY is a fresh id).
+    ///
+    /// Unlike kill + `spawn_role`, this preserves the panel's worktree — the
+    /// branch and its commits (and any uncommitted changes) stay checked out in
+    /// place, so the new agent picks up exactly where the old one left off — and
+    /// its agent session, so a wedged agent (OOM, a hung transport, a crashed
+    /// CLI) comes back with its context intact.
+    ///
+    /// The MAIN worker panel cannot be restarted: it is the caller of this very
+    /// tool and caucus's round-delivery target, so tearing it down mid-call
+    /// would orphan the request. That is an error, not a silent no-op.
+    pub fn restart_panel(&mut self, panel_id: PanelId) -> Result<PanelId> {
+        if self.main_panel_id == Some(panel_id) {
+            anyhow::bail!("cannot restart the main worker panel");
+        }
+        // Capture the agent identity to resume *before* the teardown drops the
+        // manifest. The role label (not the agent_name) is what the spawn path
+        // wants — it derives a fresh `role-N` name.
+        let manifest = self
+            .manifests
+            .get(&panel_id)
+            .ok_or_else(|| anyhow::anyhow!("no such panel: {panel_id}"))?;
+        let role = manifest.role.clone();
+        let agent_cli = Some(manifest.agent_cli);
+        let model = manifest.model.clone();
+        let resume_session_id = manifest.claude_session_id().map(str::to_string);
+
+        // Tear down through the single owner; reuse — do NOT clean up — the
+        // worktree it leaves behind.
+        let detached = self.detach_panel(panel_id)?;
+
+        let new_id = self.spawn_panel_resume(
+            &role,
+            agent_cli,
+            model,
+            detached.worktree_path,
+            detached.worktree_branch,
+            resume_session_id,
+            // A restarted panel keeps its preset role's prompt; the inline
+            // prompt is a live-`spawn_role` concern only.
+            None,
+        )?;
+        // `spawn_panel_resume` does not persist; persist the rebuilt roster now
+        // that the replacement panel is live.
+        self.persist_record();
+        Ok(new_id)
+    }
+
+    /// Remove a panel from the live registry — the single owner of that
+    /// transition (Invariant I-5): tear down its PTY, drop it from `panels` +
+    /// `manifests` + the side maps, fix focus / zoom / the main-pointer, reflow,
+    /// and persist the rebuilt roster.
+    ///
+    /// Returns the worktree the panel occupied (path + branch), if any, so the
+    /// caller decides its fate rather than this function reaching into a shared
+    /// queue: [`Multiplexer::kill_panel`] enqueues it for deletion,
+    /// [`Multiplexer::restart_panel`] reuses it. This keeps the registry
+    /// teardown in one place while leaving the worktree disposition explicit at
+    /// each call site.
+    fn detach_panel(&mut self, panel_id: PanelId) -> Result<DetachedPanel> {
+        let Some(idx) = self.panels.iter().position(|p| p.id == panel_id) else {
+            anyhow::bail!("no such panel: {panel_id}");
+        };
+        let mut panel = self.panels.remove(idx);
+        lifecycle::kill(&mut panel)?;
+
+        let detached = DetachedPanel {
+            worktree_path: panel.worktree_path.clone(),
+            worktree_branch: self.worktree_branches.remove(&panel_id),
+        };
         self.manifests.remove(&panel_id);
-        self.worktree_branches.remove(&panel_id);
         self.blocked_scan_cache.remove(&panel_id);
 
         // Keep `main_panel_id` an accurate invariant: it points to a live
@@ -338,7 +422,7 @@ impl Multiplexer {
             self.main_panel_id = None;
         }
 
-        // Killing the zoomed panel clears the zoom — the layout falls back to
+        // Detaching the zoomed panel clears the zoom — the layout falls back to
         // the tiled arrangement rather than zooming a now-dead id.
         if self.zoom == Some(panel_id) {
             self.zoom = None;
@@ -351,7 +435,7 @@ impl Multiplexer {
         }
         self.rebuild_layout_tree();
         self.persist_record();
-        Ok(())
+        Ok(detached)
     }
 
     /// Arm the close-panel confirm prompt (`Ctrl-A x`) for the focused panel.
@@ -480,6 +564,7 @@ impl Multiplexer {
 #[cfg(test)]
 mod tests {
     use crate::mcp::protocol::{ControlRequest, ControlResponse};
+    use crate::session::id::PanelId;
     use crate::session::runtime::test_support::*;
     use tempfile::TempDir;
 
@@ -627,5 +712,55 @@ mod tests {
             });
         assert!(summary.failed_worktrees.is_empty(), "{summary:?}");
         assert!(summary.failed_branches.is_empty(), "{summary:?}");
+    }
+
+    /// The main worker panel cannot be restarted — it is the caller and the
+    /// round-delivery target, so tearing it down mid-call would orphan the
+    /// request. The guard fires before any teardown (no live panel needed).
+    #[tokio::test]
+    async fn restart_panel_refuses_the_main_worker() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = PanelId::new();
+        mux.main_panel_id = Some(main);
+
+        let err = mux.restart_panel(main).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot restart the main worker panel"),
+            "got: {err}"
+        );
+    }
+
+    /// Restarting a sub-agent panel replaces it with a fresh PTY (a new id) in
+    /// the same registry slot — not a duplicate — and keeps its role. Spawning
+    /// needs a real agent CLI; the test is skipped when none is on PATH.
+    #[tokio::test]
+    async fn restart_panel_replaces_the_panel_with_a_fresh_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Ok(old) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        assert_eq!(mux.panels().len(), 1);
+
+        let new = mux.restart_panel(old).unwrap();
+        assert_ne!(new, old, "a restart is a fresh PTY → a fresh id");
+        assert_eq!(
+            mux.panels().len(),
+            1,
+            "the panel is replaced in place, not duplicated"
+        );
+        assert!(mux.panels().iter().any(|p| p.id == new));
+        assert!(!mux.panels().iter().any(|p| p.id == old));
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == new).unwrap().role,
+            "reviewer",
+            "the role is preserved across the restart"
+        );
+
+        mux.shutdown();
     }
 }

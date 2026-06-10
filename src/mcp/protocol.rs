@@ -75,6 +75,11 @@ pub enum ControlRequest {
     },
     /// Kill a panel; its worktree (if any) is enqueued for cleanup.
     KillPanel { panel: PanelId },
+    /// Restart a sub-agent panel in place: tear it down and respawn a fresh
+    /// agent resuming the same conversation in the same worktree. Answered with
+    /// the NEW panel id ([`ControlResponse::Spawned`]). The main worker panel
+    /// cannot be restarted.
+    RestartPanel { panel: PanelId },
     /// List every live panel with role + derived state.
     ListPanels,
     /// Register a *round*: caucus watches `panels` and, once they have all
@@ -294,6 +299,17 @@ mod tests {
                 backlog: None,
             }
         );
+    }
+
+    #[test]
+    fn restart_panel_round_trips() {
+        let req = ControlRequest::RestartPanel {
+            panel: PanelId::new(),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"op\":\"restart_panel\""));
+        let back: ControlRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(req, back);
     }
 
     #[test]

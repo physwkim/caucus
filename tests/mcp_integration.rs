@@ -86,6 +86,7 @@ fn mcp_serve_lists_the_tools_over_stdio() {
             "read_panel",
             "spawn_role",
             "kill_panel",
+            "restart_panel",
             "list_panels",
             "register_round",
             "read_menu",

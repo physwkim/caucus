@@ -62,6 +62,14 @@ impl Multiplexer {
                     Err(err) => ControlResponse::error(err),
                 }
             }
+            ControlRequest::RestartPanel { panel } => {
+                // Trait method (McpError) — the inherent `restart_panel`
+                // (anyhow) is shadowed, so call it through the trait.
+                match McpToolSurface::restart_panel(self, panel) {
+                    Ok(new_id) => ControlResponse::Spawned { panel: new_id },
+                    Err(err) => ControlResponse::error(err),
+                }
+            }
             ControlRequest::ListPanels => ControlResponse::Panels {
                 panels: self.list_panels(),
             },
@@ -209,6 +217,7 @@ mod tests {
                 mode: crate::mcp::ReadPanelMode::Screen,
             },
             ControlRequest::KillPanel { panel: ghost },
+            ControlRequest::RestartPanel { panel: ghost },
         ] {
             let resp = mux.execute_control(req);
             assert!(

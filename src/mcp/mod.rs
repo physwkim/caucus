@@ -2,9 +2,9 @@
 //! (`docs/design.md` §0 #4, §9).
 //!
 //! The main worker (a Claude Code agent in one panel) drives every sub-agent
-//! panel through eleven MCP tools: `send_keys`, `send_key`, `broadcast`,
-//! `ctrl_c`, `read_panel`, `spawn_role`, `kill_panel`, `list_panels`,
-//! `register_round`, `read_menu`, `select_option`.
+//! panel through twelve MCP tools: `send_keys`, `send_key`, `broadcast`,
+//! `ctrl_c`, `read_panel`, `spawn_role`, `kill_panel`, `restart_panel`,
+//! `list_panels`, `register_round`, `read_menu`, `select_option`.
 //!
 //! ## Architecture
 //!
@@ -25,7 +25,7 @@
 //! `rmcp` (1.7.0) resolves cleanly but its server surface is macro-driven and
 //! its transport runs an internal loop that resists deterministic unit
 //! testing. The MCP slice caucus needs is small — `initialize` / `tools/list`
-//! / `tools/call`, eleven tools — so [`jsonrpc`] implements exactly that, with
+//! / `tools/call`, twelve tools — so [`jsonrpc`] implements exactly that, with
 //! a pure dispatch core. See that module's header for the rationale.
 
 pub mod control_client;
@@ -137,6 +137,12 @@ pub trait McpToolSurface {
 
     /// Kill a panel; its worktree (if any) is enqueued for cleanup.
     fn kill_panel(&mut self, panel: PanelId) -> Result<(), McpError>;
+
+    /// Restart a sub-agent panel in place: tear it down and spawn a fresh agent
+    /// that resumes the same conversation in the same worktree, under the same
+    /// role / model / backend. Returns the NEW panel id. The main worker panel
+    /// cannot be restarted.
+    fn restart_panel(&mut self, panel: PanelId) -> Result<PanelId, McpError>;
 
     /// List every live panel with its derived state.
     fn list_panels(&self) -> Vec<PanelSummary>;
@@ -335,6 +341,24 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "restart_panel",
+            description: "Restart a wedged sub-agent panel in place: terminate \
+                          its current agent process and spawn a fresh one that \
+                          RESUMES the same conversation in the same worktree \
+                          (branch, commits, and uncommitted changes preserved), \
+                          under the same role / model / backend. Returns the NEW \
+                          panel id — re-target later calls at it. Use this when a \
+                          panel hangs, OOMs, or its CLI crashes and you want its \
+                          context back, instead of kill_panel + spawn_role (which \
+                          loses the worktree and the session). The main worker \
+                          panel cannot be restarted.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "panel": panel_prop() },
+                "required": ["panel"]
+            }),
+        },
+        ToolDef {
             name: "list_panels",
             description: "List every live panel with its role and derived state \
                           (working / idle / blocked_* / exited). Each row also \
@@ -459,6 +483,7 @@ mod tests {
                 "read_panel",
                 "spawn_role",
                 "kill_panel",
+                "restart_panel",
                 "list_panels",
                 "register_round",
                 "read_menu",
