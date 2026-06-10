@@ -635,17 +635,22 @@ impl Multiplexer {
 
     /// Whether every panel in `round` has settled *and* any per-panel backlog
     /// has drained. A missing panel counts as settled: there is no live worker
-    /// left to feed, even if a stale backlog entry exists for that id.
+    /// left to feed, even if a stale backlog entry exists for that id. An
+    /// `Exited` panel counts the same way: it is terminal, and
+    /// [`Self::feed_round_backlog`] only ever feeds `Idle` panels, so its
+    /// backlog can never drain — gating on it would wedge the round forever.
     fn round_settled(&self, round: &PendingRound) -> bool {
         if !self.wait_panels_settled(&round.panels) {
             return false;
         }
-        round.panels.iter().all(|id| {
-            if !self.panels.iter().any(|p| p.id == *id) {
-                return true;
-            }
-            round.backlog.get(id).is_none_or(VecDeque::is_empty)
-        })
+        round
+            .panels
+            .iter()
+            .all(|id| match self.panels.iter().find(|p| p.id == *id) {
+                None => true,
+                Some(p) if p.state() == PanelState::Exited => true,
+                Some(_) => round.backlog.get(id).is_none_or(VecDeque::is_empty),
+            })
     }
 
     /// Hand each cleanly-idle round panel its next backlog task, keeping an
@@ -2086,6 +2091,37 @@ mod tests {
 
         round.backlog.get_mut(&sub).unwrap().clear();
         assert!(mux.round_settled(&round), "draining the queue settles it");
+
+        mux.shutdown();
+    }
+
+    /// An `Exited` panel with queued backlog settles immediately. The panel is
+    /// terminal and `feed_round_backlog` only feeds `Idle` panels, so its
+    /// backlog can never drain — gating on it (like a live `Idle` panel) would
+    /// wedge the round forever. It is treated like a missing panel instead.
+    #[tokio::test]
+    async fn round_settles_when_a_panel_exits_with_undrained_backlog() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+        let round = pending_round(
+            vec![sub],
+            ReadPanelMode::LastMessage,
+            HashMap::new(),
+            HashMap::from([(sub, VecDeque::from(["queued".to_string()]))]),
+        );
+
+        assert!(
+            !mux.round_settled(&round),
+            "an idle panel with queued backlog is not settled"
+        );
+
+        mux.panels.iter_mut().find(|p| p.id == sub).unwrap().state = PanelState::Exited;
+
+        assert!(
+            mux.round_settled(&round),
+            "an exited panel with queued backlog settles — it can never drain"
+        );
 
         mux.shutdown();
     }
