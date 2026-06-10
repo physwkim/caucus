@@ -20,13 +20,15 @@
 //! synchronous `write_all` from the event loop would then block the entire
 //! multiplexer — no input, no pump, no redraw. With the writer thread, that
 //! block lands harmlessly in the per-panel writer thread while the event loop
-//! keeps ticking.
+//! keeps ticking. The queue feeding that thread is bounded, so a child that
+//! never resumes reading eventually makes `write` report `WriterFull` instead
+//! of growing memory without limit.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -84,6 +86,12 @@ pub enum PtyError {
     Io(#[from] std::io::Error),
     #[error("pty writer closed")]
     WriterClosed,
+    /// The writer queue is full: the child has stopped draining its stdin and
+    /// the bounded queue has filled. Transient — the input was not accepted and
+    /// the caller may retry once the child reads again. Distinct from
+    /// [`WriterClosed`], which means the panel is dead.
+    #[error("pty writer full")]
+    WriterFull,
 }
 
 /// One pseudo-terminal owning a child agent process (`docs/design.md` §9.1,
@@ -103,9 +111,12 @@ pub struct Pty {
     child: Box<dyn Child + Send + Sync>,
     /// Sender to the writer thread (`docs/design.md` §0 #11). `write` enqueues
     /// bytes here non-blockingly; the writer thread performs the blocking
-    /// `write_all` to the master off the event loop. `None` after `kill` (the
+    /// `write_all` to the master off the event loop. Bounded (a `SyncSender`)
+    /// so a child that stops draining its stdin cannot grow this queue without
+    /// limit; `write` `try_send`s and reports [`PtyError::WriterFull`] rather
+    /// than blocking the event loop when it is full. `None` after `kill` (the
     /// drop ends the writer thread).
-    writer_tx: Option<mpsc::Sender<Vec<u8>>>,
+    writer_tx: Option<SyncSender<Vec<u8>>>,
     /// Receiving end of the reader thread's channel; `read` drains it.
     /// `None` after `kill` drops it: dropping the receiver makes a reader thread
     /// parked in `send` on a full channel observe `Err` and exit, so the join in
@@ -124,6 +135,15 @@ impl Pty {
     /// the per-panel read buffer at ~8 MiB instead of letting it grow without
     /// bound when a panel firehoses output.
     const READER_CHANNEL_BOUND: usize = 1024;
+
+    /// Max input chunks buffered between the event loop and the writer thread
+    /// before [`write`](Self::write) starts reporting [`PtyError::WriterFull`].
+    /// Unlike the reader's producer (the child, throttled by kernel PTY
+    /// back-pressure), this queue's producer is the event loop, which must never
+    /// block — so a full queue is reported, not waited on. The cap matters only
+    /// when a child stops draining its stdin: without it, every keystroke or
+    /// `send_keys` while the child is wedged would accumulate without limit.
+    const WRITER_CHANNEL_BOUND: usize = 1024;
 
     /// Spawn `command` inside a fresh PTY sized `cols x rows`.
     ///
@@ -193,7 +213,7 @@ impl Pty {
         // Ends when the Sender is dropped (`kill`) or a write fails (child gone
         // / PTY closed) — at which point a write blocked on a non-reading child
         // unwinds via the broken-pipe error and the thread exits.
-        let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
+        let (writer_tx, writer_rx) = mpsc::sync_channel::<Vec<u8>>(Self::WRITER_CHANNEL_BOUND);
         let writer_thread = std::thread::Builder::new()
             .name("caucus-pty-writer".to_string())
             .spawn(move || {
@@ -246,12 +266,20 @@ impl Pty {
     /// Non-blocking: the bytes are handed to the per-panel writer thread, which
     /// performs the blocking `write_all` off the event loop. `Ok` therefore
     /// means "queued", not "delivered to the kernel" — the decoupling that
-    /// stops a non-reading agent from stalling the whole multiplexer. The only
-    /// error is [`PtyError::WriterClosed`]: the writer thread has gone (the PTY
-    /// was killed), i.e. the panel is dead.
+    /// stops a non-reading agent from stalling the whole multiplexer. Two
+    /// errors, both leaving the input un-queued: [`PtyError::WriterClosed`] when
+    /// the writer thread has gone (the PTY was killed — the panel is dead), and
+    /// [`PtyError::WriterFull`] when the bounded queue is full because the child
+    /// has stopped draining its stdin (transient — the caller may retry).
     pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
         match &self.writer_tx {
-            Some(tx) => tx.send(bytes.to_vec()).map_err(|_| PtyError::WriterClosed),
+            // `try_send` keeps this non-blocking: a wedged child fills the queue
+            // but never stalls the event loop. `Full` is transient back-pressure;
+            // `Disconnected` means the writer thread is gone (panel dead).
+            Some(tx) => tx.try_send(bytes.to_vec()).map_err(|e| match e {
+                mpsc::TrySendError::Full(_) => PtyError::WriterFull,
+                mpsc::TrySendError::Disconnected(_) => PtyError::WriterClosed,
+            }),
             None => Err(PtyError::WriterClosed),
         }
     }
@@ -510,6 +538,49 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(1),
             "write blocked for {elapsed:?}; it must enqueue and return at once"
+        );
+
+        pty.kill().unwrap();
+    }
+
+    #[test]
+    fn write_reports_full_instead_of_growing_without_bound() {
+        // A child that never drains its stdin wedges the writer thread on its
+        // blocking `write_all`; the bounded queue behind it then fills. `write`
+        // must report `WriterFull` (non-blocking back-pressure) within roughly
+        // `WRITER_CHANNEL_BOUND` chunks rather than queueing forever, and must
+        // never block the event loop. This is the regression guard for the
+        // unbounded-writer-queue class.
+        let mut cmd = PtyCommand::new("/bin/sh");
+        cmd.args = vec!["-c".into(), "sleep 30".into()];
+        let mut pty = Pty::spawn(&cmd, 80, 24).unwrap();
+
+        // Chunks larger than the kernel PTY input queue so the writer thread
+        // wedges almost immediately and stops draining the channel.
+        let chunk = vec![b'x'; 8192];
+        let mut full_at = None;
+        let ceiling = Pty::WRITER_CHANNEL_BOUND + 256;
+        for i in 0..ceiling {
+            let start = Instant::now();
+            let result = pty.write(&chunk);
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "write blocked on iteration {i}; it must never block the event loop"
+            );
+            match result {
+                Ok(()) => continue,
+                Err(PtyError::WriterFull) => {
+                    full_at = Some(i);
+                    break;
+                }
+                Err(e) => panic!("unexpected write error on iteration {i}: {e}"),
+            }
+        }
+        let full_at =
+            full_at.expect("writer queue never reported WriterFull; it grew without bound");
+        assert!(
+            full_at >= 1,
+            "WriterFull on the very first write ({full_at}); the queue should buffer first"
         );
 
         pty.kill().unwrap();
