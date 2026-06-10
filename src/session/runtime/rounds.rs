@@ -553,11 +553,31 @@ impl Multiplexer {
     /// `dropped-rounds.log` (preserved, not lost), and a single notice is
     /// queued for the resumed main worker — whose claude conversation reloaded
     /// still believing its `register_round` was live — telling it the round was
-    /// dropped so it stops waiting and can re-issue the work. The persisted file
-    /// is then cleared.
+    /// dropped so it stops waiting and can re-issue the work.
+    ///
+    /// `pending-rounds.json` is cleared immediately (it is reused for *this*
+    /// session's live rounds), but the generated notice is in-memory only and
+    /// not delivered until the main worker next goes idle. So the notice is also
+    /// persisted to `resume-notice.txt` and only removed once delivered
+    /// ([`Self::poll_resume_notice`]) — and any such notice a *prior* run left
+    /// undelivered is loaded here first, so a second crash before delivery does
+    /// not lose it. Delivery is at-least-once, never silently dropped.
     pub fn ingest_resumed_rounds(&mut self) {
-        let records = crate::session::round_record::read(&self.session.root_dir);
+        let root = self.session.root_dir.clone();
+
+        // A prior run may have generated a drop notice it crashed before
+        // delivering; recover it so it is still surfaced this run.
+        let carried = crate::session::round_record::read_notice(&root);
+
+        let records = crate::session::round_record::read(&root);
+        // Free `pending-rounds.json` for the resumed session's live rounds. The
+        // dropped work is preserved in `dropped-rounds.log` and the notice in
+        // `resume-notice.txt` below, so the source snapshot is no longer needed.
+        crate::session::round_record::clear(&root);
         if records.is_empty() {
+            // No newly-dropped rounds, but a carried-over notice still must be
+            // delivered (and stays persisted until it is).
+            self.resume_round_notice = carried;
             return;
         }
 
@@ -599,11 +619,20 @@ impl Multiplexer {
             );
         }
 
+        // Prepend any carried-over notice a prior run never delivered, so both
+        // reach the main worker in one push.
+        let notice = match carried {
+            Some(prev) => format!("{prev}\n\n{notice}"),
+            None => notice,
+        };
+        // Persist the notice durably *before* queuing it: it is delivered only
+        // when the main worker next goes idle, and a crash in that window would
+        // otherwise lose it (`pending-rounds.json` was already cleared above).
+        // `poll_resume_notice` removes this file once the push lands.
+        if let Err(err) = crate::session::round_record::write_notice(&root, &notice) {
+            warn!(error = %err, "resume-notice persistence failed");
+        }
         self.resume_round_notice = Some(notice);
-        // The work is now preserved + queued; the durable snapshot has served
-        // its purpose, so clear it (a re-crash before delivery would otherwise
-        // re-surface the same already-recorded rounds).
-        crate::session::round_record::clear(&self.session.root_dir);
     }
 
     /// Deliver the resume notice (in-flight rounds dropped by the last restart)
@@ -628,7 +657,11 @@ impl Multiplexer {
             .clone()
             .expect("checked Some above");
         match McpToolSurface::send_keys(self, main_id, &notice, true) {
-            Ok(()) => self.resume_round_notice = None,
+            // Delivered: drop the in-memory copy and the durable backup together.
+            Ok(()) => {
+                self.resume_round_notice = None;
+                crate::session::round_record::clear_notice(&self.session.root_dir);
+            }
             Err(err) => warn!(error = %err, "resume-notice delivery to main panel failed"),
         }
     }
@@ -2768,6 +2801,84 @@ mod tests {
             mux.panels().iter().find(|p| p.id == main).unwrap().state(),
             PanelState::Idle,
             "no persisted rounds means no notice and no injected turn",
+        );
+
+        mux.shutdown();
+    }
+
+    /// Ingest clears `pending-rounds.json` (freeing it for live rounds) but must
+    /// persist the generated drop notice to `resume-notice.txt`, so a crash
+    /// before the main worker is idle does not lose it. Delivery then removes the
+    /// durable backup.
+    #[tokio::test]
+    async fn ingest_persists_the_notice_until_delivered() {
+        use crate::session::round_record::{self, PendingRoundRecord, RoundPanelRecord};
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let recs = vec![PendingRoundRecord {
+            panels: vec![RoundPanelRecord {
+                role: "backend".into(),
+                captured: vec![],
+                pending_backlog: 0,
+            }],
+            read_mode: ReadPanelMode::LastMessage,
+        }];
+        round_record::write(&mux.session.root_dir, &recs).unwrap();
+
+        mux.ingest_resumed_rounds();
+        assert!(
+            !round_record::path(&mux.session.root_dir).exists(),
+            "pending-rounds.json is freed for the resumed session's live rounds"
+        );
+        assert!(
+            round_record::notice_path(&mux.session.root_dir).exists(),
+            "the undelivered notice must be persisted to survive a crash"
+        );
+        assert!(mux.resume_round_notice.is_some());
+
+        // Deliver it: the durable backup is removed only once it lands.
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        mux.poll_resume_notice();
+        assert!(
+            !round_record::notice_path(&mux.session.root_dir).exists(),
+            "a delivered notice clears the durable backup"
+        );
+
+        mux.shutdown();
+    }
+
+    /// A notice a prior run generated but crashed before delivering survives in
+    /// `resume-notice.txt`; the next resume must re-surface it (even with no new
+    /// dropped rounds) so the drop is delivered at-least-once, never lost.
+    #[tokio::test]
+    async fn ingest_recovers_a_prior_undelivered_notice() {
+        use crate::session::round_record;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        round_record::write_notice(&mux.session.root_dir, "[caucus] dropped round X").unwrap();
+        // No pending-rounds.json this run (the prior run already cleared it).
+
+        mux.ingest_resumed_rounds();
+        assert_eq!(
+            mux.resume_round_notice.as_deref(),
+            Some("[caucus] dropped round X"),
+            "a carried-over notice must be re-surfaced even with no new dropped rounds",
+        );
+
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        mux.poll_resume_notice();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the recovered notice is delivered to the idle main worker",
+        );
+        assert!(
+            !round_record::notice_path(&mux.session.root_dir).exists(),
+            "delivery clears the durable notice backup",
         );
 
         mux.shutdown();

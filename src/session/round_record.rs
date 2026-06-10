@@ -24,6 +24,14 @@ use crate::mcp::ReadPanelMode;
 /// File name of the pending-rounds record under a session root.
 pub const PENDING_ROUNDS_FILE: &str = "pending-rounds.json";
 
+/// File name of the durable, not-yet-delivered resume notice under a session
+/// root. The notice (in-flight rounds dropped by the last restart) is generated
+/// at resume from `pending-rounds.json`, but that file is cleared immediately to
+/// free it for the resumed session's *live* rounds. Persisting the notice text
+/// separately keeps it across a *second* crash before the main worker has been
+/// told, so the drop is delivered at-least-once instead of being silently lost.
+pub const RESUME_NOTICE_FILE: &str = "resume-notice.txt";
+
 /// One panel's slice of an in-flight round, snapshotted for resume.
 ///
 /// Keyed by position (the panel's index within the round), not by panel id:
@@ -90,6 +98,35 @@ pub fn read(session_root: &Path) -> Vec<PendingRoundRecord> {
 /// Remove the pending-rounds file, ignoring a missing one.
 pub fn clear(session_root: &Path) {
     let _ = std::fs::remove_file(path(session_root));
+}
+
+/// `<session_root>/resume-notice.txt`.
+pub fn notice_path(session_root: &Path) -> PathBuf {
+    session_root.join(RESUME_NOTICE_FILE)
+}
+
+/// Persist the undelivered resume notice durably. Atomic write-to-temp +
+/// rename, so a crash mid-write never leaves a truncated notice. Cleared by
+/// [`clear_notice`] once the main worker has received it.
+pub fn write_notice(session_root: &Path, notice: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(session_root)?;
+    let path = notice_path(session_root);
+    let tmp = path.with_extension("txt.tmp");
+    std::fs::write(&tmp, notice.as_bytes())?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Read a persisted, not-yet-delivered resume notice, if one survived a prior
+/// run that generated it but crashed before delivering it. A missing or
+/// unreadable file yields `None` — there is simply no pending notice.
+pub fn read_notice(session_root: &Path) -> Option<String> {
+    std::fs::read_to_string(notice_path(session_root)).ok()
+}
+
+/// Remove the persisted resume notice, ignoring a missing one. Called once the
+/// notice has been delivered to the main worker.
+pub fn clear_notice(session_root: &Path) {
+    let _ = std::fs::remove_file(notice_path(session_root));
 }
 
 #[cfg(test)]
