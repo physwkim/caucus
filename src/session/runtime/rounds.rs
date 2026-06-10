@@ -8,12 +8,11 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-/// Default fallback budget for a registered round when the caller omits
-/// `fallback_secs` — the safety-net deadline after which caucus delivers a
-/// partial report even if some panels never settled.
-const ROUND_FALLBACK_DEFAULT_SECS: u64 = 600;
-/// Hard cap on a round's fallback budget.
-const ROUND_FALLBACK_MAX_SECS: u64 = 3600;
+// The round fallback default + hard cap live in `config::settings` (the default
+// is the `round_fallback_secs` tunable; the cap bounds it and per-call
+// overrides). Imported here so register_round reads the single source of truth.
+use crate::config::settings::ROUND_FALLBACK_MAX_SECS;
+
 /// How long caucus holds an injected round after the user's last un-submitted
 /// keystroke to the main panel — the grace across a mid-compose pause, so a
 /// delivery never lands in the middle of a line the user is still typing.
@@ -238,7 +237,8 @@ impl Multiplexer {
     /// Register a round on `panels`: stash a [`PendingRound`] for the event
     /// loop to deliver and ack immediately with the panels' current snapshot.
     /// `fallback_secs` is clamped to `[1, ROUND_FALLBACK_MAX_SECS]`, defaulting
-    /// to `ROUND_FALLBACK_DEFAULT_SECS`; `read_mode` defaults to `LastMessage`.
+    /// to the `[settings]` `round_fallback_secs` tunable
+    /// (`self.config.settings`); `read_mode` defaults to `LastMessage`.
     ///
     /// Unlike the removed blocking wait, this never special-cases an
     /// already-settled round — delivery is decided uniformly by
@@ -259,7 +259,7 @@ impl Multiplexer {
         backlog: Option<HashMap<PanelId, Vec<String>>>,
     ) -> ControlResponse {
         let budget = fallback_secs
-            .unwrap_or(ROUND_FALLBACK_DEFAULT_SECS)
+            .unwrap_or(self.config.settings.round_fallback_secs)
             .clamp(1, ROUND_FALLBACK_MAX_SECS);
         let backlog = backlog
             .unwrap_or_default()

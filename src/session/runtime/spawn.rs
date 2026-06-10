@@ -277,6 +277,7 @@ impl Multiplexer {
             outcome.panel_id,
             outcome.manifest.agent_id,
             rect,
+            &self.config.settings,
         )?;
         let panel_id = panel.id;
         // Turn-segmented capture spills to `<session>/panels/<panel>.log`

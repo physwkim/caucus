@@ -191,8 +191,16 @@ impl Grid {
     pub const MAX_COLS: usize = 2000;
     pub const MAX_ROWS: usize = 1000;
 
-    /// Build a blank grid sized `cols x rows`.
+    /// Build a blank grid sized `cols x rows` with the default scrollback depth
+    /// ([`Self::DEFAULT_SCROLLBACK`]).
     pub fn new(cols: usize, rows: usize) -> Self {
+        Self::with_scrollback(cols, rows, Self::DEFAULT_SCROLLBACK)
+    }
+
+    /// Build a blank grid sized `cols x rows` retaining `scrollback_limit` rows
+    /// of scrollback — the configurable form behind [`Self::new`], so the panel
+    /// owner can apply the `[settings]` `scrollback_lines` tunable.
+    pub fn with_scrollback(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
         let rows = rows.clamp(1, Self::MAX_ROWS);
         let cols = cols.clamp(1, Self::MAX_COLS);
         Self {
@@ -200,7 +208,7 @@ impl Grid {
             rows,
             viewport: vec![Cell::default(); cols * rows],
             scrollback: std::collections::VecDeque::new(),
-            scrollback_limit: Self::DEFAULT_SCROLLBACK,
+            scrollback_limit,
             cursor: (0, 0),
             parser: Parser::new(),
             pen: Pen::default(),
@@ -1374,6 +1382,20 @@ mod tests {
         assert_eq!(oldest.trim_end(), "6");
         let newest: String = sb[2].iter().map(|c| c.ch).collect();
         assert_eq!(newest.trim_end(), "8");
+    }
+
+    #[test]
+    fn with_scrollback_sets_the_ring_capacity() {
+        // The configurable constructor (behind the `scrollback_lines` setting)
+        // must cap the ring at the requested depth, not the default.
+        let mut g = Grid::with_scrollback(4, 2, 3);
+        for i in 0..10u8 {
+            g.advance(&[b'0' + i]);
+            g.advance(b"\r\n");
+        }
+        assert_eq!(g.scrollback().count(), 3, "ring capped at the configured 3");
+        // ...and the default constructor keeps the documented default depth.
+        assert_eq!(Grid::new(4, 2).scrollback_limit, Grid::DEFAULT_SCROLLBACK);
     }
 
     #[test]

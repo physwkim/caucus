@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use thiserror::Error;
 
 use crate::agent::spawn::SpawnRequest;
+use crate::config::settings::Settings;
 use crate::pty::{Pty, PtyCommand, PtyError};
 use crate::render::Rect;
 use crate::session::id::{AgentId, PanelId};
@@ -235,20 +236,23 @@ pub(crate) fn transition(panel: &mut Panel, to: PanelState) -> Result<(), Illega
 /// delivered.
 ///
 /// `agent_id` ties the panel to the [`crate::agent::AgentManifest`] the caller
-/// persists; `panel_id` must equal the manifest's `panel_id`.
+/// persists; `panel_id` must equal the manifest's `panel_id`. `settings`
+/// supplies the panel's scrollback depth and capture caps (the `[settings]`
+/// tunables), applied at construction so the panel is born fully configured.
 pub(crate) fn spawn(
     request: &SpawnRequest,
     command: PtyCommand,
     panel_id: PanelId,
     agent_id: AgentId,
     rect: Rect,
+    settings: &Settings,
 ) -> Result<Panel, PanelError> {
     let inner = rect.inner();
     let cols = inner.width.max(MIN_GRID_COLS);
     let rows = inner.height.max(MIN_GRID_ROWS);
 
     let pty = Pty::spawn(&command, cols, rows).map_err(|e| PanelError::Spawn(e.to_string()))?;
-    let grid = Grid::new(cols as usize, rows as usize);
+    let grid = Grid::with_scrollback(cols as usize, rows as usize, settings.scrollback_lines);
 
     Ok(Panel {
         id: panel_id,
@@ -258,7 +262,10 @@ pub(crate) fn spawn(
         worktree_path: request.worktree_path.clone(),
         pty,
         grid,
-        capture: OutputCapture::new(),
+        capture: OutputCapture::with_limits(
+            settings.capture_turn_limit,
+            settings.capture_open_turn_bytes,
+        ),
     })
 }
 

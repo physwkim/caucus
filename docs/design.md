@@ -339,6 +339,22 @@ role의 system prompt가 되어 template을 대체한다(없으면 spec의 templ
 
 `<repo>/.caucus/roles.toml`로 프로젝트별 오버라이드 가능. 같은 role 이름이면 프로젝트가 우선.
 
+**튜너블 — `settings.toml`의 `[settings]` 테이블.** 스크롤백 깊이·라운드 fallback
+기본값·캡처 한도 등 예전엔 하드코딩이던 값을 `~/.caucus/settings.toml`(전역) +
+`<repo>/.caucus/settings.toml`(프로젝트, 우선)로 노출한다. roles.toml과 동일한
+레이어링: 키별로 미설정이면 아래 레이어로, 끝내 컴파일된 기본값(예전 상수)으로
+떨어진다.
+
+```toml
+[settings]
+scrollback_lines        = 10000  # 패널별 스크롤백 깊이(행)
+round_fallback_secs     = 600    # 라운드 안전망 데드라인 기본값([1, 3600]로 clamp)
+capture_turn_limit      = 64     # 패널당 메모리에 유지하는 닫힌 턴 수
+capture_open_turn_bytes = 4194304 # 열린(진행 중) 턴 하나의 메모리 바이트 상한
+```
+
+`[settings]` 안의 오탈자 키는 무시되지 않고 거부된다(로드 에러).
+
 **`allowed_tools`에 `Task`를 넣지 않는다(§0 #13).** agent가 자기 세션 안에서
 보이지 않는 sub-agent를 띄우면 caucus가 관찰할 수 없다. 모든 sub-agent는
 패널이어야 하므로, 위임은 main worker가 `spawn_role`로 새 패널을 만들어 수행한다.

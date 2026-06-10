@@ -78,15 +78,24 @@ impl OutputCapture {
     /// dropped head was already scrolled out of any `read_panel` result.
     pub const DEFAULT_OPEN_TURN_BYTES: usize = 4 << 20;
 
-    /// Build an empty capture.
+    /// Build an empty capture with the default in-memory caps
+    /// ([`Self::DEFAULT_TURN_LIMIT`] / [`Self::DEFAULT_OPEN_TURN_BYTES`]).
     pub fn new() -> Self {
+        Self::with_limits(Self::DEFAULT_TURN_LIMIT, Self::DEFAULT_OPEN_TURN_BYTES)
+    }
+
+    /// Build an empty capture retaining `memory_turn_limit` closed turns and
+    /// capping a single open turn at `open_turn_byte_limit` bytes — the
+    /// configurable form behind [`Self::new`], so the panel owner can apply the
+    /// `[settings]` `capture_turn_limit` / `capture_open_turn_bytes` tunables.
+    pub fn with_limits(memory_turn_limit: usize, open_turn_byte_limit: usize) -> Self {
         Self {
             turns: Vec::new(),
             open: None,
-            memory_turn_limit: Self::DEFAULT_TURN_LIMIT,
+            memory_turn_limit,
             log_path: None,
             spilled_turns: 0,
-            open_turn_byte_limit: Self::DEFAULT_OPEN_TURN_BYTES,
+            open_turn_byte_limit,
             last_render: RefCell::new(None),
         }
     }
@@ -304,6 +313,21 @@ impl Default for OutputCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_limits_sets_both_caps() {
+        // The configurable constructor (behind the capture settings) carries the
+        // requested caps; the default constructor keeps the documented defaults.
+        let cap = OutputCapture::with_limits(2, 100);
+        assert_eq!(cap.memory_turn_limit, 2);
+        assert_eq!(cap.open_turn_byte_limit, 100);
+        let default = OutputCapture::new();
+        assert_eq!(default.memory_turn_limit, OutputCapture::DEFAULT_TURN_LIMIT);
+        assert_eq!(
+            default.open_turn_byte_limit,
+            OutputCapture::DEFAULT_OPEN_TURN_BYTES
+        );
+    }
 
     #[test]
     fn turn_lifecycle_captures_output() {

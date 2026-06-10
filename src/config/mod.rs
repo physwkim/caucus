@@ -3,11 +3,14 @@
 //!
 //! Layered lookup (later layers override earlier):
 //!
-//! 1. Embedded defaults (built-in roles) — see [`embedded_defaults`].
-//! 2. `~/.caucus/roles.toml` — user-global overrides.
-//! 3. `<repo>/.caucus/roles.toml` — project overrides (highest precedence).
+//! 1. Embedded defaults (built-in roles; compiled tunables) — see
+//!    [`embedded_defaults`] / [`settings::Settings::default`].
+//! 2. `~/.caucus/{roles,settings}.toml` — user-global overrides.
+//! 3. `<repo>/.caucus/{roles,settings}.toml` — project overrides (highest
+//!    precedence).
 
 pub mod roles;
+pub mod settings;
 
 use std::path::{Path, PathBuf};
 
@@ -17,12 +20,15 @@ use crate::role::registry::RoleRegistry;
 use crate::role::spec::{AgentCli, RoleSpec};
 
 use roles::{RolesConfig, RolesError};
+use settings::{Settings, SettingsError};
 
 /// Errors from building the merged configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error(transparent)]
     Roles(#[from] RolesError),
+    #[error(transparent)]
+    Settings(#[from] SettingsError),
     #[error("home directory not found")]
     NoHome,
 }
@@ -32,6 +38,8 @@ pub enum ConfigError {
 pub struct Config {
     /// Merged role registry (embedded defaults + global + project).
     pub roles: RoleRegistry,
+    /// Resolved process-wide tunables (`[settings]`; built-in < global < project).
+    pub settings: Settings,
     /// `~/.caucus/` — the global config directory, if `$HOME` was set.
     pub global_dir: Option<PathBuf>,
     /// `<repo>/.caucus/` — the project config directory.
@@ -41,7 +49,8 @@ pub struct Config {
 impl Config {
     /// Load and merge configuration for a project rooted at `repo`.
     ///
-    /// Layers: embedded defaults < `~/.caucus/roles.toml` < `<repo>/.caucus/roles.toml`.
+    /// Layers (per file): embedded defaults < `~/.caucus/<file>` <
+    /// `<repo>/.caucus/<file>`, for both `roles.toml` and `settings.toml`.
     pub fn load(repo: &Path) -> Result<Self, ConfigError> {
         let global_dir = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".caucus"));
         let project_dir = repo.join(".caucus");
@@ -52,8 +61,11 @@ impl Config {
         }
         merged = merged.override_with(RolesConfig::load(&project_dir.join("roles.toml"))?);
 
+        let settings = settings::load(global_dir.as_deref(), &project_dir)?;
+
         Ok(Self {
             roles: RoleRegistry::from_specs(merged.into_specs()),
+            settings,
             global_dir,
             project_dir,
         })
