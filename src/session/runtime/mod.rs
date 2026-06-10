@@ -184,6 +184,13 @@ pub struct Multiplexer {
     /// the close-confirm prompt — have no such counter, so this epoch is the
     /// catch-all that forces exactly one redraw after any keystroke.
     view_epoch: u64,
+    /// An OSC 52 set-clipboard escape sequence the pager's copy-mode yank
+    /// queued, awaiting flush to the host terminal. The Multiplexer never
+    /// writes to stdout itself (it owns no terminal handle and must stay
+    /// unit-testable); the event loop drains this with
+    /// [`Multiplexer::take_pending_clipboard`] and writes it. `None` when no
+    /// copy is pending.
+    pending_clipboard: Option<String>,
 }
 
 impl Multiplexer {
@@ -262,6 +269,7 @@ impl Multiplexer {
                 resume_round_notice: None,
                 last_liveness_probe: None,
                 view_epoch: 0,
+                pending_clipboard: None,
             },
             signal_server,
             control_server,

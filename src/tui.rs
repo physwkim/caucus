@@ -635,6 +635,17 @@ async fn event_loop(
             }
         }
 
+        // 1b. Clipboard — a copy-mode yank (`v` then `y` in the pager) queued an
+        //     OSC 52 set-clipboard sequence; emit it to the host terminal so the
+        //     selection lands on the system clipboard. Best-effort: terminals
+        //     without OSC 52 support silently drop it, and a write error here is
+        //     non-fatal (the session keeps running).
+        if let Some(seq) = mux.take_pending_clipboard()
+            && let Err(e) = write_clipboard_osc(&seq)
+        {
+            warn!(error = %e, "clipboard OSC 52 write failed");
+        }
+
         // 2. Turn signals — drain whatever the socket server has queued.
         while let Ok(signal) = signal_server.signals().try_recv() {
             mux.handle_signal(signal);
@@ -737,6 +748,17 @@ fn body_area(screen: Rect) -> Rect {
         height: screen.height.saturating_sub(1),
         ..screen
     }
+}
+
+/// Write a copy-mode OSC 52 set-clipboard sequence to the host terminal. The
+/// sequence carries no visible glyphs and leaves the cursor put, so emitting it
+/// between ratatui frames does not disturb the drawn screen; stdout is locked
+/// and flushed so it is delivered as one uninterrupted burst.
+fn write_clipboard_osc(seq: &str) -> io::Result<()> {
+    use std::io::Write;
+    let mut out = io::stdout().lock();
+    out.write_all(seq.as_bytes())?;
+    out.flush()
 }
 
 /// Draw one frame: every panel, plus a one-line status bar at the bottom.

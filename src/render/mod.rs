@@ -812,7 +812,13 @@ pub(crate) fn draw_scroll_pager(frame: &mut Frame, state: &ScrollState) {
     // body; window the snapshot to exactly that many rows.
     let inner_h = popup.height.saturating_sub(2) as usize;
     let (visible, mut title) = scroll_window(&state.role, &state.lines, state.offset, inner_h);
-    title.push_str(&search_status(state));
+    // Copy mode owns the status suffix while active (its selection highlight
+    // replaces the search highlight); otherwise the search status shows.
+    if state.copy.active {
+        title.push_str(&copy_status(state));
+    } else {
+        title.push_str(&search_status(state));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -828,16 +834,28 @@ pub(crate) fn draw_scroll_pager(frame: &mut Frame, state: &ScrollState) {
                 .add_modifier(Modifier::BOLD),
         ));
 
+    let start = state.offset.min(state.lines.len());
     let lines: Vec<Line<'static>> = if visible.is_empty() {
         vec![Line::from(Span::styled(
             "  (no scrollback)",
             Style::default().fg(Color::DarkGray),
         ))]
+    } else if state.copy.active {
+        // Copy mode: paint the selected line range, the cursor end brighter.
+        let (lo, hi) = state.copy.selection();
+        let cursor = state.copy.cursor;
+        visible
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let abs = start + i;
+                select_line(l, (lo..=hi).contains(&abs), abs == cursor)
+            })
+            .collect()
     } else {
         // Highlight the committed query in every visible line; the *current*
         // match line (`n`/`N` target) gets a stronger style.
         let query = state.search.query.as_str();
-        let start = state.offset.min(state.lines.len());
         let current_line = state.search.matches.get(state.search.current).copied();
         visible
             .iter()
@@ -904,6 +922,35 @@ fn highlight_line(raw: &str, query: &str, is_current: bool) -> Line<'static> {
         spans.push(Span::raw(raw[last..].to_string()));
     }
     Line::from(spans)
+}
+
+/// The copy-mode suffix appended to the pager title: the selected line count
+/// plus the key hints. Only called while copy mode is active.
+fn copy_status(state: &ScrollState) -> String {
+    let (lo, hi) = state.copy.selection();
+    let n = hi - lo + 1;
+    let plural = if n == 1 { "" } else { "s" };
+    format!("· COPY {n} line{plural} · ↑↓ extend · y/Enter copy · Esc cancel ")
+}
+
+/// Render one scrollback line for copy mode: a `selected` line gets a filled
+/// background (the cursor end brighter than the rest) so the selection range is
+/// visible; an unselected line renders plain. Whole-line styling — copy mode is
+/// line-granular, so column offsets never matter and this is panic-proof on any
+/// content (no slicing).
+fn select_line(raw: &str, selected: bool, is_cursor: bool) -> Line<'static> {
+    if !selected {
+        return Line::from(Span::raw(raw.to_string()));
+    }
+    let style = if is_cursor {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White).bg(Color::Blue)
+    };
+    Line::from(Span::styled(raw.to_string(), style))
 }
 
 #[cfg(test)]
@@ -1087,6 +1134,43 @@ mod tests {
         // Committed with no matches.
         st.search.matches.clear();
         assert_eq!(search_status(&st), "· /ab [no match] ");
+    }
+
+    #[test]
+    fn copy_status_reports_the_selection_size() {
+        let lines: Vec<String> = (0..6).map(|i| format!("l{i}")).collect();
+        let mut st = ScrollState::new("w".to_string(), lines, 0, 6);
+        st.copy.active = true;
+        // A single-line selection (anchor == cursor) is "1 line".
+        st.copy.anchor = 2;
+        st.copy.cursor = 2;
+        assert!(
+            copy_status(&st).starts_with("· COPY 1 line ·"),
+            "got {:?}",
+            copy_status(&st)
+        );
+        // Extending the cursor grows the inclusive count and pluralises.
+        st.copy.cursor = 4;
+        assert!(
+            copy_status(&st).starts_with("· COPY 3 lines ·"),
+            "got {:?}",
+            copy_status(&st)
+        );
+    }
+
+    #[test]
+    fn select_line_styles_only_selected_lines() {
+        // Unselected → a single unstyled span, no background.
+        let plain = select_line("row", false, false);
+        assert_eq!(plain.spans.len(), 1);
+        assert!(plain.spans[0].style.bg.is_none());
+        // Selected non-cursor → filled background.
+        let sel = select_line("row", true, false);
+        assert_eq!(sel.spans[0].style.bg, Some(Color::Blue));
+        // The cursor end is styled distinctly (and the text is preserved).
+        let cur = select_line("row", true, true);
+        assert_eq!(cur.spans[0].style.bg, Some(Color::Cyan));
+        assert_eq!(cur.spans[0].content.as_ref(), "row");
     }
 
     #[test]

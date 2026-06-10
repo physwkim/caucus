@@ -40,6 +40,11 @@
 //! | (pager open) `g G Home End`| jump to oldest / newest line           |
 //! | (pager open) `/`          | search the scrollback (Enter run, Esc cancel)|
 //! | (pager open) `n` / `N`    | next / previous search match            |
+//! | (pager open) `v`          | copy mode — select lines to yank        |
+//! | (copy mode) `↑↓ k j`      | move the cursor / extend the selection  |
+//! | (copy mode) `g G Home End`| extend to the oldest / newest line      |
+//! | (copy mode) `y` / `Enter` | copy the selection (OSC 52) and exit    |
+//! | (copy mode) `Esc`         | cancel copy mode                        |
 //! | (pager open) `Esc` / `q`  | exit the scrollback pager               |
 //! | scroll wheel up           | enter / page back the scrollback pager  |
 //! | scroll wheel down         | page forward in the pager (off at live) |
@@ -69,6 +74,26 @@ pub enum InputAction {
     Caucus(CaucusCommand),
     /// Nothing to do.
     Ignore,
+}
+
+/// A cursor motion inside the pager's copy mode (`docs/design.md` §1). Carried
+/// by [`CaucusCommand::CopyMove`] so a single command covers every
+/// selection-extend key instead of one variant each (like [`Direction`] on
+/// [`CaucusCommand::FocusDir`]).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CopyMotion {
+    /// Move the cursor up one line.
+    Up,
+    /// Move the cursor down one line.
+    Down,
+    /// Move the cursor up one page.
+    PageUp,
+    /// Move the cursor down one page.
+    PageDown,
+    /// Move the cursor to the oldest line.
+    Top,
+    /// Move the cursor to the newest line.
+    Bottom,
 }
 
 /// caucus-level commands triggered by reserved key chords.
@@ -136,6 +161,16 @@ pub enum CaucusCommand {
     SearchNext,
     /// Step to the previous search match (`N`).
     SearchPrev,
+    /// Enter the pager's copy mode (`v`): start a line selection at the top
+    /// visible line. Subsequent [`CaucusCommand::CopyMove`] keys extend it.
+    CopyStart,
+    /// Move the copy-mode cursor, extending the line selection.
+    CopyMove(CopyMotion),
+    /// Copy the selected lines to the host clipboard (OSC 52) and leave copy
+    /// mode (`y`/`Enter`).
+    CopyYank,
+    /// Leave copy mode without copying (`Esc`).
+    CopyCancel,
 }
 
 /// Tracks which panel currently receives the user's keystrokes, plus whether
@@ -160,6 +195,10 @@ pub struct FocusRouter {
     /// `true` while the pager's `/` search-input line is open. A sub-mode of
     /// `scroll_open`: keystrokes edit the query instead of driving navigation.
     scroll_searching: bool,
+    /// `true` while the pager's copy mode is active (`v`). A sub-mode of
+    /// `scroll_open`: navigation keys move the selection cursor, `y`/`Enter`
+    /// copy, `Esc` cancels — instead of driving the window scroll.
+    scroll_copying: bool,
     /// `true` while the close-panel confirm prompt is open. Modal like the
     /// pager: `y` confirms, `n`/`Esc`/`Ctrl-C` cancels, every other key is
     /// swallowed and never reaches the focused panel's PTY.
@@ -188,6 +227,7 @@ impl FocusRouter {
             transcript_open: false,
             scroll_open: false,
             scroll_searching: false,
+            scroll_copying: false,
             confirm_open: false,
         }
     }
@@ -254,6 +294,14 @@ impl FocusRouter {
         self.scroll_searching = searching;
     }
 
+    /// Tell the router whether the pager's copy mode is active — when active,
+    /// [`FocusRouter::route`] sends keystrokes to the selection (navigation
+    /// moves the cursor, `y`/`Enter` copies, `Esc` cancels) instead of the
+    /// pager's window-scroll bindings.
+    pub fn set_scroll_copying(&mut self, copying: bool) {
+        self.scroll_copying = copying;
+    }
+
     /// Tell the router whether the close-panel confirm prompt is open — when
     /// open, [`FocusRouter::route`] captures every key (`y` confirms,
     /// `n`/`Esc`/`Ctrl-C` cancels, all others are swallowed).
@@ -285,6 +333,8 @@ impl FocusRouter {
         if self.scroll_open {
             let cmd = if self.scroll_searching {
                 search_input_command(&key)
+            } else if self.scroll_copying {
+                copy_input_command(&key)
             } else {
                 scroll_command(&key)
             };
@@ -372,7 +422,37 @@ fn scroll_command(key: &KeyEvent) -> Option<CaucusCommand> {
         KeyCode::Char('/') => Some(CaucusCommand::SearchStart),
         KeyCode::Char('n') => Some(CaucusCommand::SearchNext),
         KeyCode::Char('N') => Some(CaucusCommand::SearchPrev),
+        // `v` enters copy mode (vim visual-line) to select lines for the
+        // clipboard — the in-app answer to the native selection that mouse
+        // capture suppresses (`[settings] mouse`).
+        KeyCode::Char('v') => Some(CaucusCommand::CopyStart),
         KeyCode::Esc | KeyCode::Char('q') => Some(CaucusCommand::ExitScroll),
+        _ => None,
+    }
+}
+
+/// Map a key to a copy-mode command while a line selection is active. The
+/// navigation keys mirror [`scroll_command`] but move the *selection cursor*
+/// (extending the selection) rather than the window; `y`/`Enter` copy and
+/// `Esc` cancels. Every other key is swallowed so it cannot leak past the
+/// selection (matching the pager's modal capture).
+fn copy_input_command(key: &KeyEvent) -> Option<CaucusCommand> {
+    use CopyMotion::*;
+    let motion = match key.code {
+        KeyCode::Up | KeyCode::Char('k') => Some(Up),
+        KeyCode::Down | KeyCode::Char('j') => Some(Down),
+        KeyCode::PageUp | KeyCode::Char('b') => Some(PageUp),
+        KeyCode::PageDown | KeyCode::Char(' ') => Some(PageDown),
+        KeyCode::Home | KeyCode::Char('g') => Some(Top),
+        KeyCode::End | KeyCode::Char('G') => Some(Bottom),
+        _ => None,
+    };
+    if let Some(motion) = motion {
+        return Some(CaucusCommand::CopyMove(motion));
+    }
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('y') => Some(CaucusCommand::CopyYank),
+        KeyCode::Esc => Some(CaucusCommand::CopyCancel),
         _ => None,
     }
 }
@@ -1049,6 +1129,59 @@ mod tests {
         ));
         // A Ctrl-modified char is not query text — it is swallowed, not typed.
         assert!(matches!(router.route(ctrl('c')), InputAction::Ignore));
+    }
+
+    #[test]
+    fn pager_copy_keys_route_to_copy_commands() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.set_scroll_open(true);
+
+        // In the pager (not yet copying) `v` enters copy mode.
+        assert!(matches!(
+            router.route(key(KeyCode::Char('v'))),
+            InputAction::Caucus(CaucusCommand::CopyStart)
+        ));
+
+        // While copy mode is active the navigation keys move the selection
+        // cursor (extending the selection) instead of scrolling the window.
+        router.set_scroll_copying(true);
+        let moves = [
+            (KeyCode::Char('j'), CopyMotion::Down),
+            (KeyCode::Down, CopyMotion::Down),
+            (KeyCode::Char('k'), CopyMotion::Up),
+            (KeyCode::Up, CopyMotion::Up),
+            (KeyCode::PageUp, CopyMotion::PageUp),
+            (KeyCode::PageDown, CopyMotion::PageDown),
+            (KeyCode::Char('g'), CopyMotion::Top),
+            (KeyCode::Char('G'), CopyMotion::Bottom),
+        ];
+        for (code, want) in moves {
+            match router.route(key(code)) {
+                InputAction::Caucus(CaucusCommand::CopyMove(got)) => {
+                    assert_eq!(got, want, "key {code:?}")
+                }
+                other => panic!("expected CopyMove({want:?}) for {code:?}, got {other:?}"),
+            }
+        }
+        // `y`/`Enter` copy; `Esc` cancels.
+        assert!(matches!(
+            router.route(key(KeyCode::Char('y'))),
+            InputAction::Caucus(CaucusCommand::CopyYank)
+        ));
+        assert!(matches!(
+            router.route(key(KeyCode::Enter)),
+            InputAction::Caucus(CaucusCommand::CopyYank)
+        ));
+        assert!(matches!(
+            router.route(key(KeyCode::Esc)),
+            InputAction::Caucus(CaucusCommand::CopyCancel)
+        ));
+        // An unmapped key is swallowed, not forwarded to the panel.
+        assert!(matches!(
+            router.route(key(KeyCode::Char('z'))),
+            InputAction::Ignore
+        ));
     }
 
     #[test]

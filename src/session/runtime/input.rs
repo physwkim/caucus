@@ -170,6 +170,10 @@ impl Multiplexer {
             CaucusCommand::SearchCancel => self.search_cancel(),
             CaucusCommand::SearchNext => self.search_next(),
             CaucusCommand::SearchPrev => self.search_prev(),
+            CaucusCommand::CopyStart => self.copy_start(),
+            CaucusCommand::CopyMove(motion) => self.copy_move(motion),
+            CaucusCommand::CopyYank => self.copy_yank(),
+            CaucusCommand::CopyCancel => self.copy_cancel(),
         }
     }
 
