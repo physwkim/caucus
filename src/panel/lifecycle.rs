@@ -7,6 +7,7 @@
 //! by [`spawn`] / `kill`, and panel state transitions only by `transition`.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use thiserror::Error;
 
@@ -20,6 +21,15 @@ use crate::term::{Grid, OutputCapture};
 /// or one-cell PTY when the layout hands a panel a sliver of screen.
 const MIN_GRID_COLS: u16 = 8;
 const MIN_GRID_ROWS: u16 = 2;
+
+/// Whether the `CAUCUS_DUMP_PTY` raw-capture debug aid is enabled. The env var
+/// is read once on first use and cached — [`Panel::pump`] consults this on
+/// every read that carries bytes, and a process-environment lookup per pump is
+/// pure idle-loop overhead (the value cannot change after launch).
+fn dump_pty_enabled() -> bool {
+    static DUMP: OnceLock<bool> = OnceLock::new();
+    *DUMP.get_or_init(|| std::env::var_os("CAUCUS_DUMP_PTY").is_some())
+}
 
 /// Coarse panel state machine (`docs/design.md` §3).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -107,8 +117,9 @@ impl Panel {
         }
         // Debug aid: when `CAUCUS_DUMP_PTY` is set, append every raw PTY byte
         // to `/tmp/caucus-pty-<panel_id>.raw` so a corrupted live render can
-        // be replayed offline through `term::Grid`. Off by default.
-        if std::env::var_os("CAUCUS_DUMP_PTY").is_some() {
+        // be replayed offline through `term::Grid`. Off by default. The env
+        // lookup is cached once — this runs on every pump with data.
+        if dump_pty_enabled() {
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
