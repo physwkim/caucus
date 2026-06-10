@@ -108,9 +108,10 @@ pub enum Command {
     /// Inspect role definitions.
     #[command(subcommand)]
     Role(RoleCommand),
-    /// Stdio MCP server for the main worker panel — forwards the six caucus
-    /// tools to the main process over the control socket (`docs/design.md`
-    /// §0 #4). Spawned by the main worker's Claude Code instance, not by a human.
+    /// Stdio MCP server for the main worker panel — forwards the fourteen
+    /// caucus tools to the main process over the control socket
+    /// (`docs/design.md` §0 #4). Spawned by the main worker's Claude Code
+    /// instance, not by a human.
     McpServe {
         /// Path to the main caucus process's control socket.
         #[arg(long)]

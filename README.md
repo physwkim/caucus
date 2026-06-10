@@ -58,7 +58,7 @@ and renders the panels (`ratatui`). tmux and zellij are *not* dependencies —
 they are studied as references for the grid and layout design.
 
 **The main worker drives sub-agents over MCP.** caucus runs an MCP server.
-The main worker gets ten caucus tools (see [MCP tools](#mcp-tools) below)
+The main worker gets fourteen caucus tools (see [MCP tools](#mcp-tools) below)
 so a single instruction from you turns into the main worker decomposing the
 task, spawning sub-agent panels, and feeding each one its sub-task as real
 keystrokes.
@@ -134,19 +134,23 @@ panel keeps running; new output appears after you exit).
 
 ## MCP tools
 
-caucus exposes ten tools to the main worker over MCP. The main worker
+caucus exposes fourteen tools to the main worker over MCP. The main worker
 calls them to spawn, drive, observe, and reap sub-agent panels:
 
 | Tool              | What it does                                                              |
 |-------------------|---------------------------------------------------------------------------|
 | `send_keys`       | Type text into a panel's terminal; `enter=true` appends a newline.        |
+| `send_key`        | Send one named key (`enter`, `esc`, `ctrl-c`, `up`, …) to a panel — a single keypress, not text. |
 | `broadcast`       | Send the same text to several panels at once — a round's fan-out.         |
 | `ctrl_c`          | Send `Ctrl-C` (interrupt) to a panel.                                     |
 | `read_panel`      | Read a panel's captured output (modes below).                             |
 | `spawn_role`      | Spawn a sub-agent panel. `role` is a free-form label; an inline `prompt` becomes the role's instructions; `worktree` / `model` / `agent_cli` overrides. |
 | `kill_panel`      | Kill a panel; its worktree (if any) is enqueued for cleanup.              |
+| `restart_panel`   | Restart a panel's agent CLI in place, reusing its role and worktree.      |
 | `list_panels`     | List every live panel with its role and derived state.                   |
 | `register_round`  | Register a round; caucus pushes the panels' results back when they settle (or `fallback_secs`). A per-panel `backlog` queue keeps early finishers working until their tasks drain. |
+| `round_status`    | Report a registered round's progress — which panels have settled, which are still working. |
+| `cancel_round`    | Cancel a registered round so caucus stops awaiting it.                    |
 | `read_menu`       | Read a panel's interactive selection menu (question + numbered options).  |
 | `select_option`   | Answer a panel's selection menu by picking an option number.              |
 
