@@ -33,9 +33,11 @@ impl McpToolSurface for Multiplexer {
         }
         // A bracketed paste's submitting `\r` was held out of the burst — it
         // must land as a discrete keypress once the agent has ingested the
-        // paste, or it is swallowed during the `[Pasted text #N]` commit.
+        // paste, or it is swallowed during the `[Pasted text #N]` commit. The
+        // hold scales with the paste size (the commit it races is larger for a
+        // bigger paste), so the byte count is threaded through.
         if plan.defer_submit {
-            self.enqueue_submit(panel);
+            self.enqueue_submit(panel, text.len());
         }
         Ok(())
     }
@@ -213,23 +215,44 @@ impl McpToolSurface for Multiplexer {
     }
 }
 
-/// How long to hold a bracketed paste's submitting Enter before delivering it
-/// as a discrete keypress ([`Multiplexer::poll_pending_submits`]).
+/// Floor delay for holding a bracketed paste's submitting Enter before
+/// delivering it as a discrete keypress ([`Multiplexer::poll_pending_submits`]).
 ///
 /// The agent reads its PTY in its own loop; this gap guarantees the held-back
-/// `\r` arrives in a *separate* read cycle, well after the agent has processed
-/// the paste and committed its `[Pasted text #N]` placeholder, so the Enter is
-/// seen as a submit rather than swallowed during the commit. Comfortably above
-/// the agent's paste-processing latency yet imperceptible to the user.
-const SUBMIT_DELAY: Duration = Duration::from_millis(100);
+/// `\r` arrives in a *separate* read cycle, after the agent has processed the
+/// paste and committed its `[Pasted text #N]` placeholder, so the Enter is seen
+/// as a submit rather than swallowed during the commit. Comfortably above the
+/// agent's paste-processing latency for a small paste yet imperceptible.
+const SUBMIT_DELAY_BASE: Duration = Duration::from_millis(100);
+
+/// Extra hold per KiB of pasted text. The placeholder-commit the held-back
+/// `\r` races against takes longer for a bigger paste, so a *constant* delay
+/// (the prior design) was too short for a large report and let the Enter be
+/// swallowed mid-commit — the panel was already flipped `Working`, so the
+/// prompt then sat unsent until the round fallback. Scaling the hold with the
+/// paste size keeps the guard proportional to the race it guards.
+const SUBMIT_DELAY_PER_KIB: Duration = Duration::from_millis(4);
+
+/// Cap on the scaled hold, so a pathologically large paste cannot defer a
+/// submit for an absurd interval (the user would perceive the stall).
+const SUBMIT_DELAY_MAX: Duration = Duration::from_millis(2000);
+
+/// Hold time for a deferred submit whose paste was `paste_len` bytes:
+/// [`SUBMIT_DELAY_BASE`] plus [`SUBMIT_DELAY_PER_KIB`] per KiB, capped at
+/// [`SUBMIT_DELAY_MAX`]. Proportional to the placeholder-commit it races.
+fn submit_delay_for(paste_len: usize) -> Duration {
+    let scaled =
+        SUBMIT_DELAY_BASE + SUBMIT_DELAY_PER_KIB * (paste_len / 1024).min(u32::MAX as usize) as u32;
+    scaled.min(SUBMIT_DELAY_MAX)
+}
 
 /// A submitting Enter held back from a bracketed paste, waiting to be delivered
 /// as a discrete keypress (see [`Multiplexer::pending_submits`]).
 pub(crate) struct PendingSubmit {
     /// Panel the held-back `\r` is destined for.
     panel: PanelId,
-    /// Earliest instant the `\r` may be written — `now + SUBMIT_DELAY` at
-    /// enqueue time.
+    /// Earliest instant the `\r` may be written — `now + submit_delay_for(len)`
+    /// at enqueue time (the hold scales with the paste size).
     due: Instant,
 }
 
@@ -297,11 +320,11 @@ fn plan_delivery(text: &[u8], enter: bool, bracketed: bool) -> Delivery {
 
 impl Multiplexer {
     /// Record a deferred submit for `panel`: its held-back `\r` becomes
-    /// writable after [`SUBMIT_DELAY`]. Replaces any pending submit already
-    /// queued for the same panel (the latest paste wins) so a panel never
-    /// accrues stale Enters.
-    fn enqueue_submit(&mut self, panel: PanelId) {
-        let due = Instant::now() + SUBMIT_DELAY;
+    /// writable after [`submit_delay_for`]`(paste_len)` — the hold scales with
+    /// the paste size. Replaces any pending submit already queued for the same
+    /// panel (the latest paste wins) so a panel never accrues stale Enters.
+    fn enqueue_submit(&mut self, panel: PanelId, paste_len: usize) {
+        let due = Instant::now() + submit_delay_for(paste_len);
         match self.pending_submits.iter_mut().find(|s| s.panel == panel) {
             Some(s) => s.due = due,
             None => self.pending_submits.push(PendingSubmit { panel, due }),
@@ -443,15 +466,41 @@ mod tests {
         let mut mux = mux(&tmp);
         let panel = PanelId::new();
 
-        mux.enqueue_submit(panel);
+        mux.enqueue_submit(panel, 0);
         let first_due = mux.pending_submits[0].due;
         assert_eq!(mux.pending_submits.len(), 1);
 
-        mux.enqueue_submit(panel);
+        mux.enqueue_submit(panel, 0);
         assert_eq!(mux.pending_submits.len(), 1, "same panel must not stack");
         assert!(
             mux.pending_submits[0].due >= first_due,
             "re-enqueue pushes the deadline out, it does not add a second submit"
+        );
+    }
+
+    /// The deferred-submit hold scales with the paste size and is clamped: a
+    /// tiny paste gets the base delay, a mid paste gets base + per-KiB, and a
+    /// pathologically large paste is capped (never an absurd stall).
+    #[test]
+    fn submit_delay_scales_with_paste_size_and_clamps() {
+        assert_eq!(
+            submit_delay_for(0),
+            SUBMIT_DELAY_BASE,
+            "an empty/tiny paste holds for the base delay only"
+        );
+        assert_eq!(
+            submit_delay_for(64 * 1024),
+            SUBMIT_DELAY_BASE + SUBMIT_DELAY_PER_KIB * 64,
+            "a 64 KiB paste adds 64 KiB of per-KiB hold"
+        );
+        assert_eq!(
+            submit_delay_for(usize::MAX),
+            SUBMIT_DELAY_MAX,
+            "an enormous paste is clamped to the max hold, not overflowed"
+        );
+        assert!(
+            submit_delay_for(16 * 1024) > submit_delay_for(1024),
+            "a bigger paste holds strictly longer (until the clamp)"
         );
     }
 
