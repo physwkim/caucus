@@ -93,6 +93,9 @@ impl McpToolSurface for Multiplexer {
                 .get(&panel)
                 .and_then(|m| m.last_message().map(str::to_string))
                 .unwrap_or_default(),
+            // `turn` can fail (spilled / out of range), so it returns early
+            // rather than yielding a `String` into this match.
+            ReadPanelMode::Turn(index) => return Self::read_turn(p, index),
         })
     }
 
@@ -351,6 +354,40 @@ impl Multiplexer {
         self.pending_submits = still_pending;
     }
 
+    /// Render a panel's turn at absolute `index` for the `turn` read mode.
+    ///
+    /// An in-memory turn (closed or the open one) renders to readable text via
+    /// the same grid replay `since_last_turn` uses. An `index` that is out of
+    /// range, or has spilled to disk, is an error naming what is available: the
+    /// spilled turns are concatenated in the panel log with no per-turn
+    /// boundary, so they cannot be sliced back out by index (only the in-memory
+    /// ring is individually addressable).
+    fn read_turn(p: &Panel, index: usize) -> Result<String, McpError> {
+        let cap = p.capture();
+        if let Some(bytes) = cap.turn_bytes(index) {
+            let (cols, _) = p.grid().size();
+            return Ok(Self::rendered_capture_text(bytes, cols));
+        }
+        let total = cap.total_turns();
+        if index >= total {
+            return Err(McpError::Tool(format!(
+                "no turn {index}: this panel has {total} turn(s) so far \
+                 (valid indices 0..{total})"
+            )));
+        }
+        let log = cap
+            .log_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(no panel log configured)".to_string());
+        Err(McpError::Tool(format!(
+            "turn {index} has scrolled out of memory: the {spilled} oldest turn(s) \
+             are concatenated in the panel log {log} (no per-turn boundary), only \
+             the most recent {in_mem} in-memory turn(s) are individually readable",
+            spilled = cap.spilled_turns(),
+            in_mem = cap.turns().len(),
+        )))
+    }
+
     /// Render a detected [`crate::term::Menu`] as readable text for the main
     /// worker: the question, the numbered options (the highlighted one marked),
     /// and how to answer.
@@ -541,6 +578,27 @@ mod tests {
         assert_eq!(Multiplexer::menu_nav_bytes(2, 0), b"\x1b[A\x1b[A\r");
         // Already on target: just Enter, no arrows.
         assert_eq!(Multiplexer::menu_nav_bytes(1, 1), b"\r");
+    }
+
+    /// `read_panel(turn=N)` reads a specific past turn; an index past what the
+    /// panel has ever produced is a clear, named error rather than empty text.
+    /// A far-future index is out of range whether or not the spawn opened a
+    /// turn, so the assertion holds either way. Skipped without an agent CLI.
+    #[tokio::test]
+    async fn read_panel_turn_mode_reports_out_of_range() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Ok(panel) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+
+        let err = McpToolSurface::read_panel(&mux, panel, ReadPanelMode::Turn(9999)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no turn 9999"), "got: {msg}");
+
+        mux.shutdown();
     }
 
     /// `list_panels` surfaces a worktree-backed panel's path, branch, and

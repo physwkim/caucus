@@ -21,6 +21,7 @@ use tokio::net::UnixStream;
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
 
+use super::ReadPanelMode;
 use super::jsonrpc::{ToolHandler, ToolOutcome};
 use super::protocol::{ControlRequest, ControlResponse};
 
@@ -176,12 +177,21 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                 .get("mode")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing string argument `mode`".to_string())?;
-            let mode = serde_json::from_value(json!(mode_raw)).map_err(|_| {
-                format!(
-                    "invalid mode `{mode_raw}` \
-                     (expected screen|scrollback|since_last_turn|last_message)"
-                )
-            })?;
+            // `turn` carries its index in a sibling integer arg rather than in
+            // the mode string, so the mode stays a plain enum value.
+            let mode = if mode_raw == "turn" {
+                let n = args.get("turn").and_then(Value::as_u64).ok_or_else(|| {
+                    "mode `turn` requires a non-negative integer argument `turn`".to_string()
+                })? as usize;
+                ReadPanelMode::Turn(n)
+            } else {
+                serde_json::from_value(json!(mode_raw)).map_err(|_| {
+                    format!(
+                        "invalid mode `{mode_raw}` \
+                         (expected screen|scrollback|since_last_turn|last_message|turn)"
+                    )
+                })?
+            };
             Ok(ControlRequest::ReadPanel {
                 panel: panel(args)?,
                 mode,
@@ -455,6 +465,34 @@ mod tests {
                 mode: super::super::ReadPanelMode::SinceLastTurn,
             }
         );
+    }
+
+    #[test]
+    fn build_read_panel_turn_mode() {
+        let id = PanelId::new();
+        let req = build_request(
+            "read_panel",
+            &json!({"panel": id.to_string(), "mode": "turn", "turn": 3}),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::ReadPanel {
+                panel: id,
+                mode: super::super::ReadPanelMode::Turn(3),
+            }
+        );
+    }
+
+    #[test]
+    fn build_read_panel_turn_mode_requires_an_index() {
+        let id = PanelId::new();
+        let err = build_request(
+            "read_panel",
+            &json!({"panel": id.to_string(), "mode": "turn"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("requires a non-negative integer argument `turn`"));
     }
 
     #[test]

@@ -251,6 +251,33 @@ impl OutputCapture {
     pub fn turns(&self) -> &[TurnSegment] {
         &self.turns
     }
+
+    /// Total number of turns this panel has ever opened — spilled + in-memory
+    /// closed + the open one. The valid absolute turn indices are
+    /// `0..total_turns`. Backs the bounds-checking for the `turn` `read_panel`
+    /// mode.
+    pub fn total_turns(&self) -> usize {
+        self.next_index()
+    }
+
+    /// Raw bytes of the turn at absolute `index`, when it is still individually
+    /// readable — i.e. held in the in-memory ring (a closed turn) or the open
+    /// turn. `None` when `index` is out of range *or* has been spilled to disk:
+    /// the disk log concatenates spilled turns with no per-turn boundary, so a
+    /// spilled turn cannot be sliced back out by index. Callers distinguish the
+    /// two cases with [`OutputCapture::total_turns`] / [`OutputCapture::spilled_turns`].
+    pub fn turn_bytes(&self, index: usize) -> Option<&[u8]> {
+        if let Some(open) = &self.open
+            && open.index == index
+        {
+            return Some(&open.bytes);
+        }
+        // In-memory closed turns are contiguous from `spilled_turns`.
+        index
+            .checked_sub(self.spilled_turns)
+            .and_then(|i| self.turns.get(i))
+            .map(|t| t.bytes.as_slice())
+    }
 }
 
 /// Append one turn's raw bytes to the panel log, creating parent directories
@@ -457,6 +484,50 @@ mod tests {
         assert_eq!(on_disk, b"012");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `turn_bytes` addresses any in-memory turn by absolute index — including
+    /// the open one — and reports `None` for a future index. `total_turns`
+    /// counts every turn ever opened (the open turn included).
+    #[test]
+    fn turn_bytes_addresses_in_memory_turns_by_index() {
+        let mut cap = OutputCapture::new();
+        cap.begin_turn();
+        cap.push(b"zero");
+        cap.end_turn(); // turn 0 closed
+        cap.begin_turn();
+        cap.push(b"one"); // turn 1 still open
+
+        assert_eq!(cap.total_turns(), 2, "one closed + one open");
+        assert_eq!(cap.turn_bytes(0), Some(b"zero".as_slice()));
+        assert_eq!(cap.turn_bytes(1), Some(b"one".as_slice()), "the open turn");
+        assert_eq!(cap.turn_bytes(2), None, "no turn 2 yet");
+    }
+
+    /// A turn spilled to disk is no longer individually readable: the absolute
+    /// index is still in range (`< total_turns`) but `turn_bytes` is `None`,
+    /// because the disk log concatenates spilled turns without a boundary.
+    #[test]
+    fn turn_bytes_is_none_for_a_spilled_turn() {
+        let mut cap = OutputCapture::new();
+        cap.memory_turn_limit = 2;
+        for i in 0..4u8 {
+            cap.begin_turn();
+            cap.push(&[b'a' + i]);
+            cap.end_turn();
+        }
+        // Turns 0,1 spilled; 2,3 in memory.
+        assert_eq!(cap.spilled_turns(), 2);
+        assert_eq!(cap.total_turns(), 4);
+        assert_eq!(
+            cap.turn_bytes(0),
+            None,
+            "spilled — not individually readable"
+        );
+        assert_eq!(cap.turn_bytes(1), None, "spilled");
+        assert_eq!(cap.turn_bytes(2), Some(b"c".as_slice()));
+        assert_eq!(cap.turn_bytes(3), Some(b"d".as_slice()));
+        assert_eq!(cap.turn_bytes(4), None, "out of range");
     }
 
     #[test]

@@ -56,6 +56,11 @@ pub enum ReadPanelMode {
     SinceLastTurn,
     /// Only the agent's final message, as carried by the turn signal.
     LastMessage,
+    /// A specific past turn by its absolute 0-based index (`since_last_turn`
+    /// only ever returns the most recent). Readable while the turn is still in
+    /// the in-memory ring; an older turn that has spilled to disk is reported
+    /// as such (the disk log concatenates turns without a per-turn boundary).
+    Turn(usize),
 }
 
 /// One panel's status row, returned by `list_panels`.
@@ -241,15 +246,26 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                           grid), 'scrollback' (full scrollback), 'since_last_turn' \
                           (everything since the last prompt — the whole turn, no \
                           racing the screen), 'last_message' (the agent's final \
-                          message from its turn signal).",
+                          message from its turn signal), 'turn' (a specific past \
+                          turn by its 0-based index in the `turn` arg — \
+                          since_last_turn only ever returns the latest; an old \
+                          turn that has scrolled out of memory reports as such).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "panel": panel_prop(),
                     "mode": {
                         "type": "string",
-                        "enum": ["screen", "scrollback", "since_last_turn", "last_message"],
+                        "enum": [
+                            "screen", "scrollback", "since_last_turn",
+                            "last_message", "turn"
+                        ],
                         "description": "Which output slice to return."
+                    },
+                    "turn": {
+                        "type": "integer",
+                        "description": "Absolute 0-based turn index — required \
+                                        when mode is 'turn', ignored otherwise."
                     }
                 },
                 "required": ["panel", "mode"]

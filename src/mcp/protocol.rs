@@ -209,6 +209,20 @@ mod tests {
     }
 
     #[test]
+    fn read_panel_turn_mode_round_trips() {
+        // The `turn` mode carries its index; the wire form tags it as a map
+        // variant, distinct from the string-valued unit modes.
+        let req = ControlRequest::ReadPanel {
+            panel: PanelId::new(),
+            mode: ReadPanelMode::Turn(7),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"turn\":7"));
+        let back: ControlRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
     fn spawn_role_defaults_are_optional() {
         // A minimal `spawn_role` request with only `role` parses (serde
         // defaults fill worktree/model/agent_cli/prompt).

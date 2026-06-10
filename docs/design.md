@@ -23,7 +23,7 @@
 | 11 | caucus 패널은 **완전한 양방향 인터랙티브 터미널**. 단순 관찰·제어가 아니라, 로그인 / OAuth 디바이스 코드 / 기타 대화형 프롬프트를 사용자가 패널에 직접 입력하거나 main이 `send_keys`로 처리할 수 있다. PTY 입력은 완전 양방향. |
 | 12 | **토큰·효율 관리는 main의 자체 판단.** main은 패널별 토큰 사용량을 `read_panel`로 읽고, 필요 시 각 agent에 `/compact` · `/clear` 등 슬래시 커맨드를 `send_keys`로 보낸다. caucus 코어는 토큰 사용량을 노출만 하고 정책은 main이 결정한다. |
 | 13 | **중첩 sub-agent 금지.** 어떤 agent도(main 포함) 자기 Claude Code / Codex 세션 안에서 `Task` 류 in-session sub-agent를 띄우지 않는다. 모든 sub-agent는 caucus가 관리하는 *관찰 가능한 패널*이어야 한다 — 보이지 않는 프로세스는 "모든 세션을 본다"는 caucus의 존재 이유를 깨뜨린다. 각 agent는 위임받은 작업을 자기 패널에서 직접 수행하고, main은 위임을 `Task`가 아니라 `spawn_role` + `send_keys`(패널 제어)로 한다. role의 `allowed_tools`에 `Task`를 포함하지 않는다. |
-| 14 | **main은 화면을 실시간으로 경주하지 않는다.** 빠르게 스크롤되는 패널 출력은 *사람의 라이브 뷰*용이고, main은 caucus가 캡처한 영속 기록을 자기 페이스로 읽는다. caucus는 패널별 스크롤백 버퍼 + 턴 경계(`PromptDelivered`…`TurnCompleted`)로 구간된 append-only 출력 로그를 유지하며, `read_panel`은 `screen` / `scrollback` / `since_last_turn` / `last_message` 모드로 턴 출력 전체를 빠짐없이 돌려준다(§8.5). |
+| 14 | **main은 화면을 실시간으로 경주하지 않는다.** 빠르게 스크롤되는 패널 출력은 *사람의 라이브 뷰*용이고, main은 caucus가 캡처한 영속 기록을 자기 페이스로 읽는다. caucus는 패널별 스크롤백 버퍼 + 턴 경계(`PromptDelivered`…`TurnCompleted`)로 구간된 append-only 출력 로그를 유지하며, `read_panel`은 `screen` / `scrollback` / `since_last_turn` / `last_message` / `turn`(인덱스로 과거 턴) 모드로 턴 출력 전체를 빠짐없이 돌려준다(§8.5). |
 | 15 | sub-agent 모델 = **동적 병렬 워커**. main은 작업을 sub-task로 쪼개 동질적인 sub-agent를 병렬로 spawn하고 각자에 sub-task를 배분·관리·병합한다. 고정된 "전문가 팀"이 아니라 그때그때 필요한 만큼의 병렬 워커다. role(architect/backend/reviewer/…)은 *선택적 힌트*이며, 기본 sub-agent role은 범용 `worker`. 병렬 sub-agent는 worktree per agent(§5)로 격리하고 결과를 병합한다. |
 | 16 | **sub-agent 컨텍스트 = lean brief + self-served depth.** main은 sub-agent에 *focused brief*(sub-task + `file:line` 포인터 + 제약 + 성공 기준)만 주고 대화 컨텍스트를 통째로 덤프하지 않는다. sub-agent는 깊은 코드베이스 지식을 **kodex 지식 그래프**에서 스스로 길어온다 — 내장 role의 `allowed_tools`에 `mcp__kodex` 포함(읽기 `recall`/`query` + 쓰기 `learn`, 사용자 결정). main은 *scope·intent*를, sub-agent는 *detail*을 담당해 모든 패널의 컨텍스트가 lean하게 유지된다. kodex는 사용자 글로벌 MCP 서버이며 `roles.toml`로 교체·제거 가능. |
 
@@ -594,6 +594,9 @@ turn signal 수신 또는 grid 변화 시 재계산.
    - `since_last_turn` — 마지막 `PromptDelivered` 이후 출력 전체 ("이 agent가 방금
      한 일"의 자연스러운 단위)
    - `last_message` — turn signal이 실어온 agent 최종 메시지만(§7.4)
+   - `turn` — 특정 과거 턴을 절대 0-based 인덱스(`turn` 인자)로. `since_last_turn`은
+     항상 최신 턴만 주므로 이전 턴을 보려면 이걸 쓴다. 메모리 링을 벗어나 디스크로
+     spill된 옛 턴은 (경계 없이 연결돼) 개별 인덱스로 못 꺼내며, 그 경우 에러로 알린다
 4. **turn signal이 이미 결론을 실어온다.** Claude Stop hook payload는 최종
    assistant 메시지를 포함하므로(`last_message`), 대부분의 main worker 판단은
    터미널 스크래핑 없이 끝난다. `since_last_turn`은 중간 디테일(어떤 파일이
