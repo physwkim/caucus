@@ -43,11 +43,22 @@ pub struct OutputCapture {
     /// of the panel's lifetime, kept so callers can tell how much history is
     /// on disk vs in memory.
     spilled_turns: usize,
+    /// In-memory byte cap for a single still-open turn. Closed turns are bounded
+    /// by count (`memory_turn_limit`, spilling to disk); the *open* turn has no
+    /// such boundary until it closes, so a panel firehosing output mid-turn
+    /// could otherwise grow it without limit. See [`OutputCapture::push`].
+    open_turn_byte_limit: usize,
 }
 
 impl OutputCapture {
     /// Default number of closed turns kept in memory.
     pub const DEFAULT_TURN_LIMIT: usize = 64;
+
+    /// Default in-memory byte cap for a single open turn (4 MiB). Sized above
+    /// what [`crate::session`] renders from a turn (`rendered_capture_text`
+    /// replays into a grid keeping 50 rows + 10_000 scrollback rows), so the
+    /// dropped head was already scrolled out of any `read_panel` result.
+    pub const DEFAULT_OPEN_TURN_BYTES: usize = 4 << 20;
 
     /// Build an empty capture.
     pub fn new() -> Self {
@@ -57,6 +68,7 @@ impl OutputCapture {
             memory_turn_limit: Self::DEFAULT_TURN_LIMIT,
             log_path: None,
             spilled_turns: 0,
+            open_turn_byte_limit: Self::DEFAULT_OPEN_TURN_BYTES,
         }
     }
 
@@ -96,9 +108,27 @@ impl OutputCapture {
     }
 
     /// Append PTY output bytes to the currently open turn.
+    ///
+    /// A single open turn is bounded by `open_turn_byte_limit`: the buffer is
+    /// allowed to reach 2× the cap, then the oldest half is dropped back to the
+    /// cap. Letting it overshoot before trimming amortizes the drain's memmove
+    /// to O(1) per byte while holding memory to 2× the cap — a panel firehosing
+    /// output before its turn closes can no longer grow it without bound. The
+    /// retained tail is exactly what `read_panel(since_last_turn)` renders (the
+    /// recent screen + scrollback); the dropped head was already scrolled past
+    /// the grid replay's window. A turn that closes under the cap is untouched.
+    ///
+    /// Trade-off: the dropped head of an over-cap turn is also absent from the
+    /// disk-log spill on close (the open turn is not streamed to disk). The cap
+    /// is sized so this only affects turns far larger than any rendered view.
     pub(crate) fn push(&mut self, bytes: &[u8]) {
         if let Some(turn) = self.open.as_mut() {
             turn.bytes.extend_from_slice(bytes);
+            let cap = self.open_turn_byte_limit;
+            if turn.bytes.len() > cap.saturating_mul(2) {
+                let drop = turn.bytes.len() - cap;
+                turn.bytes.drain(..drop);
+            }
         }
     }
 
@@ -229,6 +259,49 @@ mod tests {
     #[test]
     fn empty_capture_has_no_turn_output() {
         assert!(OutputCapture::new().since_last_turn().is_empty());
+    }
+
+    #[test]
+    fn open_turn_buffer_is_bounded() {
+        // A turn that keeps emitting before it closes cannot grow the buffer
+        // without limit: it is held to at most 2× the cap.
+        let mut cap = OutputCapture::new();
+        cap.open_turn_byte_limit = 100;
+        cap.begin_turn();
+        for _ in 0..50 {
+            cap.push(&[b'x'; 20]); // 1000 bytes total, well past 2× the cap
+        }
+        let held = cap.since_last_turn().len();
+        assert!(held <= 200, "open turn capped at 2× the limit, got {held}");
+        assert!(held >= 100, "keeps at least the cap, got {held}");
+        assert!(cap.since_last_turn().iter().all(|&b| b == b'x'));
+    }
+
+    #[test]
+    fn open_turn_trim_keeps_the_tail_not_the_head() {
+        // Trimming drops the OLDEST bytes — read_panel renders the recent tail.
+        let mut cap = OutputCapture::new();
+        cap.open_turn_byte_limit = 10;
+        cap.begin_turn();
+        cap.push(&[b'A'; 10]);
+        cap.push(&[b'B'; 15]); // total 25 > 20 → trim to the last 10
+        let tail = cap.since_last_turn();
+        assert_eq!(tail.len(), 10);
+        assert!(
+            tail.iter().all(|&b| b == b'B'),
+            "the recent tail is kept and the head dropped"
+        );
+    }
+
+    #[test]
+    fn small_open_turn_is_not_trimmed() {
+        // A turn that stays under the cap keeps every byte through to close.
+        let mut cap = OutputCapture::new();
+        cap.open_turn_byte_limit = 1000;
+        cap.begin_turn();
+        cap.push(b"short output");
+        cap.end_turn();
+        assert_eq!(cap.turns()[0].bytes, b"short output");
     }
 
     #[test]
