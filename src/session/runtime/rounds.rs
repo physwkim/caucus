@@ -217,9 +217,9 @@ pub(super) struct PendingRound {
 }
 
 /// One round panel's contribution, collected once and rendered into both the
-/// full report ([`Multiplexer::render_round_report`]) and the injected summary
-/// ([`Multiplexer::render_round_summary`]) — so the two always show the *same*
-/// captured text (the per-panel `read_panel` happens exactly once, in
+/// full report ([`Multiplexer::assemble_round_report`]) and the injected
+/// summary ([`Multiplexer::render_round_summary`]) — so the two always show the
+/// *same* captured text (the per-panel `read_panel` happens exactly once, in
 /// [`Multiplexer::round_panel_contribution`]).
 struct RoundPanelContribution {
     /// The panel's role label.
