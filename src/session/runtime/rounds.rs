@@ -849,10 +849,13 @@ impl Multiplexer {
              re-prompts you when they settle. (Without a round there is no \
              wake-up path — you stay idle indefinitely.)",
         );
-        if let Err(err) = McpToolSurface::send_keys(self, main_id, &notice, true) {
-            warn!(error = %err, "stranded-main nudge to main panel failed");
+        match McpToolSurface::send_keys(self, main_id, &notice, true) {
+            // Arm the cooldown only on a real push. A failed delivery must not
+            // start the cooldown, or the next tick would wait it out on a nudge
+            // that never landed and main stays stranded longer.
+            Ok(()) => self.main_stranded_last_nudge = Some(Instant::now()),
+            Err(err) => warn!(error = %err, "stranded-main nudge to main panel failed"),
         }
-        self.main_stranded_last_nudge = Some(Instant::now());
     }
 
     /// Announce to the main worker when a panel in a pending round has stopped
@@ -939,10 +942,15 @@ impl Multiplexer {
             .map(|p| p.role.clone())
             .unwrap_or_default();
         let notice = Self::blocked_prompt_notice(pid, &role, &prompt);
-        if let Err(err) = McpToolSurface::send_keys(self, main_id, &notice, true) {
-            warn!(error = %err, "blocked-panel notice to main panel failed");
+        match McpToolSurface::send_keys(self, main_id, &notice, true) {
+            // Mark the panel notified only on a real push (the documented
+            // invariant above). A failed delivery leaves it un-notified so the
+            // next tick re-announces it instead of swallowing the only notice.
+            Ok(()) => {
+                self.notified_blockers.insert(pid, sig);
+            }
+            Err(err) => warn!(error = %err, "blocked-panel notice to main panel failed"),
         }
-        self.notified_blockers.insert(pid, sig);
     }
 
     /// The interim notice text for a round panel stuck on `prompt`, tailored to
@@ -2526,6 +2534,49 @@ mod tests {
             ),
             other => panic!("expected a Permission blocker, got {other:?}"),
         }
+
+        mux.shutdown();
+    }
+
+    /// A blocked-panel notice that fails to reach main (dead PTY) must leave the
+    /// panel un-notified, so the next tick re-announces it — a failed push is
+    /// not a real push. Before the fix the panel was marked notified regardless,
+    /// permanently swallowing the only notice until its prompt changed.
+    #[tokio::test]
+    async fn blocked_notice_send_failure_leaves_panel_unnotified() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        // Main is a live Idle panel (the deliverability gate is open) whose PTY
+        // is then killed so the notice send fails.
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+
+        // A round sub-panel stuck on a yes/no prompt, rendered straight into its
+        // grid for determinism.
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == sub)
+            .unwrap()
+            .grid
+            .advance(b"Building...\r\nContinue? [y/N]");
+        mux.register_round(vec![sub], None, Some(600), None);
+
+        // Kill main's PTY: a send_keys to it now errors.
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == main)
+            .unwrap()
+            .pty
+            .kill()
+            .unwrap();
+
+        mux.poll_round_blocked_panels();
+        assert!(
+            !mux.notified_blockers.contains_key(&sub),
+            "a failed notice must leave the panel un-notified so it re-announces",
+        );
 
         mux.shutdown();
     }
