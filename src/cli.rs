@@ -100,7 +100,7 @@ pub enum Command {
         #[arg(long)]
         install_hook: bool,
     },
-    /// Check git / agent CLIs / hook / role allowlists.
+    /// Check caucus version, git + repo, agent CLIs, hook, role allowlists.
     Doctor,
     /// Turn-signal client + (future) related signal subcommands.
     #[command(subcommand)]

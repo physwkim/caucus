@@ -181,7 +181,7 @@ caucus --agent-cli codex            # run the main worker on codex instead of
                                     # still chosen per spawn_role
 caucus init [--install-hook]        # create .caucus/ + bin/turn-signal;
                                     # --install-hook merges the Claude Stop hook
-caucus doctor                       # check git / agent CLIs / hook / role allowlists
+caucus doctor                       # check caucus version, git + repo, agent CLIs, hook, role allowlists
 caucus role list                    # list known roles
 caucus role show <name>             # show one role's full spec
 caucus sessions [--format json]     # list resumable sessions, newest first
