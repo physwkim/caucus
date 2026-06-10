@@ -616,12 +616,13 @@ async fn event_loop(
         //     runs before round delivery so the dropped-round notice lands first.
         mux.poll_resume_notice();
 
-        // 5. Selection prompts — if a panel in a pending round has stopped on
-        //    an interactive chooser (no Stop hook fires, so its round never
-        //    settles), announce it to the main worker so it can answer and let
-        //    the round finish. Runs before round delivery: unblocking a stuck
-        //    panel takes precedence, and both share the one-push-per-tick gate.
-        mux.poll_round_selection_prompts();
+        // 5. Blocked panels — if a panel in a pending round has stopped on an
+        //    interactive chooser or a raw `[y/n]` prompt (no Stop hook fires, so
+        //    its round never settles), announce it to the main worker so it can
+        //    answer and let the round finish. Runs before round delivery:
+        //    unblocking a stuck panel takes precedence, and both share the
+        //    one-push-per-tick gate.
+        mux.poll_round_blocked_panels();
 
         // 6. Round delivery — if a registered round's panels have now settled
         //    (or its fallback deadline passed), assemble their results and

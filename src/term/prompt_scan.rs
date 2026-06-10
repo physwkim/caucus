@@ -1,19 +1,22 @@
-//! Detect an interactive **selection menu** in a panel's rendered grid — the
-//! numbered `AskUserQuestion`-style chooser Claude Code shows when it asks the
-//! user to pick an option (`docs/design.md` §8.3).
+//! Detect what a panel is **visibly waiting on** in its rendered grid — the
+//! mid-turn attention states the coarse panel state cannot express, because
+//! none of them fire a `Stop` hook (caucus owns each panel's PTY, so a
+//! sub-agent stopped mid-turn leaves the coarse state stuck at `Working`):
 //!
-//! caucus owns each panel's PTY, so when a sub-agent stops mid-turn on such a
-//! prompt no `Stop` hook fires and the coarse panel state stays `Working`. The
-//! main worker therefore cannot tell "still thinking" from "waiting for me to
-//! choose". [`scan_menu`] reads the visible grid text and, *only when
-//! confident*, returns the parsed menu so caucus can surface an
-//! `awaiting_selection` signal and let the main worker answer it
-//! ([`crate::mcp::McpToolSurface::select_option`]).
+//! * [`scan_menu`] — the numbered `AskUserQuestion`-style chooser Claude Code
+//!   shows to pick an option (`docs/design.md` §8.3). The main worker answers
+//!   it with [`crate::mcp::McpToolSurface::select_option`].
+//! * [`scan_yes_no_prompt`] — a raw `[y/n]`-style yes/no prompt from a tool or
+//!   shell the agent ran (git, package managers, scripts). It has no numbered
+//!   options and no navigation footer, so `scan_menu` never matches it; the
+//!   main worker answers it with `send_keys`.
 //!
-//! This is a heuristic over Claude Code's TUI rendering — it is anchored on the
-//! stable navigation footer ("… to navigate", "… to select") and the cursor
-//! glyph, and returns `None` rather than guess. If Claude changes that
-//! rendering this parser is the single place to update.
+//! Both are heuristics over rendered TUI text and return `None` rather than
+//! guess: `scan_menu` is anchored on the stable navigation footer ("… to
+//! navigate", "… to select") and the cursor glyph; `scan_yes_no_prompt` is
+//! anchored on a yes/no token at the foot of the screen (where the cursor
+//! waits). If Claude changes that rendering, this module is the single place to
+//! update.
 
 /// A selection menu detected on a panel's screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +153,88 @@ fn parse_option_line(raw: &str) -> Option<(usize, String, bool)> {
         return None;
     }
     Some((number, label.to_string(), has_cursor))
+}
+
+/// Scan rendered grid rows (oldest/topmost first) for a raw `[y/n]`-style
+/// yes/no prompt the agent is waiting on — the kind a tool or shell it ran
+/// shows (`Continue? [y/N]`, `Proceed (y/n)?`, apt's `[Y/n/a/q/?]`). Returns
+/// the prompt line, or `None` unless a yes/no token sits at the foot of the
+/// last non-empty rendered line.
+///
+/// Conservative on purpose: only the **last** non-empty line is considered
+/// (that is where the cursor waits for input), the yes/no group must be the
+/// last bracketed group on it, and only prompt punctuation (`?`, `:`, a cursor
+/// glyph) may follow — so prose that merely mentions `[y/n]` mid-screen is not
+/// read as a live prompt.
+pub fn scan_yes_no_prompt(rows: &[String]) -> Option<String> {
+    let last = rows.iter().rev().find(|r| !r.trim().is_empty())?;
+    let trimmed = last.trim();
+    ends_with_yes_no_prompt(trimmed).then(|| trimmed.to_string())
+}
+
+/// Whether `line` ends in a yes/no input prompt: its last `[...]`/`(...)` group
+/// is a yes/no option group ([`yes_no_group`]) and only prompt punctuation
+/// follows it.
+fn ends_with_yes_no_prompt(line: &str) -> bool {
+    let Some(open) = line.rfind(['[', '(']) else {
+        return false;
+    };
+    let close_ch = if line.as_bytes()[open] == b'[' {
+        ']'
+    } else {
+        ')'
+    };
+    let Some(rel) = line[open + 1..].find(close_ch) else {
+        return false;
+    };
+    let close = open + 1 + rel;
+    // Only prompt punctuation (or a trailing cursor) may follow the group, so
+    // the prompt is the line's tail rather than an inline mention.
+    let tail = line[close + 1..].trim();
+    let tail_ok = tail.is_empty()
+        || tail
+            .chars()
+            .all(|c| matches!(c, '?' | ':' | '.' | '»' | '›' | '❯' | '▶' | '▸' | '>'));
+    tail_ok && yes_no_group(&line[open + 1..close])
+}
+
+/// Whether the bracket contents form a yes/no answer group: split on `/`, every
+/// token a known yes/no answer key, with at least one yes (`y`/`yes`) and one
+/// no (`n`/`no`). The extra accept keys some shells offer (apt's `a`/`q`/`?`,
+/// git's `e`/`d`/`s`) are allowed as members but never substitute for the
+/// yes/no anchor, so an arbitrary `[a/b]` group is rejected.
+fn yes_no_group(inner: &str) -> bool {
+    let (mut has_yes, mut has_no, mut tokens) = (false, false, 0usize);
+    for raw in inner.split('/') {
+        let tok = raw.trim();
+        if tok.is_empty() {
+            return false;
+        }
+        tokens += 1;
+        // Byte-wise case-insensitive compare — no per-token String alloc on
+        // this per-tick scan path.
+        let is = |kw: &str| tok.eq_ignore_ascii_case(kw);
+        if is("y") || is("yes") {
+            has_yes = true;
+        } else if is("n") || is("no") {
+            has_no = true;
+        } else if is("a")
+            || is("all")
+            || is("q")
+            || is("quit")
+            || is("c")
+            || is("cancel")
+            || tok == "?"
+            || is("d")
+            || is("e")
+            || is("s")
+        {
+            // An extra accept key (apt/git) — allowed as a member, never the anchor.
+        } else {
+            return false;
+        }
+    }
+    has_yes && has_no && (2..=8).contains(&tokens)
 }
 
 #[cfg(test)]
@@ -305,5 +390,64 @@ mod tests {
         let menu = scan_menu(&rows).expect("the bottom footer anchors the menu");
         assert_eq!(menu.options.len(), 2);
         assert_eq!(menu.cursor, 0);
+    }
+
+    fn rows(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The common yes/no prompt forms a tool or shell shows are detected, with
+    /// the prompt line returned trimmed: bracketed/parenthesised, default-cap
+    /// variants, a trailing `?`/`:`, and apt's multi-key `[Y/n/a/q/?]`.
+    #[test]
+    fn detects_yes_no_prompt_forms() {
+        for line in [
+            "Continue? [y/N]",
+            "Proceed (y/n)?",
+            "Overwrite all files? [y/n/a]:",
+            "Do you want to continue? [Y/n]",
+            "Are you sure? (yes/no)",
+            "Configuration file modified. Install package maintainer's version? [Y/n/a/q/?]",
+        ] {
+            assert_eq!(
+                scan_yes_no_prompt(&rows(&["some earlier output", "", line])).as_deref(),
+                Some(line),
+                "must detect yes/no prompt: {line:?}"
+            );
+        }
+    }
+
+    /// Only the **last** non-empty line is a live prompt: a yes/no token earlier
+    /// in the scrollback, with ordinary output after it, is not read as one.
+    #[test]
+    fn yes_no_prompt_only_at_the_foot() {
+        assert!(
+            scan_yes_no_prompt(&rows(&["Continue? [y/N]", "yes", "Done — wrote 3 files.",]))
+                .is_none(),
+            "an answered prompt with output after it is not a live prompt"
+        );
+    }
+
+    /// Prose that merely mentions a `[y/n]` token mid-line, or a non-yes/no
+    /// bracket group, must not be read as a prompt.
+    #[test]
+    fn yes_no_prompt_rejects_non_prompts() {
+        // Mention mid-line with trailing prose → tail is not prompt punctuation.
+        assert!(scan_yes_no_prompt(&rows(&["pass [y/n] to the script to confirm"])).is_none());
+        // A bracket group that is not a yes/no answer set.
+        assert!(scan_yes_no_prompt(&rows(&["pick a slot [1/2/3]?"])).is_none());
+        assert!(scan_yes_no_prompt(&rows(&["choose [a/b]?"])).is_none());
+        // A group with a yes but no "no" token is rejected.
+        assert!(scan_yes_no_prompt(&rows(&["ready [y]?"])).is_none());
+        // Empty screen.
+        assert!(scan_yes_no_prompt(&rows(&["", "   "])).is_none());
+    }
+
+    /// A numbered chooser is a `scan_menu` match, not a yes/no prompt — its last
+    /// line is the navigation footer, so `scan_yes_no_prompt` returns `None` and
+    /// the two detectors never both fire on the same screen.
+    #[test]
+    fn menu_screen_is_not_a_yes_no_prompt() {
+        assert!(scan_yes_no_prompt(&fixture()).is_none());
     }
 }

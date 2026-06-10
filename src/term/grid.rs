@@ -140,7 +140,7 @@ pub struct Grid {
     /// Monotonic content-change counter, bumped on every `advance` that ingests
     /// bytes and on every `resize`. A consumer that derives something expensive
     /// from the grid text (the menu scan,
-    /// `session::runtime::rounds::poll_round_selection_prompts`) caches its
+    /// `session::runtime::rounds::poll_round_blocked_panels`) caches its
     /// result against this value and recomputes only when it changes — so an
     /// idle panel is never re-scanned. Wraps; only equality across one tick
     /// matters, never the absolute value.

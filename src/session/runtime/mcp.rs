@@ -114,13 +114,14 @@ impl McpToolSurface for Multiplexer {
             .map(|p| {
                 // Prefer the manifest's derived_state (turn-signal fed); fall
                 // back to the coarse panel-state label before the first turn.
-                // A live selection menu on the grid overlays `awaiting_selection`
-                // (no Stop hook fires while a chooser is open).
+                // A live grid-detected prompt (selection menu or `[y/n]`)
+                // overlays its blocked state — no Stop hook fires while one is
+                // open, so the signal-derived state alone would read `working`.
                 let (state, agent_cli) = match self.manifests.get(&p.id) {
                     Some(m) => {
-                        let st = Self::overlay_menu_state(
+                        let st = Self::overlay_blocked_state(
                             m.derived_state(),
-                            Self::panel_menu(p).is_some(),
+                            Self::panel_blocked_prompt(p).as_ref(),
                         );
                         (st.as_str().to_string(), m.agent_cli)
                     }

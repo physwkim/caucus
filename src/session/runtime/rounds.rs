@@ -65,6 +65,56 @@ fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
     idx.min(s.len())
 }
 
+/// What a round panel is visibly waiting on, detected from its rendered grid
+/// ([`Multiplexer::panel_blocked_prompt`]) — a mid-turn attention state the
+/// coarse panel state cannot express, because none of these fire a `Stop` hook.
+/// The panel therefore stays coarse `Working` and its round never settles; the
+/// per-tick round watch ([`Multiplexer::poll_round_blocked_panels`]) pushes a
+/// deduped interim notice for each so the main worker can act before the
+/// fallback deadline rather than the round silently stalling.
+#[derive(Debug, Clone)]
+pub(crate) enum BlockedPrompt {
+    /// A numbered selection menu — answered with `select_option`.
+    Selection(crate::term::Menu),
+    /// A raw `[y/n]`-style yes/no prompt from a tool/shell the agent ran —
+    /// answered with `send_keys`. Carries the prompt line for the notice.
+    Permission(String),
+}
+
+impl BlockedPrompt {
+    /// The [`DerivedState`] this visible prompt corresponds to.
+    pub(crate) fn derived_state(&self) -> DerivedState {
+        match self {
+            BlockedPrompt::Selection(_) => DerivedState::AwaitingSelection,
+            BlockedPrompt::Permission(_) => DerivedState::BlockedPermissionPrompt,
+        }
+    }
+
+    /// Content signature for dedup ([`Multiplexer::notified_blockers`]): a
+    /// menu's question + numbered option labels (cursor row **excluded**, so a
+    /// moving highlight never re-announces), or a yes/no prompt's text. A
+    /// variant tag is folded in so the two kinds can never collide on a hash.
+    pub(crate) fn signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match self {
+            BlockedPrompt::Selection(menu) => {
+                0u8.hash(&mut h);
+                menu.question.hash(&mut h);
+                for opt in &menu.options {
+                    opt.number.hash(&mut h);
+                    opt.label.hash(&mut h);
+                }
+            }
+            BlockedPrompt::Permission(line) => {
+                1u8.hash(&mut h);
+                line.hash(&mut h);
+            }
+        }
+        h.finish()
+    }
+}
+
 /// A round caucus is watching on the main worker's behalf
 /// ([`Multiplexer::poll_pending_rounds`]).
 ///
@@ -449,7 +499,7 @@ impl Multiplexer {
     /// Only a panel in coarse `Idle` is fed — never one that is `Working` or
     /// still `Spawning`. A panel stopped on a selection menu is excluded for
     /// free: a chooser fires no `Stop` hook, so such a panel stays coarse
-    /// `Working` (and [`Multiplexer::poll_round_selection_prompts`] routes it to
+    /// `Working` (and [`Multiplexer::poll_round_blocked_panels`] routes it to
     /// the main worker instead). The next task is delivered with `enter`, which
     /// flips the panel back to `Working` (so it is no longer settled); an empty
     /// queue is left in place and the panel settles. The queue is popped only after
@@ -521,7 +571,7 @@ impl Multiplexer {
     /// `COMPOSE_GRACE` (so the user is not mid-compose). The single gate shared
     /// by both push paths — round completion
     /// ([`Multiplexer::poll_pending_rounds`]) and selection prompts
-    /// ([`Multiplexer::poll_round_selection_prompts`]). Each push flips the main
+    /// ([`Multiplexer::poll_round_blocked_panels`]). Each push flips the main
     /// panel to `Working`, closing the gate for the rest of the tick, so at most
     /// one push of either kind lands per tick.
     fn main_deliverable(&self) -> bool {
@@ -542,7 +592,7 @@ impl Multiplexer {
     /// safety net. Called once per event-loop tick, after round delivery.
     ///
     /// caucus's only caucus→main pushes ([`Multiplexer::poll_pending_rounds`],
-    /// [`Multiplexer::poll_round_selection_prompts`]) both require a registered
+    /// [`Multiplexer::poll_round_blocked_panels`]) both require a registered
     /// round. If the main worker broadcasts/spawns work and ends its turn
     /// *without* calling `register_round`, no round exists, so nothing ever
     /// re-prompts it: it sits idle forever while the sub-panels work. This is
@@ -618,19 +668,22 @@ impl Multiplexer {
     }
 
     /// Announce to the main worker when a panel in a pending round has stopped
-    /// on an interactive selection menu — the caucus→main *selection* push.
+    /// on a prompt it cannot self-resolve — a selection menu or a raw `[y/n]`
+    /// yes/no prompt ([`BlockedPrompt`]). This is the caucus→main *blocked-panel*
+    /// push.
     ///
-    /// A chooser fires no `Stop` hook, so the panel stays coarse `Working` and
-    /// its round never settles; without this the main worker would only learn
-    /// at the fallback deadline. caucus pushes an interim notice so the main
-    /// worker can answer it (`read_menu` / `select_option`) and let the round
-    /// finish. Gated by `Multiplexer::main_deliverable` and deduped by menu
-    /// content signature (`Multiplexer::notified_menus`): a panel sitting on
-    /// one menu is announced once; a menu whose content changes re-announces;
-    /// a panel that leaves its menu is forgotten so a future menu re-announces.
-    /// At most one notice per tick (shares the deliverability gate with round
-    /// completion, which a push closes by flipping the main panel to `Working`).
-    pub fn poll_round_selection_prompts(&mut self) {
+    /// Neither kind fires a `Stop` hook, so the panel stays coarse `Working` and
+    /// its round never settles; without this the main worker would only learn at
+    /// the fallback deadline (default 600s). caucus pushes an interim notice so
+    /// the main worker can answer it (`select_option` / `send_keys`) and let the
+    /// round finish. Gated by `Multiplexer::main_deliverable` and deduped by
+    /// prompt content signature (`Multiplexer::notified_blockers`): a panel
+    /// sitting on one prompt is announced once; a prompt whose content changes
+    /// re-announces; a panel that leaves its prompt is forgotten so a future
+    /// prompt re-announces. At most one notice per tick (shares the
+    /// deliverability gate with round completion, which a push closes by
+    /// flipping the main panel to `Working`).
+    pub fn poll_round_blocked_panels(&mut self) {
         let Some(main_id) = self.main_panel_id else {
             return;
         };
@@ -638,9 +691,9 @@ impl Multiplexer {
             return;
         }
 
-        // Round panels currently showing a menu, with a content signature
-        // (question + options, not the cursor row) so cursor movement alone
-        // never re-announces.
+        // Round panels currently stuck on a prompt, with a content signature
+        // (cursor-independent for a menu) so a moving highlight never
+        // re-announces.
         let round_panels: std::collections::HashSet<PanelId> = self
             .pending_rounds
             .iter()
@@ -662,17 +715,18 @@ impl Multiplexer {
             })
             .collect();
         let mut open: Vec<(PanelId, u64)> = Vec::new();
-        let mut menus: HashMap<PanelId, crate::term::Menu> = HashMap::new();
+        let mut prompts: HashMap<PanelId, BlockedPrompt> = HashMap::new();
         for (pid, generation) in scan_targets {
-            if let Some(menu) = self.panel_menu_cached(pid, generation) {
-                open.push((pid, Self::menu_signature(&menu)));
-                menus.insert(pid, menu);
+            if let Some(prompt) = self.panel_blocked_cached(pid, generation) {
+                open.push((pid, prompt.signature()));
+                prompts.insert(pid, prompt);
             }
         }
 
-        let (pick, open_set) = Self::pick_menu_to_notify(&open, &self.notified_menus);
-        // Forget panels that have left their menu, so a future menu re-announces.
-        self.notified_menus.retain(|pid, _| open_set.contains(pid));
+        let (pick, open_set) = Self::pick_blocker_to_notify(&open, &self.notified_blockers);
+        // Forget panels that have left their prompt, so a future one re-announces.
+        self.notified_blockers
+            .retain(|pid, _| open_set.contains(pid));
 
         // One notice per tick, only while the gate is open. Dedup state above
         // is updated regardless; the panel is marked notified only on a real
@@ -689,34 +743,49 @@ impl Multiplexer {
             .find(|(p, _)| *p == pid)
             .map(|(_, s)| *s)
             .unwrap();
-        let menu = menus.remove(&pid).unwrap();
+        let prompt = prompts.remove(&pid).unwrap();
         let role = self
             .panels
             .iter()
             .find(|p| p.id == pid)
             .map(|p| p.role.clone())
             .unwrap_or_default();
-        let notice = format!(
-            "[caucus] panel {pid} (role: {role}) is waiting on a selection — \
-             answer it so the round can finish.\n{}\n(answer with \
-             select_option({pid}, <number>); for a free-text reply pick the \
-             'type something' option, then send_keys your text.)",
-            Self::render_menu(&menu)
-        );
+        let notice = Self::blocked_prompt_notice(pid, &role, &prompt);
         if let Err(err) = McpToolSurface::send_keys(self, main_id, &notice, true) {
-            warn!(error = %err, "selection-prompt notice to main panel failed");
+            warn!(error = %err, "blocked-panel notice to main panel failed");
         }
-        self.notified_menus.insert(pid, sig);
+        self.notified_blockers.insert(pid, sig);
     }
 
-    /// Pick which round panel to announce a selection menu for this tick.
+    /// The interim notice text for a round panel stuck on `prompt`, tailored to
+    /// how the main worker answers it: `select_option` for a menu, `send_keys`
+    /// for a yes/no prompt.
+    fn blocked_prompt_notice(pid: PanelId, role: &str, prompt: &BlockedPrompt) -> String {
+        match prompt {
+            BlockedPrompt::Selection(menu) => format!(
+                "[caucus] panel {pid} (role: {role}) is waiting on a selection — \
+                 answer it so the round can finish.\n{}\n(answer with \
+                 select_option({pid}, <number>); for a free-text reply pick the \
+                 'type something' option, then send_keys your text.)",
+                Self::render_menu(menu)
+            ),
+            BlockedPrompt::Permission(line) => format!(
+                "[caucus] panel {pid} (role: {role}) is waiting on a yes/no prompt — \
+                 answer it so the round can finish.\n{line}\n(answer with \
+                 send_keys({pid}, \"y\") or send_keys({pid}, \"n\") as appropriate; \
+                 caucus never auto-answers prompts.)"
+            ),
+        }
+    }
+
+    /// Pick which round panel to announce a blocking prompt for this tick.
     ///
-    /// Pure decision core of [`Multiplexer::poll_round_selection_prompts`]:
-    /// given the panels currently showing a menu as `(panel, signature)` and
-    /// the already-notified set, return the first panel whose signature is new
-    /// or changed (the one to push), plus the set of panels showing a menu now
+    /// Pure decision core of [`Multiplexer::poll_round_blocked_panels`]: given
+    /// the panels currently stuck on a prompt as `(panel, signature)` and the
+    /// already-notified set, return the first panel whose signature is new or
+    /// changed (the one to push), plus the set of panels stuck on a prompt now
     /// (so the caller can prune stale dedup entries).
-    fn pick_menu_to_notify(
+    fn pick_blocker_to_notify(
         open: &[(PanelId, u64)],
         notified: &HashMap<PanelId, u64>,
     ) -> (Option<PanelId>, std::collections::HashSet<PanelId>) {
@@ -726,22 +795,6 @@ impl Multiplexer {
             .find(|(p, sig)| notified.get(p) != Some(sig))
             .map(|(p, _)| *p);
         (pick, open_set)
-    }
-
-    /// Content signature of a selection menu — a hash of the question and the
-    /// numbered option labels, **excluding** the cursor row. Two reads of the
-    /// same chooser hash equal even as the highlighted row moves; a changed
-    /// question or option set hashes differently. Used to dedup the
-    /// selection-prompt push ([`Multiplexer::notified_menus`]).
-    fn menu_signature(menu: &crate::term::Menu) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        menu.question.hash(&mut h);
-        for opt in &menu.options {
-            opt.number.hash(&mut h);
-            opt.label.hash(&mut h);
-        }
-        h.finish()
     }
 
     /// Assemble a round's delivery message: a self-describing block per panel
@@ -898,38 +951,61 @@ impl Multiplexer {
         crate::term::scan_menu(&lines)
     }
 
-    /// [`Multiplexer::panel_menu`] gated by the panel's grid `generation`. If
-    /// the panel's grid has not changed since the last scan (cached generation
-    /// matches), the cached result is returned without re-materialising the
-    /// viewport or re-running `scan_menu`; otherwise it re-scans and refreshes
-    /// the cache. This is what keeps the per-tick selection-prompt poll from
-    /// re-scanning every idle round panel. Returns `None` for an unknown id.
-    fn panel_menu_cached(&mut self, id: PanelId, generation: u64) -> Option<crate::term::Menu> {
-        if let Some((cached_gen, cached)) = self.menu_scan_cache.get(&id)
+    /// Scan a panel's visible grid for whatever it is stuck waiting on
+    /// ([`BlockedPrompt`]): a numbered selection menu first (the richer,
+    /// higher-confidence match), then a raw `[y/n]` yes/no prompt. `None` when
+    /// neither is confidently detected.
+    pub(crate) fn panel_blocked_prompt(panel: &Panel) -> Option<BlockedPrompt> {
+        let (_, rows) = panel.grid().size();
+        let lines: Vec<String> = (0..rows)
+            .map(|r| panel.grid().row_text(r).trim_end().to_string())
+            .collect();
+        if let Some(menu) = crate::term::scan_menu(&lines) {
+            return Some(BlockedPrompt::Selection(menu));
+        }
+        crate::term::scan_yes_no_prompt(&lines).map(BlockedPrompt::Permission)
+    }
+
+    /// [`Multiplexer::panel_blocked_prompt`] gated by the panel's grid
+    /// `generation`. If the panel's grid has not changed since the last scan
+    /// (cached generation matches), the cached result is returned without
+    /// re-materialising the viewport or re-running the scanners; otherwise it
+    /// re-scans and refreshes the cache. This is what keeps the per-tick
+    /// blocked-panel poll from re-scanning every idle round panel. Returns
+    /// `None` for an unknown id.
+    fn panel_blocked_cached(&mut self, id: PanelId, generation: u64) -> Option<BlockedPrompt> {
+        if let Some((cached_gen, cached)) = self.blocked_scan_cache.get(&id)
             && *cached_gen == generation
         {
             return cached.clone();
         }
-        let menu = self
+        let prompt = self
             .panels
             .iter()
             .find(|p| p.id == id)
-            .and_then(Self::panel_menu);
-        self.menu_scan_cache.insert(id, (generation, menu.clone()));
-        menu
+            .and_then(Self::panel_blocked_prompt);
+        self.blocked_scan_cache
+            .insert(id, (generation, prompt.clone()));
+        prompt
     }
 
-    /// Overlay a live selection-menu detection onto the turn-signal-derived
-    /// state. A visible menu means the agent stopped mid-turn for a choice —
-    /// which the `Stop`-hook state cannot see — so it outranks the
-    /// signal-derived `Working`/`Idle` (mirroring `derive_agent_state`, where
-    /// a grid hint is weighed before the turn signal). It never masks a
-    /// stronger state (`Exited`/`Blocked*`/`Interrupted`/`Degraded`).
-    pub(crate) fn overlay_menu_state(base: DerivedState, has_menu: bool) -> DerivedState {
-        if has_menu && matches!(base, DerivedState::Working | DerivedState::Idle) {
-            DerivedState::AwaitingSelection
-        } else {
-            base
+    /// Overlay a live grid-detected blocking prompt ([`BlockedPrompt`]) onto the
+    /// turn-signal-derived state, so `list_panels` reports the same blocked
+    /// state the round-watch push announces. A visible menu or `[y/n]` prompt
+    /// means the agent stopped mid-turn needing the main worker — which the
+    /// `Stop`-hook state cannot see — so it outranks the signal-derived
+    /// `Working`/`Idle` (mirroring `derive_agent_state`, where a grid hint is
+    /// weighed before the turn signal). It never masks a stronger state
+    /// (`Exited`/`Blocked*`/`Interrupted`/`Degraded`).
+    pub(crate) fn overlay_blocked_state(
+        base: DerivedState,
+        blocked: Option<&BlockedPrompt>,
+    ) -> DerivedState {
+        match blocked {
+            Some(prompt) if matches!(base, DerivedState::Working | DerivedState::Idle) => {
+                prompt.derived_state()
+            }
+            _ => base,
         }
     }
 
@@ -1844,94 +1920,161 @@ mod tests {
         mux.shutdown();
     }
 
-    /// A live selection menu overlays `AwaitingSelection` onto an otherwise
-    /// signal-derived state, but never masks a stronger state.
+    /// A live grid-detected prompt overlays its blocked state onto an otherwise
+    /// signal-derived `Working`/`Idle`, but never masks a stronger state. A menu
+    /// maps to `AwaitingSelection`, a `[y/n]` prompt to `BlockedPermissionPrompt`.
     #[test]
-    fn overlay_menu_state_only_overrides_working_and_idle() {
+    fn overlay_blocked_state_only_overrides_working_and_idle() {
         use DerivedState::*;
-        // Mid-turn (Working) or back-at-prompt (Idle) + menu → AwaitingSelection.
+        let menu = BlockedPrompt::Selection(menu_of("Pick one", ["alpha", "beta"], 0));
+        let perm = BlockedPrompt::Permission("Continue? [y/N]".into());
+        // Mid-turn (Working) or back-at-prompt (Idle) + a prompt → its state.
         assert_eq!(
-            Multiplexer::overlay_menu_state(Working, true),
+            Multiplexer::overlay_blocked_state(Working, Some(&menu)),
             AwaitingSelection
         );
         assert_eq!(
-            Multiplexer::overlay_menu_state(Idle, true),
-            AwaitingSelection
+            Multiplexer::overlay_blocked_state(Idle, Some(&perm)),
+            BlockedPermissionPrompt
         );
-        // No menu detected → unchanged.
-        assert_eq!(Multiplexer::overlay_menu_state(Working, false), Working);
-        // Stronger states are never masked by a stray on-screen menu.
-        assert_eq!(Multiplexer::overlay_menu_state(Exited, true), Exited);
+        // No prompt detected → unchanged.
+        assert_eq!(Multiplexer::overlay_blocked_state(Working, None), Working);
+        // Stronger states are never masked by a stray on-screen prompt.
         assert_eq!(
-            Multiplexer::overlay_menu_state(BlockedMergeConflict, true),
+            Multiplexer::overlay_blocked_state(Exited, Some(&menu)),
+            Exited
+        );
+        assert_eq!(
+            Multiplexer::overlay_blocked_state(BlockedMergeConflict, Some(&menu)),
             BlockedMergeConflict
         );
         assert_eq!(
-            Multiplexer::overlay_menu_state(InterruptedTransport, true),
+            Multiplexer::overlay_blocked_state(InterruptedTransport, Some(&perm)),
             InterruptedTransport
         );
     }
 
-    /// `menu_signature` tracks menu *content* — question + option labels — and
-    /// ignores the cursor row, so navigation alone never re-announces.
+    /// A `Selection` blocker's signature tracks menu *content* — question +
+    /// option labels — and ignores the cursor row, so navigation alone never
+    /// re-announces.
     #[test]
-    fn menu_signature_ignores_cursor_tracks_content() {
-        let base = menu_of("Pick one", ["alpha", "beta"], 0);
+    fn selection_signature_ignores_cursor_tracks_content() {
+        let sig = |q, labels: [&str; 2], cur| {
+            BlockedPrompt::Selection(menu_of(q, labels, cur)).signature()
+        };
         // Same content, cursor moved → same signature.
-        let moved = menu_of("Pick one", ["alpha", "beta"], 1);
         assert_eq!(
-            Multiplexer::menu_signature(&base),
-            Multiplexer::menu_signature(&moved),
+            sig("Pick one", ["alpha", "beta"], 0),
+            sig("Pick one", ["alpha", "beta"], 1),
             "cursor movement must not change the signature"
         );
         // Changed option label → different signature.
-        let relabelled = menu_of("Pick one", ["alpha", "gamma"], 0);
         assert_ne!(
-            Multiplexer::menu_signature(&base),
-            Multiplexer::menu_signature(&relabelled),
+            sig("Pick one", ["alpha", "beta"], 0),
+            sig("Pick one", ["alpha", "gamma"], 0),
             "a changed option must change the signature"
         );
         // Changed question → different signature.
-        let requestioned = menu_of("Pick another", ["alpha", "beta"], 0);
         assert_ne!(
-            Multiplexer::menu_signature(&base),
-            Multiplexer::menu_signature(&requestioned),
+            sig("Pick one", ["alpha", "beta"], 0),
+            sig("Pick another", ["alpha", "beta"], 0),
             "a changed question must change the signature"
         );
     }
 
-    /// `pick_menu_to_notify` announces a panel's menu once, re-announces on a
-    /// content change, stays silent while unchanged, and reports the open set
-    /// so the caller can prune panels that have left their menus.
+    /// A `Permission` blocker's signature tracks the prompt line, and a menu and
+    /// a yes/no prompt never collide — the variant tag is folded into the hash.
     #[test]
-    fn pick_menu_to_notify_announces_new_and_dedups() {
+    fn permission_signature_tracks_line_and_never_collides_with_a_menu() {
+        let a = BlockedPrompt::Permission("Continue? [y/N]".into()).signature();
+        let b = BlockedPrompt::Permission("Overwrite? [y/N]".into()).signature();
+        assert_ne!(a, b, "a changed prompt line must change the signature");
+
+        let menu =
+            BlockedPrompt::Selection(menu_of("Continue? [y/N]", ["yes", "no"], 0)).signature();
+        let perm = BlockedPrompt::Permission("Continue? [y/N]".into()).signature();
+        assert_ne!(menu, perm, "a menu and a yes/no prompt must not collide");
+    }
+
+    /// `panel_blocked_prompt` glues the grid rows to the scanners: a `[y/n]`
+    /// prompt rendered into a live panel's grid is detected as a `Permission`
+    /// blocker (the grid → `row_text` → `scan_yes_no_prompt` path end to end).
+    #[tokio::test]
+    async fn panel_blocked_prompt_detects_a_live_yes_no_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let pid = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        // Render a yes/no prompt into the panel's grid directly (bypassing the
+        // PTY for determinism — the scanner reads whatever the grid holds).
+        let panel = mux.panels.iter_mut().find(|p| p.id == pid).unwrap();
+        panel
+            .grid
+            .advance(b"Building project...\r\nContinue? [y/N]");
+
+        match Multiplexer::panel_blocked_prompt(panel) {
+            Some(BlockedPrompt::Permission(line)) => assert!(
+                line.contains("[y/N]"),
+                "the detected prompt line must be the y/n line: {line:?}"
+            ),
+            other => panic!("expected a Permission blocker, got {other:?}"),
+        }
+
+        mux.shutdown();
+    }
+
+    /// `blocked_prompt_notice` tailors the answer instructions to the prompt
+    /// kind: `select_option` for a menu, `send_keys` + the prompt line for a
+    /// yes/no prompt.
+    #[test]
+    fn blocked_prompt_notice_tailors_the_answer_path() {
+        let pid = PanelId::new();
+        let menu = BlockedPrompt::Selection(menu_of("Pick one", ["alpha", "beta"], 0));
+        let menu_notice = Multiplexer::blocked_prompt_notice(pid, "reviewer", &menu);
+        assert!(
+            menu_notice.contains("select_option"),
+            "a menu notice must point at select_option: {menu_notice}"
+        );
+
+        let perm = BlockedPrompt::Permission("Continue? [y/N]".into());
+        let perm_notice = Multiplexer::blocked_prompt_notice(pid, "reviewer", &perm);
+        assert!(
+            perm_notice.contains("send_keys") && perm_notice.contains("Continue? [y/N]"),
+            "a yes/no notice must point at send_keys and echo the prompt: {perm_notice}"
+        );
+    }
+
+    /// `pick_blocker_to_notify` announces a panel's prompt once, re-announces on
+    /// a content change, stays silent while unchanged, and reports the open set
+    /// so the caller can prune panels that have left their prompts.
+    #[test]
+    fn pick_blocker_to_notify_announces_new_and_dedups() {
         let pid = PanelId::new();
         let sig_a = 11u64;
         let sig_b = 22u64;
 
         // Nothing on screen → nothing to announce, empty open set.
-        let (pick, open) = Multiplexer::pick_menu_to_notify(&[], &HashMap::new());
+        let (pick, open) = Multiplexer::pick_blocker_to_notify(&[], &HashMap::new());
         assert_eq!(pick, None);
         assert!(open.is_empty());
 
-        // A menu not yet notified → announce it; open set carries the panel.
-        let (pick, open) = Multiplexer::pick_menu_to_notify(&[(pid, sig_a)], &HashMap::new());
+        // A prompt not yet notified → announce it; open set carries the panel.
+        let (pick, open) = Multiplexer::pick_blocker_to_notify(&[(pid, sig_a)], &HashMap::new());
         assert_eq!(pick, Some(pid));
         assert!(open.contains(&pid));
 
-        // Same menu already notified → silent.
+        // Same prompt already notified → silent.
         let notified = HashMap::from([(pid, sig_a)]);
-        let (pick, open) = Multiplexer::pick_menu_to_notify(&[(pid, sig_a)], &notified);
+        let (pick, open) = Multiplexer::pick_blocker_to_notify(&[(pid, sig_a)], &notified);
         assert_eq!(pick, None);
         assert!(open.contains(&pid));
 
-        // Menu content changed under the same panel → re-announce.
-        let (pick, _) = Multiplexer::pick_menu_to_notify(&[(pid, sig_b)], &notified);
+        // Prompt content changed under the same panel → re-announce.
+        let (pick, _) = Multiplexer::pick_blocker_to_notify(&[(pid, sig_b)], &notified);
         assert_eq!(pick, Some(pid));
 
-        // Panel left its menu (not in `open`) → not in the open set, so the
+        // Panel left its prompt (not in `open`) → not in the open set, so the
         // caller's retain drops its dedup entry.
-        let (pick, open) = Multiplexer::pick_menu_to_notify(&[], &notified);
+        let (pick, open) = Multiplexer::pick_blocker_to_notify(&[], &notified);
         assert_eq!(pick, None);
         assert!(!open.contains(&pid));
     }
@@ -2112,13 +2255,13 @@ mod tests {
         mux.shutdown();
     }
 
-    /// `panel_menu_cached` reuses its result while the panel's grid generation
-    /// is unchanged and recomputes once it advances. A sentinel menu seeded into
-    /// the cache (the live cat-panel grid has no menu) lets the test tell a
-    /// cache hit from a recompute: a hit returns the sentinel, a recompute on
-    /// the empty grid returns `None`.
+    /// `panel_blocked_cached` reuses its result while the panel's grid
+    /// generation is unchanged and recomputes once it advances. A sentinel
+    /// prompt seeded into the cache (the live cat-panel grid has no prompt) lets
+    /// the test tell a cache hit from a recompute: a hit returns the sentinel, a
+    /// recompute on the empty grid returns `None`.
     #[tokio::test]
-    async fn panel_menu_cached_reuses_until_generation_advances() {
+    async fn panel_blocked_cached_reuses_until_generation_advances() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let pid = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
@@ -2130,22 +2273,22 @@ mod tests {
             .grid()
             .generation();
 
-        let sentinel = crate::term::Menu {
-            question: "cached?".into(),
-            options: vec![],
-            cursor: 0,
-        };
-        mux.menu_scan_cache
+        let sentinel = BlockedPrompt::Permission("Continue? [y/N]".into());
+        mux.blocked_scan_cache
             .insert(pid, (generation, Some(sentinel.clone())));
 
         // Same generation → cache hit → the sentinel, no re-scan.
-        assert_eq!(mux.panel_menu_cached(pid, generation), Some(sentinel));
+        assert_eq!(
+            mux.panel_blocked_cached(pid, generation)
+                .map(|p| p.signature()),
+            Some(sentinel.signature()),
+        );
 
         // Advanced generation → recompute → the empty grid yields None, and the
         // cache is refreshed to the new generation.
-        assert_eq!(mux.panel_menu_cached(pid, generation + 1), None);
+        assert!(mux.panel_blocked_cached(pid, generation + 1).is_none());
         assert_eq!(
-            mux.menu_scan_cache.get(&pid).map(|(g, _)| *g),
+            mux.blocked_scan_cache.get(&pid).map(|(g, _)| *g),
             Some(generation + 1),
             "the cache must track the latest generation it scanned"
         );
@@ -2153,19 +2296,19 @@ mod tests {
         mux.shutdown();
     }
 
-    /// A killed panel's menu-scan cache entry is pruned, so the cache cannot
+    /// A killed panel's blocked-scan cache entry is pruned, so the cache cannot
     /// grow with dead-panel ids over a long session.
     #[tokio::test]
-    async fn kill_panel_prunes_the_menu_scan_cache() {
+    async fn kill_panel_prunes_the_blocked_scan_cache() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let pid = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
-        mux.menu_scan_cache.insert(pid, (0, None));
+        mux.blocked_scan_cache.insert(pid, (0, None));
 
         mux.kill_panel(pid).unwrap();
         assert!(
-            !mux.menu_scan_cache.contains_key(&pid),
-            "killing a panel must drop its menu-scan cache entry"
+            !mux.blocked_scan_cache.contains_key(&pid),
+            "killing a panel must drop its blocked-scan cache entry"
         );
 
         mux.shutdown();

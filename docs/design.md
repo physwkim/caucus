@@ -198,9 +198,13 @@ AskUserQuestion`이 걸리고, 양 백엔드의 시스템 프롬프트에 질문
 main이 라운드 보고서에서 읽고 답한다)이 덧붙는다(`agent::spawn::build_command`).
 그래도 메뉴가 뜨는 경우 — plan-mode 승인, codex 승인 프롬프트 등 하네스가
 그리는 chooser — 를 위해 감지 경로가 fallback으로 남는다: caucus는 매 tick
-`poll_round_selection_prompts`로 라운드 패널의 메뉴를 감지해 main worker에 push
-알림을 보낸다(round 완료 push와 같은 idle·quiet 게이트, tick당 1건). main은
-`read_menu`/`select_option`으로 답해 패널을 풀어 준다 — §8.3.
+`poll_round_blocked_panels`로 라운드 패널이 멈춘 프롬프트를 감지해 main worker에
+push 알림을 보낸다(round 완료 push와 같은 idle·quiet 게이트, tick당 1건). 감지
+대상은 선택 메뉴(`scan_menu`)뿐 아니라 tool/shell이 띄운 raw `[y/n]`
+프롬프트(`scan_yes_no_prompt`)까지다 — 둘 다 Stop hook이 안 떠 패널이 `Working`에
+묶이고 라운드가 settle하지 못하는 같은 부류이기 때문이다. main은 메뉴면
+`read_menu`/`select_option`으로, `[y/n]`이면 `send_keys`로 답해 패널을 풀어 준다 —
+§8.3.
 
 라이브 모델에는 `max_rounds` 같은 강제 캡이 없다 — main worker가 자기 토큰
 예산(§0 #12)에 맞춰 라운드를 몇 번 돌지 스스로 판단한다.
@@ -517,7 +521,7 @@ enum LaneEventKind {
 working                     (PromptDelivered 후, 다음 turn signal 전)
 idle                        (turn signal 수신 — 다음 지시 대기)
 awaiting_selection          (grid에 화살표-탐색 선택 메뉴 — turn signal 없이 중단, §8.3)
-blocked_permission_prompt   (grid에 권한 프롬프트 정규식 매치)
+blocked_permission_prompt   (grid 끝에 tool/shell `[y/n]` 프롬프트 — turn signal 없이 중단)
 blocked_merge_conflict
 blocked_background_job
 degraded_mcp
@@ -528,14 +532,18 @@ exited
 파일 기반 `finished_cleanable` / `finished_pending_report`는 제거 — 라이브엔 응답
 파일이 없다. turn signal 수신 = `idle`, 다음 `PromptDelivered`부터 다시 `working`.
 
-`blocked_permission_prompt`: turn signal 없음 AND 패널 grid에
-`Allow this tool? [y/n]` 류 정규식 매치. main worker에 알림 — 자동 yes는 안 한다(위험).
+`blocked_permission_prompt`: turn signal 없음 AND 패널 grid 끝에 tool/shell이 띄운
+`Continue? [y/N]` 류 yes/no 프롬프트(`term::prompt_scan::scan_yes_no_prompt` —
+화면 맨 아래 non-empty 줄 끝의 y/n 토큰에만 보수적으로 매치, 본문 중간의 `[y/n]`
+언급은 무시). `awaiting_selection`과 동일 경로로 `list_panels` 시 `working`/`idle`
+위에 덮어씌우고(`overlay_blocked_state`), 라운드 소속이면 `poll_round_blocked_panels`로
+매 tick 감지해 main worker에 push한다. 자동 yes는 안 한다(위험) — main이 `send_keys`로 답한다.
 
 `awaiting_selection`: 패널 grid에 AskUserQuestion 류 선택 메뉴(`❯` 커서 + footer
 `Enter to select · ↑/↓ to navigate`)가 보일 때 — agent가 turn을 끝내지 않고 선택을
 기다리며 멈춘 상태라 turn signal이 안 온다. `term::prompt_scan`이 메뉴를 파싱하고,
 `list_panels` 읽는 시점에 `working`/`idle` 위로 덮어씌운다(더 강한 상태는 안 가린다).
-이 패널이 라운드 소속이면 caucus가 매 tick `poll_round_selection_prompts`로 감지해
+이 패널이 라운드 소속이면 caucus가 매 tick `poll_round_blocked_panels`로 감지해
 main worker에 push 알림을 보낸다(라운드는 settle 못 하므로 — §4). main은 `read_menu`로
 선택지를 읽고 `select_option(panel, n)`으로 답한다(caucus가 화살표 n칸 + Enter 주입);
 자유 입력은 메뉴의 'type something' 옵션을 고른 뒤 `send_keys`. `list_panels` 표면 문자열은

@@ -7,4 +7,4 @@ pub mod prompt_scan;
 
 pub use capture::{OutputCapture, TurnSegment};
 pub use grid::{Cell, Grid};
-pub use prompt_scan::{Menu, MenuOption, scan_menu};
+pub use prompt_scan::{Menu, MenuOption, scan_menu, scan_yes_no_prompt};
