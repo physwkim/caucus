@@ -3,8 +3,14 @@ use crate::agent::manifest;
 use crate::input::CaucusCommand;
 use crate::panel::lifecycle::{self, PanelState};
 use crate::signal::TurnSignal;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::warn;
+
+/// How often [`Multiplexer::pump_all`] probes child-process liveness. PTYs are
+/// drained every tick, but `try_wait` (a `waitpid` syscall) per panel on the
+/// ~250 Hz idle loop is pure overhead; a child exit surfaces within one
+/// interval, imperceptible for a UI reap.
+const LIVENESS_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 impl Multiplexer {
     /// Apply a key event via the focus router. Returns `true` while caucus
@@ -86,7 +92,8 @@ impl Multiplexer {
     /// Drain every panel's PTY into its grid + capture, and reap panels whose
     /// agent process has exited. Called once per event-loop tick.
     pub fn pump_all(&mut self) {
-        let mut exited = Vec::new();
+        // Drain every PTY into its grid + capture on every tick — this is the
+        // responsiveness path and must not be throttled.
         for panel in &mut self.panels {
             match panel.pump() {
                 Ok(n) => {
@@ -102,6 +109,20 @@ impl Multiplexer {
                     warn!(panel = %panel.id, error = %err, "panel pump failed");
                 }
             }
+        }
+        // Liveness probing is throttled (`LIVENESS_PROBE_INTERVAL`): `try_wait`
+        // is a `waitpid` syscall per panel, and on the idle loop that runs
+        // ~250×/s for no benefit. A child exit surfaces within one interval.
+        let now = Instant::now();
+        let due = self
+            .last_liveness_probe
+            .is_none_or(|t| now.duration_since(t) >= LIVENESS_PROBE_INTERVAL);
+        if !due {
+            return;
+        }
+        self.last_liveness_probe = Some(now);
+        let mut exited = Vec::new();
+        for panel in &mut self.panels {
             if panel.state() != PanelState::Exited && !panel.is_child_alive() {
                 exited.push(panel.id);
             }
@@ -294,5 +315,39 @@ mod tests {
         let mut mux = mux(&tmp);
         mux.apply_command(CaucusCommand::CloseFocused);
         assert!(mux.pending_close().is_none());
+    }
+
+    /// `pump_all` probes child liveness on its first call, then throttles:
+    /// a second pump within `LIVENESS_PROBE_INTERVAL` must not re-probe
+    /// (the timestamp is unchanged), so per-panel `waitpid` does not run
+    /// every ~4 ms tick on the idle loop.
+    #[tokio::test]
+    async fn pump_all_throttles_the_liveness_probe() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        assert!(
+            mux.last_liveness_probe.is_none(),
+            "no probe has run before the first pump"
+        );
+
+        mux.pump_all();
+        let first = mux.last_liveness_probe;
+        assert!(first.is_some(), "the first pump_all probes liveness");
+
+        // A second pump immediately after is inside the interval — the probe
+        // timestamp must be untouched (no second waitpid sweep).
+        mux.pump_all();
+        assert_eq!(
+            mux.last_liveness_probe, first,
+            "a pump within LIVENESS_PROBE_INTERVAL must not re-probe"
+        );
+
+        // Backdate the latch past the interval; the next pump re-probes.
+        mux.last_liveness_probe = Some(Instant::now() - LIVENESS_PROBE_INTERVAL);
+        mux.pump_all();
+        assert!(
+            mux.last_liveness_probe.unwrap() > first.unwrap(),
+            "a pump after the interval re-probes and advances the latch"
+        );
     }
 }

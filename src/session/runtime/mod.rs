@@ -163,6 +163,13 @@ pub struct Multiplexer {
     /// `pending-rounds.json`; delivered and cleared by
     /// [`Multiplexer::poll_resume_notice`]. `None` on a fresh launch.
     resume_round_notice: Option<String>,
+    /// Instant of the last child-liveness probe, or `None` before the first.
+    /// [`Multiplexer::pump_all`] drains every PTY each tick for responsiveness
+    /// but probes process liveness (a `try_wait`/`waitpid` syscall per panel)
+    /// only every [`LIVENESS_PROBE_INTERVAL`]: on the idle loop (~250 Hz) a
+    /// per-panel `waitpid` every tick is pure overhead, and a child exit may
+    /// surface up to one interval late without any user-visible cost.
+    last_liveness_probe: Option<Instant>,
 }
 
 impl Multiplexer {
@@ -225,6 +232,7 @@ impl Multiplexer {
                 worktree_branches: HashMap::new(),
                 menu_scan_cache: HashMap::new(),
                 resume_round_notice: None,
+                last_liveness_probe: None,
             },
             signal_server,
             control_server,
