@@ -423,17 +423,27 @@ impl Multiplexer {
         spec
     }
 
-    /// Create an execute-phase worktree for a `spawn_role(worktree=true)` call
-    /// (`docs/design.md` §5). Single owner of worktree creation is
-    /// `worktree::manager::create` (Invariant I-3).
+    /// Build the [`WorktreeRequest`] for a `spawn_role(worktree=true)` call —
+    /// the cheap, event-loop-thread part of worktree creation (`docs/design.md`
+    /// §5). The slow `git worktree add` is run from this request by
+    /// [`Multiplexer::create_role_worktree`] (synchronous) or off-thread by
+    /// [`Multiplexer::begin_spawn_role_worktree`] (the live socket path).
     ///
-    /// `worktree::manager::create` is synchronous (`git worktree add` is a
-    /// fast subprocess); the event loop calls it directly on its own thread —
-    /// no async bridging, so no nested-runtime panic.
-    pub(crate) fn create_role_worktree(&self, role: &str) -> Result<WorktreeHandle, McpError> {
-        let next = self.role_counts.get(role).copied().unwrap_or(0) + 1;
+    /// The per-role sequence number that disambiguates the branch/path counts
+    /// completed spawns (`role_counts`) **plus** spawns already in flight
+    /// (`pending_spawns` for this role). Counting the in-flight ones is what
+    /// keeps two concurrent same-role `spawn_role` calls from computing the same
+    /// branch name and colliding on `git worktree add` — `role_counts` is only
+    /// bumped later, when each deferred spawn actually launches its panel.
+    pub(crate) fn role_worktree_request(&self, role: &str) -> WorktreeRequest {
+        let inflight = self
+            .pending_spawns
+            .iter()
+            .filter(|s| s.role == role)
+            .count();
+        let next = self.role_counts.get(role).copied().unwrap_or(0) + inflight + 1;
         let stem = role_worktree_stem(role);
-        let req = WorktreeRequest {
+        WorktreeRequest {
             repo_root: self.session.repo_path.clone(),
             session_id: self.session.id,
             role: role.to_string(),
@@ -452,7 +462,17 @@ impl Multiplexer {
                 stem,
                 next,
             )),
-        };
+        }
+    }
+
+    /// Create an execute-phase worktree for a `spawn_role(worktree=true)` call,
+    /// synchronously (`docs/design.md` §5). Single owner of worktree creation is
+    /// `worktree::manager::create` (Invariant I-3). Used by the synchronous
+    /// `spawn_role` trait method and tests; the live socket path defers the
+    /// `git worktree add` off the event loop instead
+    /// ([`Multiplexer::begin_spawn_role_worktree`]).
+    pub(crate) fn create_role_worktree(&self, role: &str) -> Result<WorktreeHandle, McpError> {
+        let req = self.role_worktree_request(role);
         create_worktree(&req).map_err(|err| McpError::Tool(format!("worktree create: {err}")))
     }
 }

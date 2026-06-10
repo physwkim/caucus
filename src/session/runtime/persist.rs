@@ -53,6 +53,12 @@ impl Multiplexer {
     /// The `Active -> Closed` transition goes through `session::state::transition`
     /// (Invariant I-1, the single owner of session state).
     pub fn shutdown(&mut self) {
+        // Tear down any in-flight deferred worktree spawns first: block for each
+        // worker thread's `git worktree add`, remove the orphan it created (the
+        // panel will never launch), and answer the blocked MCP call. Done before
+        // `persist_record` so the record reflects no half-spawned panels.
+        self.abort_pending_spawns();
+
         // Persist the final roster before tearing panels down — this is the
         // record `caucus resume` reads. Worktree directories are removed
         // below, but their branches persist, so the record stays resumable.

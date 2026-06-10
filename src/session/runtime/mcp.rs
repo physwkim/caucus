@@ -2,7 +2,6 @@ use super::*;
 use crate::mcp::{McpError, McpToolSurface, PanelSummary, ReadPanelMode};
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
-use crate::worktree::cleanup::CleanupJob;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -85,47 +84,17 @@ impl McpToolSurface for Multiplexer {
         agent_cli: Option<AgentCli>,
         prompt: Option<&str>,
     ) -> Result<PanelId, McpError> {
+        // Worktree creation is the slow part (`git worktree add`). The real
+        // socket path defers it off the event loop (see
+        // [`Multiplexer::begin_spawn_role_worktree`] / `poll_pending_spawns`);
+        // this synchronous trait method — kept for direct callers and tests —
+        // creates it inline, then shares the same finish path.
         let wt_handle = if worktree {
             Some(self.create_role_worktree(role)?)
         } else {
             None
         };
-        let worktree_path = wt_handle.as_ref().map(|h| h.path.clone());
-        let worktree_branch = wt_handle.as_ref().map(|h| h.branch.clone());
-        // `spawn_panel_resume` with no resume id is a plain spawn that also
-        // records the worktree branch (so `caucus resume` can re-attach it). The
-        // inline `prompt`, when set, becomes the role's system prompt — the
-        // free-form-role path (`docs/design.md` §6).
-        let spawned = self.spawn_panel_resume(
-            role,
-            agent_cli,
-            model.map(str::to_string),
-            worktree_path,
-            worktree_branch,
-            None,
-            prompt.map(str::to_string),
-        );
-        match spawned {
-            Ok(id) => {
-                self.persist_record();
-                Ok(id)
-            }
-            Err(e) => {
-                // The panel never came up — don't leak the worktree (dir +
-                // branch) `create_role_worktree` just created. Enqueue it for
-                // serial cleanup (Invariant I-3); the branch is empty (the
-                // sub-agent never ran) so it is deleted, not preserved.
-                if let Some(h) = wt_handle {
-                    let _ = self.cleanup.enqueue(CleanupJob {
-                        repo_root: self.session.repo_path.clone(),
-                        worktree_paths: vec![h.path],
-                        branches_to_delete: vec![h.branch],
-                        done: None,
-                    });
-                }
-                Err(McpError::Tool(format!("spawn_role: {e:#}")))
-            }
-        }
+        self.finish_spawn_role(role, model, agent_cli, prompt, wt_handle)
     }
 
     fn kill_panel(&mut self, panel: PanelId) -> Result<(), McpError> {

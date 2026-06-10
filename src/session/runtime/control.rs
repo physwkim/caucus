@@ -85,18 +85,36 @@ impl Multiplexer {
     /// single point at which main worker MCP tool calls touch live panels, on
     /// the same thread that pumps PTYs (Invariant I-5).
     ///
-    /// Every request is answered immediately via
-    /// [`Multiplexer::execute_control`]. `register_round` is non-blocking too:
-    /// it acks with a panel snapshot and the round is delivered later by the
-    /// caucus→main push in [`Multiplexer::poll_pending_rounds`] — so the event
-    /// loop is never blocked and there is no deferred-reply path.
+    /// Most requests are answered immediately via
+    /// [`Multiplexer::execute_control`]. The one exception is
+    /// `spawn_role(worktree=true)`: its `git worktree add` is slow enough to
+    /// freeze the single-threaded loop, so it is deferred off-thread
+    /// ([`Multiplexer::begin_spawn_role_worktree`]) and its reply is sent later
+    /// from [`Multiplexer::poll_pending_spawns`]. `register_round` is
+    /// non-blocking in a different way: it acks now and the round is delivered
+    /// later by the caucus→main push in [`Multiplexer::poll_pending_rounds`].
     pub fn drain_control(&mut self, server: &mut ControlServer) {
         while let Ok(job) = server.jobs().try_recv() {
             let ControlJob { request, reply } = job;
-            let response = self.execute_control(request);
-            // A dropped reply channel means the control-socket connection
-            // closed before we answered — nothing to do.
-            let _ = reply.send(response);
+            match request {
+                // Defer the worktree create off the event loop; the reply is
+                // moved into the pending entry and answered on completion.
+                ControlRequest::SpawnRole {
+                    role,
+                    worktree: true,
+                    model,
+                    agent_cli,
+                    prompt,
+                } => {
+                    self.begin_spawn_role_worktree(role, model, agent_cli, prompt, reply);
+                }
+                other => {
+                    let response = self.execute_control(other);
+                    // A dropped reply channel means the control-socket
+                    // connection closed before we answered — nothing to do.
+                    let _ = reply.send(response);
+                }
+            }
         }
     }
 

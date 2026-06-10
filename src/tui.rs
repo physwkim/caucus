@@ -580,6 +580,12 @@ async fn event_loop(
         //    live panels on this same thread (Invariant I-5).
         mux.drain_control(&mut control_server);
 
+        // 3b. Deferred worktree spawns — a `spawn_role(worktree=true)` runs its
+        //     slow `git worktree add` on a worker thread so it never freezes this
+        //     loop; finish any whose worktree is now ready (launch the panel and
+        //     answer the deferred MCP call). New panels are pumped by step 4.
+        mux.poll_pending_spawns();
+
         // 4. PTY pump — drain every panel into its grid + capture, reap exits.
         mux.pump_all();
 

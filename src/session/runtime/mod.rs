@@ -35,6 +35,7 @@ mod persist;
 mod rounds;
 mod scroll;
 mod spawn;
+mod spawn_async;
 
 use self::mcp::PendingSubmit;
 use self::rounds::PendingRound;
@@ -81,6 +82,10 @@ pub struct Multiplexer {
     /// Rounds caucus is watching to deliver to the main worker
     /// ([`Multiplexer::poll_pending_rounds`]).
     pending_rounds: Vec<PendingRound>,
+    /// `spawn_role(worktree=true)` calls whose `git worktree add` is running on
+    /// a worker thread. Finished off the event loop so a slow worktree create
+    /// never freezes the TUI; completed by [`Multiplexer::poll_pending_spawns`].
+    pending_spawns: Vec<spawn_async::PendingSpawn>,
     /// Submitting Enters held back from bracketed pastes until the agent has
     /// ingested the paste. A bracketed-paste agent (Claude Code) that commits a
     /// large paste to a `[Pasted text #N]` placeholder swallows a `\r` arriving
@@ -206,6 +211,7 @@ impl Multiplexer {
                 quit: false,
                 role_counts: HashMap::new(),
                 pending_rounds: Vec::new(),
+                pending_spawns: Vec::new(),
                 pending_submits: Vec::new(),
                 pending_close: None,
                 main_panel_id: None,

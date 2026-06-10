@@ -661,6 +661,17 @@ lifecycle이 아니라 main worker가 MCP 툴로 라이브 수행). worktree 생
 
 각 모듈은 외부에 노출하는 함수 외엔 `pub(crate)` 미만으로 잠금. Rust visibility로 강제.
 
+**worktree 생성은 이벤트 루프 밖에서.** `worktree::manager::create()`가 단일
+owner인 것은 그대로지만, `spawn_role(worktree=true)`의 `git worktree add`는 큰
+repo·느린 디스크에서 수백 ms가 걸려 단일 스레드 이벤트 루프를 그 시간만큼 얼린다.
+그래서 라이브 제어 소켓 경로는 이를 워커 스레드로 미룬다: 요청 빌드(저렴)만 루프에서
+하고, `git worktree add`는 스레드에서 돌리며, MCP 툴 콜의 응답은 워크트리가 준비되고
+패널이 뜬 *나중* tick에 `poll_pending_spawns`가 보낸다(`session::runtime::spawn_async`).
+`register_round`와 함께 제어 프로토콜의 둘뿐인 **지연 응답(deferred-reply)** 경로다 —
+나머지 요청은 같은 tick에 동기 응답한다. 동시 같은-role spawn이 같은 브랜치명을 만들지
+않도록, 시퀀스 번호는 완료된 spawn(`role_counts`)에 in-flight spawn(`pending_spawns`)을
+더해 센다.
+
 ### 9.2 키맵 · 레이아웃 제어 · transcript 오버레이 · 스크롤백 페이저
 
 caucus는 단 하나의 **프리픽스 키** `Ctrl-A`를 자기 명령용으로 예약한다. 그 외
