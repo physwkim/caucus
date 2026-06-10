@@ -715,13 +715,14 @@ impl Grid {
             return;
         }
         let n = n.min(self.scroll_bottom - cr + 1);
-        for _ in 0..n {
-            for r in (cr + 1..=self.scroll_bottom).rev() {
-                let dst = self.idx(r, 0);
-                let src = self.idx(r - 1, 0);
-                self.viewport.copy_within(src..src + self.cols, dst);
-            }
-            self.clear_row(cr);
+        // Shift rows [cr, scroll_bottom - n] down by `n` in one move, then blank
+        // the `n` rows opened at the cursor — one memmove, not n × per-row.
+        let src = self.idx(cr, 0);
+        let end = self.idx(self.scroll_bottom + 1 - n, 0);
+        let dst = self.idx(cr + n, 0);
+        self.viewport.copy_within(src..end, dst);
+        for r in cr..cr + n {
+            self.clear_row(r);
         }
         self.wrap_pending = false;
     }
@@ -734,13 +735,14 @@ impl Grid {
             return;
         }
         let n = n.min(self.scroll_bottom - cr + 1);
-        for _ in 0..n {
-            for r in cr..self.scroll_bottom {
-                let dst = self.idx(r, 0);
-                let src = self.idx(r + 1, 0);
-                self.viewport.copy_within(src..src + self.cols, dst);
-            }
-            self.clear_row(self.scroll_bottom);
+        // Pull rows [cr + n, scroll_bottom] up by `n` in one move, then blank
+        // the `n` rows vacated at the bottom margin — one memmove, not n × N.
+        let src = self.idx(cr + n, 0);
+        let end = self.idx(self.scroll_bottom + 1, 0);
+        let dst = self.idx(cr, 0);
+        self.viewport.copy_within(src..end, dst);
+        for r in (self.scroll_bottom + 1 - n)..(self.scroll_bottom + 1) {
+            self.clear_row(r);
         }
         self.wrap_pending = false;
     }
@@ -1616,6 +1618,28 @@ mod tests {
         g2.advance(b"\x1b[2;1H\x1b[1M"); // delete 1 line at row 1
         assert_eq!(g2.row_text(1).trim_end(), "ccccc");
         assert_eq!(g2.row_text(2).trim_end(), "ddddd");
+    }
+
+    #[test]
+    fn insert_and_delete_multiple_lines_batched() {
+        // IL 2 at row 1 pushes the lower rows down by two in one move: rows 1,2
+        // blank, only bbbbb survives within the 4-row region.
+        let mut g = Grid::new(5, 4);
+        g.advance(b"aaaaa\r\nbbbbb\r\nccccc\r\nddddd");
+        g.advance(b"\x1b[2;1H\x1b[2L"); // insert 2 lines at row 1 (0-based)
+        assert_eq!(g.row_text(0).trim_end(), "aaaaa");
+        assert_eq!(g.row_text(1).trim(), "");
+        assert_eq!(g.row_text(2).trim(), "");
+        assert_eq!(g.row_text(3).trim_end(), "bbbbb");
+
+        // DL 2 at row 1 pulls ddddd up to row 1 in one move; rows 2,3 blank.
+        let mut g2 = Grid::new(5, 4);
+        g2.advance(b"aaaaa\r\nbbbbb\r\nccccc\r\nddddd");
+        g2.advance(b"\x1b[2;1H\x1b[2M"); // delete 2 lines at row 1
+        assert_eq!(g2.row_text(0).trim_end(), "aaaaa");
+        assert_eq!(g2.row_text(1).trim_end(), "ddddd");
+        assert_eq!(g2.row_text(2).trim(), "");
+        assert_eq!(g2.row_text(3).trim(), "");
     }
 
     #[test]
