@@ -320,7 +320,7 @@ fn run_init(install_hook: bool) -> Result<ExitCode> {
 fn run_doctor() -> Result<ExitCode> {
     let repo = repo_root()?;
     let config = Config::load(&repo).context("load caucus configuration")?;
-    let report = doctor::run(&config);
+    let report = doctor::run(&repo, &config);
 
     eprintln!("caucus doctor — {} check(s):", report.checks.len());
     for check in &report.checks {

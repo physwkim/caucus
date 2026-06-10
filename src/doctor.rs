@@ -1,11 +1,12 @@
 //! `caucus doctor` — environment + configuration health check
 //! (`docs/design.md` §10).
 //!
-//! Checks: `git`, the agent CLIs (`claude` / `codex`), the Stop hook
+//! Checks: the running caucus version + `caucus` on `PATH`, `git`, that the cwd
+//! is a git repository, the agent CLIs (`claude` / `codex`), the Stop hook
 //! installation, and every role's `allowed_tools` for the forbidden `Task`
 //! tool (Invariant I-7).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
@@ -51,14 +52,19 @@ impl Report {
     }
 }
 
-/// Run all environment + configuration checks for `config`.
+/// Run all environment + configuration checks for the project rooted at `repo`.
 ///
-/// Probes `git` and the agent CLIs (`claude` / `codex`) on `PATH`,
-/// verifies the Claude `Stop` hook is installed in `~/.claude/settings.json`,
-/// and audits every role's `allowed_tools` for the forbidden `Task` tool
-/// (Invariant I-7).
-pub fn run(config: &Config) -> Report {
+/// Reports the running caucus version (and that `caucus` is on `PATH` for the
+/// turn-signal hook), probes `git` and the agent CLIs (`claude` / `codex`) on
+/// `PATH`, confirms `repo` is a git repository, verifies the Claude `Stop` hook
+/// is installed in `~/.claude/settings.json`, and audits every role's
+/// `allowed_tools` for the forbidden `Task` tool (Invariant I-7).
+pub fn run(repo: &Path, config: &Config) -> Report {
     let mut report = Report::default();
+
+    // Identify the running build first — and confirm `caucus` is on PATH, since
+    // the turn-signal hook script execs it by bare name.
+    report.checks.push(caucus_check());
 
     // `git` is mandatory — worktree creation/cleanup shell out to it.
     report.checks.push(binary_check(
@@ -66,6 +72,10 @@ pub fn run(config: &Config) -> Report {
         Severity::Error,
         "required for worktree creation and commit provenance",
     ));
+
+    // ...and the cwd must actually be a git repository, or those shell-outs
+    // fail later, confusingly, at the first role spawn.
+    report.checks.push(git_repo_check(repo));
 
     // The agent CLIs: a missing one is a warning, not fatal — a session may
     // only use a subset (e.g. claude-only). `caucus` itself still runs.
@@ -143,6 +153,72 @@ fn binary_check(bin: &str, missing_severity: Severity, why: &str) -> Check {
     }
 }
 
+/// Report the running caucus version and confirm a `caucus` binary is on
+/// `PATH`. The turn-signal hook script execs bare `caucus signal post`
+/// (`crate::init`), so a caucus that is not on `PATH` — run via `cargo run` or
+/// an absolute path — leaves turn-completion signals dead even though the TUI
+/// itself works. The version is surfaced so `caucus doctor` output pins the
+/// exact build for bug reports and upgrade confirmation.
+fn caucus_check() -> Check {
+    let version = env!("CARGO_PKG_VERSION");
+    match which("caucus") {
+        Some(p) => Check {
+            name: "caucus".into(),
+            severity: Severity::Ok,
+            detail: format!("v{version} (on PATH at {})", p.display()),
+        },
+        None => Check {
+            name: "caucus".into(),
+            severity: Severity::Warn,
+            detail: format!(
+                "v{version} running, but `caucus` is not on PATH — the turn-signal \
+                 hook (`exec caucus signal post`) cannot run; install caucus on PATH"
+            ),
+        },
+    }
+}
+
+/// Check that `repo` is inside a git work tree. caucus's per-panel isolation
+/// creates git worktrees and its provenance commits shell out to git, so a
+/// non-repo cwd is fatal — it fails later, confusingly, at the first spawn.
+/// Asks git itself (`git -C <repo> rev-parse --is-inside-work-tree`) so the
+/// answer matches what caucus's own worktree shell-outs will see; if git cannot
+/// be run at all the `git` binary check above already carries the Error, so
+/// this degrades to a Warn rather than double-reporting it as fatal.
+fn git_repo_check(repo: &Path) -> Check {
+    let name = "git-repo".to_string();
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+    {
+        Ok(out)
+            if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true" =>
+        {
+            Check {
+                name,
+                severity: Severity::Ok,
+                detail: format!("{} is inside a git work tree", repo.display()),
+            }
+        }
+        Ok(_) => Check {
+            name,
+            severity: Severity::Error,
+            detail: format!(
+                "{} is not a git repository — worktree isolation and provenance \
+                 commits will fail; run `git init` or cd into a repo",
+                repo.display()
+            ),
+        },
+        Err(err) => Check {
+            name,
+            severity: Severity::Warn,
+            detail: format!("could not run `git rev-parse` (is git installed?): {err}"),
+        },
+    }
+}
+
 /// Check that `~/.claude/settings.json` carries a `Stop` hook entry. caucus
 /// installs it via `caucus init --install-hook`; without it turn-completion
 /// signals never reach the socket (§7).
@@ -215,7 +291,7 @@ mod tests {
     fn clean_config_has_no_task_warnings() {
         let tmp = TempDir::new().unwrap();
         let config = Config::load(tmp.path()).unwrap();
-        let report = run(&config);
+        let report = run(tmp.path(), &config);
         assert!(report.checks.iter().all(|c| !c.name.starts_with("role:")));
     }
 
@@ -228,13 +304,68 @@ mod tests {
     fn run_includes_binary_and_hook_checks() {
         let tmp = TempDir::new().unwrap();
         let config = Config::load(tmp.path()).unwrap();
-        let report = run(&config);
-        for expected in ["git", "claude", "codex", "claude-stop-hook"] {
+        let report = run(tmp.path(), &config);
+        for expected in [
+            "caucus",
+            "git",
+            "git-repo",
+            "claude",
+            "codex",
+            "claude-stop-hook",
+        ] {
             assert!(
                 report.checks.iter().any(|c| c.name == expected),
                 "missing doctor check: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn caucus_check_reports_the_running_version() {
+        // Regardless of whether `caucus` is on PATH, the detail pins the
+        // running build's version so `caucus doctor` output is self-dating.
+        let check = caucus_check();
+        assert_eq!(check.name, "caucus");
+        assert!(
+            check.detail.contains(env!("CARGO_PKG_VERSION")),
+            "version not surfaced: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn git_repo_check_flags_a_non_repo() {
+        if which("git").is_none() {
+            return; // no git → the `git` binary check carries the Error instead.
+        }
+        // A bare TempDir is not inside any git work tree.
+        let tmp = TempDir::new().unwrap();
+        let check = git_repo_check(tmp.path());
+        assert_eq!(check.name, "git-repo");
+        assert_eq!(
+            check.severity,
+            Severity::Error,
+            "a non-repo cwd is fatal: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn git_repo_check_accepts_a_real_repo() {
+        if which("git").is_none() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .arg("init")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "git init failed in test setup");
+        let check = git_repo_check(tmp.path());
+        assert_eq!(check.severity, Severity::Ok, "{}", check.detail);
     }
 
     #[test]
