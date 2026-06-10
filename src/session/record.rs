@@ -106,13 +106,20 @@ impl SessionRecord {
 
     /// Look up one session's record by id under `<repo>/.caucus/sessions/`.
     pub fn read_for_id(repo: &Path, id: SessionId) -> Result<Self, SessionRecordError> {
-        Self::read(&sessions_dir(repo).join(id.to_string()))
+        Self::read(&session_root(repo, id))
     }
 }
 
 /// `<repo>/.caucus/sessions/`.
 fn sessions_dir(repo: &Path) -> PathBuf {
     repo.join(".caucus").join("sessions")
+}
+
+/// `<repo>/.caucus/sessions/<id>/` — the on-disk root of one session. The
+/// single place the per-session path layout is spelled, so `caucus gc` and the
+/// resume path agree on where a session's state lives.
+pub fn session_root(repo: &Path, id: SessionId) -> PathBuf {
+    sessions_dir(repo).join(id.to_string())
 }
 
 /// Scan `<repo>/.caucus/sessions/*/session.json` for resumable sessions,

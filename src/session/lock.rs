@@ -71,6 +71,35 @@ impl SessionLock {
             Err(TryLockError::Error(source)) => Err(SessionLockError::Io { path, source }),
         }
     }
+
+    /// Whether a live caucus process currently holds the lock on `session_root`.
+    ///
+    /// A read-only probe for `caucus gc`, which must never prune a session
+    /// another caucus is actively running. It opens the *existing* `<root>/lock`
+    /// without creating it — a session with no lock file (never opened, or
+    /// opened before this lock existed) reads as not held — and tries the
+    /// advisory lock; a `WouldBlock` means a live owner holds it. The momentary
+    /// lock we take on success is released immediately when `file` drops here.
+    ///
+    /// On any I/O ambiguity it returns `true`: gc fails safe toward *keeping* a
+    /// session rather than risk deleting one that is running.
+    pub fn is_held(session_root: &Path) -> bool {
+        let path = session_root.join("lock");
+        let file = match OpenOptions::new().write(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+            // Can't even open the lock file — treat as held (fail safe).
+            Err(_) => return true,
+        };
+        match file.try_lock() {
+            // We acquired it, so no live owner held it; the lock releases as
+            // `file` drops at the end of this scope.
+            Ok(()) => false,
+            Err(TryLockError::WouldBlock) => true,
+            // Ambiguous lock error — fail safe toward "held".
+            Err(TryLockError::Error(_)) => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -109,5 +138,22 @@ mod tests {
         // Re-acquiring after the prior owner dropped must succeed — the model
         // for `caucus resume` after the original process exits.
         assert!(SessionLock::acquire(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn is_held_reflects_a_live_owner() {
+        let tmp = TempDir::new().unwrap();
+        // No lock file yet → not held (a session gc may freely prune).
+        assert!(!SessionLock::is_held(tmp.path()));
+        {
+            let _held = SessionLock::acquire(tmp.path()).unwrap();
+            // While a live owner holds it, the probe reports held.
+            assert!(SessionLock::is_held(tmp.path()));
+        }
+        // After the owner drops, the (now stale) lock file remains on disk but
+        // the probe must report not-held — the model for gc pruning the state
+        // of a session whose caucus has exited.
+        assert!(tmp.path().join("lock").exists());
+        assert!(!SessionLock::is_held(tmp.path()));
     }
 }

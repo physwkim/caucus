@@ -127,6 +127,18 @@ pub enum Command {
         /// Session id to resume (see `caucus sessions`).
         session_id: String,
     },
+    /// Reclaim disk by pruning old, not-running sessions under
+    /// `.caucus/sessions/` (resume records, panel logs, agent manifests).
+    /// Dry-run unless `--prune`; git branches and worktrees are left untouched.
+    Gc {
+        /// Prune sessions older than this window: `30m`, `24h`, `7d`, `2w`
+        /// (a bare number is days). Default `7d`.
+        #[arg(long, default_value = "7d", value_parser = crate::gc::parse_retention)]
+        older_than: chrono::Duration,
+        /// Actually delete. Without it, gc only prints what it would remove.
+        #[arg(long)]
+        prune: bool,
+    },
 }
 
 /// Output format for listing subcommands.
@@ -232,6 +244,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Some(Command::McpServe { control_sock }) => run_mcp_serve(&control_sock),
         Some(Command::Sessions { format }) => run_sessions(format),
         Some(Command::Resume { session_id }) => run_resume(&session_id, prefix),
+        Some(Command::Gc { older_than, prune }) => run_gc(older_than, prune),
     }
 }
 
@@ -476,6 +489,59 @@ fn run_resume(session_id: &str, prefix: char) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `caucus gc [--older-than DUR] [--prune]` — prune old, not-running session
+/// state under `.caucus/sessions/`.
+///
+/// Prints the plan and, only with `--prune`, removes the directories. A removal
+/// failure exits `1` (unexpected failure, `docs/design.md` §10.1); a clean run,
+/// a dry-run, and "nothing to prune" all exit `0`.
+fn run_gc(older_than: chrono::Duration, prune: bool) -> Result<ExitCode> {
+    let repo = repo_root()?;
+    let plan = crate::gc::plan(&repo, older_than, chrono::Utc::now());
+
+    if plan.prunable.is_empty() && plan.skipped_live.is_empty() {
+        eprintln!(
+            "caucus gc: no sessions older than {} under .caucus/sessions/",
+            humanize_age(older_than)
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    for id in &plan.skipped_live {
+        eprintln!("  skip {id}  (running — lock held)");
+    }
+    for session in &plan.prunable {
+        eprintln!(
+            "  {} {:<6} {}",
+            session.id,
+            humanize_age(session.age),
+            session.topic,
+        );
+    }
+
+    if !prune {
+        eprintln!(
+            "\n{} session(s) would be pruned. Re-run with --prune to delete.",
+            plan.prunable.len()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let report = crate::gc::execute(&plan);
+    eprintln!("\ncaucus gc: pruned {} session(s)", report.removed.len());
+    for id in &report.raced {
+        eprintln!("  kept {id}  (a caucus opened it before deletion)");
+    }
+    for (id, err) in &report.failed {
+        eprintln!("  FAILED {id}: {err}");
+    }
+    if report.failed.is_empty() {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,6 +695,30 @@ mod tests {
             Some(Command::Resume { session_id }) => assert_eq!(session_id, "01ABCXYZ"),
             other => panic!("expected Resume, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gc_subcommand_parses_with_defaults_and_overrides() {
+        // Bare `gc`: 7-day window, dry-run.
+        let cli = Cli::try_parse_from(["caucus", "gc"]).unwrap();
+        match cli.command {
+            Some(Command::Gc { older_than, prune }) => {
+                assert_eq!(older_than, chrono::Duration::days(7));
+                assert!(!prune);
+            }
+            other => panic!("expected Gc, got {other:?}"),
+        }
+        // `--older-than 2w --prune` parses the window and the delete flag.
+        let cli = Cli::try_parse_from(["caucus", "gc", "--older-than", "2w", "--prune"]).unwrap();
+        match cli.command {
+            Some(Command::Gc { older_than, prune }) => {
+                assert_eq!(older_than, chrono::Duration::weeks(2));
+                assert!(prune);
+            }
+            other => panic!("expected Gc, got {other:?}"),
+        }
+        // A bad retention spec is a usage error.
+        assert!(Cli::try_parse_from(["caucus", "gc", "--older-than", "7x"]).is_err());
     }
 
     /// `caucus sessions` discovers a written `session.json`: build a record

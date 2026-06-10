@@ -788,6 +788,11 @@ caucus role list                    # 알려진 role 나열
 caucus role show <name>             # 한 role의 전체 spec 출력
 caucus sessions [--format json]     # resume 가능한 세션 나열 (최신순; §3.1)
 caucus resume <session_id>          # 영속된 세션을 복원해 TUI 재기동 (§3.1)
+caucus gc [--older-than 7d] [--prune]
+                                    # .caucus/sessions/ 의 오래된·비실행 세션 상태
+                                    # (resume 레코드, 패널 로그, manifest) 정리.
+                                    # --prune 없으면 dry-run; lock 잡힌 실행 중 세션은
+                                    # 건너뜀; git 브랜치/worktree는 건드리지 않음.
 
 caucus signal post --sock <s> --session <id> --panel <id> --kind stop
                                     # turn-signal hook이 호출 (사람은 안 침, 내부용)
@@ -800,7 +805,7 @@ TUI 안에서 사용자는 main worker 패널과 대화하고, main worker가 MC
 
 ### 10.1 exit code 규약
 
-비-TUI 서브커맨드(`init` / `doctor` / `signal` / `role` / `sessions`)에 적용:
+비-TUI 서브커맨드(`init` / `doctor` / `signal` / `role` / `sessions` / `gc`)에 적용:
 
 - `0` — 성공
 - `2` — 사용자 오류 (잘못된 인자 등)
