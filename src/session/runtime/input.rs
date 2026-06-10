@@ -34,10 +34,10 @@ impl Multiplexer {
                 if Some(panel) == self.main_panel_id && !submit {
                     self.main_compose_since = Some(Instant::now());
                 }
-                if let Some(p) = self.panels.iter_mut().find(|p| p.id == panel) {
-                    if let Err(err) = p.write_input(&bytes) {
-                        warn!(panel = %panel, error = %err, "panel write failed");
-                    }
+                if let Some(p) = self.panels.iter_mut().find(|p| p.id == panel)
+                    && let Err(err) = p.write_input(&bytes)
+                {
+                    warn!(panel = %panel, error = %err, "panel write failed");
                 }
                 // A submitted line (Enter) typed directly into a panel is a
                 // prompt delivered by the user — flip it to `Working`, the
@@ -168,12 +168,11 @@ impl Multiplexer {
                 let _ = lifecycle::transition(panel, PanelState::Exited);
             }
             // Reflect the exit on the manifest so `list_panels` shows `exited`.
-            if let Some(manifest) = self.manifests.get_mut(&id) {
-                if manifest.status() != crate::agent::AgentStatus::Exited {
-                    if let Err(err) = manifest::record_exited(manifest, &self.session.root_dir) {
-                        warn!(panel = %id, error = %err, "manifest exit write failed");
-                    }
-                }
+            if let Some(manifest) = self.manifests.get_mut(&id)
+                && manifest.status() != crate::agent::AgentStatus::Exited
+                && let Err(err) = manifest::record_exited(manifest, &self.session.root_dir)
+            {
+                warn!(panel = %id, error = %err, "manifest exit write failed");
             }
         }
     }

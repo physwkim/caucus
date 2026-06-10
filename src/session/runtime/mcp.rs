@@ -375,10 +375,10 @@ impl Multiplexer {
                 still_pending.push(s);
                 continue;
             }
-            if let Some(p) = self.panels.iter_mut().find(|p| p.id == s.panel) {
-                if let Err(e) = p.write_input(b"\r") {
-                    warn!(panel = %s.panel, error = %e, "deferred submit write failed");
-                }
+            if let Some(p) = self.panels.iter_mut().find(|p| p.id == s.panel)
+                && let Err(e) = p.write_input(b"\r")
+            {
+                warn!(panel = %s.panel, error = %e, "deferred submit write failed");
             }
         }
         self.pending_submits = still_pending;

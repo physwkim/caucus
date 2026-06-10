@@ -10,7 +10,9 @@ homepage = "https://github.com/physwkim/caucus"
 readme = "README.md"
 keywords = ["claude", "claude-code", "agent", "orchestrator"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.85"
+# 1.89 stabilized std::fs::File::try_lock, used for the session single-instance
+# lock (src/session/lock.rs).
+rust-version = "1.89"
 
 [[bin]]
 name = "caucus"

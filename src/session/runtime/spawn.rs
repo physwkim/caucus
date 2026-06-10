@@ -255,16 +255,15 @@ impl Multiplexer {
         // "Yes"; codex honors only its on-disk config, not a `-c` override).
         // Best-effort: a failure must not fail the spawn — the panel still
         // launches and the user can answer the gate by hand.
-        if request.effective_cli() == AgentCli::Codex {
-            if let Some(cwd) = outcome.command.cwd.as_deref() {
-                if let Err(err) = crate::agent::codex_trust::ensure_trusted(cwd) {
-                    warn!(
-                        cwd = %cwd.display(),
-                        error = %err,
-                        "codex directory-trust pre-grant failed; codex may stall on its trust gate"
-                    );
-                }
-            }
+        if request.effective_cli() == AgentCli::Codex
+            && let Some(cwd) = outcome.command.cwd.as_deref()
+            && let Err(err) = crate::agent::codex_trust::ensure_trusted(cwd)
+        {
+            warn!(
+                cwd = %cwd.display(),
+                error = %err,
+                "codex directory-trust pre-grant failed; codex may stall on its trust gate"
+            );
         }
 
         ids.push(outcome.panel_id);
@@ -461,10 +460,10 @@ impl Multiplexer {
     /// prompt. The prompt is always dismissed, even if the kill fails.
     pub(crate) fn confirm_close(&mut self) {
         self.focus.set_confirm_open(false);
-        if let Some(id) = self.pending_close.take() {
-            if let Err(err) = self.kill_panel(id) {
-                warn!(panel = %id, error = %err, "close-panel failed");
-            }
+        if let Some(id) = self.pending_close.take()
+            && let Err(err) = self.kill_panel(id)
+        {
+            warn!(panel = %id, error = %err, "close-panel failed");
         }
     }
 

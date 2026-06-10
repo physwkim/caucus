@@ -38,10 +38,10 @@ impl Multiplexer {
             },
         };
         for panel in &mut self.panels {
-            if let Some(rect) = self.layout.rect_of(panel.id) {
-                if let Err(err) = panel.resize(rect) {
-                    warn!(panel = %panel.id, error = %err, "panel resize failed");
-                }
+            if let Some(rect) = self.layout.rect_of(panel.id)
+                && let Err(err) = panel.resize(rect)
+            {
+                warn!(panel = %panel.id, error = %err, "panel resize failed");
             }
         }
     }

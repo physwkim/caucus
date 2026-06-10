@@ -120,15 +120,14 @@ impl Panel {
         // to `/tmp/caucus-pty-<panel_id>.raw` so a corrupted live render can
         // be replayed offline through `term::Grid`. Off by default. The env
         // lookup is cached once — this runs on every pump with data.
-        if dump_pty_enabled() {
-            if let Ok(mut f) = std::fs::OpenOptions::new()
+        if dump_pty_enabled()
+            && let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(format!("/tmp/caucus-pty-{}.raw", self.id))
-            {
-                use std::io::Write;
-                let _ = f.write_all(&bytes);
-            }
+        {
+            use std::io::Write;
+            let _ = f.write_all(&bytes);
         }
         // Single sanctioned grid mutation path: PTY bytes through `advance`.
         self.grid.advance(&bytes);
