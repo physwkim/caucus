@@ -126,8 +126,17 @@ impl Multiplexer {
     /// `COMPOSE_GRACE` — so an injected turn never collides with a line the
     /// user is composing. At most one round is delivered per tick: the
     /// injection flips the main panel to `Working`, so any other due round
-    /// naturally holds until the main worker is idle again. A due round with
-    /// no main panel to deliver to is dropped (it would otherwise be stranded).
+    /// naturally holds until the main worker is idle again.
+    ///
+    /// A due round whose main worker is *gone* — no main panel id, the panel
+    /// no longer exists, or it has `Exited` (the agent process died on its
+    /// own; only `kill_panel` clears the id, so a self-exit leaves
+    /// `main_panel_id` pointing at an `Exited` panel) — is dropped after its
+    /// assembled report is spilled to `dropped-rounds.log`: no caucus→main
+    /// push can ever land, so re-queuing it would spin forever, and discarding
+    /// it silently would lose every sub-agent's work. A delivery that *fails*
+    /// (e.g. the main PTY writer went away mid-tick) keeps the round for a
+    /// later tick rather than dropping it.
     ///
     /// Before the due-check, each non-expired round's backlog is fed
     /// ([`Multiplexer::feed_round_backlog`]): a panel that finished early with
@@ -144,7 +153,18 @@ impl Multiplexer {
         // Take the queue so the settle-checks below can borrow `self`.
         let rounds = std::mem::take(&mut self.pending_rounds);
 
-        let main_id = self.main_panel_id;
+        // Resolve main's liveness once. Main is *gone* — no caucus→main push
+        // can ever land — when there is no main panel id, the panel no longer
+        // exists, or it has `Exited`. A due round against a gone main is
+        // spilled and dropped, never re-queued forever.
+        let main = self.main_panel_id.and_then(|id| {
+            self.panels
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| (id, p.state()))
+        });
+        let main_gone = !matches!(main, Some((_, s)) if s != PanelState::Exited);
+        let main_id = main.map(|(id, _)| id);
         let deliverable = self.main_deliverable();
 
         let mut delivered = false;
@@ -159,22 +179,63 @@ impl Multiplexer {
             }
             let all_settled = self.round_settled(&round);
             let due = fallback_due || all_settled;
-            match main_id {
-                // Due, gate open, nothing delivered yet this tick: assemble +
-                // inject into the main panel, then drop the round.
-                Some(main_id) if due && deliverable && !delivered => {
-                    let report = self.assemble_round_report(&round, all_settled);
-                    if let Err(err) = McpToolSurface::send_keys(self, main_id, &report, true) {
-                        warn!(error = %err, "round delivery to main panel failed");
-                    }
-                    delivered = true;
-                }
-                // Due but there is no main panel to deliver to: drop it.
-                None if due => {}
-                // Not due, gate closed, or already delivered one this tick:
-                // keep it for a later tick.
-                _ => self.pending_rounds.push(round),
+
+            if !due {
+                // Sub-agents still working: keep watching, whatever main's state.
+                self.pending_rounds.push(round);
+                continue;
             }
+            if main_gone {
+                // No wake path will ever exist. Spill the assembled report so
+                // the sub-agents' work is not silently lost, then drop.
+                let report = self.assemble_round_report(&round, all_settled);
+                self.record_dropped_round(&report);
+                continue;
+            }
+            if deliverable && !delivered {
+                let report = self.assemble_round_report(&round, all_settled);
+                // `deliverable` implies a live, idle main panel exists.
+                let mid = main_id.expect("deliverable implies a main panel");
+                match McpToolSurface::send_keys(self, mid, &report, true) {
+                    Ok(()) => delivered = true,
+                    Err(err) => {
+                        // Delivery failed (e.g. the main PTY writer went away
+                        // mid-tick): keep the round so a later tick retries,
+                        // rather than discarding every sub-agent's result.
+                        warn!(error = %err, "round delivery to main panel failed; will retry");
+                        self.pending_rounds.push(round);
+                    }
+                }
+            } else {
+                // Gate closed (main busy / mid-compose) or one already
+                // delivered this tick: keep it for a later tick.
+                self.pending_rounds.push(round);
+            }
+        }
+    }
+
+    /// Append a dropped round's assembled report to the session's
+    /// `dropped-rounds.log`, so a round whose main worker is gone (exited or
+    /// never existed) is recorded rather than silently lost. Best-effort: a
+    /// write failure is logged, not propagated — the round is being dropped
+    /// either way.
+    fn record_dropped_round(&self, report: &str) {
+        use std::io::Write;
+        let path = self.session.root_dir.join("dropped-rounds.log");
+        let spill = || -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            writeln!(
+                f,
+                "----- dropped round (no main worker to deliver to) -----"
+            )?;
+            writeln!(f, "{report}")?;
+            Ok(())
+        };
+        if let Err(err) = spill() {
+            warn!(path = %path.display(), error = %err, "failed to spill dropped round report");
         }
     }
 
@@ -902,6 +963,37 @@ mod tests {
         );
     }
 
+    /// A due round whose main worker has *exited on its own* (process crash/
+    /// OOM) must drop, not re-queue forever. `pump_all` flips the panel to
+    /// `Exited` but does not clear `main_panel_id` (only `kill_panel` does), so
+    /// before this fix the round saw `main_panel_id == Some(..)` yet
+    /// `deliverable == false`, falling into the re-queue arm every tick. The
+    /// dropped report is spilled rather than silently lost.
+    #[tokio::test]
+    async fn poll_pending_rounds_drops_when_main_has_exited() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Exited);
+        mux.main_panel_id = Some(main);
+
+        // A round on a non-existent id is due immediately (a missing id counts
+        // as settled).
+        mux.register_round(vec![PanelId::new()], None, Some(600), None);
+        assert_eq!(mux.pending_rounds.len(), 1);
+
+        mux.poll_pending_rounds();
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "a due round against an exited main must drop, not re-queue forever"
+        );
+        assert!(
+            mux.session.root_dir.join("dropped-rounds.log").exists(),
+            "the dropped round's report must be spilled to the session dir"
+        );
+
+        mux.shutdown();
+    }
+
     /// Killing a panel keeps `main_panel_id` an accurate invariant — it points
     /// to a live panel or is None. Boundary: killing a non-main panel leaves it
     /// intact; killing main clears it, so a due round then *drops* (reaching the
@@ -941,22 +1033,27 @@ mod tests {
         mux.shutdown();
     }
 
-    /// A due round is *held*, not delivered, while the main panel is not idle.
-    /// Here `main_panel_id` points at an id with no live panel, so the idle
-    /// gate is closed and the round stays pending for a later tick.
+    /// A due round is *held*, not delivered, while the main panel is alive but
+    /// busy (not `Idle`). The round stays pending for a later tick rather than
+    /// landing mid-turn. (A main that is *gone* — missing/exited — is dropped,
+    /// not held: that is the wedge guarded by
+    /// `poll_pending_rounds_drops_when_main_has_exited`.)
     #[tokio::test]
-    async fn poll_pending_rounds_holds_when_main_not_idle() {
+    async fn poll_pending_rounds_holds_when_main_busy() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        mux.main_panel_id = Some(PanelId::new());
+        let main = push_cat_panel(&mut mux, "main", PanelState::Working);
+        mux.main_panel_id = Some(main);
 
         mux.register_round(vec![PanelId::new()], None, Some(600), None);
         mux.poll_pending_rounds();
         assert_eq!(
             mux.pending_rounds.len(),
             1,
-            "round must be held while the main panel is not idle"
+            "round must be held while the live main panel is busy"
         );
+
+        mux.shutdown();
     }
 
     /// The caucus→main push end to end: a round on a `Working` sub-panel is
