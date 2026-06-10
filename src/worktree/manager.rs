@@ -254,6 +254,25 @@ pub(crate) fn reconcile_stale(repo_root: &Path, branch: &str) {
             .unwrap_or_else(|_| stale.clone())
             .starts_with(&caucus_dir)
     {
+        // The stale checkout may hold a crashed agent's *uncommitted* work, and
+        // resume re-attaches `branch` to a different (`-resume`) path — so a bare
+        // `git worktree remove --force` here would destroy that work with no
+        // trace. Salvage it onto the branch first: a WIP commit rides to the
+        // resume worktree (which re-checks out `branch`) and is trivially
+        // reversible. Only a *clean* or *salvaged* worktree may be force-removed;
+        // if the work cannot be salvaged, leave the directory in place rather
+        // than discard it.
+        if worktree_is_dirty(&stale)
+            && let Err(err) = salvage_uncommitted_work(&stale, branch)
+        {
+            tracing::warn!(
+                branch = %branch, path = %stale.display(), error = %format!("{err}"),
+                "stale caucus worktree has uncommitted changes that could not be \
+                 salvaged; leaving it in place rather than discarding the work"
+            );
+            return;
+        }
+
         let args = vec![
             "worktree".to_string(),
             "remove".to_string(),
@@ -267,6 +286,44 @@ pub(crate) fn reconcile_stale(repo_root: &Path, branch: &str) {
             );
         }
     }
+}
+
+/// Whether `worktree` has uncommitted changes — tracked edits/deletions or
+/// non-ignored untracked files (`git status --porcelain` is non-empty).
+///
+/// An *unreadable* status is treated as dirty: when in doubt, preserve the
+/// directory rather than risk force-removing live work.
+fn worktree_is_dirty(worktree: &Path) -> bool {
+    match run_git(worktree, &["status".to_string(), "--porcelain".to_string()]) {
+        Ok(out) => !out.trim().is_empty(),
+        Err(_) => true,
+    }
+}
+
+/// Commit a crashed worktree's uncommitted changes onto its branch so they are
+/// preserved across the resume re-attach instead of being discarded.
+///
+/// Stages everything `git status` reported (tracked changes, deletions, and
+/// non-ignored untracked files; `.gitignore` is honoured, so build artefacts
+/// are excluded) and commits it. A recovery identity is supplied via `-c` so
+/// the commit cannot fail on a repo without a configured `user.name`/`email`,
+/// and `--no-verify` skips hooks that have no business blocking crash recovery.
+/// The commit is plainly labelled and reversible with `git reset HEAD^`.
+fn salvage_uncommitted_work(worktree: &Path, branch: &str) -> Result<String, WorktreeError> {
+    run_git(worktree, &["add".to_string(), "-A".to_string()])?;
+    run_git(
+        worktree,
+        &[
+            "-c".to_string(),
+            "user.name=caucus".to_string(),
+            "-c".to_string(),
+            "user.email=caucus@localhost".to_string(),
+            "commit".to_string(),
+            "--no-verify".to_string(),
+            "-m".to_string(),
+            format!("caucus: recovered uncommitted work from a crashed worktree ({branch})"),
+        ],
+    )
 }
 
 /// The worktree directory currently checked out on `branch`, if any, parsed
@@ -379,6 +436,64 @@ mod tests {
         let w2 = attach(repo, &p2, &branch).expect("re-attach after reconcile");
         assert_eq!(w2.branch, branch);
         assert!(p2.exists(), "the re-attached worktree directory exists");
+    }
+
+    /// A crashed worktree with *uncommitted* work must not be silently
+    /// discarded on resume: `reconcile_stale` salvages the changes onto the
+    /// branch (a reversible recovery commit) before removing the directory, so
+    /// the work rides to the re-attached resume worktree instead of being lost
+    /// to `--force`.
+    #[test]
+    fn reconcile_stale_salvages_uncommitted_work_before_removing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .expect("run git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "caucus-test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        let req = WorktreeRequest {
+            repo_root: repo.to_path_buf(),
+            session_id: SessionId::new(),
+            role: "backend".into(),
+            branch: Some("caucus/test/backend-1".into()),
+            base_ref: None,
+            name_override: Some("s-backend-1".into()),
+        };
+        let w1 = create(&req).unwrap();
+        let branch = w1.branch.clone();
+
+        // The crashed agent left uncommitted work in its worktree.
+        std::fs::write(w1.path.join("recovered.txt"), b"unsaved agent work").unwrap();
+        assert!(worktree_is_dirty(&w1.path), "the stale worktree is dirty");
+
+        reconcile_stale(repo, &branch);
+        assert!(!w1.path.exists(), "the salvaged stale worktree is removed");
+
+        // The work rode onto the branch: re-attaching it to the resume path
+        // brings the recovered file back, instead of a clean checkout that
+        // lost it.
+        let p2 = repo
+            .join(".caucus")
+            .join("worktrees")
+            .join("s-backend-1-resume");
+        let w2 = attach(repo, &p2, &branch).expect("re-attach after reconcile");
+        assert_eq!(w2.branch, branch);
+        assert!(
+            p2.join("recovered.txt").exists(),
+            "the crashed agent's uncommitted work must survive on the branch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p2.join("recovered.txt")).unwrap(),
+            "unsaved agent work",
+        );
     }
 
     /// `reconcile_stale` must not touch a checkout outside `.caucus/worktrees/`
