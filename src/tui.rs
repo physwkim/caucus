@@ -438,6 +438,10 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
     // Restore the panel arrangement, then persist the rebuilt roster.
     mux.set_layout_mode(record.layout_mode);
     mux.persist_record();
+    // Surface any rounds the prior instance left in flight — preserve their
+    // captured work and queue a notice for the resumed main worker so it does
+    // not wait forever for a delivery that cannot cross the restart.
+    mux.ingest_resumed_rounds();
     Ok(())
 }
 
@@ -584,6 +588,13 @@ async fn event_loop(
         //     a `[Pasted text #N]` placeholder) and written here as a discrete
         //     keypress once its delay has elapsed, a tick after the paste landed.
         mux.poll_pending_submits();
+
+        // 4c. Resume notice — if this session resumed with rounds left in flight
+        //     by the prior instance, tell the main worker (whose conversation
+        //     reloaded believing its round was live) once it is idle, so it
+        //     stops waiting. One-shot; shares the one-push-per-tick gate and
+        //     runs before round delivery so the dropped-round notice lands first.
+        mux.poll_resume_notice();
 
         // 5. Selection prompts — if a panel in a pending round has stopped on
         //    an interactive chooser (no Stop hook fires, so its round never

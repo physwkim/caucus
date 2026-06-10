@@ -141,6 +141,15 @@ pub struct Multiplexer {
     /// shutdown); the branch persists and is what `caucus resume` re-attaches
     /// a worktree on. Populated at spawn, dropped on kill.
     worktree_branches: HashMap<PanelId, String>,
+    /// Notice to inject into the resumed main worker once it is idle: the
+    /// in-flight rounds a prior caucus instance dropped on quit/crash. The
+    /// main worker's claude conversation reloads still believing its
+    /// `register_round` is live, so without this it waits forever for a
+    /// delivery that can never come. Set once by
+    /// [`Multiplexer::ingest_resumed_rounds`] from the persisted
+    /// `pending-rounds.json`; delivered and cleared by
+    /// [`Multiplexer::poll_resume_notice`]. `None` on a fresh launch.
+    resume_round_notice: Option<String>,
 }
 
 impl Multiplexer {
@@ -200,6 +209,7 @@ impl Multiplexer {
                 show_transcript: false,
                 scroll: None,
                 worktree_branches: HashMap::new(),
+                resume_round_notice: None,
             },
             signal_server,
             control_server,

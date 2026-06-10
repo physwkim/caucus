@@ -3,6 +3,7 @@
 
 pub mod id;
 pub mod record;
+pub mod round_record;
 pub mod runtime;
 pub mod state;
 

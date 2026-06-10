@@ -113,6 +113,9 @@ impl Multiplexer {
             read_mode: read_mode.unwrap_or(ReadPanelMode::LastMessage),
             fallback_deadline: Instant::now() + Duration::from_secs(budget),
         });
+        // Durably shadow the new round so a quit/crash before delivery surfaces
+        // it on resume instead of losing it silently.
+        self.persist_pending_rounds();
         ack
     }
 
@@ -168,6 +171,10 @@ impl Multiplexer {
         let deliverable = self.main_deliverable();
 
         let mut delivered = false;
+        // Whether the pending-round set changed this tick (a round dropped,
+        // delivered, or had backlog fed) — only then is the durable snapshot
+        // re-written, so the common idle tick does no I/O.
+        let mut changed = false;
         for mut round in rounds {
             let fallback_due = now >= round.fallback_deadline;
             if !fallback_due {
@@ -175,7 +182,7 @@ impl Multiplexer {
                 // next queued task before judging the round done. Once the
                 // fallback deadline has fired, do not start more queued work:
                 // the deadline means deliver the partial report now.
-                self.feed_round_backlog(&mut round);
+                changed |= self.feed_round_backlog(&mut round);
             }
             let all_settled = self.round_settled(&round);
             let due = fallback_due || all_settled;
@@ -190,6 +197,7 @@ impl Multiplexer {
                 // the sub-agents' work is not silently lost, then drop.
                 let report = self.assemble_round_report(&round, all_settled);
                 self.record_dropped_round(&report);
+                changed = true;
                 continue;
             }
             if deliverable && !delivered {
@@ -197,7 +205,10 @@ impl Multiplexer {
                 // `deliverable` implies a live, idle main panel exists.
                 let mid = main_id.expect("deliverable implies a main panel");
                 match McpToolSurface::send_keys(self, mid, &report, true) {
-                    Ok(()) => delivered = true,
+                    Ok(()) => {
+                        delivered = true;
+                        changed = true;
+                    }
                     Err(err) => {
                         // Delivery failed (e.g. the main PTY writer went away
                         // mid-tick): keep the round so a later tick retries,
@@ -212,6 +223,9 @@ impl Multiplexer {
                 self.pending_rounds.push(round);
             }
         }
+        if changed {
+            self.persist_pending_rounds();
+        }
     }
 
     /// Append a dropped round's assembled report to the session's
@@ -220,6 +234,17 @@ impl Multiplexer {
     /// write failure is logged, not propagated — the round is being dropped
     /// either way.
     fn record_dropped_round(&self, report: &str) {
+        self.append_dropped_round(
+            "----- dropped round (no main worker to deliver to) -----",
+            report,
+        );
+    }
+
+    /// Append a `header` line then a `body` block to the session's
+    /// `dropped-rounds.log` — the single sink for every round caucus could not
+    /// deliver (main gone, or lost to a restart). Best-effort: a write failure
+    /// is logged, not propagated.
+    fn append_dropped_round(&self, header: &str, body: &str) {
         use std::io::Write;
         let path = self.session.root_dir.join("dropped-rounds.log");
         let spill = || -> std::io::Result<()> {
@@ -227,15 +252,144 @@ impl Multiplexer {
                 .create(true)
                 .append(true)
                 .open(&path)?;
-            writeln!(
-                f,
-                "----- dropped round (no main worker to deliver to) -----"
-            )?;
-            writeln!(f, "{report}")?;
+            writeln!(f, "{header}")?;
+            writeln!(f, "{body}")?;
             Ok(())
         };
         if let Err(err) = spill() {
             warn!(path = %path.display(), error = %err, "failed to spill dropped round report");
+        }
+    }
+
+    /// Snapshot the live pending rounds into their persistable form. Panel ids
+    /// (regenerated on resume) are resolved to role labels; per-panel captured
+    /// turns and the remaining backlog count are carried so resume can both
+    /// preserve the work and summarise it.
+    fn pending_round_records(&self) -> Vec<crate::session::round_record::PendingRoundRecord> {
+        use crate::session::round_record::{PendingRoundRecord, RoundPanelRecord};
+        self.pending_rounds
+            .iter()
+            .map(|r| {
+                let panels = r
+                    .panels
+                    .iter()
+                    .map(|&id| RoundPanelRecord {
+                        role: self
+                            .panels
+                            .iter()
+                            .find(|p| p.id == id)
+                            .map(|p| p.role.clone())
+                            .unwrap_or_else(|| "(gone)".to_string()),
+                        captured: r.captured.get(&id).cloned().unwrap_or_default(),
+                        pending_backlog: r.backlog.get(&id).map(VecDeque::len).unwrap_or(0),
+                    })
+                    .collect();
+                PendingRoundRecord {
+                    panels,
+                    read_mode: r.read_mode,
+                }
+            })
+            .collect()
+    }
+
+    /// Persist the live pending rounds to `<session_root>/pending-rounds.json`
+    /// (or remove it when there are none). Single owner of pending-round
+    /// persistence: called whenever the set changes (registration, delivery,
+    /// drop, backlog feed). Best-effort — a write failure is logged, not fatal.
+    fn persist_pending_rounds(&self) {
+        let records = self.pending_round_records();
+        if let Err(err) = crate::session::round_record::write(&self.session.root_dir, &records) {
+            warn!(error = %err, "pending-rounds persistence failed");
+        }
+    }
+
+    /// Surface the rounds a prior caucus instance left in flight when it quit
+    /// or crashed — read from the persisted `pending-rounds.json`. Called once
+    /// after the roster is restored, before the event loop starts; a no-op on a
+    /// fresh launch (no file) or after a clean delivery (file removed).
+    ///
+    /// The sub-agent processes restart fresh, so a round is never silently
+    /// continued. Each dropped round's captured work is appended to
+    /// `dropped-rounds.log` (preserved, not lost), and a single notice is
+    /// queued for the resumed main worker — whose claude conversation reloaded
+    /// still believing its `register_round` was live — telling it the round was
+    /// dropped so it stops waiting and can re-issue the work. The persisted file
+    /// is then cleared.
+    pub fn ingest_resumed_rounds(&mut self) {
+        let records = crate::session::round_record::read(&self.session.root_dir);
+        if records.is_empty() {
+            return;
+        }
+
+        let mut notice = format!(
+            "[caucus] {} round(s) you registered before the last restart were \
+             dropped — caucus cannot deliver a round across a restart (the \
+             sub-agent processes started fresh). Re-issue the work if you still \
+             need it. Their captured output is preserved in \
+             dropped-rounds.log. Summary:\n",
+            records.len()
+        );
+        for (i, round) in records.iter().enumerate() {
+            notice.push_str(&format!(
+                "\n## dropped round {} ({} panel(s))\n",
+                i + 1,
+                round.panels.len()
+            ));
+            let mut spill = String::new();
+            for panel in &round.panels {
+                notice.push_str(&format!(
+                    "  - role {}: {} captured turn(s), {} backlog task(s) un-run\n",
+                    panel.role,
+                    panel.captured.len(),
+                    panel.pending_backlog
+                ));
+                spill.push_str(&format!(
+                    "\n## role {} ({} captured turn(s), {} backlog un-run)\n",
+                    panel.role,
+                    panel.captured.len(),
+                    panel.pending_backlog
+                ));
+                for (t, body) in panel.captured.iter().enumerate() {
+                    spill.push_str(&format!("\n### task {}\n{}\n", t + 1, body.trim()));
+                }
+            }
+            self.append_dropped_round(
+                &format!("----- dropped round {} (lost to a restart) -----", i + 1),
+                &spill,
+            );
+        }
+
+        self.resume_round_notice = Some(notice);
+        // The work is now preserved + queued; the durable snapshot has served
+        // its purpose, so clear it (a re-crash before delivery would otherwise
+        // re-surface the same already-recorded rounds).
+        crate::session::round_record::clear(&self.session.root_dir);
+    }
+
+    /// Deliver the resume notice (in-flight rounds dropped by the last restart)
+    /// to the main worker once it is idle, then clear it. Mirrors
+    /// [`Multiplexer::poll_stranded_main`]: one-shot, gated by
+    /// [`Multiplexer::main_deliverable`] so it never lands mid-compose, and the
+    /// push flips the main panel to `Working`, closing the gate for the tick.
+    /// The notice is cleared only on a confirmed send, so a closed gate this
+    /// tick simply retries next tick.
+    pub fn poll_resume_notice(&mut self) {
+        if self.resume_round_notice.is_none() {
+            return;
+        }
+        let Some(main_id) = self.main_panel_id else {
+            return;
+        };
+        if !self.main_deliverable() {
+            return;
+        }
+        let notice = self
+            .resume_round_notice
+            .clone()
+            .expect("checked Some above");
+        match McpToolSurface::send_keys(self, main_id, &notice, true) {
+            Ok(()) => self.resume_round_notice = None,
+            Err(err) => warn!(error = %err, "resume-notice delivery to main panel failed"),
         }
     }
 
@@ -277,7 +431,11 @@ impl Multiplexer {
     /// every backlog task's result rather than only the panel's final turn (see
     /// [`Multiplexer::assemble_round_report`]); the capture and the queue pop are
     /// committed together so a failed send re-reads and retries both next tick.
-    fn feed_round_backlog(&mut self, round: &mut PendingRound) {
+    ///
+    /// Returns `true` if at least one task was actually fed (queue popped +
+    /// turn captured) — i.e. the round's persistable state changed, so the
+    /// caller re-writes the durable snapshot.
+    fn feed_round_backlog(&mut self, round: &mut PendingRound) -> bool {
         // Decide every feed first (borrows only `round` + reads `self.panels`),
         // then deliver (mut-borrows `self`), so the two borrows never overlap.
         // The front is cloned, not popped, here — it is consumed only on a
@@ -304,6 +462,7 @@ impl Multiplexer {
                 feeds.push((id, task, done));
             }
         }
+        let mut fed = false;
         for (id, task, done) in feeds {
             match McpToolSurface::send_keys(self, id, &task, true) {
                 // Delivered: consume the task (still the queue's front, single
@@ -313,6 +472,7 @@ impl Multiplexer {
                 Ok(()) => {
                     round.backlog.get_mut(&id).and_then(VecDeque::pop_front);
                     round.captured.entry(id).or_default().push(done);
+                    fed = true;
                 }
                 // Delivery failed: leave the task at the front and capture
                 // nothing; the panel is still idle, so the next tick re-reads
@@ -320,6 +480,7 @@ impl Multiplexer {
                 Err(err) => warn!(error = %err, panel = %id, "round backlog feed failed"),
             }
         }
+        fed
     }
 
     /// Whether a caucus→main push may land *this tick*: the main panel exists,
@@ -1673,5 +1834,125 @@ mod tests {
         );
         assert!(text.contains("hello"), "got: {text:?}");
         assert!(text.contains("from caucus"), "got: {text:?}");
+    }
+
+    /// Registering a round writes a durable snapshot to `pending-rounds.json`
+    /// (resolving panel ids to role labels) so a quit/crash before delivery can
+    /// surface it on resume instead of losing it silently.
+    #[tokio::test]
+    async fn register_round_persists_a_durable_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+
+        mux.register_round(vec![sub], None, Some(600), None);
+
+        let recs = crate::session::round_record::read(&mux.session.root_dir);
+        assert_eq!(recs.len(), 1, "the registered round must be persisted");
+        assert_eq!(recs[0].panels.len(), 1);
+        assert_eq!(
+            recs[0].panels[0].role, "reviewer",
+            "the panel id must be resolved to its role label"
+        );
+
+        mux.shutdown();
+    }
+
+    /// Delivering the last round removes `pending-rounds.json` — resume must see
+    /// a clean state once nothing is in flight, not a stale snapshot.
+    #[tokio::test]
+    async fn delivering_a_round_clears_the_durable_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+
+        // A round on a non-existent id is due immediately and delivers to the
+        // idle main panel.
+        mux.register_round(vec![PanelId::new()], None, Some(600), None);
+        assert!(
+            crate::session::round_record::path(&mux.session.root_dir).exists(),
+            "registration writes the snapshot"
+        );
+
+        mux.poll_pending_rounds();
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "the round delivered to the idle main panel"
+        );
+        assert!(
+            !crate::session::round_record::path(&mux.session.root_dir).exists(),
+            "a delivered round must clear the durable snapshot"
+        );
+
+        mux.shutdown();
+    }
+
+    /// `ingest_resumed_rounds` reads a prior instance's persisted round, spills
+    /// its captured work to `dropped-rounds.log` (preserved, not lost), clears
+    /// the persisted file, and queues a notice — which `poll_resume_notice` then
+    /// delivers to the idle main worker (flipping it to `Working`), one-shot.
+    #[tokio::test]
+    async fn resume_ingests_dropped_rounds_and_notifies_main() {
+        use crate::session::round_record::{PendingRoundRecord, RoundPanelRecord};
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        // A round the prior instance left in flight when it quit/crashed.
+        let recs = vec![PendingRoundRecord {
+            panels: vec![RoundPanelRecord {
+                role: "backend".into(),
+                captured: vec!["finished analysis".into()],
+                pending_backlog: 1,
+            }],
+            read_mode: ReadPanelMode::LastMessage,
+        }];
+        crate::session::round_record::write(&mux.session.root_dir, &recs).unwrap();
+
+        mux.ingest_resumed_rounds();
+
+        let log = std::fs::read_to_string(mux.session.root_dir.join("dropped-rounds.log")).unwrap();
+        assert!(log.contains("lost to a restart"), "spill header: {log}");
+        assert!(
+            log.contains("finished analysis"),
+            "captured work must be preserved in the log: {log}"
+        );
+        assert!(
+            !crate::session::round_record::path(&mux.session.root_dir).exists(),
+            "the persisted file must be cleared after ingest"
+        );
+
+        // The notice is held until the main worker exists and is idle, then
+        // delivered exactly once.
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        mux.poll_resume_notice();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "delivering the resume notice injects a turn into the main panel",
+        );
+
+        mux.shutdown();
+    }
+
+    /// `ingest_resumed_rounds` is a no-op on a fresh launch (no persisted file):
+    /// no notice is queued, so `poll_resume_notice` never injects anything.
+    #[tokio::test]
+    async fn resume_ingest_is_a_noop_without_a_persisted_file() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+
+        mux.ingest_resumed_rounds();
+        mux.poll_resume_notice();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "no persisted rounds means no notice and no injected turn",
+        );
+
+        mux.shutdown();
     }
 }
