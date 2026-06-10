@@ -141,6 +141,14 @@ pub struct Multiplexer {
     /// shutdown); the branch persists and is what `caucus resume` re-attaches
     /// a worktree on. Populated at spawn, dropped on kill.
     worktree_branches: HashMap<PanelId, String>,
+    /// Cached menu-scan result per panel, keyed by panel id, valued by the
+    /// grid `generation` it was computed against plus the parsed menu (or
+    /// `None`). [`Multiplexer::poll_round_selection_prompts`] runs every tick
+    /// while a round is pending; without this it would re-materialise each round
+    /// panel's full viewport and run `scan_menu` on every iteration even when
+    /// the grid did not change. The cache recomputes only when a panel's grid
+    /// generation advances; an entry is pruned when its panel is killed.
+    menu_scan_cache: HashMap<PanelId, (u64, Option<crate::term::Menu>)>,
     /// Notice to inject into the resumed main worker once it is idle: the
     /// in-flight rounds a prior caucus instance dropped on quit/crash. The
     /// main worker's claude conversation reloads still believing its
@@ -209,6 +217,7 @@ impl Multiplexer {
                 show_transcript: false,
                 scroll: None,
                 worktree_branches: HashMap::new(),
+                menu_scan_cache: HashMap::new(),
                 resume_round_notice: None,
             },
             signal_server,

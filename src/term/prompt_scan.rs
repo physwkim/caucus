@@ -36,6 +36,23 @@ pub struct MenuOption {
     pub label: String,
 }
 
+/// Allocation-free case-insensitive substring test for an **ASCII** `needle`.
+/// The footer anchors ("to navigate"/"to select"/"to cancel") are ASCII, so
+/// byte-wise `eq_ignore_ascii_case` over the haystack windows is exact — and
+/// avoids the `to_lowercase` String that a per-row, per-tick scan would
+/// otherwise allocate just to usually find no menu. Non-ASCII bytes in the
+/// haystack (the `↑/↓ · Esc` glyphs) simply never match the ASCII needle.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 /// Cursor glyphs Claude Code may render before the highlighted option.
 const CURSOR_GLYPHS: [char; 5] = ['❯', '›', '▶', '▸', '»'];
 
@@ -52,10 +69,15 @@ const MAX_OPTION_INDENT: usize = 3;
 /// positive unlikely.
 pub fn scan_menu(rows: &[String]) -> Option<Menu> {
     // 1. The navigation footer is the high-confidence anchor: an interactive
-    //    chooser shows help like "↑/↓ to navigate · Enter to select".
-    let footer = rows.iter().position(|r| {
-        let l = r.to_lowercase();
-        l.contains("to navigate") && (l.contains("to select") || l.contains("to cancel"))
+    //    chooser shows help like "↑/↓ to navigate · Enter to select". Search
+    //    bottom-up (the footer sits at the screen's foot) and match without
+    //    allocating a lowercased copy of every row — this runs per round panel
+    //    every tick, and the common case is "no menu", which otherwise paid a
+    //    `to_lowercase` String per row to conclude nothing.
+    let footer = rows.iter().rposition(|r| {
+        contains_ignore_ascii_case(r, "to navigate")
+            && (contains_ignore_ascii_case(r, "to select")
+                || contains_ignore_ascii_case(r, "to cancel"))
     })?;
 
     // 2. Options are the shallow-indented "N. title" lines above the footer; a
@@ -243,5 +265,45 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert!(scan_menu(&rows).is_none());
+    }
+
+    /// The allocation-free footer matcher is case-insensitive over ASCII,
+    /// tolerates non-ASCII bytes in the haystack (the `↑/↓ · Esc` glyphs), and
+    /// handles the empty-needle / needle-longer-than-haystack edges.
+    #[test]
+    fn contains_ignore_ascii_case_edges() {
+        assert!(contains_ignore_ascii_case("Enter to SELECT", "to select"));
+        assert!(contains_ignore_ascii_case(
+            "↑/↓ to navigate · Esc",
+            "to navigate"
+        ));
+        assert!(!contains_ignore_ascii_case("plain output", "to select"));
+        assert!(
+            contains_ignore_ascii_case("anything", ""),
+            "empty needle matches"
+        );
+        assert!(
+            !contains_ignore_ascii_case("ab", "abc"),
+            "needle longer than haystack"
+        );
+    }
+
+    /// `scan_menu` searches the footer bottom-up: when an earlier line happens
+    /// to read like a footer, the real chooser footer at the screen's foot is
+    /// the one anchored, and the options between it and the top still parse.
+    #[test]
+    fn footer_is_anchored_bottom_up() {
+        let rows: Vec<String> = [
+            "(an aside mentioning to navigate and to select inline)",
+            "❯ 1. first",
+            "  2. second",
+            "Enter to select · ↑/↓ to navigate · Esc to cancel",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let menu = scan_menu(&rows).expect("the bottom footer anchors the menu");
+        assert_eq!(menu.options.len(), 2);
+        assert_eq!(menu.cursor, 0);
     }
 }

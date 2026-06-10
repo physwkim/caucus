@@ -137,6 +137,14 @@ pub struct Grid {
     /// bracketed paste so the agent does not absorb the submitting `\r` as a
     /// literal newline (`session::runtime::mcp::plan_delivery`).
     bracketed_paste: bool,
+    /// Monotonic content-change counter, bumped on every `advance` that ingests
+    /// bytes and on every `resize`. A consumer that derives something expensive
+    /// from the grid text (the menu scan,
+    /// `session::runtime::rounds::poll_round_selection_prompts`) caches its
+    /// result against this value and recomputes only when it changes — so an
+    /// idle panel is never re-scanned. Wraps; only equality across one tick
+    /// matters, never the absolute value.
+    generation: u64,
 }
 
 /// Cursor + pen state preserved by DECSC (`ESC 7`) / SCO save (`CSI s`).
@@ -204,7 +212,15 @@ impl Grid {
             saved_cursor: None,
             alt_saved: None,
             bracketed_paste: false,
+            generation: 0,
         }
+    }
+
+    /// The grid's content-change counter (see the `generation` field). Two reads
+    /// that compare equal mean the grid did not ingest any bytes or resize in
+    /// between, so any text derived from it is unchanged.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Whether the panel is currently on the alternate screen (`?1049h` and
@@ -277,6 +293,13 @@ impl Grid {
     ///
     /// The only sanctioned way to mutate grid state.
     pub(crate) fn advance(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // Bytes arrived → the grid may have changed; invalidate generation-keyed
+        // caches (the menu scan). Conservative: an escape sequence that renders
+        // to a no-op still bumps, which only costs one redundant re-scan.
+        self.generation = self.generation.wrapping_add(1);
         // `Parser` and the `Perform` sink can't both be `&mut self` at once,
         // so swap the parser out, drive it, swap it back.
         let mut parser = std::mem::take(&mut self.parser);
@@ -300,6 +323,9 @@ impl Grid {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        // A real resize reflows the rows, so any generation-keyed cache (the
+        // menu scan) must recompute against the new layout.
+        self.generation = self.generation.wrapping_add(1);
 
         // Existing rows as owned vectors.
         let old_rows: Vec<Vec<Cell>> = (0..self.rows)
@@ -1196,6 +1222,30 @@ mod tests {
 
     fn at(g: &Grid, row: usize, col: usize) -> char {
         g.cell(row, col).unwrap().ch
+    }
+
+    /// The content-change `generation` advances when bytes are ingested or the
+    /// grid is resized, and stays put on a no-op (empty advance / same-size
+    /// resize) — the equality the menu-scan cache relies on to skip an idle
+    /// panel.
+    #[test]
+    fn generation_tracks_content_changes_only() {
+        let mut g = Grid::new(20, 5);
+        let g0 = g.generation();
+
+        g.advance(b"");
+        assert_eq!(g.generation(), g0, "an empty advance must not bump");
+
+        g.advance(b"hello");
+        let g1 = g.generation();
+        assert!(g1 > g0, "ingesting bytes must bump the generation");
+
+        g.resize(30, 6);
+        let g2 = g.generation();
+        assert!(g2 > g1, "a real resize must bump the generation");
+
+        g.resize(30, 6);
+        assert_eq!(g.generation(), g2, "a no-op resize must not bump");
     }
 
     #[test]

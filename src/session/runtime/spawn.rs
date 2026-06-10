@@ -327,6 +327,7 @@ impl Multiplexer {
         }
         self.manifests.remove(&panel_id);
         self.worktree_branches.remove(&panel_id);
+        self.menu_scan_cache.remove(&panel_id);
 
         // Keep `main_panel_id` an accurate invariant: it points to a live
         // panel or is None. Without this, killing main leaves it Some(stale),

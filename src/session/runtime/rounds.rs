@@ -646,15 +646,25 @@ impl Multiplexer {
             .iter()
             .flat_map(|r| r.panels.iter().copied())
             .collect();
+        // Snapshot each non-main round panel's grid generation (immutable
+        // borrow), then scan through the generation-keyed cache (mutable
+        // borrow) — so an idle panel whose grid did not change is never
+        // re-materialised + re-scanned this tick.
+        let scan_targets: Vec<(PanelId, u64)> = round_panels
+            .iter()
+            .copied()
+            .filter(|&pid| pid != main_id)
+            .filter_map(|pid| {
+                self.panels
+                    .iter()
+                    .find(|p| p.id == pid)
+                    .map(|p| (pid, p.grid().generation()))
+            })
+            .collect();
         let mut open: Vec<(PanelId, u64)> = Vec::new();
         let mut menus: HashMap<PanelId, crate::term::Menu> = HashMap::new();
-        for pid in round_panels {
-            if pid == main_id {
-                continue;
-            }
-            if let Some(p) = self.panels.iter().find(|p| p.id == pid)
-                && let Some(menu) = Self::panel_menu(p)
-            {
+        for (pid, generation) in scan_targets {
+            if let Some(menu) = self.panel_menu_cached(pid, generation) {
                 open.push((pid, Self::menu_signature(&menu)));
                 menus.insert(pid, menu);
             }
@@ -886,6 +896,27 @@ impl Multiplexer {
             .map(|r| panel.grid().row_text(r).trim_end().to_string())
             .collect();
         crate::term::scan_menu(&lines)
+    }
+
+    /// [`Multiplexer::panel_menu`] gated by the panel's grid `generation`. If
+    /// the panel's grid has not changed since the last scan (cached generation
+    /// matches), the cached result is returned without re-materialising the
+    /// viewport or re-running `scan_menu`; otherwise it re-scans and refreshes
+    /// the cache. This is what keeps the per-tick selection-prompt poll from
+    /// re-scanning every idle round panel. Returns `None` for an unknown id.
+    fn panel_menu_cached(&mut self, id: PanelId, generation: u64) -> Option<crate::term::Menu> {
+        if let Some((cached_gen, cached)) = self.menu_scan_cache.get(&id)
+            && *cached_gen == generation
+        {
+            return cached.clone();
+        }
+        let menu = self
+            .panels
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(Self::panel_menu);
+        self.menu_scan_cache.insert(id, (generation, menu.clone()));
+        menu
     }
 
     /// Overlay a live selection-menu detection onto the turn-signal-derived
@@ -2076,6 +2107,65 @@ mod tests {
             std::fs::read_to_string(spilled[0].path()).unwrap().len(),
             big.len(),
             "the spill preserves the entire body"
+        );
+
+        mux.shutdown();
+    }
+
+    /// `panel_menu_cached` reuses its result while the panel's grid generation
+    /// is unchanged and recomputes once it advances. A sentinel menu seeded into
+    /// the cache (the live cat-panel grid has no menu) lets the test tell a
+    /// cache hit from a recompute: a hit returns the sentinel, a recompute on
+    /// the empty grid returns `None`.
+    #[tokio::test]
+    async fn panel_menu_cached_reuses_until_generation_advances() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let pid = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        let generation = mux
+            .panels()
+            .iter()
+            .find(|p| p.id == pid)
+            .unwrap()
+            .grid()
+            .generation();
+
+        let sentinel = crate::term::Menu {
+            question: "cached?".into(),
+            options: vec![],
+            cursor: 0,
+        };
+        mux.menu_scan_cache
+            .insert(pid, (generation, Some(sentinel.clone())));
+
+        // Same generation → cache hit → the sentinel, no re-scan.
+        assert_eq!(mux.panel_menu_cached(pid, generation), Some(sentinel));
+
+        // Advanced generation → recompute → the empty grid yields None, and the
+        // cache is refreshed to the new generation.
+        assert_eq!(mux.panel_menu_cached(pid, generation + 1), None);
+        assert_eq!(
+            mux.menu_scan_cache.get(&pid).map(|(g, _)| *g),
+            Some(generation + 1),
+            "the cache must track the latest generation it scanned"
+        );
+
+        mux.shutdown();
+    }
+
+    /// A killed panel's menu-scan cache entry is pruned, so the cache cannot
+    /// grow with dead-panel ids over a long session.
+    #[tokio::test]
+    async fn kill_panel_prunes_the_menu_scan_cache() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let pid = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        mux.menu_scan_cache.insert(pid, (0, None));
+
+        mux.kill_panel(pid).unwrap();
+        assert!(
+            !mux.menu_scan_cache.contains_key(&pid),
+            "killing a panel must drop its menu-scan cache entry"
         );
 
         mux.shutdown();
