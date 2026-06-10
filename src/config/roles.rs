@@ -20,14 +20,23 @@ use tracing::warn;
 use crate::role::spec::{AgentCli, RoleSpec};
 
 /// On-disk representation of a `roles.toml` file. One entry per role.
+///
+/// `deny_unknown_fields` so a misplaced top-level table (e.g. `[architect]`
+/// instead of `[roles.architect]`, or a `[settings]` block in the wrong file)
+/// is a hard parse error the user sees, not silently dropped.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RolesConfig {
     pub roles: BTreeMap<String, RoleEntry>,
 }
 
 /// One `[roles.<name>]` table.
+///
+/// `deny_unknown_fields` so a typo'd key (`permision_mode`, `allowed_tool`,
+/// `cli`) fails the parse rather than being silently ignored — leaving the role
+/// quietly running on defaults the user thought they had overridden.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoleEntry {
     #[serde(default)]
     pub description: String,
@@ -195,6 +204,49 @@ mod tests {
         let specs = merged.into_specs();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].permission_mode, "acceptEdits");
+    }
+
+    #[test]
+    fn unknown_field_in_a_role_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("roles.toml");
+        // `permision_mode` is a typo for `permission_mode`; without
+        // deny_unknown_fields it would be silently ignored and the role would
+        // run on the default mode.
+        std::fs::write(
+            &path,
+            r#"
+                [roles.reviewer]
+                description = "typo'd a key"
+                system_prompt_template = "roles/reviewer.md"
+                permision_mode = "plan"
+            "#,
+        )
+        .unwrap();
+        let err = RolesConfig::load(&path).unwrap_err();
+        assert!(
+            matches!(err, RolesError::Toml { .. }),
+            "an unknown role field must fail the parse, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_table_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("roles.toml");
+        // `[architect]` is missing the `roles.` prefix, so it would never
+        // register as a role; deny_unknown_fields surfaces the mistake.
+        std::fs::write(
+            &path,
+            r#"
+                [architect]
+                description = "missing the roles. prefix"
+                system_prompt_template = "roles/architect.md"
+            "#,
+        )
+        .unwrap();
+        let err = RolesConfig::load(&path).unwrap_err();
+        assert!(matches!(err, RolesError::Toml { .. }), "got {err:?}");
     }
 
     #[test]
