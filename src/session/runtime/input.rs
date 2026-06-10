@@ -26,14 +26,24 @@ impl Multiplexer {
         match self.focus.route(key) {
             InputAction::ToPanel { panel, bytes } => {
                 let submit = bytes.contains(&b'\r') || bytes.contains(&b'\n');
+                let is_main = Some(panel) == self.main_panel_id;
                 // A non-submit keystroke to the main panel means the user may
                 // be composing an un-submitted line: open the compose hold so a
                 // round delivery never lands mid-line (see `poll_pending_rounds`
                 // / `COMPOSE_GRACE`). A submit is not a compose — it is handled
                 // by `note_prompt_delivered` below, which clears the hold.
-                if Some(panel) == self.main_panel_id && !submit {
+                if is_main && !submit {
                     self.main_compose_since = Some(Instant::now());
                 }
+                // A submit on the main panel delivers a prompt only if the user
+                // actually composed a line. A bare Enter on an empty main input
+                // (no composition since the last submit) sends the agent nothing
+                // to act on, so it never opens a turn that could end — flipping
+                // it to `Working` would wedge it there forever. `main_compose_since`
+                // is caucus's model of "the main line holds un-submitted text".
+                // Sub-panels carry no compose model, so a submit there always
+                // delivers (unchanged behaviour).
+                let delivers_prompt = submit && (!is_main || self.main_compose_since.is_some());
                 if let Some(p) = self.panels.iter_mut().find(|p| p.id == panel)
                     && let Err(err) = p.write_input(&bytes)
                 {
@@ -41,8 +51,10 @@ impl Multiplexer {
                 }
                 // A submitted line (Enter) typed directly into a panel is a
                 // prompt delivered by the user — flip it to `Working`, the
-                // same as the MCP `send_keys` path.
-                if submit {
+                // same as the MCP `send_keys` path. An empty main submit is not
+                // a prompt: the keystroke still reaches the agent above, but no
+                // turn is opened and the panel stays put.
+                if delivers_prompt {
                     self.note_prompt_delivered(panel);
                 }
             }
@@ -360,6 +372,51 @@ mod tests {
         assert!(
             mux.main_compose_since.is_some(),
             "a paste into the main panel arms the compose hold (un-submitted composition)",
+        );
+
+        mux.shutdown();
+    }
+
+    /// A bare Enter on an empty main input must not flip main to `Working`.
+    /// Nothing was composed, so the agent receives no prompt it can finish —
+    /// flipping it would wedge it in `Working` with no turn ever to end. A
+    /// submit *after* real composition is a genuine prompt and does flip it.
+    #[tokio::test]
+    async fn bare_enter_on_empty_main_does_not_flip_to_working() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        mux.focus.set_focus(Some(main));
+        assert!(mux.main_compose_since.is_none());
+
+        // Bare Enter, no prior composition: the keystroke reaches the agent but
+        // opens no turn — the panel stays Idle.
+        mux.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "a bare Enter on an empty main input must not open a turn",
+        );
+
+        // Compose a character, then submit: a genuine prompt flips to Working
+        // and clears the compose hold.
+        mux.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(
+            mux.main_compose_since.is_some(),
+            "composing a character arms the compose hold",
+        );
+        mux.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "submitting a composed line delivers a prompt and flips to Working",
+        );
+        assert!(
+            mux.main_compose_since.is_none(),
+            "delivering the prompt clears the compose hold",
         );
 
         mux.shutdown();
