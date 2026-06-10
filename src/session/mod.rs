@@ -2,6 +2,7 @@
 //! around one topic. See `docs/design.md` §3.
 
 pub mod id;
+pub mod lock;
 pub mod record;
 pub mod round_record;
 pub mod runtime;

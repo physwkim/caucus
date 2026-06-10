@@ -23,6 +23,7 @@ use crate::mcp::control_server::ControlServer;
 use crate::panel::lifecycle::Panel;
 use crate::render::{Layout, LayoutMode, LayoutTree, Rect};
 use crate::session::id::PanelId;
+use crate::session::lock::{SessionLock, SessionLockError};
 use crate::session::state::Session;
 use crate::signal::server::SignalServer;
 use crate::worktree::cleanup::CleanupQueue;
@@ -47,6 +48,10 @@ pub struct Multiplexer {
     pub session: Session,
     /// Merged role configuration (embedded + global + project).
     pub config: Config,
+    /// Single-instance lock on the session root, held for this multiplexer's
+    /// lifetime so no second caucus can open the same session concurrently. Kept
+    /// only for its `Drop` (the kernel releases the lock on process exit).
+    _session_lock: SessionLock,
     /// Live panels, in spawn order — also the focus-cycle order.
     panels: Vec<Panel>,
     /// Per-panel agent manifest, keyed by panel id. Mutated only via
@@ -201,6 +206,19 @@ impl Multiplexer {
             .with_context(|| format!("create {}", session.root_dir.display()))?;
         std::fs::create_dir_all(session.root_dir.join("panels"))?;
 
+        // Claim the session before binding its sockets: `SignalServer::bind`
+        // unlinks any existing socket, so acquiring the lock first means a
+        // second caucus refuses here instead of stealing the live owner's
+        // socket. The lock is held for the multiplexer's lifetime.
+        let session_lock = SessionLock::acquire(&session.root_dir).map_err(|err| match err {
+            SessionLockError::AlreadyRunning { .. } => anyhow::anyhow!(
+                "session {} is already open in another caucus process; \
+                 close it first (or it exited uncleanly — retry)",
+                session.id
+            ),
+            other => anyhow::Error::new(other),
+        })?;
+
         let sock_path = socket_path(&session);
         let signal_server = SignalServer::bind(&sock_path)
             .with_context(|| format!("bind turn-signal socket {}", sock_path.display()))?;
@@ -215,6 +233,7 @@ impl Multiplexer {
             Self {
                 session,
                 config,
+                _session_lock: session_lock,
                 panels: Vec::new(),
                 manifests: HashMap::new(),
                 layout: Layout::default(),
