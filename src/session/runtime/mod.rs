@@ -170,6 +170,14 @@ pub struct Multiplexer {
     /// per-panel `waitpid` every tick is pure overhead, and a child exit may
     /// surface up to one interval late without any user-visible cost.
     last_liveness_probe: Option<Instant>,
+    /// Monotonic counter bumped on every handled key event. The draw loop is
+    /// dirty-gated on [`Multiplexer::render_signature`], whose other inputs
+    /// (grid generations, panel set, derived states) cover everything that
+    /// changes off a PTY read or a turn signal. Key-driven view changes —
+    /// layout/zoom/scroll/transcript toggles, the prefix-armed status hint,
+    /// the close-confirm prompt — have no such counter, so this epoch is the
+    /// catch-all that forces exactly one redraw after any keystroke.
+    view_epoch: u64,
 }
 
 impl Multiplexer {
@@ -233,6 +241,7 @@ impl Multiplexer {
                 menu_scan_cache: HashMap::new(),
                 resume_round_notice: None,
                 last_liveness_probe: None,
+                view_epoch: 0,
             },
             signal_server,
             control_server,
@@ -288,6 +297,46 @@ impl Multiplexer {
     /// open — drives the confirm prompt drawn in the status bar.
     pub fn pending_close(&self) -> Option<PanelId> {
         self.pending_close
+    }
+
+    /// A hash of everything [`crate::tui::draw`] reads, so the event loop can
+    /// skip a redraw when nothing visible changed (the idle-CPU floor: an idle
+    /// session otherwise repaints the whole screen every 16 ms `TICK`).
+    ///
+    /// The inputs partition cleanly by what can change them:
+    /// - **PTY reads** bump each panel's grid `generation` (any byte ingest,
+    ///   including cursor moves — see [`crate::term::Grid::advance`]).
+    /// - **Spawn/kill** change the panel set (ids + count).
+    /// - **Turn signals / exit reaping** change `state_label` and the
+    ///   manifest-derived state.
+    /// - **Keystrokes** change the view with no other counter, so they bump
+    ///   [`view_epoch`](Self::view_epoch) (focus, layout, zoom, scroll,
+    ///   transcript, prefix hint, close-confirm).
+    ///
+    /// Per-panel and per-manifest contributions are XOR-folded so the
+    /// non-deterministic `HashMap` iteration order of `manifests` cannot
+    /// perturb the result. The draw loop also forces a periodic redraw, so a
+    /// missed input degrades to bounded staleness, never a permanent freeze.
+    pub fn render_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        fn hash_one(v: impl Hash) -> u64 {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        }
+        let mut acc = hash_one((self.view_epoch, self.focused(), self.panels.len()));
+        for p in &self.panels {
+            acc ^= hash_one((
+                p.id,
+                p.grid().generation(),
+                p.state_label(),
+                p.role.as_str(),
+            ));
+        }
+        for (id, manifest) in &self.manifests {
+            acc ^= hash_one((*id, manifest.derived_state().as_str()));
+        }
+        acc
     }
 }
 

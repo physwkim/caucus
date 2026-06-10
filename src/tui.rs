@@ -37,8 +37,16 @@ use crate::session::Multiplexer;
 use crate::session::record::{PanelRecord, SessionRecord};
 use crate::session::state::Session;
 
-/// Event-loop redraw period — ~60 Hz.
+/// Event-loop redraw period — ~60 Hz. Paces the *fastest* redraw and the
+/// render-signature check; within a tick a frame is painted only when the
+/// signature changed (see [`Multiplexer::render_signature`]).
 const TICK: Duration = Duration::from_millis(16);
+
+/// Safety-net repaint interval for the dirty-gated draw. Even when the render
+/// signature is unchanged, the screen is repainted at least this often, so any
+/// draw input not modelled by the signature (e.g. a no-op-interior resize)
+/// degrades to at most this much staleness rather than a frozen frame.
+const FORCED_REDRAW_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Slept after a terminal-I/O error before retrying, so a persistently failing
 /// terminal cannot hot-spin the loop (a failing `poll` returns immediately,
@@ -495,6 +503,12 @@ async fn event_loop(
     mut control_server: crate::mcp::control_server::ControlServer,
 ) -> Result<()> {
     let mut last_draw = Instant::now();
+    // Dirty-gated redraw bookkeeping: `last_sig` is the render signature of the
+    // last painted frame (`None` forces the first paint), and `last_forced_draw`
+    // is the safety-net timer that repaints periodically even when the signature
+    // is unchanged, so any unmodelled draw input degrades to bounded staleness.
+    let mut last_sig: Option<u64> = None;
+    let mut last_forced_draw = Instant::now();
     // `SIGHUP` is a *trigger to verify*, not a verdict. A genuine hangup (window
     // closed, parent gone, SSH dropped) revokes the controlling terminal; a
     // spurious one (WezTerm delivering `SIGHUP` across a macOS display wake while
@@ -625,13 +639,24 @@ async fn event_loop(
             break;
         }
 
-        // 8. Redraw on the tick. A draw failure is treated like a poll/read
-        //    error — always transient and recoverable — so a write hiccup during
-        //    a display wake or monitor switch does not tear the session down.
-        //    The TICK gate already paces this, so no extra backoff is needed.
+        // 8. Redraw on the tick — dirty-gated to keep an idle session off the
+        //    CPU (an unchanged screen otherwise repaints every 16 ms). The TICK
+        //    paces the signature check; within a tick a frame is painted only
+        //    when `render_signature` changed since the last paint, plus a
+        //    periodic forced repaint as a safety net. A draw failure is treated
+        //    like a poll/read error — always transient and recoverable — so a
+        //    write hiccup during a display wake or monitor switch does not tear
+        //    the session down, and the TICK gate paces it with no extra backoff.
         if last_draw.elapsed() >= TICK {
-            if let Err(e) = draw(&mut terminal, &mux) {
-                warn!(error = %e, "terminal draw error; continuing");
+            let sig = mux.render_signature();
+            let forced = last_forced_draw.elapsed() >= FORCED_REDRAW_INTERVAL;
+            if forced || Some(sig) != last_sig {
+                if let Err(e) = draw(&mut terminal, &mux) {
+                    warn!(error = %e, "terminal draw error; continuing");
+                }
+                last_sig = Some(sig);
+                // Any paint — dirty or forced — resets the safety-net timer.
+                last_forced_draw = Instant::now();
             }
             last_draw = Instant::now();
         }

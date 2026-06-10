@@ -17,6 +17,12 @@ impl Multiplexer {
     /// should keep running, `false` once quit was requested.
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         use crate::input::InputAction;
+        // Any keystroke may change the view: it arms/disarms the prefix hint,
+        // toggles layout/zoom/scroll/transcript, or is forwarded to a panel
+        // (whose echo the grid-generation signature will catch a tick later,
+        // but the local cursor feedback should not wait). Bump the view epoch
+        // so the dirty-gated draw renders exactly one frame for this key.
+        self.view_epoch = self.view_epoch.wrapping_add(1);
         match self.focus.route(key) {
             InputAction::ToPanel { panel, bytes } => {
                 let submit = bytes.contains(&b'\r') || bytes.contains(&b'\n');
@@ -315,6 +321,36 @@ mod tests {
         let mut mux = mux(&tmp);
         mux.apply_command(CaucusCommand::CloseFocused);
         assert!(mux.pending_close().is_none());
+    }
+
+    /// The render signature changes on any view-affecting change the
+    /// dirty-gated draw must repaint for: a handled keystroke (via the view
+    /// epoch — the catch-all for prefix-hint / layout / scroll toggles) and a
+    /// focus change (which can be non-key-driven, e.g. a kill moving focus off
+    /// a dead panel). An unchanged view yields a stable signature so an idle
+    /// session does not repaint.
+    #[tokio::test]
+    async fn render_signature_tracks_view_changes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let s0 = mux.render_signature();
+        assert_eq!(
+            s0,
+            mux.render_signature(),
+            "an unchanged view must yield a stable signature"
+        );
+
+        // A handled key bumps the view epoch → the signature must change.
+        mux.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let s1 = mux.render_signature();
+        assert_ne!(s0, s1, "a handled key must change the render signature");
+
+        // A focus change (not key-driven here) is reflected too.
+        mux.focus.set_focus(Some(PanelId::new()));
+        let s2 = mux.render_signature();
+        assert_ne!(s1, s2, "a focus change must change the render signature");
     }
 
     /// `pump_all` probes child liveness on its first call, then throttles:
