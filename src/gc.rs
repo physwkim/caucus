@@ -61,11 +61,11 @@ pub fn plan(repo: &Path, older_than: Duration, now: DateTime<Utc>) -> GcPlan {
     let mut prunable = Vec::new();
     let mut skipped_live = Vec::new();
     for rec in record::discover(repo) {
-        let age = now - rec.created_at;
+        let root = session_root(repo, rec.id);
+        let age = now - last_active(&root, &rec);
         if age < older_than {
             continue;
         }
-        let root = session_root(repo, rec.id);
         if SessionLock::is_held(&root) {
             skipped_live.push(rec.id);
             continue;
@@ -81,6 +81,25 @@ pub fn plan(repo: &Path, older_than: Duration, now: DateTime<Utc>) -> GcPlan {
         prunable,
         skipped_live,
     }
+}
+
+/// A session's last-activity time: the mtime of its `session.json`.
+///
+/// `created_at` is stamped once at creation and never moves, so ageing by it
+/// prunes a long-lived session that was *resumed* — and is therefore actively
+/// in use — only yesterday. `session.json` is rewritten (atomic temp + rename)
+/// on every roster change and once on every resume (`persist_record`), so its
+/// mtime tracks real activity. Because the file is first written at creation,
+/// its mtime is always at or after `created_at`; switching to it can only make
+/// a session look *fresher*, never staler, so gc never prunes something the
+/// `created_at` rule would have kept. Falls back to `created_at` when the mtime
+/// cannot be read (e.g. a record write raced the stat).
+fn last_active(session_root: &Path, rec: &record::SessionRecord) -> DateTime<Utc> {
+    record::SessionRecord::path(session_root)
+        .metadata()
+        .and_then(|m| m.modified())
+        .map(DateTime::<Utc>::from)
+        .unwrap_or(rec.created_at)
 }
 
 /// Remove each prunable session's state directory.
@@ -144,20 +163,32 @@ mod tests {
     use crate::session::record::SessionRecord;
 
     /// Write a session record `age` old under `repo/.caucus/sessions/<id>/`,
-    /// returning its id.
+    /// returning its id. Both `created_at` and the `session.json` mtime — gc's
+    /// activity signal — are backdated by `age`.
     fn write_session(repo: &Path, topic: &str, age: Duration) -> SessionId {
         let id = SessionId::new();
+        let when = Utc::now() - age;
         let rec = SessionRecord {
             id,
             topic: topic.to_string(),
             repo_path: repo.to_path_buf(),
-            created_at: Utc::now() - age,
+            created_at: when,
             layout_mode: LayoutMode::Tiled,
             panels: Vec::new(),
             role_counts: std::collections::HashMap::new(),
         };
         rec.write(&session_root(repo, id)).unwrap();
+        set_record_mtime(repo, id, when);
         id
+    }
+
+    /// Backdate a session's `session.json` mtime — the activity timestamp gc
+    /// ages by — to `when`, independent of the record's `created_at`.
+    fn set_record_mtime(repo: &Path, id: SessionId, when: DateTime<Utc>) {
+        let path = SessionRecord::path(&session_root(repo, id));
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::from(when))
+            .unwrap();
     }
 
     #[test]
@@ -175,6 +206,21 @@ mod tests {
         );
         assert_eq!(plan.prunable[0].id, old);
         assert!(plan.skipped_live.is_empty());
+    }
+
+    #[test]
+    fn plan_ages_by_session_json_mtime_not_created_at() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        // Created 30 days ago, but resumed (session.json rewritten) an hour ago.
+        let id = write_session(repo, "long-lived", Duration::days(30));
+        set_record_mtime(repo, id, Utc::now() - Duration::hours(1));
+
+        let plan = plan(repo, Duration::days(7), Utc::now());
+        assert!(
+            plan.prunable.is_empty(),
+            "a session resumed within the window is fresh by mtime, not stale by created_at"
+        );
     }
 
     #[test]
