@@ -386,12 +386,45 @@ impl Multiplexer {
     }
 }
 
+/// Maximum decoded bytes carried in one OSC 52 set-clipboard sequence.
+///
+/// Terminals cap the length of an OSC string and *silently drop the whole
+/// sequence* once it is exceeded (xterm's limit is configurable; many fixed
+/// implementations sit near 100 KB for the entire escape), so an unbounded yank
+/// of a huge selection would copy nothing at all. Bounding the payload keeps the
+/// emitted `ESC ] 52 ; c ;` + base64 + BEL — base64 inflates the text by 4/3 —
+/// under that budget: 72 KiB of text encodes to 96 KiB of base64, comfortably
+/// under 100 KB. A larger selection lands a truncated prefix on the clipboard
+/// rather than vanishing.
+const OSC52_MAX_TEXT_BYTES: usize = 72 * 1024;
+
 /// Wrap `text` in an OSC 52 set-clipboard escape sequence targeting the system
 /// clipboard (`c`): `ESC ] 52 ; c ; <base64> BEL`. The host terminal — not
 /// caucus — applies it, so it works over SSH; terminals without OSC 52 support
 /// silently ignore it.
+///
+/// The single owner of OSC 52 emission, so the payload bound
+/// ([`OSC52_MAX_TEXT_BYTES`]) is enforced here by construction: no caller can
+/// emit a sequence the terminal would reject wholesale.
 fn osc52_set_clipboard(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+    format!(
+        "\x1b]52;c;{}\x07",
+        base64_encode(bound_clipboard_text(text).as_bytes())
+    )
+}
+
+/// Bound `text` to [`OSC52_MAX_TEXT_BYTES`], truncating on a UTF-8 char boundary
+/// so the base64 payload never encodes a split character. Returns the input
+/// unchanged when it already fits.
+fn bound_clipboard_text(text: &str) -> &str {
+    if text.len() <= OSC52_MAX_TEXT_BYTES {
+        return text;
+    }
+    let mut end = OSC52_MAX_TEXT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Standard base64 (RFC 4648, `+`/`/` alphabet, `=` padding). Hand-rolled to
@@ -843,5 +876,34 @@ mod tests {
     fn osc52_wraps_the_base64_payload() {
         // ESC ] 52 ; c ; <base64> BEL targeting the system clipboard.
         assert_eq!(osc52_set_clipboard("hi"), "\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn osc52_caps_an_oversized_payload() {
+        // A selection past the terminal's OSC-string cap is bounded so the
+        // sequence is still emitted, not silently dropped whole by the terminal.
+        let big = "x".repeat(OSC52_MAX_TEXT_BYTES + 5000);
+        let seq = osc52_set_clipboard(&big);
+        let b64 = seq
+            .strip_prefix("\x1b]52;c;")
+            .and_then(|s| s.strip_suffix('\x07'))
+            .unwrap();
+        // base64 length is ceil(capped/3)*4; the cap is a multiple of 3.
+        assert_eq!(b64.len(), OSC52_MAX_TEXT_BYTES.div_ceil(3) * 4);
+    }
+
+    #[test]
+    fn osc52_truncates_on_a_char_boundary() {
+        // The cap landing inside a multi-byte char must back up to a boundary so
+        // the base64 never encodes a split character.
+        let mut s = "a".repeat(OSC52_MAX_TEXT_BYTES - 1);
+        s.push('é'); // 2 bytes → the byte at the cap is a continuation byte
+        let bounded = bound_clipboard_text(&s);
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+        assert_eq!(
+            bounded.len(),
+            OSC52_MAX_TEXT_BYTES - 1,
+            "backed up off the split char rather than cutting through it"
+        );
     }
 }
