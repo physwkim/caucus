@@ -340,12 +340,19 @@ impl Grid {
             .map(|r| self.viewport[r * self.cols..(r + 1) * self.cols].to_vec())
             .collect();
 
-        // If shrinking vertically, oldest rows spill into scrollback.
+        // Scrollback belongs to the primary screen only. When shrinking
+        // vertically, the primary buffer's oldest rows spill into scrollback so
+        // no output is lost — but on the alt screen the live viewport *is* the
+        // alt buffer, which has no scrollback. There the viewport overflow is
+        // dropped and the primary (stashed in `alt_saved`) spills instead, below.
+        let on_alt = self.alt_saved.is_some();
         let overflow = old_rows.len().saturating_sub(rows);
-        for row in old_rows.iter().take(overflow) {
-            let mut row = resize_row(row, cols);
-            row.truncate(cols);
-            self.push_scrollback(row);
+        if !on_alt {
+            for row in old_rows.iter().take(overflow) {
+                let mut row = resize_row(row, cols);
+                row.truncate(cols);
+                self.push_scrollback(row);
+            }
         }
 
         let mut new_viewport = Vec::with_capacity(cols * rows);
@@ -360,11 +367,20 @@ impl Grid {
         // Reflow the stashed primary buffer too when resizing on the alt
         // screen, so leaving the alt screen restores a correctly-sized
         // viewport rather than a truncate/pad approximation.
-        if let Some(alt) = self.alt_saved.as_mut() {
+        if let Some(mut alt) = self.alt_saved.take() {
             let alt_old: Vec<Vec<Cell>> = (0..self.rows)
                 .map(|r| alt.viewport[r * self.cols..(r + 1) * self.cols].to_vec())
                 .collect();
             let alt_overflow = alt_old.len().saturating_sub(rows);
+            // `alt_saved` holds the *primary* buffer while on the alt screen, so
+            // its top overflow — not the alt viewport's — is what spills into
+            // scrollback. (`self.alt_saved` is `None` here, so `self` is free to
+            // borrow mutably.)
+            for row in alt_old.iter().take(alt_overflow) {
+                let mut row = resize_row(row, cols);
+                row.truncate(cols);
+                self.push_scrollback(row);
+            }
             let mut alt_new = Vec::with_capacity(cols * rows);
             for row in alt_old.iter().skip(alt_overflow) {
                 alt_new.extend(resize_row(row, cols));
@@ -380,6 +396,7 @@ impl Grid {
             alt.scroll_top = 0;
             alt.scroll_bottom = rows - 1;
             alt.wrap_pending = false;
+            self.alt_saved = Some(alt);
         }
 
         self.cols = cols;
@@ -2022,6 +2039,38 @@ mod tests {
         assert_eq!(g.size(), (30, 6));
         assert_eq!(g.row_text(0).trim_end(), "BANNER ONE");
         assert_eq!(g.row_text(1).trim_end(), "BANNER TWO");
+    }
+
+    #[test]
+    fn alt_screen_shrink_spills_primary_not_alt_into_scrollback() {
+        // Scrollback belongs to the primary screen. Shrinking while on the alt
+        // screen must spill the stashed *primary* rows that scroll off — never
+        // the alt buffer's rows, which have no scrollback.
+        let mut g = Grid::new(20, 4);
+        g.advance(b"prim0\r\nprim1\r\nprim2\r\nprim3");
+        g.advance(b"\x1b[?1049h"); // enter alt screen
+        g.advance(b"ALT0\r\nALT1\r\nALT2\r\nALT3");
+        g.resize(20, 2); // shrink to 2 rows while on the alt screen
+
+        let sb: Vec<String> = g
+            .scrollback()
+            .map(|row| {
+                let s: String = row.iter().filter(|c| c.ch != '\0').map(|c| c.ch).collect();
+                s.trim_end().to_string()
+            })
+            .collect();
+        assert_eq!(
+            sb,
+            vec!["prim0".to_string(), "prim1".to_string()],
+            "scrollback must be the primary overflow, not alt content"
+        );
+
+        // Leaving the alt screen restores the shrunk primary: its surviving rows
+        // are the bottom two, with the scrolled-off rows in scrollback above.
+        g.advance(b"\x1b[?1049l");
+        assert_eq!(g.size(), (20, 2));
+        assert_eq!(g.row_text(0).trim_end(), "prim2");
+        assert_eq!(g.row_text(1).trim_end(), "prim3");
     }
 
     // ----- cursor save / restore (DECSC/DECRC, SCOSC/SCORC) ----------------
