@@ -100,19 +100,21 @@ multiplexer — for example a tmux remapped to `Ctrl-A`. Pass `--prefix b` or se
 `ctrl-b` / `^b` form both work). The table below shows the default; substitute
 your prefix for `Ctrl-A`.
 
-| Key                     | Action                                  |
-|-------------------------|-----------------------------------------|
-| `Ctrl-A` then `n` / `→` | focus the next panel                    |
-| `Ctrl-A` then `p` / `←` | focus the previous panel                |
-| `Ctrl-A` then `q`       | quit caucus                             |
-| `Ctrl-A` then `z`       | toggle zoom on the focused panel        |
-| `Ctrl-A` then `<`       | move the focused panel one step earlier |
-| `Ctrl-A` then `>`       | move the focused panel one step later   |
-| `Ctrl-A` then `Space`   | cycle the layout arrangement mode       |
-| `Ctrl-A` then `t`       | toggle the transcript overlay           |
-| `Esc` (overlay open)    | hide the transcript overlay             |
-| `Ctrl-A` then `[`       | open the scrollback pager (focused panel) |
-| `Ctrl-A` then `Ctrl-A`  | send a literal `Ctrl-A` to the panel    |
+| Key                           | Action                                   |
+|-------------------------------|------------------------------------------|
+| `Ctrl-A` then `n` / `p`       | focus the next / previous panel (cycle)  |
+| `Ctrl-A` then `↑` `↓` `←` `→` | focus the panel in that direction        |
+| `Ctrl-A` then `Ctrl-↑↓←→`     | resize the focused panel (tmux-style)    |
+| `Ctrl-A` then `q`             | quit caucus                              |
+| `Ctrl-A` then `z`             | toggle zoom on the focused panel         |
+| `Ctrl-A` then `<` / `>`       | move the focused panel one step earlier / later |
+| `Ctrl-A` then `x`             | close the focused panel (y/n confirm)    |
+| `Ctrl-A` then `Space`         | cycle the layout arrangement mode        |
+| `Ctrl-A` then `t`             | toggle the transcript overlay            |
+| `Esc` (overlay open)          | hide the transcript overlay              |
+| `Ctrl-A` then `[`             | open the scrollback pager (focused panel) |
+| scroll wheel                  | enter / page the scrollback pager (mouse capture on) |
+| `Ctrl-A` then `Ctrl-A`        | send a literal `Ctrl-A` to the panel     |
 
 The layout modes cycled by `Ctrl-A Space` are **Tiled**, **EvenHorizontal**,
 **EvenVertical**, and **MainVertical** — caucus reflows the panels into the
@@ -128,9 +130,14 @@ The **scrollback pager** (`Ctrl-A [`) is a tmux copy-mode-style view of the
 focused panel's terminal scrollback (the grid ring, up to 10,000 rows). It
 opens at the newest line; `↑/↓ k/j` scroll a line, `PgUp/PgDn` a page,
 `g/Home` jumps to the oldest line, `G/End` to the newest, and `Esc/q` exits.
-Unlike the transcript overlay, the pager **captures** input — keys drive
-scrolling and none reach the panel's PTY — and shows a frozen snapshot (the
-panel keeps running; new output appears after you exit).
+Inside the pager, `/` searches (case-insensitive; `Enter` runs it, `n`/`N`
+step matches), and `v` starts a line-selection **copy mode** — move to extend
+the selection, then `y`/`Enter` copies it to your clipboard (via OSC 52),
+`Esc` cancels. With mouse capture on (the default; the `mouse` setting), the
+scroll wheel also enters and pages the pager. Unlike the transcript overlay,
+the pager **captures** input — keys drive scrolling and none reach the panel's
+PTY — and shows a frozen snapshot (the panel keeps running; new output appears
+after you exit).
 
 ## MCP tools
 
