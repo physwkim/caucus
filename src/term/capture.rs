@@ -150,13 +150,19 @@ impl OutputCapture {
     /// Append PTY output bytes to the currently open turn.
     ///
     /// A single open turn is bounded by `open_turn_byte_limit`: the buffer is
-    /// allowed to reach 2× the cap, then the oldest half is dropped back to the
-    /// cap. Letting it overshoot before trimming amortizes the drain's memmove
-    /// to O(1) per byte while holding memory to 2× the cap — a panel firehosing
-    /// output before its turn closes can no longer grow it without bound. The
-    /// retained tail is exactly what `read_panel(since_last_turn)` renders (the
-    /// recent screen + scrollback); the dropped head was already scrolled past
-    /// the grid replay's window. A turn that closes under the cap is untouched.
+    /// allowed to reach 2× the cap, then the oldest head is dropped back toward
+    /// the cap. Letting it overshoot before trimming amortizes the drain's
+    /// memmove to O(1) per byte while holding memory to 2× the cap — a panel
+    /// firehosing output before its turn closes can no longer grow it without
+    /// bound. The retained tail is exactly what `read_panel(since_last_turn)`
+    /// renders (the recent screen + scrollback); the dropped head was already
+    /// scrolled past the grid replay's window. A turn that closes under the cap
+    /// is untouched.
+    ///
+    /// The cut advances to a clean replay boundary ([`safe_head_trim`]) so the
+    /// retained tail never begins mid-escape-sequence or mid-UTF8-character —
+    /// the tail is replayed through a terminal grid, which would otherwise
+    /// misparse a truncated `ESC [ … m` or choke on a leading continuation byte.
     ///
     /// Trade-off: the dropped head of an over-cap turn is also absent from the
     /// disk-log spill on close (the open turn is not streamed to disk). The cap
@@ -166,7 +172,7 @@ impl OutputCapture {
             turn.bytes.extend_from_slice(bytes);
             let cap = self.open_turn_byte_limit;
             if turn.bytes.len() > cap.saturating_mul(2) {
-                let drop = turn.bytes.len() - cap;
+                let drop = safe_head_trim(&turn.bytes, turn.bytes.len() - cap);
                 turn.bytes.drain(..drop);
             }
             // Monotonic, trim-immune: the render cache uses this to notice a
@@ -327,6 +333,44 @@ fn write_turn(path: &Path, turn: &TurnSegment) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Advance a head-trim `drop` count forward to a clean replay boundary so the
+/// retained tail (`bytes[drop..]`) never begins mid-escape-sequence or
+/// mid-UTF8-character.
+///
+/// The tail is replayed through a terminal grid ([`OutputCapture::since_last_turn`]).
+/// Cutting at an arbitrary byte would either strand a partial escape (a
+/// truncated `ESC [ … m` renders as literal text, and a dangling `ESC` swallows
+/// the bytes after it) or strand a UTF-8 continuation byte (the decoder cannot
+/// resync). Cutting at the start of the next *line* — the byte just past the
+/// next `\n` — fixes both at once: ANSI escape sequences are line-local, and a
+/// line start is always a UTF-8 character boundary. If the tail past `drop`
+/// holds no newline (one pathologically long line), fall back to the next UTF-8
+/// character boundary so at least no multi-byte character is split.
+///
+/// Always returns a value `>= drop` and `<= bytes.len()`, so the buffer is
+/// trimmed at least back to the cap (the line-boundary cut drops slightly more,
+/// never less).
+fn safe_head_trim(bytes: &[u8], drop: usize) -> usize {
+    debug_assert!(drop <= bytes.len());
+    // Already at a line start (or the buffer start): the tail begins cleanly, so
+    // do not advance — that would needlessly drop the whole line at `drop`.
+    if drop == 0 || bytes[drop - 1] == b'\n' {
+        return drop;
+    }
+    // Otherwise advance to the byte just past the next newline.
+    if let Some(nl) = bytes[drop..].iter().position(|&b| b == b'\n') {
+        return drop + nl + 1;
+    }
+    // No line boundary in the tail (one pathologically long line): stop splitting
+    // a multi-byte character by skipping past leading UTF-8 continuation bytes
+    // (`10xx_xxxx`).
+    let mut d = drop;
+    while d < bytes.len() && (bytes[d] & 0xC0) == 0x80 {
+        d += 1;
+    }
+    d
+}
+
 impl Default for OutputCapture {
     fn default() -> Self {
         Self::new()
@@ -419,6 +463,68 @@ mod tests {
         assert!(
             tail.iter().all(|&b| b == b'B'),
             "the recent tail is kept and the head dropped"
+        );
+    }
+
+    #[test]
+    fn safe_head_trim_advances_a_mid_escape_cut_to_the_next_line_start() {
+        // A naive byte cut inside `ESC [ 3 1 m` would strand a partial escape
+        // sequence in the replayed tail; the trim advances past the next newline.
+        //         0123 4   5 6 7 8 9 0 1 2  3...
+        let buf = b"old\n\x1b[31mred\nkept line\n";
+        let d = safe_head_trim(buf, 6); // index 6 == '3', inside the escape
+        assert_eq!(d, 13, "cut just past the '\\n' at index 12");
+        assert_eq!(&buf[d..], b"kept line\n");
+    }
+
+    #[test]
+    fn safe_head_trim_falls_back_to_a_utf8_boundary_without_a_newline() {
+        // One long line with no '\n' cannot use a line boundary, so the trim
+        // advances past UTF-8 continuation bytes rather than split a character.
+        let buf = "aaaé bbb".as_bytes(); // 'é' == 0xC3 0xA9 at indices 3,4
+        let d = safe_head_trim(buf, 4); // index 4 == the 0xA9 continuation byte
+        assert_eq!(d, 5, "advances past the continuation byte");
+        assert!(std::str::from_utf8(&buf[d..]).is_ok());
+        assert_eq!(&buf[d..], " bbb".as_bytes());
+    }
+
+    #[test]
+    fn safe_head_trim_leaves_an_aligned_drop_in_place() {
+        // A drop already at a line start must NOT advance to the next newline —
+        // that would drop a whole intact line for no benefit.
+        let buf = b"line one\nline two\n";
+        let d = safe_head_trim(buf, 9); // index 9 == 'l' of "line two", a line start
+        assert_eq!(d, 9, "an aligned cut is kept as-is");
+        assert_eq!(&buf[d..], b"line two\n");
+    }
+
+    #[test]
+    fn open_turn_trim_resumes_at_a_clean_replay_boundary() {
+        // The retained tail is replayed through a terminal grid, so a trim must
+        // never strand a partial escape sequence or a split multi-byte character.
+        let mut cap = OutputCapture::with_limits(OutputCapture::DEFAULT_TURN_LIMIT, 10);
+        cap.begin_turn();
+        // 30 bytes: a head to drop, then a coloured line, then a clean line that
+        // contains a multi-byte char. The naive cut (len - cap == byte 20) lands
+        // inside the coloured line; the safe trim advances to the next line start.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"AAAAAAAAAAAAAA\n"); // 14 'A' + '\n' = 15 bytes
+        buf.extend_from_slice(b"\x1b[31mRED\n"); // ESC [ 3 1 m R E D \n = 9 bytes
+        buf.extend_from_slice("k\u{00e9}pt\n".as_bytes()); // 'é' == 0xC3 0xA9 = 6 bytes
+        cap.push(&buf);
+        let tail = cap.since_last_turn();
+        assert!(
+            std::str::from_utf8(tail).is_ok(),
+            "the retained tail is valid UTF-8 (no split multi-byte char)"
+        );
+        assert!(
+            !tail.contains(&0x1b),
+            "no dangling ESC: the partial escape line was dropped whole"
+        );
+        assert_eq!(
+            tail,
+            "k\u{00e9}pt\n".as_bytes(),
+            "the tail resumes at a line start"
         );
     }
 
