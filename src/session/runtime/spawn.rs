@@ -37,8 +37,10 @@ struct SpawnPanelOpts<'a> {
 }
 
 /// The worktree a [`Multiplexer::detach_panel`] left behind, for the caller to
-/// dispose of: `kill_panel` enqueues it for deletion, `restart_panel` reuses it
-/// in place. `worktree_path` is `None` for a panel sharing the main checkout.
+/// dispose of: `kill_panel` retires it for deletion, `restart_panel` reuses it
+/// in place on success and retires it if the replacement spawn fails — every
+/// path disposes of it. `worktree_path` is `None` for a panel sharing the main
+/// checkout.
 struct DetachedPanel {
     worktree_path: Option<PathBuf>,
     worktree_branch: Option<String>,
@@ -319,22 +321,32 @@ impl Multiplexer {
     /// is the other disposition — it *reuses* the worktree in place.
     pub fn kill_panel(&mut self, panel_id: PanelId) -> Result<()> {
         let detached = self.detach_panel(panel_id)?;
-
-        // Enqueue the worktree for serial cleanup (Invariant I-3). The branch
-        // is kept (not in `branches_to_delete`) — `caucus resume` re-attaches a
-        // fresh worktree on it.
-        if let Some(worktree) = detached.worktree_path {
-            let job = CleanupJob {
-                repo_root: self.session.repo_path.clone(),
-                worktree_paths: vec![worktree],
-                branches_to_delete: Vec::new(),
-                done: None,
-            };
-            if self.cleanup.enqueue(job).is_err() {
-                warn!(panel = %panel_id, "worktree cleanup queue closed");
-            }
-        }
+        self.retire_worktree(panel_id, detached.worktree_path);
         Ok(())
+    }
+
+    /// Retire a detached panel's worktree: enqueue the checked-out directory for
+    /// serial cleanup (Invariant I-3) while KEEPING its branch — the branch
+    /// holds the sub-agent's commits and `caucus resume` re-attaches a fresh
+    /// worktree on it, so only the working copy is reclaimed.
+    ///
+    /// The single owner of the "reclaim the directory, preserve the branch"
+    /// disposition: every exit path that leaves a worktree ownerless — a
+    /// [`Self::kill_panel`], or a [`Self::restart_panel`] that fails *after* its
+    /// teardown — routes the orphan through here, so none can leak on disk.
+    fn retire_worktree(&mut self, panel_id: PanelId, worktree: Option<PathBuf>) {
+        let Some(worktree) = worktree else {
+            return;
+        };
+        let job = CleanupJob {
+            repo_root: self.session.repo_path.clone(),
+            worktree_paths: vec![worktree],
+            branches_to_delete: Vec::new(),
+            done: None,
+        };
+        if self.cleanup.enqueue(job).is_err() {
+            warn!(panel = %panel_id, "worktree cleanup queue closed");
+        }
     }
 
     /// Restart a sub-agent panel in place: tear it down and spawn a fresh agent
@@ -367,11 +379,15 @@ impl Multiplexer {
         let model = manifest.model.clone();
         let resume_session_id = manifest.claude_session_id().map(str::to_string);
 
-        // Tear down through the single owner; reuse — do NOT clean up — the
-        // worktree it leaves behind.
+        // Tear down through the single owner. The worktree it leaves behind is
+        // now ownerless and MUST reach a disposition on every exit path below:
+        // success hands it to the replacement panel; a failed spawn must retire
+        // it (the old panel is already gone and unpersisted), or it orphans on
+        // disk — a leaked directory no live panel or resume record references.
         let detached = self.detach_panel(panel_id)?;
+        let orphan_worktree = detached.worktree_path.clone();
 
-        let new_id = self.spawn_panel_resume(
+        let new_id = match self.spawn_panel_resume(
             &role,
             agent_cli,
             model,
@@ -381,7 +397,17 @@ impl Multiplexer {
             // A restarted panel keeps its preset role's prompt; the inline
             // prompt is a live-`spawn_role` concern only.
             None,
-        )?;
+        ) {
+            Ok(id) => id,
+            Err(err) => {
+                // Bringing up the replacement failed after the old panel was
+                // torn down. Retire the now-ownerless worktree (same disposition
+                // as a kill — directory reclaimed, branch + commits kept), then
+                // surface the spawn failure.
+                self.retire_worktree(panel_id, orphan_worktree);
+                return Err(err);
+            }
+        };
         // The fresh PTY carries a fresh PanelId, but the panel is the same
         // logical round member. Re-key its membership so live rounds follow it
         // to the new id instead of dropping it as a vanished panel.
@@ -826,6 +852,111 @@ mod tests {
             mux.panels().iter().find(|p| p.id == new).unwrap().role,
             "reviewer",
             "the role is preserved across the restart"
+        );
+
+        mux.shutdown();
+    }
+
+    /// A restart that fails *after* the old panel is torn down must not orphan
+    /// the worktree. The old code reused the worktree only on the success path,
+    /// so a failed replacement spawn left a checked-out directory no live panel
+    /// or resume record referenced. The fix retires it (same disposition as a
+    /// kill). The deterministic failure is a known role whose
+    /// `system_prompt_template` points at a missing file, so `resolve` fails in
+    /// `spawn_panel_inner` after `detach_panel` already ran.
+    #[tokio::test]
+    async fn restart_panel_failure_retires_the_worktree_not_orphans_it() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::panel::lifecycle::{Panel, PanelState};
+        use crate::pty::{Pty, PtyCommand};
+        use crate::role::spec::AgentCli;
+        use crate::session::id::AgentId;
+        use crate::term::{Grid, OutputCapture};
+        use std::time::Duration;
+
+        let tmp = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(tmp.path())
+                .args(args)
+                .output()
+                .expect("run git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "caucus-test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        // A role whose template cannot resolve, so the resumed spawn fails after
+        // teardown — the exact orphan path.
+        std::fs::create_dir_all(tmp.path().join(".caucus")).unwrap();
+        std::fs::write(
+            tmp.path().join(".caucus").join("roles.toml"),
+            "[roles.bad-template]\n\
+             description = \"missing template\"\n\
+             allowed_tools = [\"Read\"]\n\
+             permission_mode = \"default\"\n\
+             system_prompt_template = \"roles/intentionally-missing.md\"\n",
+        )
+        .unwrap();
+
+        let mut mux = mux(&tmp);
+
+        // A real worktree the injected panel occupies, so the cleanup job can
+        // actually remove it and the test can observe the retirement.
+        let handle = mux.create_role_worktree("bad-template").unwrap();
+        let wt = handle.path.clone();
+        assert!(wt.is_dir(), "worktree created");
+
+        // Inject the panel + its manifest (restart reads the manifest for the
+        // role/identity to resume) + its tracked branch.
+        let id = PanelId::new();
+        let inner = area().inner();
+        let pty = Pty::spawn(&PtyCommand::new("/bin/cat"), inner.width, inner.height).unwrap();
+        mux.panels.push(Panel {
+            id,
+            role: "bad-template".to_string(),
+            agent_id: AgentId::new(),
+            state: PanelState::Idle,
+            worktree_path: Some(wt.clone()),
+            pty,
+            grid: Grid::new(inner.width as usize, inner.height as usize),
+            capture: OutputCapture::new(),
+        });
+        mux.rebuild_layout_tree();
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "bad-template",
+            "bad-template-1",
+            AgentCli::Claude,
+            None,
+        );
+        mux.manifests.insert(id, mf);
+        mux.worktree_branches.insert(id, handle.branch.clone());
+
+        let err = mux.restart_panel(id).unwrap_err();
+        assert!(
+            err.to_string().contains("intentionally-missing.md"),
+            "the spawn must fail on the unresolvable template: {err}"
+        );
+        assert!(
+            !mux.panels().iter().any(|p| p.id == id),
+            "the old panel is detached even though its replacement never launched"
+        );
+
+        // Cleanup is a serial async queue — poll for the worktree's removal.
+        let mut cleaned = false;
+        for _ in 0..100 {
+            if !wt.exists() {
+                cleaned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            cleaned,
+            "a failed restart must retire the worktree, not orphan it"
         );
 
         mux.shutdown();
