@@ -324,6 +324,34 @@ role의 system prompt가 되어 template을 대체한다(없으면 spec의 templ
 패널이어야 하므로, 위임은 main worker가 `spawn_role`로 새 패널을 만들어 수행한다.
 `caucus doctor`는 role 정의에 `Task`가 있으면 경고한다.
 
+**권한 정책 — 모든 패널은 승인 프롬프트를 건너뛴다 (구조적).**
+**모든** 패널(`main` 포함, 모든 sub-agent)은 백엔드의 *승인 프롬프트 전체 건너뛰기*
+플래그로 띄운다 — `claude --dangerously-skip-permissions`,
+`codex --dangerously-bypass-approvals-and-sandbox`
+(`spawn_panel_inner`가 `skip_permissions: true`를 하드코딩; 모든 spawn 경로가
+이를 공유). 이것은 누락이 아니라 구조적 선택이다: caucus 패널은 백그라운드의
+비대화형 PTY이므로 "이 edit/command 허용?" 같은 대화형 프롬프트에 **답할 주체가
+없다** — 답을 받지 못한 프롬프트는 turn을 무한정 멈추고, 사용자도 main worker도
+in-band로 응답할 길이 없다(이것이 정확히 caucus가 피하려는 stall이다).
+
+따라서:
+
+- **실제 안전 경계는 tool allowlist 하나다.** agent가 *할 수 있는* 일은 role의
+  `allowed_tools`(claude `--allowedTools`/`--disallowedTools`)로만 제한된다 —
+  대화형 승인 게이트가 아니다. `Edit`/`Write`/`Bash`가 없는 `reviewer`는 파일을
+  바꿀 수 없다. allowlist를 보안 경계로 취급하라.
+- **`permission_mode`는 여기서 승인 게이트가 아니다.** claude에는 여전히
+  `--permission-mode`로 전달되어 *행동* 효과는 남지만(특히 `plan`은 편집보다 계획
+  우선), skip 플래그 위에 확인 단계를 더하지 않는다. `default` role도 허용된
+  동작 전에 사용자 승인을 기다리지 않는다.
+- **codex 패널은 샌드박스 없이 돈다.** bypass 플래그가 codex의 파일시스템/네트워크
+  샌드박스를 완전히 끈다. `permission_mode`→`--sandbox` 매핑(`codex_args`의
+  else 가지)은 비프로덕션 fallback이다 — skip 플래그가 꺼졌을 때만 적용되는데
+  라이브 spawn 경로는 그런 적이 없다.
+
+요지: caucus는 *신뢰하는* 저장소에서 돌리고, `allowed_tools`(+ execute-phase
+role의 패널별 worktree 격리)를 경계로 삼는다. 동작별 human-in-the-loop 확인은 없다.
+
 ### 6.1 System prompt template (claw-code 4-제약 + role-specific)
 
 `roles/reviewer.md` 예:

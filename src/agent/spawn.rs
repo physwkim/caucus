@@ -424,7 +424,13 @@ fn codex_args(
     if skip_permissions {
         args.push("--dangerously-bypass-approvals-and-sandbox".into());
     } else {
-        // Map the role's permission mode onto a codex sandbox level.
+        // Map the role's permission mode onto a codex sandbox level. NOTE: the
+        // live spawn path always sets `skip_permissions: true`
+        // (`spawn_panel_inner`), so production never reaches this branch — a
+        // backgrounded panel cannot answer an approval prompt (see the
+        // permission-policy note in README / `design.md` §6). This mapping is
+        // the fallback for `skip_permissions == false` (tests today), kept so a
+        // future opt-in to gating has a defined sandbox level per mode.
         let sandbox = match role.permission_mode.as_str() {
             "acceptEdits" => "workspace-write",
             "bypassPermissions" => "danger-full-access",

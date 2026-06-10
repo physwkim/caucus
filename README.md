@@ -230,7 +230,7 @@ sub-task clearly calls for it, and invent a role when none fits.
 The embedded presets are read-only defaults; override per-project in
 `<repo>/.caucus/roles.toml` or globally in `~/.caucus/roles.toml`:
 
-| Role               | Agent CLI | Default model | Tools                                                  | Permission mode |
+| Role               | Agent CLI | Default model | Tools                                                  | Permission mode † |
 |--------------------|-----------|---------------|--------------------------------------------------------|-----------------|
 | `main`             | claude    | `opus`        | Read, Glob, Grep, Edit, Write, Bash, TodoWrite, Web*   | `default`       |
 | `worker`           | claude    | `sonnet`      | Read, Glob, Grep, Edit, Write, Bash, TodoWrite         | `acceptEdits`   |
@@ -245,6 +245,39 @@ The embedded presets are read-only defaults; override per-project in
 sub-agent the main worker spawns for parallel work. The remaining presets are
 optional specialist hints — use them when a sub-task clearly calls for one, or
 go off-list with a free-form role as above.
+
+### † Permissions & sandbox posture — read before you trust a role
+
+**Every** caucus panel — `main` and every sub-agent — is spawned with the
+backend's *skip-all-approval-prompts* flag: `claude
+--dangerously-skip-permissions`, `codex
+--dangerously-bypass-approvals-and-sandbox`. This is deliberate and structural,
+not an oversight: a caucus panel is a backgrounded, non-interactive PTY, so an
+interactive "allow this edit / command?" prompt has **no one to answer it** —
+it would stall the agent's turn indefinitely with no in-band way for you or the
+main worker to respond. caucus's whole model depends on agents that never block
+on a prompt.
+
+The consequences you must account for:
+
+- **The tool allowlist is the only real boundary.** What an agent *can* do is
+  bounded by its role's `allowed_tools` (claude `--allowedTools` /
+  `--disallowedTools`, e.g. a `reviewer` with no `Edit`/`Write`/`Bash` cannot
+  modify files), **not** by interactive approval gating. Treat `allowed_tools`
+  as the security perimeter; pick a role whose tools match the trust you extend.
+- **`permission_mode` is not an approval gate here.** For `claude` it is still
+  passed (`--permission-mode`), so its *behavioural* effect remains — notably
+  `plan` keeps a role planning-first rather than editing — but it adds **no**
+  confirmation step on top of the skip flag. A `default`-mode role does **not**
+  pause for your approval before an allowed action.
+- **codex panels run with no sandbox.** The bypass flag disables codex's
+  filesystem/network sandbox entirely. The role-`permission_mode`→`--sandbox`
+  mapping in the code is a non-production fallback (it applies only when the
+  skip flag is off, which the live spawn path never does).
+
+In short: run caucus on a repository you trust, and rely on `allowed_tools` —
+plus the per-panel worktree isolation for execute-phase roles — as the boundary.
+There is no per-action human-in-the-loop confirmation.
 
 For a worked orchestration pattern — a continuous review → fix → regression
 loop driven by `main` over a durable review doc — see
