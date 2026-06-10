@@ -15,13 +15,16 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 /// Memoized render of the most-recent turn, keyed so a cache hit is exact.
-/// The key is `(turn index, byte length, cols)`: within one turn the byte
-/// length only grows (or shrinks on a head trim), so it discriminates every
-/// state of that turn; across turns the index differs, so two different turns
-/// that happen to share a byte length never collide.
+/// The key is `(turn index, version, cols)`. `version` must be *monotonic* per
+/// turn: byte length is not, because [`OutputCapture::push`] trims an over-cap
+/// open turn back to exactly `cap`, so two different post-trim contents both
+/// report `byte_len == cap` and would collide into a stale render. The version
+/// is therefore the count of bytes ever *appended* to the most-recent turn —
+/// trim does not decrement it — so any content change bumps it. Across turns
+/// the index differs, so two turns sharing a version never collide.
 struct RenderCache {
     turn_index: Option<usize>,
-    byte_len: usize,
+    version: usize,
     cols: usize,
     text: String,
 }
@@ -61,6 +64,12 @@ pub struct OutputCapture {
     /// such boundary until it closes, so a panel firehosing output mid-turn
     /// could otherwise grow it without limit. See [`OutputCapture::push`].
     open_turn_byte_limit: usize,
+    /// Count of bytes ever appended to the currently open turn — incremented on
+    /// every [`OutputCapture::push`], reset when a new turn opens, and never
+    /// decremented by the head trim. Unlike the open turn's byte length it is
+    /// monotonic, so [`RenderCache`] can use it to detect a content change that
+    /// a trim hid by returning the buffer to exactly `cap` bytes.
+    open_appended: usize,
     /// Memoized render of the most-recent turn for
     /// [`OutputCapture::rendered_since_last_turn`]. `RefCell` so the read path
     /// stays `&self` (it shares the `read_panel` immutable-borrow signature)
@@ -96,6 +105,7 @@ impl OutputCapture {
             log_path: None,
             spilled_turns: 0,
             open_turn_byte_limit,
+            open_appended: 0,
             last_render: RefCell::new(None),
         }
     }
@@ -127,6 +137,8 @@ impl OutputCapture {
             return;
         }
         let index = self.next_index();
+        // New turn → reset the monotonic append counter the render cache keys on.
+        self.open_appended = 0;
         self.open = Some(TurnSegment {
             index,
             started_at: Utc::now(),
@@ -157,6 +169,9 @@ impl OutputCapture {
                 let drop = turn.bytes.len() - cap;
                 turn.bytes.drain(..drop);
             }
+            // Monotonic, trim-immune: the render cache uses this to notice a
+            // content change the trim above hid by restoring the buffer to `cap`.
+            self.open_appended = self.open_appended.saturating_add(bytes.len());
         }
     }
 
@@ -234,10 +249,18 @@ impl OutputCapture {
             .as_ref()
             .map(|t| t.index)
             .or_else(|| self.turns.last().map(|t| t.index));
+        // Monotonic content version: the open turn's append counter (trim-immune)
+        // while a turn is open, else the last closed turn's byte length (closed
+        // turns never trim, so their length is stable and collision-free).
+        let version = if self.open.is_some() {
+            self.open_appended
+        } else {
+            bytes.len()
+        };
 
         if let Some(c) = self.last_render.borrow().as_ref()
             && c.turn_index == turn_index
-            && c.byte_len == bytes.len()
+            && c.version == version
             && c.cols == cols
         {
             return c.text.clone();
@@ -246,7 +269,7 @@ impl OutputCapture {
         let text = render(bytes, cols);
         *self.last_render.borrow_mut() = Some(RenderCache {
             turn_index,
-            byte_len: bytes.len(),
+            version,
             cols,
             text: text.clone(),
         });
@@ -440,6 +463,34 @@ mod tests {
         cap.begin_turn();
         cap.push(b"BBBBB"); // also 5 bytes
         assert_eq!(cap.rendered_since_last_turn(80, render), "BBBBB");
+    }
+
+    #[test]
+    fn render_cache_invalidates_after_an_open_turn_trim_to_equal_length() {
+        // Each trim restores the open turn to exactly `cap` bytes, so byte length
+        // alone cannot tell two post-trim contents apart. The render cache must
+        // still re-render when the trimmed tail's content has changed.
+        let mut cap = OutputCapture::new();
+        cap.open_turn_byte_limit = 10;
+        cap.begin_turn();
+
+        let render = |b: &[u8], _c: usize| String::from_utf8_lossy(b).into_owned();
+
+        cap.push(&[b'A'; 10]);
+        cap.push(&[b'B'; 15]); // 25 > 20 → trim to the last 10 (all B)
+        assert_eq!(cap.rendered_since_last_turn(80, render), "BBBBBBBBBB");
+
+        cap.push(&[b'C'; 15]); // trims again back to exactly 10 (all C)
+        assert_eq!(
+            cap.since_last_turn().len(),
+            10,
+            "same byte length as the previous render"
+        );
+        assert_eq!(
+            cap.rendered_since_last_turn(80, render),
+            "CCCCCCCCCC",
+            "a trim to equal length must not serve the stale pre-trim render"
+        );
     }
 
     #[test]
