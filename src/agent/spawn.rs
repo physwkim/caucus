@@ -103,7 +103,10 @@ pub struct SpawnRequest {
     /// `spawn_role` call or the text resolved from `role.system_prompt_template`
     /// (`crate::role::prompt::resolve`). `None` when the role configures no
     /// prompt. Injected via `claude --append-system-prompt` and via codex
-    /// `-c instructions=<text>` (`build_command`).
+    /// `-c instructions=<text>` (`build_command`). For a sub-agent panel,
+    /// `build_command` appends the caucus question contract
+    /// ([`crate::role::prompt::SUBAGENT_QUESTION_CONTRACT`]) to this text —
+    /// or injects it alone when `None`.
     pub system_prompt: Option<String>,
     /// caucus MCP server registration — set only for the main worker panel (the
     /// orchestrator). The codex backend consumes it via `-c mcp_servers.caucus.*`;
@@ -141,6 +144,16 @@ impl Default for SpawnRequest {
 }
 
 impl SpawnRequest {
+    /// Whether this request spawns the **main worker** (orchestrator) panel —
+    /// exactly the panel that receives the caucus MCP registration
+    /// (`caucus_mcp`, set only by `spawn_main_panel_resume`). Every other
+    /// panel is a sub-agent, which gates the sub-agent-only spawn policy:
+    /// the question contract and the `AskUserQuestion` disallow
+    /// (`build_command`, `claude_args`).
+    pub fn is_main(&self) -> bool {
+        self.caucus_mcp.is_some()
+    }
+
     /// Effective backend CLI (override beats role default).
     pub fn effective_cli(&self) -> AgentCli {
         self.agent_cli_override.unwrap_or(self.role.agent_cli)
@@ -190,6 +203,22 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
     let cli = request.effective_cli();
     let model = request.effective_model();
 
+    // Every sub-agent prompt carries the caucus question contract (ask in
+    // plain text and end the turn — `role::prompt::SUBAGENT_QUESTION_CONTRACT`):
+    // no human sits at a sub-agent's panel, so an interactive chooser stalls it
+    // `Working` with no turn signal (§8.3). Appended here, the single spawn
+    // path, so it covers preset roles, free-form inline prompts, and roles
+    // with no prompt, on both backends. The main worker is exempt — its panel
+    // is the one the human actually watches.
+    let system_prompt = if request.is_main() {
+        request.system_prompt.clone()
+    } else {
+        Some(match &request.system_prompt {
+            Some(p) => format!("{p}\n\n{}", crate::role::prompt::SUBAGENT_QUESTION_CONTRACT),
+            None => crate::role::prompt::SUBAGENT_QUESTION_CONTRACT.to_string(),
+        })
+    };
+
     let args: Vec<OsString> = match cli {
         AgentCli::Claude => claude_args(
             &request.role,
@@ -197,7 +226,8 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
             request.skip_permissions,
             request.mcp_config_path.as_deref(),
             request.resume_session_id.as_deref(),
-            request.system_prompt.as_deref(),
+            system_prompt.as_deref(),
+            request.is_main(),
         ),
         // codex has no standard resume flag — `resume_session_id` is
         // intentionally ignored and the agent spawns fresh. It also has no
@@ -222,7 +252,7 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
                 &request.role,
                 model.as_deref(),
                 request.skip_permissions,
-                request.system_prompt.as_deref(),
+                system_prompt.as_deref(),
                 request.caucus_mcp.as_ref(),
                 notify.as_ref(),
             )
@@ -267,7 +297,8 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
 /// `claude` argv: `--model`, `--permission-mode`, `--allowedTools`,
 /// `--append-system-prompt <text>` for the role's system prompt, optionally
 /// `--dangerously-skip-permissions`, `--mcp-config <path>` for the main
-/// worker panel (so its claude loads the caucus MCP server), and
+/// worker panel (so its claude loads the caucus MCP server),
+/// `--disallowedTools AskUserQuestion` for every sub-agent panel, and
 /// `--resume <id>` on the resume launch path.
 fn claude_args(
     role: &RoleSpec,
@@ -276,6 +307,7 @@ fn claude_args(
     mcp_config: Option<&std::path::Path>,
     resume_session_id: Option<&str>,
     system_prompt: Option<&str>,
+    is_main: bool,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     if let Some(id) = resume_session_id {
@@ -298,6 +330,16 @@ fn claude_args(
     if !tools.is_empty() {
         args.push("--allowedTools".into());
         args.push(tools.into());
+    }
+    // No human sits at a sub-agent's panel: an AskUserQuestion chooser would
+    // stall it `Working` with no turn signal (§8.3). Disallow the tool; the
+    // question contract (`build_command`) has the model ask in plain text and
+    // end its turn instead, so the round report carries the question to the
+    // main worker. The main worker keeps the tool — the human answers its
+    // menus directly.
+    if !is_main {
+        args.push("--disallowedTools".into());
+        args.push("AskUserQuestion".into());
     }
     if skip_permissions {
         args.push("--dangerously-skip-permissions".into());
@@ -422,6 +464,7 @@ pub(crate) fn spawn(request: &SpawnRequest) -> Result<SpawnOutcome, SpawnError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::role::prompt::SUBAGENT_QUESTION_CONTRACT;
 
     fn role() -> RoleSpec {
         RoleSpec {
@@ -521,8 +564,11 @@ mod tests {
         assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
+    /// A sub-agent's resolved role prompt is injected with the caucus question
+    /// contract appended — ask in plain text and end the turn, never through
+    /// an interactive chooser (`build_command`).
     #[test]
-    fn claude_argv_injects_resolved_system_prompt() {
+    fn claude_argv_injects_resolved_system_prompt_with_question_contract() {
         let req = SpawnRequest {
             role: role(),
             agent_name: "reviewer-r1".into(),
@@ -530,27 +576,113 @@ mod tests {
             ..SpawnRequest::default()
         };
         let args = args_of(&build_command(&req, PanelId::new()));
+        let expected = format!("You are a reviewer.\n\n{SUBAGENT_QUESTION_CONTRACT}");
         assert!(
             args.windows(2)
-                .any(|w| w == ["--append-system-prompt", "You are a reviewer."]),
+                .any(|w| w[0] == "--append-system-prompt" && w[1] == expected),
             "args: {args:?}"
         );
     }
 
+    /// A sub-agent whose role configures no prompt still gets the question
+    /// contract — the contract matters most exactly when the role gives no
+    /// guidance of its own.
     #[test]
-    fn claude_argv_omits_system_prompt_when_unset() {
+    fn claude_subagent_without_role_prompt_still_gets_the_contract() {
         let req = SpawnRequest {
             role: role(),
             agent_name: "reviewer-r1".into(),
             ..SpawnRequest::default()
         };
         let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--append-system-prompt" && w[1] == SUBAGENT_QUESTION_CONTRACT),
+            "args: {args:?}"
+        );
+    }
+
+    /// The main worker's prompt is passed through untouched — no contract. Its
+    /// panel is the one the human actually watches, so it may ask directly.
+    #[test]
+    fn claude_main_prompt_is_not_rewritten() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "main-1".into(),
+            system_prompt: Some("You are the main worker.".into()),
+            caucus_mcp: Some(CaucusMcp {
+                caucus_bin: PathBuf::from("/usr/local/bin/caucus"),
+                control_sock: PathBuf::from("/repo/.caucus/sessions/S1/control.sock"),
+            }),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--append-system-prompt", "You are the main worker."]),
+            "args: {args:?}"
+        );
+    }
+
+    /// A main worker with no role prompt carries no `--append-system-prompt`
+    /// at all — the contract is sub-agent-only.
+    #[test]
+    fn claude_main_argv_omits_system_prompt_when_unset() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "main-1".into(),
+            caucus_mcp: Some(CaucusMcp {
+                caucus_bin: PathBuf::from("/usr/local/bin/caucus"),
+                control_sock: PathBuf::from("/repo/.caucus/sessions/S1/control.sock"),
+            }),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
         assert!(!args.contains(&"--append-system-prompt".to_string()));
+    }
+
+    /// Every claude sub-agent disallows `AskUserQuestion`: nothing answers an
+    /// interactive chooser in a sub-agent panel, so the menu would stall it
+    /// `Working` with no turn signal. The question contract has it ask in
+    /// plain text instead.
+    #[test]
+    fn claude_subagent_argv_disallows_ask_user_question() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "reviewer-r1".into(),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--disallowedTools", "AskUserQuestion"]),
+            "args: {args:?}"
+        );
+    }
+
+    /// The main worker keeps `AskUserQuestion` — the human answers its menus
+    /// directly in the TUI.
+    #[test]
+    fn claude_main_argv_keeps_ask_user_question() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "main-1".into(),
+            caucus_mcp: Some(CaucusMcp {
+                caucus_bin: PathBuf::from("/usr/local/bin/caucus"),
+                control_sock: PathBuf::from("/repo/.caucus/sessions/S1/control.sock"),
+            }),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(!args.contains(&"--disallowedTools".to_string()));
     }
 
     /// codex has no `--append-system-prompt` flag, so a resolved role prompt is
     /// injected via the `-c instructions=<text>` config override instead — the
-    /// value passed raw (no TOML quoting) as one argv element.
+    /// value passed raw (no TOML quoting) as one argv element. A codex
+    /// sub-agent's prompt carries the question contract too: the contract is
+    /// backend-neutral (codex has no `--disallowedTools`, so the prompt is its
+    /// only enforcement).
     #[test]
     fn codex_argv_injects_system_prompt_as_instructions_config() {
         let mut r = role();
@@ -565,17 +697,41 @@ mod tests {
         let args = args_of(&build_command(&req, PanelId::new()));
         // No claude flag leaks onto a codex invocation.
         assert!(!args.contains(&"--append-system-prompt".to_string()));
-        // The prompt rides as `-c instructions=<raw text>`.
+        assert!(!args.contains(&"--disallowedTools".to_string()));
+        // The prompt rides as `-c instructions=<raw text>`, contract appended.
+        let expected =
+            format!("instructions=ROLE GUIDANCE\nsecond line\n\n{SUBAGENT_QUESTION_CONTRACT}");
         assert!(
-            args.windows(2)
-                .any(|w| w[0] == "-c" && w[1] == "instructions=ROLE GUIDANCE\nsecond line"),
+            args.windows(2).any(|w| w[0] == "-c" && w[1] == expected),
             "codex argv must carry the role prompt via -c instructions=: {args:?}"
         );
     }
 
-    /// With no role prompt, codex carries no `-c instructions=` override.
+    /// With no role prompt, a codex **main worker** carries no
+    /// `-c instructions=` override. (A codex sub-agent always carries one —
+    /// the question contract.)
     #[test]
-    fn codex_argv_omits_instructions_when_no_system_prompt() {
+    fn codex_main_argv_omits_instructions_when_no_system_prompt() {
+        let mut r = role();
+        r.agent_cli = AgentCli::Codex;
+        r.model = None;
+        let req = SpawnRequest {
+            role: r,
+            agent_name: "main-1".into(),
+            caucus_mcp: Some(CaucusMcp {
+                caucus_bin: PathBuf::from("/usr/local/bin/caucus"),
+                control_sock: PathBuf::from("/repo/.caucus/sessions/S1/control.sock"),
+            }),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(!args.iter().any(|a| a.starts_with("instructions=")));
+    }
+
+    /// A codex sub-agent with no role prompt still gets the question contract
+    /// as its `-c instructions=` override.
+    #[test]
+    fn codex_subagent_without_role_prompt_still_gets_the_contract() {
         let mut r = role();
         r.agent_cli = AgentCli::Codex;
         r.model = None;
@@ -585,7 +741,11 @@ mod tests {
             ..SpawnRequest::default()
         };
         let args = args_of(&build_command(&req, PanelId::new()));
-        assert!(!args.iter().any(|a| a.starts_with("instructions=")));
+        let expected = format!("instructions={SUBAGENT_QUESTION_CONTRACT}");
+        assert!(
+            args.windows(2).any(|w| w[0] == "-c" && w[1] == expected),
+            "codex argv must carry the contract via -c instructions=: {args:?}"
+        );
     }
 
     /// A codex main worker panel (codex backend + `caucus_mcp` set) registers

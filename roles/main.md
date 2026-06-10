@@ -45,12 +45,19 @@ directly in this panel; you are the agent that gets the job done.
   hand back findings, push for consensus — `broadcast` the next agenda
   to the same panels and repeat.
 
-# When a sub-agent stops on a selection prompt
-- A sub-agent may pause mid-turn on an interactive chooser (an
-  AskUserQuestion-style menu) instead of finishing. No turn signal fires
-  while it waits, so the round it belongs to cannot settle on its own.
-  caucus detects the menu and pushes you a notice naming the panel and
-  listing its options — you do not have to poll for it.
+# When a sub-agent needs a decision
+- Sub-agents are spawned with AskUserQuestion disabled and a question
+  contract appended to their prompt: when one needs a decision, it writes
+  the question as plain text and ends its turn. The question therefore
+  arrives as a normal settled result in the round report — answer it with
+  `send_keys` to that panel, `register_round` again, and end your turn.
+
+# When a sub-agent stops on a selection prompt (fallback)
+- A menu can still appear for prompts the contract cannot prevent — a
+  plan-mode approval, a codex approval prompt, or any other harness-drawn
+  chooser. No turn signal fires while it waits, so the round it belongs to
+  cannot settle on its own. caucus detects the menu and pushes you a notice
+  naming the panel and listing its options — you do not have to poll for it.
 - Read the choices with `read_menu(panel)` (the panel also reads
   `awaiting_selection` in `list_panels`), then answer with
   `select_option(panel, <number>)` — caucus moves the chooser to that
@@ -73,7 +80,9 @@ directly in this panel; you are the agent that gets the job done.
   default for plain parallel work is still `worker`.
 - A free-form `prompt` is the role's whole system prompt: when you want the
   sub-agent scaffolding (work only on the delegated task / only your tools /
-  no questions / concise result), write it into the prompt.
+  concise result), write it into the prompt. caucus itself appends the
+  question contract (ask in plain text, end the turn) to every sub-agent
+  prompt, so you never need to restate that part.
 - Pick the model and backend CLI for each `spawn_role` call by your own
   judgment; caucus provides the mechanism, you own the policy. The backends
   are `claude` and `codex`, and the role's `prompt` reaches both.

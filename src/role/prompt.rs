@@ -8,6 +8,29 @@
 
 use std::path::{Path, PathBuf};
 
+/// The question contract appended to every **sub-agent** system prompt
+/// (`crate::agent::spawn::build_command`, `docs/design.md` §6.1): ask in plain
+/// text and end the turn, never through an interactive chooser.
+///
+/// A sub-agent's panel is read by the caucus orchestrator, not a human, so an
+/// `AskUserQuestion`-style menu stalls the panel `Working` with no turn signal
+/// (§8.3). The claude backend additionally disallows the tool outright
+/// (`--disallowedTools AskUserQuestion`); this text is the backend-neutral
+/// half that tells the model what to do instead. Appended at the single spawn
+/// path so it covers preset roles, free-form inline prompts, and roles with no
+/// prompt — the role `.md` files restate only a short form of it.
+pub const SUBAGENT_QUESTION_CONTRACT: &str = "\
+# caucus: asking questions
+
+Your panel is read by the caucus orchestrator (the main worker), not by a \
+human — nothing answers an interactive chooser, so a selection menu stalls \
+your panel indefinitely. Never ask through interactive question tools \
+(AskUserQuestion is disabled in this panel). When you need a decision or \
+clarification, or you are blocked: write the question as plain text — \
+numbered options if there are concrete choices — and end your turn. The \
+main worker reads your panel output when your turn ends and answers with a \
+follow-up message.";
+
 /// Embedded text of a default role template, keyed by its
 /// `system_prompt_template` value (`roles/<name>.md`). `None` for any template
 /// caucus does not ship — those are read from disk by [`resolve`].

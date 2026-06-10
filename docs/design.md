@@ -190,8 +190,14 @@ task 산출물을 담도록. settle해 전달될 때는 캡처분 + 최종 턴 �
 시 미완 패널은 끝낸 task들 + "still working" 마커).
 
 **선택 프롬프트 엣지**: 라운드 패널의 sub-agent가 턴을 끝내지 않고 대화형
-선택 메뉴(AskUserQuestion 류)에서 멈추면 turn signal이 안 와 라운드가 settle하지
-못한다 — 그대로 두면 fallback_secs까지 멈춰 있다. caucus는 매 tick
+선택 메뉴에서 멈추면 turn signal이 안 와 라운드가 settle하지
+못한다 — 그대로 두면 fallback_secs까지 멈춰 있다. 모델 주도 메뉴는 spawn에서
+원천 차단한다: 모든 sub-agent는 claude 백엔드에 `--disallowedTools
+AskUserQuestion`이 걸리고, 양 백엔드의 시스템 프롬프트에 질문 계약
+(`role::prompt::SUBAGENT_QUESTION_CONTRACT` — 질문을 텍스트로 쓰고 턴을 끝내면
+main이 라운드 보고서에서 읽고 답한다)이 덧붙는다(`agent::spawn::build_command`).
+그래도 메뉴가 뜨는 경우 — plan-mode 승인, codex 승인 프롬프트 등 하네스가
+그리는 chooser — 를 위해 감지 경로가 fallback으로 남는다: caucus는 매 tick
 `poll_round_selection_prompts`로 라운드 패널의 메뉴를 감지해 main worker에 push
 알림을 보낸다(round 완료 push와 같은 idle·quiet 게이트, tick당 1건). main은
 `read_menu`/`select_option`으로 답해 패널을 풀어 준다 — §8.3.
@@ -507,6 +513,11 @@ main worker에 push 알림을 보낸다(라운드는 settle 못 하므로 — §
 자유 입력은 메뉴의 'type something' 옵션을 고른 뒤 `send_keys`. `list_panels` 표면 문자열은
 이 §8.3 이름 그대로 `awaiting_selection` — 모든 state 문자열은 `DerivedState::as_str`(serde
 snake_case와 동일, 테스트로 고정)을 단일 소스로 쓴다.
+
+모델 주도 메뉴는 spawn 정책이 원천 차단하므로(§4 선택 프롬프트 엣지 — sub-agent에
+`--disallowedTools AskUserQuestion` + 질문 계약 주입) 이 상태에 실제로 도달하는
+것은 주로 하네스가 그리는 chooser(plan-mode 승인, codex 승인 프롬프트 등)다 —
+감지·응답 경로는 그 fallback으로 유지된다.
 
 turn-completion hook이 없는 백엔드(codex가 hook 미지원 시): caucus가 grid
 관찰로 `idle`을 판정한다 — agent 프롬프트 복귀 패턴 매치. 휴리스틱이므로 hook

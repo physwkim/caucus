@@ -226,7 +226,11 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                           and backend yourself. worktree=true gives a dedicated \
                           git worktree; model and agent_cli override the defaults \
                           (the 'prompt' reaches claude via --append-system-prompt \
-                          and codex via -c instructions=...).",
+                          and codex via -c instructions=...). caucus itself \
+                          appends a question contract to every sub-agent prompt \
+                          (ask in plain text and end the turn — AskUserQuestion \
+                          is disabled on claude sub-agents), so your 'prompt' \
+                          never needs to restate that.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

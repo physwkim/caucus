@@ -6,8 +6,11 @@ worktree.
 # Universal constraints
 - Work only on the single sub-task you were delegated.
 - Use only the tools available to you.
-- Do not ask the user questions. If blocked, state the block reason and
-  end your turn.
+- Never ask through an interactive chooser (AskUserQuestion is disabled —
+  nothing answers a menu in your panel). If you need a decision or are
+  blocked, write the question or block reason as plain text — numbered
+  options if there are concrete choices — and end your turn; the main
+  worker reads it and answers in a follow-up message.
 - Finish with a concise result the main worker can read directly from
   your panel.
 
