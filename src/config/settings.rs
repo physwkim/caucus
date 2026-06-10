@@ -21,6 +21,14 @@ pub(crate) const ROUND_FALLBACK_DEFAULT_SECS: u64 = 600;
 /// `round_fallback_secs` setting and any per-`register_round` override alike.
 pub(crate) const ROUND_FALLBACK_MAX_SECS: u64 = 3600;
 
+/// Hard ceiling on `scrollback_lines` — bounds per-panel scrollback memory
+/// against an absurd or typo'd setting. The ring fills lazily, so this caps
+/// worst-case retained rows, not an upfront allocation. There is deliberately
+/// no floor: `0` is a valid value meaning *scrollback disabled* (`Grid` treats
+/// a 0 limit as "retain nothing"), unlike the capture caps where a 0 is
+/// degenerate and lifted to 1.
+pub(crate) const SCROLLBACK_MAX_LINES: usize = 1_000_000;
+
 /// Resolved, process-wide tunables. Built once at [`crate::config::Config`]
 /// load (built-in defaults < global < project) and read where the values were
 /// previously hardcoded.
@@ -133,11 +141,16 @@ impl SettingsOverrides {
 
     /// Resolve against the compiled defaults, clamping to safe ranges: the round
     /// fallback into `[1, ROUND_FALLBACK_MAX_SECS]`, the capture caps to a floor
-    /// of 1 (a 0 limit would evict/spill every turn).
+    /// of 1 (a 0 limit would evict/spill every turn), and the scrollback depth to
+    /// a ceiling of [`SCROLLBACK_MAX_LINES`] (0 stays valid — disabled scrollback
+    /// — so it takes no floor).
     fn resolve(self) -> Settings {
         let d = Settings::default();
         Settings {
-            scrollback_lines: self.scrollback_lines.unwrap_or(d.scrollback_lines),
+            scrollback_lines: self
+                .scrollback_lines
+                .unwrap_or(d.scrollback_lines)
+                .min(SCROLLBACK_MAX_LINES),
             round_fallback_secs: self
                 .round_fallback_secs
                 .unwrap_or(d.round_fallback_secs)
@@ -244,6 +257,37 @@ mod tests {
             !load(None, tmp.path()).unwrap().mouse,
             "mouse = false keeps the terminal's native selection"
         );
+    }
+
+    #[test]
+    fn scrollback_lines_is_clamped_to_the_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("settings.toml"),
+            format!(
+                "[settings]\nscrollback_lines = {}\n",
+                SCROLLBACK_MAX_LINES as u64 + 50_000_000
+            ),
+        )
+        .unwrap();
+        let settings = load(None, tmp.path()).unwrap();
+        assert_eq!(
+            settings.scrollback_lines, SCROLLBACK_MAX_LINES,
+            "an absurd scrollback depth is bounded to the ceiling"
+        );
+    }
+
+    #[test]
+    fn scrollback_lines_zero_disables_scrollback_without_a_floor() {
+        let tmp = TempDir::new().unwrap();
+        // Unlike the capture caps, 0 is a valid value (scrollback disabled) and
+        // must survive resolution rather than being lifted to a floor.
+        std::fs::write(
+            tmp.path().join("settings.toml"),
+            "[settings]\nscrollback_lines = 0\n",
+        )
+        .unwrap();
+        assert_eq!(load(None, tmp.path()).unwrap().scrollback_lines, 0);
     }
 
     #[test]
