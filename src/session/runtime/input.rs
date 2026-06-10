@@ -163,6 +163,13 @@ impl Multiplexer {
             CaucusCommand::ScrollPageDown => self.scroll_page(1),
             CaucusCommand::ScrollTop => self.scroll_to_edge(true),
             CaucusCommand::ScrollBottom => self.scroll_to_edge(false),
+            CaucusCommand::SearchStart => self.search_start(),
+            CaucusCommand::SearchInput(c) => self.search_input(c),
+            CaucusCommand::SearchBackspace => self.search_backspace(),
+            CaucusCommand::SearchCommit => self.search_commit(),
+            CaucusCommand::SearchCancel => self.search_cancel(),
+            CaucusCommand::SearchNext => self.search_next(),
+            CaucusCommand::SearchPrev => self.search_prev(),
         }
     }
 
@@ -395,12 +402,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         // 20 lines, page 4 → max offset 16. Start at the bottom (newest).
-        mux.scroll = Some(ScrollState {
-            role: "worker".to_string(),
-            lines: (0..20).map(|i| format!("l{i}")).collect(),
-            offset: 16,
-            page: 4,
-        });
+        mux.scroll = Some(ScrollState::new(
+            "worker".to_string(),
+            (0..20).map(|i| format!("l{i}")).collect(),
+            16,
+            4,
+        ));
 
         // Wheel up moves toward older output by WHEEL_STEP (3).
         mux.handle_mouse(at(MouseEventKind::ScrollUp));

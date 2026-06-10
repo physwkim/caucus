@@ -780,7 +780,9 @@ fn scroll_window<'a>(
     } else {
         format!("{}–{}/{}", start + 1, end, total)
     };
-    let title = format!(" caucus · scrollback — {role} [{range}] · ↑↓ PgUp/PgDn g/G · Esc/q exit ");
+    let title = format!(
+        " caucus · scrollback — {role} [{range}] · ↑↓ PgUp/PgDn g/G · /n N search · Esc/q exit "
+    );
     (visible, title)
 }
 
@@ -809,7 +811,8 @@ pub(crate) fn draw_scroll_pager(frame: &mut Frame, state: &ScrollState) {
     // Interior height (popup minus its single-cell border) is the real visible
     // body; window the snapshot to exactly that many rows.
     let inner_h = popup.height.saturating_sub(2) as usize;
-    let (visible, title) = scroll_window(&state.role, &state.lines, state.offset, inner_h);
+    let (visible, mut title) = scroll_window(&state.role, &state.lines, state.offset, inner_h);
+    title.push_str(&search_status(state));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -831,14 +834,76 @@ pub(crate) fn draw_scroll_pager(frame: &mut Frame, state: &ScrollState) {
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
+        // Highlight the committed query in every visible line; the *current*
+        // match line (`n`/`N` target) gets a stronger style.
+        let query = state.search.query.as_str();
+        let start = state.offset.min(state.lines.len());
+        let current_line = state.search.matches.get(state.search.current).copied();
         visible
             .iter()
-            .map(|l| Line::from(Span::raw(l.clone())))
+            .enumerate()
+            .map(|(i, l)| highlight_line(l, query, Some(start + i) == current_line))
             .collect()
     };
 
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// The search suffix appended to the pager title: the live `/` input line while
+/// editing, or `query [i/n]` (or `[no match]`) for a committed search. Empty
+/// when no search is active.
+fn search_status(state: &ScrollState) -> String {
+    let s = &state.search;
+    if s.editing {
+        // A trailing `_` stands in for the input cursor.
+        format!("· /{}_ ", s.input)
+    } else if s.query.is_empty() {
+        String::new()
+    } else if s.matches.is_empty() {
+        format!("· /{} [no match] ", s.query)
+    } else {
+        format!("· /{} [{}/{}] ", s.query, s.current + 1, s.matches.len())
+    }
+}
+
+/// Render one scrollback line, highlighting case-insensitive occurrences of
+/// `query`. The current match line gets a bolder style than the rest. An empty
+/// query or a non-ASCII line is rendered unhighlighted — restricting byte-offset
+/// slicing to ASCII (where lowercasing is length-preserving and every offset is
+/// a char boundary) keeps it panic-proof; terminal scrollback is almost all
+/// ASCII, so this loses highlighting only on the occasional non-ASCII line.
+fn highlight_line(raw: &str, query: &str, is_current: bool) -> Line<'static> {
+    if query.is_empty() || !raw.is_ascii() {
+        return Line::from(Span::raw(raw.to_string()));
+    }
+    let hay = raw.to_ascii_lowercase();
+    let needle = query.to_ascii_lowercase();
+    if needle.is_empty() || !hay.contains(&needle) {
+        return Line::from(Span::raw(raw.to_string()));
+    }
+    let style = if is_current {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut last = 0;
+    for (idx, _) in hay.match_indices(&needle) {
+        if idx > last {
+            spans.push(Span::raw(raw[last..idx].to_string()));
+        }
+        let end = idx + needle.len();
+        spans.push(Span::styled(raw[idx..end].to_string(), style));
+        last = end;
+    }
+    if last < raw.len() {
+        spans.push(Span::raw(raw[last..].to_string()));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -979,6 +1044,49 @@ mod tests {
         let (vis, title) = scroll_window("worker", &[], 0, 5);
         assert!(vis.is_empty());
         assert!(title.contains("empty"), "title was {title:?}");
+    }
+
+    #[test]
+    fn highlight_line_styles_case_insensitive_matches() {
+        // Two occurrences (mixed case) get highlighted; the text is preserved.
+        let line = highlight_line("the Needle in needles", "needle", false);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "the Needle in needles");
+        let styled = line.spans.iter().filter(|s| s.style.bg.is_some()).count();
+        assert_eq!(styled, 2, "both occurrences highlighted");
+    }
+
+    #[test]
+    fn highlight_line_leaves_plain_and_non_ascii_untouched() {
+        // No query → a single unstyled span.
+        let plain = highlight_line("hello", "", false);
+        assert_eq!(plain.spans.len(), 1);
+        assert!(plain.spans[0].style.bg.is_none());
+        // A non-ASCII line is rendered verbatim, never sliced (panic-proof).
+        let uni = highlight_line("café menu", "menu", false);
+        let text: String = uni.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "café menu");
+        assert!(uni.spans.iter().all(|s| s.style.bg.is_none()));
+    }
+
+    #[test]
+    fn search_status_reports_editing_and_committed_state() {
+        let mut st = ScrollState::new("w".to_string(), vec!["abc".to_string()], 0, 1);
+        // No search → empty suffix.
+        assert_eq!(search_status(&st), "");
+        // Editing → the live `/` line with a cursor stand-in.
+        st.search.editing = true;
+        st.search.input = "ab".to_string();
+        assert_eq!(search_status(&st), "· /ab_ ");
+        // Committed with matches → `query [i/n]`.
+        st.search.editing = false;
+        st.search.query = "ab".to_string();
+        st.search.matches = vec![0];
+        st.search.current = 0;
+        assert_eq!(search_status(&st), "· /ab [1/1] ");
+        // Committed with no matches.
+        st.search.matches.clear();
+        assert_eq!(search_status(&st), "· /ab [no match] ");
     }
 
     #[test]

@@ -38,6 +38,8 @@
 //! | `Ctrl-A` then `[`         | open the scrollback pager (focused panel)|
 //! | (pager open) `↑↓ k j`     | scroll a line; `PgUp/PgDn` a page       |
 //! | (pager open) `g G Home End`| jump to oldest / newest line           |
+//! | (pager open) `/`          | search the scrollback (Enter run, Esc cancel)|
+//! | (pager open) `n` / `N`    | next / previous search match            |
 //! | (pager open) `Esc` / `q`  | exit the scrollback pager               |
 //! | scroll wheel up           | enter / page back the scrollback pager  |
 //! | scroll wheel down         | page forward in the pager (off at live) |
@@ -120,6 +122,20 @@ pub enum CaucusCommand {
     ScrollTop,
     /// Jump the pager to the newest line.
     ScrollBottom,
+    /// Open the pager's `/` search-input line.
+    SearchStart,
+    /// Append a character to the open `/` search line.
+    SearchInput(char),
+    /// Delete the last character of the `/` search line.
+    SearchBackspace,
+    /// Commit the `/` search line: run the query and jump to the first match.
+    SearchCommit,
+    /// Cancel the `/` search line, keeping any prior committed search.
+    SearchCancel,
+    /// Step to the next search match (`n`).
+    SearchNext,
+    /// Step to the previous search match (`N`).
+    SearchPrev,
 }
 
 /// Tracks which panel currently receives the user's keystrokes, plus whether
@@ -141,6 +157,9 @@ pub struct FocusRouter {
     /// drive scrolling and are *captured* — every key is consumed by the
     /// pager and none reach the focused panel's PTY.
     scroll_open: bool,
+    /// `true` while the pager's `/` search-input line is open. A sub-mode of
+    /// `scroll_open`: keystrokes edit the query instead of driving navigation.
+    scroll_searching: bool,
     /// `true` while the close-panel confirm prompt is open. Modal like the
     /// pager: `y` confirms, `n`/`Esc`/`Ctrl-C` cancels, every other key is
     /// swallowed and never reaches the focused panel's PTY.
@@ -168,6 +187,7 @@ impl FocusRouter {
             prefix_armed: false,
             transcript_open: false,
             scroll_open: false,
+            scroll_searching: false,
             confirm_open: false,
         }
     }
@@ -226,6 +246,14 @@ impl FocusRouter {
         self.scroll_open = open;
     }
 
+    /// Tell the router whether the pager's `/` search-input line is open — when
+    /// open, [`FocusRouter::route`] sends keystrokes to the query line (printable
+    /// chars, `Backspace`, `Enter` to commit, `Esc` to cancel) instead of the
+    /// pager's navigation bindings.
+    pub fn set_scroll_searching(&mut self, searching: bool) {
+        self.scroll_searching = searching;
+    }
+
     /// Tell the router whether the close-panel confirm prompt is open — when
     /// open, [`FocusRouter::route`] captures every key (`y` confirms,
     /// `n`/`Esc`/`Ctrl-C` cancels, all others are swallowed).
@@ -252,11 +280,15 @@ impl FocusRouter {
         // While the scrollback pager is open it is fully modal: it captures
         // every key. Navigation keys scroll it; `Esc`/`q` close it; all other
         // keys are swallowed and never reach the focused panel's PTY (unlike
-        // the read-only transcript overlay, which passes input through).
+        // the read-only transcript overlay, which passes input through). Its `/`
+        // search sub-mode reroutes keystrokes to the query input line.
         if self.scroll_open {
-            return scroll_command(&key)
-                .map(InputAction::Caucus)
-                .unwrap_or(InputAction::Ignore);
+            let cmd = if self.scroll_searching {
+                search_input_command(&key)
+            } else {
+                scroll_command(&key)
+            };
+            return cmd.map(InputAction::Caucus).unwrap_or(InputAction::Ignore);
         }
         if self.prefix_armed {
             self.prefix_armed = false;
@@ -336,7 +368,32 @@ fn scroll_command(key: &KeyEvent) -> Option<CaucusCommand> {
         KeyCode::PageDown | KeyCode::Char(' ') => Some(CaucusCommand::ScrollPageDown),
         KeyCode::Home | KeyCode::Char('g') => Some(CaucusCommand::ScrollTop),
         KeyCode::End | KeyCode::Char('G') => Some(CaucusCommand::ScrollBottom),
+        // `/` opens the search line; `n`/`N` step the committed matches (`less`).
+        KeyCode::Char('/') => Some(CaucusCommand::SearchStart),
+        KeyCode::Char('n') => Some(CaucusCommand::SearchNext),
+        KeyCode::Char('N') => Some(CaucusCommand::SearchPrev),
         KeyCode::Esc | KeyCode::Char('q') => Some(CaucusCommand::ExitScroll),
+        _ => None,
+    }
+}
+
+/// Map a key to a search-input command while the pager's `/` line is open.
+/// Printable chars extend the query, `Backspace` trims it, `Enter` commits,
+/// `Esc` cancels; every other key (including the pager's navigation bindings)
+/// is swallowed so it cannot leak past the input line.
+fn search_input_command(key: &KeyEvent) -> Option<CaucusCommand> {
+    match key.code {
+        KeyCode::Enter => Some(CaucusCommand::SearchCommit),
+        KeyCode::Esc => Some(CaucusCommand::SearchCancel),
+        KeyCode::Backspace => Some(CaucusCommand::SearchBackspace),
+        // A bare printable char (no Ctrl/Alt) extends the query.
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(CaucusCommand::SearchInput(c))
+        }
         _ => None,
     }
 }
@@ -948,6 +1005,50 @@ mod tests {
                 other => panic!("expected Caucus({want:?}) for {code:?}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn pager_search_keys_route_to_search_commands() {
+        let mut router = FocusRouter::new();
+        router.set_focus(Some(PanelId::new()));
+        router.set_scroll_open(true);
+
+        // In the pager (not yet searching) `/` opens the search line and `n`/`N`
+        // step committed matches.
+        assert!(matches!(
+            router.route(key(KeyCode::Char('/'))),
+            InputAction::Caucus(CaucusCommand::SearchStart)
+        ));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('n'))),
+            InputAction::Caucus(CaucusCommand::SearchNext)
+        ));
+        assert!(matches!(
+            router.route(key(KeyCode::Char('N'))),
+            InputAction::Caucus(CaucusCommand::SearchPrev)
+        ));
+
+        // While the `/` line is open, keystrokes edit the query — even `j`,
+        // which would otherwise scroll — and Backspace/Enter/Esc edit it.
+        router.set_scroll_searching(true);
+        assert!(matches!(
+            router.route(key(KeyCode::Char('j'))),
+            InputAction::Caucus(CaucusCommand::SearchInput('j'))
+        ));
+        assert!(matches!(
+            router.route(key(KeyCode::Backspace)),
+            InputAction::Caucus(CaucusCommand::SearchBackspace)
+        ));
+        assert!(matches!(
+            router.route(key(KeyCode::Enter)),
+            InputAction::Caucus(CaucusCommand::SearchCommit)
+        ));
+        assert!(matches!(
+            router.route(key(KeyCode::Esc)),
+            InputAction::Caucus(CaucusCommand::SearchCancel)
+        ));
+        // A Ctrl-modified char is not query text — it is swallowed, not typed.
+        assert!(matches!(router.route(ctrl('c')), InputAction::Ignore));
     }
 
     #[test]
