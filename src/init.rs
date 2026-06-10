@@ -57,23 +57,26 @@ pub struct InitOutcome {
     pub hook_install: Option<HookInstall>,
 }
 
-/// Result of ensuring `.caucus/` is ignored by the project `.gitignore`.
+/// Result of ensuring `.caucus/sessions/` is ignored by the project
+/// `.gitignore`.
 #[derive(Debug)]
 pub enum GitignoreOutcome {
-    /// `.caucus/` was appended to (or, when `created`, the file written with)
-    /// `<repo>/.gitignore`.
+    /// `.caucus/sessions/` was appended to (or, when `created`, the file written
+    /// with) `<repo>/.gitignore`.
     Updated { path: PathBuf, created: bool },
-    /// `.caucus/` was already ignored — the file was left untouched.
+    /// The session state was already ignored — the file was left untouched.
     AlreadyIgnored { path: PathBuf },
 }
 
 /// Run `caucus init` for the project rooted at `repo`.
 ///
 /// Always creates `<repo>/.caucus/` (plus `bin/`, `sessions/`), writes
-/// `bin/turn-signal`, and ensures `<repo>/.gitignore` ignores `.caucus/` (the
-/// directory holds per-session worktrees, panel logs, and round reports — local
-/// state that must never be committed). When `install_hook` is set, also merges
-/// the Stop hook into `~/.claude/settings.json`.
+/// `bin/turn-signal`, and ensures `<repo>/.gitignore` ignores
+/// `.caucus/sessions/` (per-session worktrees, panel logs, and round reports —
+/// local state that must never be committed). Project config under `.caucus/`
+/// (`roles.toml`, `settings.toml`) is deliberately *not* ignored, so it stays
+/// committable. When `install_hook` is set, also merges the Stop hook into
+/// `~/.claude/settings.json`.
 pub fn run(repo: &Path, install_hook: bool) -> Result<InitOutcome> {
     let caucus_dir = repo.join(".caucus");
     let bin_dir = caucus_dir.join("bin");
@@ -104,16 +107,19 @@ pub fn run(repo: &Path, install_hook: bool) -> Result<InitOutcome> {
     Ok(outcome)
 }
 
-/// The single `.gitignore` line `caucus init` ensures is present.
-const GITIGNORE_ENTRY: &str = ".caucus/";
+/// The single `.gitignore` line `caucus init` ensures is present. Scoped to the
+/// session-state subdirectory, *not* all of `.caucus/`, so project config
+/// (`roles.toml`, `settings.toml`) directly under `.caucus/` stays committable.
+const GITIGNORE_ENTRY: &str = ".caucus/sessions/";
 
-/// Ensure `<repo>/.gitignore` ignores `.caucus/`, idempotently.
+/// Ensure `<repo>/.gitignore` ignores `.caucus/sessions/`, idempotently.
 ///
-/// Appends `.caucus/` (under a one-line comment) when missing, creating the
-/// file if absent; leaves the file untouched when `.caucus/` is already covered
-/// ([`gitignore_covers_caucus`]). Existing entries and the trailing-newline
-/// style of the file are preserved — a missing final newline is added before
-/// the appended block so the new entry lands on its own line.
+/// Appends the entry (under a one-line comment) when missing, creating the file
+/// if absent; leaves the file untouched when the session state is already
+/// covered ([`gitignore_covers_session_state`]) — including a pre-existing
+/// broader `.caucus/` ignore. Existing entries and the trailing-newline style
+/// of the file are preserved — a missing final newline is added before the
+/// appended block so the new entry lands on its own line.
 fn ensure_gitignore(repo: &Path) -> Result<GitignoreOutcome> {
     let path = repo.join(".gitignore");
     let existing = match std::fs::read_to_string(&path) {
@@ -122,7 +128,10 @@ fn ensure_gitignore(repo: &Path) -> Result<GitignoreOutcome> {
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
 
-    if existing.as_deref().is_some_and(gitignore_covers_caucus) {
+    if existing
+        .as_deref()
+        .is_some_and(gitignore_covers_session_state)
+    {
         return Ok(GitignoreOutcome::AlreadyIgnored { path });
     }
 
@@ -143,17 +152,21 @@ fn ensure_gitignore(repo: &Path) -> Result<GitignoreOutcome> {
     Ok(GitignoreOutcome::Updated { path, created })
 }
 
-/// Whether `text` already ignores `.caucus/` at the repo root. Matches the
-/// common hand-written spellings — `.caucus` or `/.caucus`, with or without a
-/// trailing slash — ignoring blank lines, comments, and surrounding
-/// whitespace. A negation (`!.caucus/`) does not count as covering it.
-fn gitignore_covers_caucus(text: &str) -> bool {
+/// Whether `text` already ignores the caucus session state. Matches the narrow
+/// `.caucus/sessions` entry *and* a broader `.caucus` ignore (which already
+/// covers `sessions/`) — each with or without a leading `/` or trailing slash —
+/// ignoring blank lines, comments, and surrounding whitespace. A negation
+/// (`!...`) does not count as covering it.
+fn gitignore_covers_session_state(text: &str) -> bool {
     text.lines().any(|line| {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             return false;
         }
-        matches!(line.trim_end_matches('/'), ".caucus" | "/.caucus")
+        matches!(
+            line.trim_end_matches('/'),
+            ".caucus" | "/.caucus" | ".caucus/sessions" | "/.caucus/sessions"
+        )
     })
 }
 
@@ -316,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn init_creates_gitignore_ignoring_caucus() {
+    fn init_creates_gitignore_ignoring_session_state() {
         let tmp = TempDir::new().unwrap();
         let outcome = run(tmp.path(), false).unwrap();
         match outcome.gitignore {
@@ -324,7 +337,16 @@ mod tests {
             other => panic!("expected a created .gitignore, got {other:?}"),
         }
         let body = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-        assert!(gitignore_covers_caucus(&body), "`.caucus/` is now ignored");
+        assert!(
+            gitignore_covers_session_state(&body),
+            "session state is now ignored"
+        );
+        // Scoped to sessions/, so project config under .caucus/ stays trackable.
+        assert!(body.contains(".caucus/sessions/"), "narrow entry: {body:?}");
+        assert!(
+            !body.lines().any(|l| l.trim() == ".caucus/"),
+            "must not ignore all of .caucus/: {body:?}"
+        );
     }
 
     #[test]
@@ -342,11 +364,30 @@ mod tests {
 
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.lines().any(|l| l.trim() == "/target"), "kept /target");
-        assert!(gitignore_covers_caucus(&body), "added .caucus/");
-        // `/target` and `.caucus/` are on separate lines.
+        assert!(
+            gitignore_covers_session_state(&body),
+            "added .caucus/sessions/"
+        );
+        // `/target` and the appended entry are on separate lines.
         assert!(
             !body.contains("/target.caucus"),
             "entries not glued: {body:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_gitignore_treats_a_broad_caucus_ignore_as_covered() {
+        // A repo that already ignores all of `.caucus/` (e.g. from an earlier
+        // caucus, or by hand) is left untouched — the broad ignore already
+        // covers the session state, so no narrower entry is appended.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "/target\n.caucus/\n").unwrap();
+        let outcome = ensure_gitignore(tmp.path()).unwrap();
+        assert!(matches!(outcome, GitignoreOutcome::AlreadyIgnored { .. }));
+        let body = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(
+            !body.contains(".caucus/sessions/"),
+            "no redundant narrow entry: {body:?}"
         );
     }
 
@@ -368,20 +409,36 @@ mod tests {
     }
 
     #[test]
-    fn gitignore_covers_caucus_recognizes_spellings() {
-        // Each of these counts as already-ignored.
+    fn gitignore_covers_session_state_recognizes_spellings() {
+        // Each of these counts as already-ignored: the narrow sessions entry and
+        // a broader `.caucus` ignore that subsumes it, in their common spellings.
         for text in [
+            ".caucus/sessions/",
+            ".caucus/sessions",
+            "/.caucus/sessions/",
             ".caucus/",
             ".caucus",
-            "/.caucus/",
             "/.caucus",
-            "foo\n.caucus/\nbar",
+            "foo\n.caucus/sessions/\nbar",
         ] {
-            assert!(gitignore_covers_caucus(text), "should cover: {text:?}");
+            assert!(
+                gitignore_covers_session_state(text),
+                "should cover: {text:?}"
+            );
         }
-        // These do not — a comment, a negation, and an unrelated entry.
-        for text in ["# .caucus/", "!.caucus/", ".caucusx", "caucus/", ""] {
-            assert!(!gitignore_covers_caucus(text), "should not cover: {text:?}");
+        // These do not — a comment, a negation, and unrelated entries.
+        for text in [
+            "# .caucus/sessions/",
+            "!.caucus/sessions/",
+            ".caucusx",
+            "caucus/",
+            ".caucus/roles.toml",
+            "",
+        ] {
+            assert!(
+                !gitignore_covers_session_state(text),
+                "should not cover: {text:?}"
+            );
         }
     }
 

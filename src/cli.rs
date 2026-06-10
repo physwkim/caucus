@@ -281,7 +281,7 @@ fn run_init(install_hook: bool) -> Result<ExitCode> {
             created: true,
         } => {
             eprintln!(
-                "  .gitignore:    created {} ignoring .caucus/",
+                "  .gitignore:    created {} ignoring .caucus/sessions/",
                 path.display()
             );
         }
@@ -289,11 +289,14 @@ fn run_init(install_hook: bool) -> Result<ExitCode> {
             path,
             created: false,
         } => {
-            eprintln!("  .gitignore:    added .caucus/ to {}", path.display());
+            eprintln!(
+                "  .gitignore:    added .caucus/sessions/ to {}",
+                path.display()
+            );
         }
         crate::init::GitignoreOutcome::AlreadyIgnored { path } => {
             eprintln!(
-                "  .gitignore:    .caucus/ already ignored in {} — no change",
+                "  .gitignore:    session state already ignored in {} — no change",
                 path.display()
             );
         }
