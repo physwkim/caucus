@@ -346,6 +346,98 @@ fn arrow_direction(code: KeyCode) -> Option<Direction> {
     }
 }
 
+/// Parse a human-readable key name (as the MCP `send_key` tool receives it)
+/// into a [`KeyEvent`] — the inverse direction of [`encode_key`], whose output
+/// is fed straight back through `encode_key` to produce the PTY bytes.
+///
+/// Grammar: zero or more case-insensitive modifier prefixes — `ctrl`
+/// (`control`), `alt` (`meta` / `option`), `shift` — joined to the base by `-`
+/// or `+`, then one base key:
+/// * a named key: `esc`/`escape`, `enter`/`return`, `tab`, `backtab`,
+///   `backspace`/`bs`, `space`, `up`, `down`, `left`, `right`, `home`, `end`,
+///   `pageup`/`pgup`, `pagedown`/`pgdn`, `insert`/`ins`, `delete`/`del`;
+/// * a function key `f1`..`f12`;
+/// * or a single character (`a`, `/`, `?`, and the separators `-`/`+`
+///   themselves when given alone), taken with its literal case.
+///
+/// Examples: `esc`, `up`, `ctrl-c`, `alt-enter`, `ctrl-shift-left`, `f5`.
+///
+/// Returns a human-readable error for an empty name, an unknown modifier, or
+/// an unrecognised base key. A parsed key that has no terminal encoding (e.g.
+/// `ctrl-5`) parses here but [`encode_key`] returns `None` for it.
+pub fn parse_key_name(name: &str) -> Result<KeyEvent, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("empty key name".to_string());
+    }
+
+    // A lone character is taken literally — this is also how the separator
+    // characters `-` / `+` reach a panel as bare keys, since the split below
+    // would otherwise consume them.
+    let mut solo = trimmed.chars();
+    if let (Some(c), None) = (solo.next(), solo.next()) {
+        return Ok(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    // Otherwise: separator-joined tokens — every token but the last is a
+    // modifier, the last is the base key. Empty tokens (a doubled or trailing
+    // separator) are dropped.
+    let parts: Vec<&str> = trimmed
+        .split(['-', '+'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    let (base, mod_toks) = parts
+        .split_last()
+        .ok_or_else(|| format!("unrecognised key `{trimmed}`"))?;
+
+    let mut modifiers = KeyModifiers::NONE;
+    for m in mod_toks {
+        match m.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
+            "alt" | "meta" | "option" => modifiers |= KeyModifiers::ALT,
+            "shift" => modifiers |= KeyModifiers::SHIFT,
+            other => return Err(format!("unknown key modifier `{other}`")),
+        }
+    }
+
+    let code = match base.to_ascii_lowercase().as_str() {
+        "esc" | "escape" => KeyCode::Esc,
+        "enter" | "return" => KeyCode::Enter,
+        "tab" => KeyCode::Tab,
+        "backtab" => KeyCode::BackTab,
+        "backspace" | "bs" => KeyCode::Backspace,
+        "space" => KeyCode::Char(' '),
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" | "pgup" => KeyCode::PageUp,
+        "pagedown" | "pgdn" => KeyCode::PageDown,
+        "insert" | "ins" => KeyCode::Insert,
+        "delete" | "del" => KeyCode::Delete,
+        lower => {
+            // `fN` function key, else a single literal character (original
+            // case, e.g. `ctrl-A` vs `ctrl-a`).
+            if let Some(n) = lower
+                .strip_prefix('f')
+                .and_then(|d| d.parse::<u8>().ok())
+                .filter(|n| (1..=12).contains(n))
+            {
+                KeyCode::F(n)
+            } else {
+                let mut bc = base.chars();
+                match (bc.next(), bc.next()) {
+                    (Some(c), None) => KeyCode::Char(c),
+                    _ => return Err(format!("unrecognised key `{base}`")),
+                }
+            }
+        }
+    };
+    Ok(KeyEvent::new(code, modifiers))
+}
+
 /// Encode a crossterm [`KeyEvent`] into the byte sequence a terminal would
 /// send for that key — the fully bidirectional input path (`docs/design.md`
 /// §0 #11).
@@ -859,5 +951,74 @@ mod tests {
     fn function_key_encodes() {
         assert_eq!(encode_key(&key(KeyCode::F(1))).unwrap(), b"\x1bOP");
         assert_eq!(encode_key(&key(KeyCode::F(5))).unwrap(), b"\x1b[15~");
+    }
+
+    #[test]
+    fn parse_key_name_named_keys() {
+        assert_eq!(parse_key_name("esc").unwrap(), key(KeyCode::Esc));
+        assert_eq!(parse_key_name("Escape").unwrap(), key(KeyCode::Esc));
+        assert_eq!(parse_key_name("enter").unwrap(), key(KeyCode::Enter));
+        assert_eq!(parse_key_name("up").unwrap(), key(KeyCode::Up));
+        assert_eq!(parse_key_name("pgdn").unwrap(), key(KeyCode::PageDown));
+        assert_eq!(parse_key_name("del").unwrap(), key(KeyCode::Delete));
+        assert_eq!(parse_key_name("space").unwrap(), key(KeyCode::Char(' ')));
+        assert_eq!(parse_key_name(" tab ").unwrap(), key(KeyCode::Tab));
+    }
+
+    #[test]
+    fn parse_key_name_function_keys() {
+        assert_eq!(parse_key_name("f1").unwrap(), key(KeyCode::F(1)));
+        assert_eq!(parse_key_name("F12").unwrap(), key(KeyCode::F(12)));
+        // f0 / f13 are out of range — fall through to a literal char base,
+        // which is multi-char ("f0") and therefore unrecognised.
+        assert!(parse_key_name("f13").is_err());
+    }
+
+    #[test]
+    fn parse_key_name_modifiers() {
+        assert_eq!(parse_key_name("ctrl-c").unwrap(), ctrl('c'));
+        assert_eq!(
+            parse_key_name("alt-enter").unwrap(),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+        );
+        assert_eq!(
+            parse_key_name("ctrl-shift-left").unwrap(),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        );
+        // `+` is an accepted separator and `meta`/`option` alias `alt`.
+        assert_eq!(
+            parse_key_name("meta+up").unwrap(),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)
+        );
+    }
+
+    /// A lone character — including the separator characters themselves — is a
+    /// literal key with its original case, no modifiers.
+    #[test]
+    fn parse_key_name_single_chars() {
+        assert_eq!(parse_key_name("a").unwrap(), key(KeyCode::Char('a')));
+        assert_eq!(parse_key_name("A").unwrap(), key(KeyCode::Char('A')));
+        assert_eq!(parse_key_name("/").unwrap(), key(KeyCode::Char('/')));
+        assert_eq!(parse_key_name("-").unwrap(), key(KeyCode::Char('-')));
+        assert_eq!(parse_key_name("+").unwrap(), key(KeyCode::Char('+')));
+    }
+
+    /// The parse → encode round-trip: a name the tool receives produces the
+    /// same bytes a real keypress would.
+    #[test]
+    fn parse_key_name_round_trips_through_encode() {
+        let bytes = |n: &str| encode_key(&parse_key_name(n).unwrap()).unwrap();
+        assert_eq!(bytes("ctrl-c"), vec![0x03]);
+        assert_eq!(bytes("esc"), vec![0x1b]);
+        assert_eq!(bytes("up"), b"\x1b[A");
+        assert_eq!(bytes("alt-b"), vec![0x1b, b'b']);
+    }
+
+    #[test]
+    fn parse_key_name_rejects_bad_input() {
+        assert!(parse_key_name("").is_err());
+        assert!(parse_key_name("   ").is_err());
+        assert!(parse_key_name("hyper-x").is_err());
+        assert!(parse_key_name("ctrl-notakey").is_err());
     }
 }

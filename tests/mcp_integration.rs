@@ -80,6 +80,7 @@ fn mcp_serve_lists_the_tools_over_stdio() {
         names,
         vec![
             "send_keys",
+            "send_key",
             "broadcast",
             "ctrl_c",
             "read_panel",

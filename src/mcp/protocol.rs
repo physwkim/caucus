@@ -35,6 +35,12 @@ pub enum ControlRequest {
         #[serde(default)]
         enter: bool,
     },
+    /// Send a single raw key to a panel's PTY — the escape hatch for keys
+    /// `SendKeys` text cannot express (`esc`, arrows, `ctrl-*`, `tab`, function
+    /// keys). `key` is a human-readable key name decoded by
+    /// [`crate::input::parse_key_name`]. Unlike `SendKeys` with `enter`, this
+    /// does no turn/`Working` bookkeeping — it is a bare keystroke.
+    SendKey { panel: PanelId, key: String },
     /// Type the same `text` into several panels' PTYs at once — a round's
     /// fan-out. Equivalent to one [`ControlRequest::SendKeys`] per panel;
     /// executed synchronously like `SendKeys`, not deferred.
@@ -143,6 +149,18 @@ mod tests {
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains("\"op\":\"send_keys\""));
+        let back: ControlRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn send_key_round_trips() {
+        let req = ControlRequest::SendKey {
+            panel: PanelId::new(),
+            key: "ctrl-c".into(),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"op\":\"send_key\""));
         let back: ControlRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(req, back);
     }

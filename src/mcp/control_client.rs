@@ -130,6 +130,17 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                 enter,
             })
         }
+        "send_key" => {
+            let key = args
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing string argument `key`".to_string())?
+                .to_string();
+            Ok(ControlRequest::SendKey {
+                panel: panel(args)?,
+                key,
+            })
+        }
         "broadcast" => {
             let raw = args
                 .get("panels")
@@ -346,6 +357,27 @@ mod tests {
                 enter: true,
             }
         );
+    }
+
+    #[test]
+    fn build_send_key_request() {
+        let id = PanelId::new();
+        let req =
+            build_request("send_key", &json!({"panel": id.to_string(), "key": "esc"})).unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::SendKey {
+                panel: id,
+                key: "esc".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_send_key_requires_key() {
+        let id = PanelId::new();
+        let err = build_request("send_key", &json!({"panel": id.to_string()})).unwrap_err();
+        assert!(err.contains("missing string argument `key`"));
     }
 
     #[test]

@@ -41,6 +41,24 @@ impl McpToolSurface for Multiplexer {
         Ok(())
     }
 
+    fn send_key(&mut self, panel: PanelId, key: &str) -> Result<(), McpError> {
+        // Decode the human key name into the exact bytes a real keypress would
+        // send, then write them raw. No `note_prompt_delivered`: a bare key is
+        // navigation/control, not a submitted turn (use `send_keys(enter)` for
+        // that).
+        let event = crate::input::parse_key_name(key)
+            .map_err(|e| McpError::Tool(format!("send_key: {e}")))?;
+        let bytes = crate::input::encode_key(&event)
+            .ok_or_else(|| McpError::Tool(format!("send_key: `{key}` has no terminal encoding")))?;
+        let p = self
+            .panels
+            .iter_mut()
+            .find(|p| p.id == panel)
+            .ok_or(McpError::NoSuchPanel(panel))?;
+        p.write_input(&bytes)
+            .map_err(|e| McpError::Tool(format!("send_key: {e}")))
+    }
+
     fn ctrl_c(&mut self, panel: PanelId) -> Result<(), McpError> {
         let p = self
             .panels

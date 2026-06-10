@@ -21,6 +21,10 @@ impl Multiplexer {
                     Err(err) => ControlResponse::error(err),
                 }
             }
+            ControlRequest::SendKey { panel, key } => match self.send_key(panel, &key) {
+                Ok(()) => ControlResponse::Ok,
+                Err(err) => ControlResponse::error(err),
+            },
             ControlRequest::Broadcast {
                 panels,
                 text,
@@ -195,6 +199,10 @@ mod tests {
                 panel: ghost,
                 text: "hi".into(),
                 enter: true,
+            },
+            ControlRequest::SendKey {
+                panel: ghost,
+                key: "esc".into(),
             },
             ControlRequest::ReadPanel {
                 panel: ghost,

@@ -2,9 +2,9 @@
 //! (`docs/design.md` §0 #4, §9).
 //!
 //! The main worker (a Claude Code agent in one panel) drives every sub-agent
-//! panel through ten MCP tools: `send_keys`, `broadcast`, `ctrl_c`,
-//! `read_panel`, `spawn_role`, `kill_panel`, `list_panels`, `register_round`,
-//! `read_menu`, `select_option`.
+//! panel through eleven MCP tools: `send_keys`, `send_key`, `broadcast`,
+//! `ctrl_c`, `read_panel`, `spawn_role`, `kill_panel`, `list_panels`,
+//! `register_round`, `read_menu`, `select_option`.
 //!
 //! ## Architecture
 //!
@@ -25,8 +25,8 @@
 //! `rmcp` (1.7.0) resolves cleanly but its server surface is macro-driven and
 //! its transport runs an internal loop that resists deterministic unit
 //! testing. The MCP slice caucus needs is small — `initialize` / `tools/list`
-//! / `tools/call`, ten tools — so [`jsonrpc`] implements exactly that, with a
-//! pure dispatch core. See that module's header for the rationale.
+//! / `tools/call`, eleven tools — so [`jsonrpc`] implements exactly that, with
+//! a pure dispatch core. See that module's header for the rationale.
 
 pub mod control_client;
 pub mod control_server;
@@ -102,6 +102,12 @@ pub trait McpToolSurface {
     /// §4). When `enter` is set, a trailing newline is appended.
     fn send_keys(&mut self, panel: PanelId, text: &str, enter: bool) -> Result<(), McpError>;
 
+    /// Send a single raw key to a panel's PTY, named as
+    /// [`crate::input::parse_key_name`] parses it (`esc`, `up`, `ctrl-c`,
+    /// `f5`, …). The escape hatch for keys `send_keys` text cannot express; no
+    /// turn/`Working` bookkeeping is done.
+    fn send_key(&mut self, panel: PanelId, key: &str) -> Result<(), McpError>;
+
     /// Send `Ctrl-C` (interrupt) to a panel's PTY.
     fn ctrl_c(&mut self, panel: PanelId) -> Result<(), McpError>;
 
@@ -168,6 +174,30 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                     }
                 },
                 "required": ["panel", "text"]
+            }),
+        },
+        ToolDef {
+            name: "send_key",
+            description: "Send ONE raw key to a panel — the escape hatch for keys \
+                          send_keys text cannot express: 'esc' (dismiss a prompt), \
+                          arrows ('up'/'down'/'left'/'right'), 'tab', 'enter', \
+                          control chords ('ctrl-c', 'ctrl-d'), 'alt-*', and \
+                          function keys ('f1'..'f12'). Names are case-insensitive \
+                          with '-' or '+' joining modifiers (ctrl / alt / shift), \
+                          e.g. 'ctrl-shift-left'. Unlike send_keys this does no \
+                          turn bookkeeping — use send_keys(enter=true) to deliver \
+                          a prompt as a turn.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "panel": panel_prop(),
+                    "key": {
+                        "type": "string",
+                        "description": "Key name, e.g. 'esc', 'up', 'ctrl-c', \
+                                        'alt-enter', 'f5'."
+                    }
+                },
+                "required": ["panel", "key"]
             }),
         },
         ToolDef {
@@ -407,6 +437,7 @@ mod tests {
             names,
             vec![
                 "send_keys",
+                "send_key",
                 "broadcast",
                 "ctrl_c",
                 "read_panel",
