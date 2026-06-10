@@ -5,7 +5,7 @@ use crate::worktree::cleanup::CleanupJob;
 use tracing::warn;
 
 impl Multiplexer {
-    /// Build a [`SessionRecord`] from the live panels + manifests.
+    /// Build a [`SessionRecord`](crate::session::record::SessionRecord) from the live panels + manifests.
     fn build_record(&self) -> crate::session::record::SessionRecord {
         use crate::session::record::{PanelRecord, SessionRecord};
         let panels = self
