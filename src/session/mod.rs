@@ -7,7 +7,7 @@ pub mod round_record;
 pub mod runtime;
 pub mod state;
 
-pub use id::{AgentId, PanelId, SessionId};
+pub use id::{AgentId, PanelId, RoundId, SessionId};
 pub use record::{PanelRecord, SessionRecord, SessionRecordError};
 pub use runtime::Multiplexer;
 pub use state::{Session, SessionState};

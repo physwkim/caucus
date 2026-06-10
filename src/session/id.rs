@@ -46,6 +46,7 @@ macro_rules! ulid_newtype {
 ulid_newtype!(SessionId);
 ulid_newtype!(PanelId);
 ulid_newtype!(AgentId);
+ulid_newtype!(RoundId);
 
 #[cfg(test)]
 mod tests {

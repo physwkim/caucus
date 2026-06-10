@@ -79,6 +79,8 @@ impl Multiplexer {
                 fallback_secs,
                 backlog,
             } => self.register_round(panels, read_mode, fallback_secs, backlog),
+            ControlRequest::RoundStatus { round } => self.round_status(round),
+            ControlRequest::CancelRound { round } => self.cancel_round(round),
             ControlRequest::ReadMenu { panel } => match self.read_menu(panel) {
                 Ok(text) => ControlResponse::Panel { text },
                 Err(err) => ControlResponse::error(err),
@@ -143,15 +145,6 @@ impl Multiplexer {
             })
     }
 
-    /// A [`ControlResponse::Panels`] snapshot of `panels` — the immediate ack
-    /// `register_round` returns. A missing id is omitted (it is gone —
-    /// `list_panels` would not show it either).
-    pub(crate) fn panel_snapshot(&self, panels: &[PanelId]) -> ControlResponse {
-        ControlResponse::Panels {
-            panels: self.panel_summaries(panels),
-        }
-    }
-
     /// Type the same `text` into every panel in `panels` — a round's fan-out
     /// (`docs/design.md` §4). Each panel is driven exactly as the MCP
     /// `send_keys` tool would drive it: the text is written, a `\r` appended
@@ -179,7 +172,7 @@ impl Multiplexer {
     /// The [`PanelSummary`] for each id in `panels` that still exists, in the
     /// caller's order — missing ids are omitted (they were killed or the id
     /// was bad).
-    fn panel_summaries(&self, panels: &[PanelId]) -> Vec<PanelSummary> {
+    pub(crate) fn panel_summaries(&self, panels: &[PanelId]) -> Vec<PanelSummary> {
         let all = self.list_panels();
         panels
             .iter()

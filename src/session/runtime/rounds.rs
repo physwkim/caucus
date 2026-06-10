@@ -3,7 +3,7 @@ use crate::agent::derive_state::DerivedState;
 use crate::mcp::protocol::ControlResponse;
 use crate::mcp::{McpToolSurface, ReadPanelMode};
 use crate::panel::lifecycle::{Panel, PanelState};
-use crate::session::id::PanelId;
+use crate::session::id::{PanelId, RoundId};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -125,6 +125,12 @@ impl BlockedPrompt {
 /// them into the main worker's panel as a fresh turn. This is the caucus→main
 /// push that the pull-only MCP transport cannot do.
 pub(super) struct PendingRound {
+    /// Stable identity handed back at registration ([`ControlResponse::RoundRegistered`]),
+    /// the handle the main worker uses to poll ([`Multiplexer::round_status`]) or
+    /// cancel ([`Multiplexer::cancel_round`]) this round. Live-only: not persisted,
+    /// since a round never survives a restart (the sub-agent processes start
+    /// fresh — see [`Multiplexer::ingest_resumed_rounds`]).
+    id: RoundId,
     /// Panel ids in the round. Ids that no longer exist count as settled
     /// (see [`Multiplexer::round_settled`]).
     panels: Vec<PanelId>,
@@ -188,8 +194,11 @@ impl Multiplexer {
             .filter(|(id, tasks)| panels.contains(id) && !tasks.is_empty())
             .map(|(id, tasks)| (id, VecDeque::from(tasks)))
             .collect();
-        let ack = self.panel_snapshot(&panels);
+        let round_id = RoundId::new();
+        // Snapshot the panels for the ack before moving `panels` into the round.
+        let panels_snapshot = self.panel_summaries(&panels);
         self.pending_rounds.push(PendingRound {
+            id: round_id,
             panels,
             backlog,
             captured: HashMap::new(),
@@ -199,7 +208,72 @@ impl Multiplexer {
         // Durably shadow the new round so a quit/crash before delivery surfaces
         // it on resume instead of losing it silently.
         self.persist_pending_rounds();
-        ack
+        ControlResponse::RoundRegistered {
+            round_id,
+            panels: panels_snapshot,
+        }
+    }
+
+    /// Report the live status of a registered round by id: per-panel state
+    /// (working / draining backlog / settled / gone), remaining backlog count,
+    /// and seconds left on the fallback deadline. An unknown id is an error —
+    /// the round never existed, already delivered, or was cancelled/dropped.
+    ///
+    /// Round ids are live-only (not persisted across a restart), so a status
+    /// poll only ever resolves rounds the current caucus instance is watching.
+    pub(crate) fn round_status(&self, round_id: RoundId) -> ControlResponse {
+        let Some(round) = self.pending_rounds.iter().find(|r| r.id == round_id) else {
+            return ControlResponse::error(format!(
+                "no live round {round_id}: it never existed, already delivered, or was cancelled"
+            ));
+        };
+        let remaining = round
+            .fallback_deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        let mut out = format!(
+            "Round {round_id}: {} panel(s), {remaining}s until the fallback deadline\n",
+            round.panels.len()
+        );
+        for &id in &round.panels {
+            let backlog = round.backlog.get(&id).map(VecDeque::len).unwrap_or(0);
+            let (role, status) = match self.panels.iter().find(|p| p.id == id) {
+                None => ("(gone)", "gone".to_string()),
+                Some(p) => {
+                    let idle = !matches!(p.state(), PanelState::Working | PanelState::Spawning);
+                    let status = if idle && backlog == 0 {
+                        "settled".to_string()
+                    } else if idle {
+                        "draining backlog".to_string()
+                    } else {
+                        "working".to_string()
+                    };
+                    (p.role.as_str(), status)
+                }
+            };
+            out.push_str(&format!(
+                "  - {role} ({id}): {status}, {backlog} backlog task(s) remaining\n"
+            ));
+        }
+        ControlResponse::Panel { text: out }
+    }
+
+    /// Cancel a live registered round by id: stop watching it and drop its
+    /// pending caucus→main delivery. The panels are left exactly where they
+    /// are — work already in flight keeps running and any backlog stops being
+    /// fed; only the barrier that would inject the assembled report into the
+    /// main worker is removed. An unknown id is an error. The durable snapshot
+    /// is re-written so the cancellation survives a crash.
+    pub(crate) fn cancel_round(&mut self, round_id: RoundId) -> ControlResponse {
+        let before = self.pending_rounds.len();
+        self.pending_rounds.retain(|r| r.id != round_id);
+        if self.pending_rounds.len() == before {
+            return ControlResponse::error(format!(
+                "no live round {round_id}: it never existed, already delivered, or was already cancelled"
+            ));
+        }
+        self.persist_pending_rounds();
+        ControlResponse::Ok
     }
 
     /// Deliver one due, deliverable round to the main worker — the caucus→main
@@ -1066,6 +1140,7 @@ mod tests {
         backlog: HashMap<PanelId, VecDeque<String>>,
     ) -> PendingRound {
         PendingRound {
+            id: RoundId::new(),
             panels,
             backlog,
             captured,
@@ -1094,9 +1169,10 @@ mod tests {
         id
     }
 
-    /// `register_round` acks immediately with a panel snapshot and stashes a
-    /// `PendingRound` — it never blocks. An unknown id is omitted from the ack
-    /// (it would not appear in `list_panels` either). `read_mode` defaults to
+    /// `register_round` acks immediately with the round id and a panel snapshot
+    /// and stashes a `PendingRound` — it never blocks. An unknown id is omitted
+    /// from the ack (it would not appear in `list_panels` either). The acked
+    /// `round_id` matches the stashed round. `read_mode` defaults to
     /// `last_message`.
     #[tokio::test]
     async fn register_round_acks_and_stashes_a_pending_round() {
@@ -1105,12 +1181,85 @@ mod tests {
         let ghost = PanelId::new();
 
         let ack = mux.register_round(vec![ghost], None, Some(60), None);
-        match ack {
-            ControlResponse::Panels { panels } => assert!(panels.is_empty()),
-            other => panic!("expected an immediate Panels ack, got {other:?}"),
-        }
+        let acked_id = match ack {
+            ControlResponse::RoundRegistered { round_id, panels } => {
+                assert!(panels.is_empty());
+                round_id
+            }
+            other => panic!("expected an immediate RoundRegistered ack, got {other:?}"),
+        };
         assert_eq!(mux.pending_rounds.len(), 1, "round must be stashed");
+        assert_eq!(mux.pending_rounds[0].id, acked_id, "acked id must match");
         assert_eq!(mux.pending_rounds[0].read_mode, ReadPanelMode::LastMessage);
+    }
+
+    /// `round_status` reports a live round by its registered id: each panel's
+    /// state and remaining backlog. An unknown id is an error.
+    #[tokio::test]
+    async fn round_status_reports_a_live_round_and_errors_on_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let working = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        let idle = push_cat_panel(&mut mux, "writer", PanelState::Idle);
+
+        let round_id = match mux.register_round(vec![working, idle], None, Some(600), None) {
+            ControlResponse::RoundRegistered { round_id, .. } => round_id,
+            other => panic!("expected RoundRegistered, got {other:?}"),
+        };
+
+        match mux.round_status(round_id) {
+            ControlResponse::Panel { text } => {
+                assert!(text.contains("2 panel(s)"), "status: {text}");
+                assert!(text.contains("reviewer"), "status: {text}");
+                assert!(text.contains("working"), "status: {text}");
+                assert!(text.contains("writer"), "status: {text}");
+                assert!(text.contains("settled"), "status: {text}");
+            }
+            other => panic!("expected Panel status, got {other:?}"),
+        }
+
+        let ghost_round = RoundId::new();
+        assert!(
+            matches!(mux.round_status(ghost_round), ControlResponse::Error { .. }),
+            "an unknown round id must be an error"
+        );
+
+        mux.shutdown();
+    }
+
+    /// `cancel_round` drops a live round by id (leaving the panels alone) and
+    /// errors on an unknown id. After cancelling, the round no longer polls.
+    #[tokio::test]
+    async fn cancel_round_drops_a_live_round_and_errors_on_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let panel = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+
+        let round_id = match mux.register_round(vec![panel], None, Some(600), None) {
+            ControlResponse::RoundRegistered { round_id, .. } => round_id,
+            other => panic!("expected RoundRegistered, got {other:?}"),
+        };
+        assert_eq!(mux.pending_rounds.len(), 1);
+
+        // An unknown id is rejected and leaves the round in place.
+        assert!(
+            matches!(
+                mux.cancel_round(RoundId::new()),
+                ControlResponse::Error { .. }
+            ),
+            "an unknown round id must be an error"
+        );
+        assert_eq!(mux.pending_rounds.len(), 1, "unknown cancel must not drop");
+
+        // The real id drops the round; the panel itself is untouched.
+        assert!(matches!(mux.cancel_round(round_id), ControlResponse::Ok));
+        assert!(mux.pending_rounds.is_empty(), "round must be dropped");
+        assert!(
+            mux.panels().iter().any(|p| p.id == panel),
+            "cancel must not kill the panel"
+        );
+
+        mux.shutdown();
     }
 
     /// `register_round` stashes a backlog only for panels actually in the round

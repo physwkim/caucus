@@ -2,9 +2,10 @@
 //! (`docs/design.md` §0 #4, §9).
 //!
 //! The main worker (a Claude Code agent in one panel) drives every sub-agent
-//! panel through twelve MCP tools: `send_keys`, `send_key`, `broadcast`,
+//! panel through fourteen MCP tools: `send_keys`, `send_key`, `broadcast`,
 //! `ctrl_c`, `read_panel`, `spawn_role`, `kill_panel`, `restart_panel`,
-//! `list_panels`, `register_round`, `read_menu`, `select_option`.
+//! `list_panels`, `register_round`, `round_status`, `cancel_round`,
+//! `read_menu`, `select_option`.
 //!
 //! ## Architecture
 //!
@@ -25,7 +26,7 @@
 //! `rmcp` (1.7.0) resolves cleanly but its server surface is macro-driven and
 //! its transport runs an internal loop that resists deterministic unit
 //! testing. The MCP slice caucus needs is small — `initialize` / `tools/list`
-//! / `tools/call`, twelve tools — so [`jsonrpc`] implements exactly that, with
+//! / `tools/call`, fourteen tools — so [`jsonrpc`] implements exactly that, with
 //! a pure dispatch core. See that module's header for the rationale.
 
 pub mod control_client;
@@ -421,6 +422,48 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "round_status",
+            description: "Check on a round you registered, by the round id \
+                          register_round returned. Reports each panel's state \
+                          (working / draining backlog / settled / gone), its \
+                          remaining backlog count, and the seconds left on the \
+                          fallback deadline. Use this only if you must inspect a \
+                          round out-of-band — normally you end your turn after \
+                          register_round and caucus re-prompts you; do NOT \
+                          sleep-poll this. A round id caucus is no longer \
+                          watching (already delivered, or cancelled) is an error.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "round": {
+                        "type": "string",
+                        "description": "Round id (a ULID) from register_round."
+                    }
+                },
+                "required": ["round"]
+            }),
+        },
+        ToolDef {
+            name: "cancel_round",
+            description: "Cancel a round you registered, by the round id \
+                          register_round returned, so caucus stops watching it \
+                          and never delivers its report. The panels are left \
+                          exactly as they are — work already running keeps \
+                          running and any backlog simply stops being fed; this \
+                          does not kill or interrupt them. A round id caucus is \
+                          no longer watching is an error.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "round": {
+                        "type": "string",
+                        "description": "Round id (a ULID) from register_round."
+                    }
+                },
+                "required": ["round"]
+            }),
+        },
+        ToolDef {
             name: "read_menu",
             description: "Read the interactive selection menu currently shown in \
                           a panel — an AskUserQuestion-style chooser. Returns the \
@@ -486,6 +529,8 @@ mod tests {
                 "restart_panel",
                 "list_panels",
                 "register_round",
+                "round_status",
+                "cancel_round",
                 "read_menu",
                 "select_option",
             ]

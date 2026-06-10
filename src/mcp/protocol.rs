@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::role::spec::AgentCli;
-use crate::session::id::PanelId;
+use crate::session::id::{PanelId, RoundId};
 
 use super::{PanelSummary, ReadPanelMode};
 
@@ -107,6 +107,17 @@ pub enum ControlRequest {
         #[serde(default)]
         backlog: Option<HashMap<PanelId, Vec<String>>>,
     },
+    /// Report the live status of a registered round by its id: which panels
+    /// have settled vs are still working, the per-panel backlog remaining, and
+    /// the seconds left until the fallback deadline. Answered with a
+    /// [`ControlResponse::Panel`] (text), or an error if the id is unknown
+    /// (delivered, cancelled, or never registered).
+    RoundStatus { round: RoundId },
+    /// Cancel a registered round by its id: caucus stops watching it and never
+    /// delivers its report. The sub-agent panels keep running — only the round
+    /// watch is dropped. Answered with [`ControlResponse::Ok`], or an error if
+    /// the id is unknown.
+    CancelRound { round: RoundId },
     /// Read the interactive selection menu shown in a panel (if any) as
     /// readable text. Answered with a [`ControlResponse::Panel`].
     ReadMenu { panel: PanelId },
@@ -128,6 +139,13 @@ pub enum ControlResponse {
     Spawned { panel: PanelId },
     /// `list_panels` succeeded.
     Panels { panels: Vec<PanelSummary> },
+    /// `register_round` succeeded; `round_id` identifies the round for later
+    /// `round_status` / `cancel_round`, and `panels` is the same snapshot
+    /// `list_panels` returns for the round's panels.
+    RoundRegistered {
+        round_id: RoundId,
+        panels: Vec<PanelSummary>,
+    },
     /// The tool call failed; `message` is human-readable.
     Error { message: String },
 }
@@ -310,6 +328,34 @@ mod tests {
         assert!(line.contains("\"op\":\"restart_panel\""));
         let back: ControlRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn round_status_and_cancel_round_trip() {
+        for req in [
+            ControlRequest::RoundStatus {
+                round: RoundId::new(),
+            },
+            ControlRequest::CancelRound {
+                round: RoundId::new(),
+            },
+        ] {
+            let line = serde_json::to_string(&req).unwrap();
+            let back: ControlRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(req, back);
+        }
+    }
+
+    #[test]
+    fn round_registered_response_round_trips() {
+        let resp = ControlResponse::RoundRegistered {
+            round_id: RoundId::new(),
+            panels: vec![],
+        };
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains("round_registered"));
+        let back: ControlResponse = serde_json::from_str(&line).unwrap();
+        assert_eq!(resp, back);
     }
 
     #[test]

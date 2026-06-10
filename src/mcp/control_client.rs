@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::role::spec::AgentCli;
-use crate::session::id::PanelId;
+use crate::session::id::{PanelId, RoundId};
 
 use super::ReadPanelMode;
 use super::jsonrpc::{ToolHandler, ToolOutcome};
@@ -115,6 +115,16 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
             .ok_or_else(|| "missing string argument `panel`".to_string())?;
         raw.parse::<PanelId>()
             .map_err(|e| format!("invalid panel id `{raw}`: {e}"))
+    }
+
+    /// Pull a required round-id argument and parse it.
+    fn round(args: &Value) -> std::result::Result<RoundId, String> {
+        let raw = args
+            .get("round")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "missing string argument `round`".to_string())?;
+        raw.parse::<RoundId>()
+            .map_err(|e| format!("invalid round id `{raw}`: {e}"))
     }
 
     match name {
@@ -303,6 +313,12 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                 backlog,
             })
         }
+        "round_status" => Ok(ControlRequest::RoundStatus {
+            round: round(args)?,
+        }),
+        "cancel_round" => Ok(ControlRequest::CancelRound {
+            round: round(args)?,
+        }),
         "read_menu" => Ok(ControlRequest::ReadMenu {
             panel: panel(args)?,
         }),
@@ -331,6 +347,14 @@ fn render_response(resp: ControlResponse) -> ToolOutcome {
             Ok(text) => ToolOutcome::Ok(text),
             Err(err) => ToolOutcome::Err(format!("serialise panel list: {err}")),
         },
+        ControlResponse::RoundRegistered { round_id, panels } => {
+            // The round id is the handle the main worker polls/cancels with, so
+            // it leads the result; the panel snapshot follows as JSON.
+            match serde_json::to_string_pretty(&panels) {
+                Ok(text) => ToolOutcome::Ok(format!("round {round_id}\n{text}")),
+                Err(err) => ToolOutcome::Err(format!("serialise panel list: {err}")),
+            }
+        }
         ControlResponse::Error { message } => ToolOutcome::Err(message),
     }
 }
@@ -669,6 +693,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("invalid backlog panel id"), "got: {err}");
+    }
+
+    #[test]
+    fn build_round_status_request() {
+        let r = RoundId::new();
+        let req = build_request("round_status", &json!({"round": r.to_string()})).unwrap();
+        assert_eq!(req, ControlRequest::RoundStatus { round: r });
+    }
+
+    #[test]
+    fn build_cancel_round_request() {
+        let r = RoundId::new();
+        let req = build_request("cancel_round", &json!({"round": r.to_string()})).unwrap();
+        assert_eq!(req, ControlRequest::CancelRound { round: r });
+    }
+
+    #[test]
+    fn build_round_status_requires_round() {
+        let err = build_request("round_status", &json!({})).unwrap_err();
+        assert!(err.contains("missing string argument `round`"));
+    }
+
+    #[test]
+    fn build_round_status_rejects_bad_round_id() {
+        let err = build_request("cancel_round", &json!({"round": "not-a-ulid"})).unwrap_err();
+        assert!(err.contains("invalid round id"));
+    }
+
+    #[test]
+    fn render_round_registered_response_leads_with_round_id() {
+        let r = RoundId::new();
+        match render_response(ControlResponse::RoundRegistered {
+            round_id: r,
+            panels: vec![],
+        }) {
+            ToolOutcome::Ok(text) => {
+                assert!(text.starts_with(&format!("round {r}")), "got: {text}");
+            }
+            ToolOutcome::Err(_) => panic!("expected Ok"),
+        }
     }
 
     #[test]

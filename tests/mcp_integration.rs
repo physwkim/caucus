@@ -89,6 +89,8 @@ fn mcp_serve_lists_the_tools_over_stdio() {
             "restart_panel",
             "list_panels",
             "register_round",
+            "round_status",
+            "cancel_round",
             "read_menu",
             "select_option",
         ],
