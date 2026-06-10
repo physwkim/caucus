@@ -58,22 +58,41 @@ pub struct GcReport {
 /// `older_than` old that no live caucus is holding open. `now` is injected so
 /// the decision is testable.
 pub fn plan(repo: &Path, older_than: Duration, now: DateTime<Utc>) -> GcPlan {
-    let mut prunable = Vec::new();
-    let mut skipped_live = Vec::new();
-    for rec in record::discover(repo) {
+    let records = record::discover(repo);
+    let known: std::collections::HashSet<SessionId> = records.iter().map(|r| r.id).collect();
+
+    // Candidate sessions come from two sources, then pass one uniform filter:
+    //   1. Parseable records, aged by last activity (`session.json` mtime).
+    //   2. Orphan directories — a valid-id session dir whose `session.json` is
+    //      missing or corrupt, so `discover` cannot see it — aged by directory
+    //      mtime. These still consume disk and would otherwise leak forever.
+    let mut candidates: Vec<(SessionId, PathBuf, String, Duration)> = Vec::new();
+    for rec in records {
         let root = session_root(repo, rec.id);
         let age = now - last_active(&root, &rec);
+        candidates.push((rec.id, root, rec.topic, age));
+    }
+    for (id, root) in orphan_session_dirs(repo, &known) {
+        // No record to age by; fall back to the directory mtime. An unreadable
+        // mtime yields age 0 (kept) — never prune what we cannot assess.
+        let age = now - dir_mtime(&root).unwrap_or(now);
+        candidates.push((id, root, ORPHAN_TOPIC.to_string(), age));
+    }
+
+    let mut prunable = Vec::new();
+    let mut skipped_live = Vec::new();
+    for (id, root, topic, age) in candidates {
         if age < older_than {
             continue;
         }
         if SessionLock::is_held(&root) {
-            skipped_live.push(rec.id);
+            skipped_live.push(id);
             continue;
         }
         prunable.push(PrunableSession {
-            id: rec.id,
+            id,
             root,
-            topic: rec.topic,
+            topic,
             age,
         });
     }
@@ -81,6 +100,51 @@ pub fn plan(repo: &Path, older_than: Duration, now: DateTime<Utc>) -> GcPlan {
         prunable,
         skipped_live,
     }
+}
+
+/// Topic shown for an orphan directory pruned without a readable record.
+const ORPHAN_TOPIC: &str = "(unreadable session record)";
+
+/// Caucus session directories under `.caucus/sessions/` that `record::discover`
+/// did not yield — their `session.json` is missing or unparseable — but whose
+/// directory name is a valid [`SessionId`], so caucus created them. A directory
+/// whose name is not a session id is left alone: it is not caucus's to remove,
+/// honouring the module's safety boundary.
+fn orphan_session_dirs(
+    repo: &Path,
+    known: &std::collections::HashSet<SessionId>,
+) -> Vec<(SessionId, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(record::sessions_dir(repo)) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(id) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse::<SessionId>().ok())
+        else {
+            continue; // not a caucus session directory
+        };
+        if known.contains(&id) {
+            continue; // already covered by a parseable record
+        }
+        out.push((id, path));
+    }
+    out
+}
+
+/// A directory's own mtime — the activity timestamp for an orphan with no
+/// readable record.
+fn dir_mtime(path: &Path) -> Option<DateTime<Utc>> {
+    path.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .map(DateTime::<Utc>::from)
 }
 
 /// A session's last-activity time: the mtime of its `session.json`.
@@ -191,6 +255,27 @@ mod tests {
             .unwrap();
     }
 
+    /// Backdate a directory's own mtime to `when`.
+    fn set_dir_mtime(path: &Path, when: DateTime<Utc>) {
+        let dir = std::fs::File::open(path).unwrap();
+        dir.set_modified(std::time::SystemTime::from(when)).unwrap();
+    }
+
+    /// Create an orphan session directory `age` old: a valid-id dir whose
+    /// `session.json` is absent (`corrupt == false`) or unparseable, so
+    /// `record::discover` skips it. Returns its id.
+    fn write_orphan_dir(repo: &Path, age: Duration, corrupt: bool) -> SessionId {
+        let id = SessionId::new();
+        let root = session_root(repo, id);
+        std::fs::create_dir_all(&root).unwrap();
+        if corrupt {
+            std::fs::write(SessionRecord::path(&root), b"{ not valid json").unwrap();
+        }
+        // Backdate after the writes above, which would otherwise touch the dir.
+        set_dir_mtime(&root, Utc::now() - age);
+        id
+    }
+
     #[test]
     fn plan_selects_only_old_unlocked_sessions() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -221,6 +306,74 @@ mod tests {
             plan.prunable.is_empty(),
             "a session resumed within the window is fresh by mtime, not stale by created_at"
         );
+    }
+
+    #[test]
+    fn plan_prunes_an_old_orphan_directory_with_no_record() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        // A leaked session dir whose session.json never landed (crash mid-create).
+        let orphan = write_orphan_dir(repo, Duration::days(30), false);
+
+        let plan = plan(repo, Duration::days(7), Utc::now());
+        assert_eq!(plan.prunable.len(), 1, "the orphan dir is prunable");
+        assert_eq!(plan.prunable[0].id, orphan);
+        assert_eq!(plan.prunable[0].topic, ORPHAN_TOPIC);
+    }
+
+    #[test]
+    fn plan_prunes_an_old_orphan_directory_with_a_corrupt_record() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let orphan = write_orphan_dir(repo, Duration::days(30), true);
+
+        let plan = plan(repo, Duration::days(7), Utc::now());
+        assert_eq!(plan.prunable.len(), 1, "a corrupt record is still prunable");
+        assert_eq!(plan.prunable[0].id, orphan);
+    }
+
+    #[test]
+    fn plan_keeps_a_fresh_orphan_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let _recent = write_orphan_dir(repo, Duration::hours(1), false);
+
+        let plan = plan(repo, Duration::days(7), Utc::now());
+        assert!(
+            plan.prunable.is_empty(),
+            "a recently-touched orphan is within the retention window"
+        );
+    }
+
+    #[test]
+    fn plan_ignores_a_directory_that_is_not_a_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        // A non-session directory under sessions/ (name is not a session id).
+        let stray = record::sessions_dir(repo).join("scratch");
+        std::fs::create_dir_all(&stray).unwrap();
+        set_dir_mtime(&stray, Utc::now() - Duration::days(30));
+
+        let plan = plan(repo, Duration::days(7), Utc::now());
+        assert!(
+            plan.prunable.is_empty(),
+            "a non-session dir is not gc's to remove"
+        );
+        assert!(plan.skipped_live.is_empty());
+        assert!(stray.is_dir(), "the stray dir is untouched");
+    }
+
+    #[test]
+    fn execute_removes_an_orphan_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+        let id = write_orphan_dir(repo, Duration::days(30), true);
+        let root = session_root(repo, id);
+        assert!(root.is_dir());
+
+        let report = execute(&plan(repo, Duration::days(7), Utc::now()));
+        assert_eq!(report.removed, vec![id]);
+        assert!(!root.exists(), "the orphan directory is reclaimed");
     }
 
     #[test]

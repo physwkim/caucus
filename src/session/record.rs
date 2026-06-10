@@ -118,8 +118,9 @@ impl SessionRecord {
     }
 }
 
-/// `<repo>/.caucus/sessions/`.
-fn sessions_dir(repo: &Path) -> PathBuf {
+/// `<repo>/.caucus/sessions/`. The directory `caucus gc` enumerates to find
+/// both parseable records and orphaned session directories.
+pub(crate) fn sessions_dir(repo: &Path) -> PathBuf {
     repo.join(".caucus").join("sessions")
 }
 
