@@ -8,11 +8,13 @@
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use super::TurnSignal;
+use crate::line_io::{CappedLine, MAX_IPC_LINE_BYTES, read_capped_line};
 
 /// Errors from the turn-signal server.
 #[derive(Debug, Error)]
@@ -112,10 +114,13 @@ async fn accept_loop(listener: UnixListener, tx: mpsc::UnboundedSender<TurnSigna
 /// A malformed line is dropped (the connection continues); a closed receiver
 /// ends the connection early.
 async fn handle_connection(stream: UnixStream, tx: mpsc::UnboundedSender<TurnSignal>) {
-    let mut lines = BufReader::new(stream).lines();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
     loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
+        // Bounded read: a peer cannot OOM the listener with a newline-less
+        // flood (`line_io`). A line over the cap desyncs the stream, so we stop.
+        match read_capped_line(&mut reader, &mut line, MAX_IPC_LINE_BYTES).await {
+            Ok(CappedLine::Line) => {
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -132,8 +137,12 @@ async fn handle_connection(stream: UnixStream, tx: mpsc::UnboundedSender<TurnSig
                     }
                 }
             }
+            Ok(CappedLine::TooLong) => {
+                warn!("turn-signal line exceeded {MAX_IPC_LINE_BYTES} bytes; closing connection");
+                return;
+            }
             // Clean EOF or a read error: the client is done with us.
-            Ok(None) | Err(_) => return,
+            Ok(CappedLine::Eof) | Err(_) => return,
         }
     }
 }

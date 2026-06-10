@@ -16,7 +16,9 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
+
+use crate::line_io::{CappedLine, MAX_IPC_LINE_BYTES, read_capped_line};
 
 /// JSON-RPC protocol version string carried in every message.
 const JSONRPC_VERSION: &str = "2.0";
@@ -210,28 +212,50 @@ impl<H: ToolHandler> McpDispatch<H> {
 pub async fn serve_stdio<H: ToolHandler>(mut dispatch: McpDispatch<H>) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let mut lines = BufReader::new(stdin).lines();
+    let mut reader = BufReader::new(stdin);
+    let mut line = String::new();
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => dispatch.handle(req),
-            Err(err) => {
-                // Parse error: reply with a JSON-RPC parse error (null id).
-                Some(Response::err(
+    loop {
+        // Bounded read: a client cannot OOM the server with a newline-less
+        // flood (`line_io`).
+        match read_capped_line(&mut reader, &mut line, MAX_IPC_LINE_BYTES).await? {
+            CappedLine::Eof => break,
+            CappedLine::TooLong => {
+                // An over-cap request leaves the stream desynchronised; emit a
+                // parse error and stop rather than resume into the leftover.
+                let response = Response::err(
                     Value::Null,
                     -32700,
-                    format!("parse error: {err}"),
-                ))
+                    format!("request exceeds {MAX_IPC_LINE_BYTES} bytes"),
+                );
+                let mut out = serde_json::to_string(&response)?;
+                out.push('\n');
+                stdout.write_all(out.as_bytes()).await?;
+                stdout.flush().await?;
+                break;
             }
-        };
-        if let Some(response) = response {
-            let mut out = serde_json::to_string(&response)?;
-            out.push('\n');
-            stdout.write_all(out.as_bytes()).await?;
-            stdout.flush().await?;
+            CappedLine::Line => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let response = match serde_json::from_str::<Request>(&line) {
+                    Ok(req) => dispatch.handle(req),
+                    Err(err) => {
+                        // Parse error: reply with a JSON-RPC parse error (null id).
+                        Some(Response::err(
+                            Value::Null,
+                            -32700,
+                            format!("parse error: {err}"),
+                        ))
+                    }
+                };
+                if let Some(response) = response {
+                    let mut out = serde_json::to_string(&response)?;
+                    out.push('\n');
+                    stdout.write_all(out.as_bytes()).await?;
+                    stdout.flush().await?;
+                }
+            }
         }
     }
     Ok(())

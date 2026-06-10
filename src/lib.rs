@@ -12,6 +12,7 @@ pub mod gc;
 pub mod hook;
 pub mod init;
 pub mod input;
+pub mod line_io;
 pub mod mcp;
 pub mod panel;
 pub mod pty;

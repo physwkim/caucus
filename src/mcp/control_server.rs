@@ -22,12 +22,13 @@
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use super::protocol::{ControlRequest, ControlResponse};
+use crate::line_io::{CappedLine, MAX_IPC_LINE_BYTES, read_capped_line};
 
 /// One queued control request plus the channel its [`ControlResponse`] is
 /// returned on. The accept task creates these; the multiplexer consumes them.
@@ -126,15 +127,27 @@ async fn handle_connection(stream: UnixStream, tx: mpsc::UnboundedSender<Control
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
+    // Bounded read: a peer cannot OOM the listener with a newline-less flood
+    // (`line_io`). Over-cap requests are answered with an error, not buffered.
     let mut line = String::new();
-    match reader.read_line(&mut line).await {
-        Ok(0) => return, // client closed without sending
-        Ok(_) => {}
+    let line = match read_capped_line(&mut reader, &mut line, MAX_IPC_LINE_BYTES).await {
+        Ok(CappedLine::Eof) => return, // client closed without sending
+        Ok(CappedLine::Line) => line,
+        Ok(CappedLine::TooLong) => {
+            send_response(
+                &mut write_half,
+                ControlResponse::error(format!(
+                    "control request exceeds {MAX_IPC_LINE_BYTES} bytes"
+                )),
+            )
+            .await;
+            return;
+        }
         Err(err) => {
             warn!(error = %err, "control socket read failed");
             return;
         }
-    }
+    };
 
     let response = match serde_json::from_str::<ControlRequest>(line.trim_end()) {
         Ok(request) => {
@@ -157,6 +170,12 @@ async fn handle_connection(stream: UnixStream, tx: mpsc::UnboundedSender<Control
         Err(err) => ControlResponse::error(format!("malformed control request: {err}")),
     };
 
+    send_response(&mut write_half, response).await;
+}
+
+/// Serialise `response` and write it as one newline-terminated line. Logs and
+/// drops on a serialise or write error — the connection is closing regardless.
+async fn send_response(write_half: &mut (impl AsyncWrite + Unpin), response: ControlResponse) {
     let mut out = match serde_json::to_string(&response) {
         Ok(out) => out,
         Err(err) => {
@@ -176,6 +195,7 @@ mod tests {
     use super::*;
     use crate::mcp::control_client::roundtrip;
     use crate::session::id::PanelId;
+    use tokio::io::AsyncBufReadExt;
 
     /// Dropping the server removes its socket file, so it does not accumulate
     /// in the temp dir across runs.
