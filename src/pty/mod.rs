@@ -90,9 +90,15 @@ pub enum PtyError {
 /// Invariant I-5).
 pub struct Pty {
     size: PtySize,
-    /// Master side of the PTY pair. Owns the fd; used for `resize` and to
-    /// hand out the writer / reader. Dropping it closes the master fd.
-    master: Box<dyn MasterPty + Send>,
+    /// Master side of the PTY pair. Owns the master fd; used for `resize`.
+    /// `None` after `kill` drops it. Held as an `Option` so `kill` can close it
+    /// while the `Pty` lives on: dropping the *last* master-side reference (this
+    /// handle plus the reader's and writer's cloned fds) closes the master
+    /// device, which makes a child wedged in a PTY write fail with `EIO` and
+    /// exit — macOS does not interrupt a flow-controlled PTY write even with
+    /// `SIGKILL`, so this is what lets `kill` reap such a child instead of
+    /// leaving it wedged until the `Pty` is finally dropped.
+    master: Option<Box<dyn MasterPty + Send>>,
     /// The child agent process. `kill` tears it down.
     child: Box<dyn Child + Send + Sync>,
     /// Sender to the writer thread (`docs/design.md` §0 #11). `write` enqueues
@@ -101,7 +107,10 @@ pub struct Pty {
     /// drop ends the writer thread).
     writer_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Receiving end of the reader thread's channel; `read` drains it.
-    rx: Receiver<Vec<u8>>,
+    /// `None` after `kill` drops it: dropping the receiver makes a reader thread
+    /// parked in `send` on a full channel observe `Err` and exit, so the join in
+    /// `kill` cannot hang the event loop.
+    rx: Option<Receiver<Vec<u8>>>,
     /// Join handle for the reader thread; `kill` joins it.
     reader: Option<JoinHandle<()>>,
     /// Join handle for the writer thread; `kill` joins it.
@@ -198,10 +207,10 @@ impl Pty {
 
         Ok(Self {
             size,
-            master: pair.master,
+            master: Some(pair.master),
             child,
             writer_tx: Some(writer_tx),
-            rx,
+            rx: Some(rx),
             reader: Some(reader),
             writer: Some(writer_thread),
         })
@@ -223,8 +232,10 @@ impl Pty {
         // Drain every queued chunk; any error ends the drain — `Empty` means
         // nothing pending, `Disconnected` means the reader thread finished
         // after a clean child exit. Both surface as an empty (or partial) read.
-        while let Ok(chunk) = self.rx.try_recv() {
-            out.extend_from_slice(&chunk);
+        if let Some(rx) = &self.rx {
+            while let Ok(chunk) = rx.try_recv() {
+                out.extend_from_slice(&chunk);
+            }
         }
         Ok(out)
     }
@@ -262,35 +273,96 @@ impl Pty {
             pixel_width: 0,
             pixel_height: 0,
         };
-        self.master
-            .resize(size)
-            .map_err(|e| PtyError::Open(e.to_string()))?;
+        if let Some(master) = &self.master {
+            master
+                .resize(size)
+                .map_err(|e| PtyError::Open(e.to_string()))?;
+        }
         self.size = size;
         Ok(())
     }
 
-    /// Kill the child process and tear down the PTY.
+    /// Kill the child process and tear down the PTY in bounded time.
     ///
-    /// Single owner of PTY destruction (Invariant I-5). Killing the child
-    /// closes its end of the PTY; the reader thread then sees EOF and exits,
-    /// so the join completes without a leaked thread or fd.
+    /// Single owner of PTY destruction (Invariant I-5). A naive
+    /// `child.kill()` then `wait` then join leaves three failure modes open;
+    /// teardown closes each so the event loop never hangs and nothing leaks:
+    ///
+    /// 1. **The reader is parked in `send` on a full channel.** When the event
+    ///    loop stopped draining while a panel firehosed output, the reader
+    ///    thread blocks in `send`; killing the child does not wake it. Dropping
+    ///    the receiver makes that `send` return `Err`, so the thread exits and
+    ///    the join completes.
+    /// 2. **The child is wedged in a PTY write.** A firehosing child whose
+    ///    output filled the master buffer blocks in `write`; macOS does not
+    ///    interrupt that write even for `SIGKILL`, so neither the signal nor
+    ///    `wait` makes progress. Closing every master-side fd makes the write
+    ///    fail with `EIO`, which is the only thing that unwedges the child.
+    /// 3. **Descendants outlive the direct child.** The agent (`claude`) spawns
+    ///    its own children — MCP servers, language servers, helpers — that share
+    ///    the child's process group. `portable-pty`'s `kill` (which escalates
+    ///    `SIGHUP` to `SIGKILL` after a grace period) signals only the direct
+    ///    child, so those descendants survive as orphans after every teardown.
+    ///    The child is a session leader (`portable-pty` calls `setsid`), so its
+    ///    process-group id equals its pid; one `SIGKILL` to that whole group
+    ///    reaps them. On Linux a surviving descendant also holds the slave open,
+    ///    so reaping the group is additionally what lets the reader see EOF;
+    ///    macOS revokes the controlling terminal when the session leader exits,
+    ///    so there the group kill is purely leak prevention.
     pub(crate) fn kill(&mut self) -> Result<(), PtyError> {
-        // Killing the child is idempotent enough for a kill path: an
-        // already-exited child yields an error we deliberately ignore so a
-        // second `kill` (or `kill` after natural exit) still tears down.
+        // 1. Graceful: `SIGHUP` via portable-pty lets a well-behaved agent exit
+        //    on its own. An already-exited child yields an error we ignore so a
+        //    second `kill` (or `kill` after natural exit) still tears down.
         let _ = self.child.kill();
-        let _ = self.child.wait();
-        // Drop the writer Sender so the writer thread's `recv` returns `Err`
-        // and it exits. If it was blocked in `write_all` on a non-reading
-        // child, the child kill above closed the PTY, so that write now fails
-        // and unwinds the thread — either way the join below completes.
+
+        // 2. Forceful, whole-group: `child.kill()` above already escalates
+        //    `SIGHUP` to `SIGKILL` on the *single* child pid, but never signals
+        //    the child's descendants (failure mode 3). `killpg` to the group the
+        //    child leads reaps every descendant so none leaks; on Linux it is
+        //    also what closes their slave handles so the reader can reach EOF.
+        //    Best-effort: `ESRCH`/`EPERM` on an already-dead or unsignalable
+        //    group is fine. caucus is unaffected — the group is the child's own
+        //    (it called `setsid`), not caucus's.
+        #[cfg(unix)]
+        if let Some(pid) = self.child.process_id() {
+            let pid = pid as libc::pid_t;
+            // SAFETY: best-effort `SIGKILL` to the child's process group; the
+            // return value is deliberately ignored.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+
+        // 3. Unwedge and tear down the I/O threads, closing every master-side fd
+        //    so a child blocked in a PTY write (the firehose case `SIGKILL` does
+        //    not interrupt) fails with `EIO` and exits:
+        //    a. Drop the reader's receiver so a reader parked in `send` on a full
+        //       channel returns `Err`, breaks, and drops its master-reader clone.
+        self.rx = None;
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+        //    b. Drop the writer Sender so the writer thread exits and drops its
+        //       master writer.
         self.writer_tx = None;
         if let Some(handle) = self.writer.take() {
             let _ = handle.join();
         }
-        if let Some(handle) = self.reader.take() {
-            // Reader exits on EOF once the child's PTY fd is closed.
-            let _ = handle.join();
+        //    c. Drop our own master handle — the last master-side reference. The
+        //       child's slave write now fails with `EIO` and the child exits, so
+        //       the reap below collects it here rather than leaving it wedged
+        //       until the `Pty` itself is dropped.
+        self.master = None;
+
+        // 4. Reap so the child is not left a zombie. Bounded: every path above
+        //    drives the child toward exit, but the event loop must never block
+        //    indefinitely on `wait`, so poll `try_wait` for a short window and
+        //    give up (leaving the OS to reap) rather than hang.
+        for _ in 0..50 {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
         }
         Ok(())
     }
@@ -441,6 +513,85 @@ mod tests {
         );
 
         pty.kill().unwrap();
+    }
+
+    #[test]
+    fn kill_completes_when_the_reader_channel_is_full() {
+        // A child firehoses output while the event loop never drains, so the
+        // reader thread fills the bounded channel and parks in `send`. `kill`
+        // must still return promptly: it drops the receiver, which makes that
+        // `send` return `Err` so the reader thread exits and the join completes.
+        // Without the drop the join hangs forever and freezes the multiplexer.
+        //
+        // `exec head …` so the child *is* `head` (no forked shell that could
+        // outlive SIGHUP and keep the PTY open — that orphan case is covered by
+        // the process-group teardown test). 64 MiB ≫ the ~8 MiB channel bound,
+        // so with no consumer draining the reader is parked in `send` — not
+        // waiting on `read` — when we kill.
+        let mut cmd = PtyCommand::new("/bin/sh");
+        cmd.args = vec!["-c".into(), "exec head -c 67108864 /dev/zero".into()];
+        let mut pty = Pty::spawn(&cmd, 80, 24).unwrap();
+        // Let the reader fill the channel and block on `send`; we never read.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let start = Instant::now();
+        pty.kill().unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "kill blocked for {elapsed:?}; dropping the receiver must unblock the reader"
+        );
+    }
+
+    #[test]
+    fn kill_reaps_the_childs_whole_process_group() {
+        // The agent the child runs spawns its own children — MCP servers,
+        // language servers, helpers — that share the child's process group (the
+        // child is the session leader, since `portable-pty` calls `setsid`).
+        // `portable-pty`'s kill signals only the direct child, so without a
+        // group-wide SIGKILL those descendants survive as orphans after every
+        // panel teardown. `kill` must reap the whole group.
+        //
+        // The descendant here both ignores SIGHUP and `exec`s `sleep`, so
+        // neither the SIGHUP `portable-pty` sends nor the SIGHUP the kernel
+        // delivers when the session leader exits (and the controlling terminal
+        // is revoked) can stop it — only the uncatchable group SIGKILL does. A
+        // unique sleep interval lets us detect a survivor by command line.
+        let mut cmd = PtyCommand::new("/bin/sh");
+        cmd.args = vec![
+            "-c".into(),
+            "(trap '' HUP; exec sleep 31337) & echo started".into(),
+        ];
+        let mut pty = Pty::spawn(&cmd, 80, 24).unwrap();
+        std::thread::sleep(Duration::from_millis(200)); // let the descendant install its trap
+
+        let start = Instant::now();
+        pty.kill().unwrap();
+        let elapsed = start.elapsed();
+
+        // Let the group SIGKILL land before we look for survivors.
+        std::thread::sleep(Duration::from_millis(300));
+        let found = std::process::Command::new("pgrep")
+            .args(["-f", "sleep 31337"])
+            .output()
+            .unwrap();
+        let survivors = String::from_utf8_lossy(&found.stdout);
+        let survivors = survivors.trim();
+        // Best-effort cleanup so a failed assertion never leaks the process on.
+        for pid in survivors.split_whitespace() {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid])
+                .status();
+        }
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "kill blocked for {elapsed:?}; teardown must stay bounded"
+        );
+        assert!(
+            survivors.is_empty(),
+            "descendant {survivors:?} survived kill; the child's process group was not reaped"
+        );
     }
 
     #[test]
