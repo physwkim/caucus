@@ -32,6 +32,39 @@ const COMPOSE_GRACE: Duration = Duration::from_secs(5);
 /// at most this often, so the safety net never floods its context every tick.
 const STRANDED_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Per-captured-turn byte budget in a delivered round report
+/// ([`Multiplexer::assemble_round_report`]). A turn body over this is head/tail
+/// truncated in the report and its full text spilled to
+/// `<session_root>/round-spills/`. Without it a `scrollback` read (up to 10k
+/// rows × the panel width per panel) concatenated across a multi-panel round
+/// would inflate the report into a multi-hundred-KB bracketed paste injected
+/// into the main panel's PTY — a size that risks the backend's paste-handling
+/// pathologies. Split evenly between the head and tail kept around the elision.
+const MAX_ROUND_BODY_BYTES: usize = 16 * 1024;
+
+/// Largest char-boundary byte index `<= idx` in `s` (stable stand-in for the
+/// unstable `str::floor_char_boundary`). Truncating a `&str` at this index
+/// never splits a UTF-8 scalar.
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Smallest char-boundary byte index `>= idx` in `s` (stable stand-in for the
+/// unstable `str::ceil_char_boundary`). Slicing `&s[idx..]` from this index
+/// never splits a UTF-8 scalar.
+fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx.min(s.len())
+}
+
 /// A round caucus is watching on the main worker's behalf
 /// ([`Multiplexer::poll_pending_rounds`]).
 ///
@@ -755,12 +788,13 @@ impl Multiplexer {
                     out.push_str(&format!("\n### task {}\n", i + 1));
                 }
                 let body = body.trim();
-                out.push_str(if body.is_empty() {
-                    "(no output captured)\n"
+                if body.is_empty() {
+                    out.push_str("(no output captured)\n");
                 } else {
-                    body
-                });
-                if !body.is_empty() {
+                    // Bound each turn's body so a `scrollback` read cannot
+                    // inflate the injected paste without limit; the full text is
+                    // spilled to disk and pointed at.
+                    out.push_str(&self.bound_round_body(id, body));
                     out.push('\n');
                 }
             }
@@ -777,6 +811,56 @@ impl Multiplexer {
             }
         }
         out
+    }
+
+    /// Bound one captured turn's body for the injected round report. A body
+    /// within [`MAX_ROUND_BODY_BYTES`] is returned verbatim; a larger one is
+    /// head/tail truncated around an elision marker and its **full** text
+    /// spilled to `<session_root>/round-spills/`, so nothing is lost and the
+    /// report points the main worker at the complete output. Truncation lands
+    /// on UTF-8 char boundaries so the returned string is always valid.
+    fn bound_round_body(&self, panel: PanelId, body: &str) -> String {
+        if body.len() <= MAX_ROUND_BODY_BYTES {
+            return body.to_string();
+        }
+        let half = MAX_ROUND_BODY_BYTES / 2;
+        let head_end = floor_char_boundary(body, half);
+        let tail_start = ceil_char_boundary(body, body.len() - half);
+        let elided = tail_start.saturating_sub(head_end);
+        let pointer = match self.spill_round_body(panel, body) {
+            Some(path) => format!("full output spilled to {}", path.display()),
+            None => "full output spill failed".to_string(),
+        };
+        format!(
+            "{}\n…[{elided} bytes elided — {pointer}]…\n{}",
+            &body[..head_end],
+            &body[tail_start..]
+        )
+    }
+
+    /// Write a too-large round-report body verbatim to
+    /// `<session_root>/round-spills/<panel>-<hash>.txt` and return its path.
+    /// The file name carries a content hash so identical bodies map to one file
+    /// (idempotent) and distinct bodies never clobber each other — a report's
+    /// pointer always resolves to exactly the text it elided. Best-effort: a
+    /// failure is logged and yields `None` (the report then says so).
+    fn spill_round_body(&self, panel: PanelId, body: &str) -> Option<std::path::PathBuf> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        body.hash(&mut h);
+        let dir = self.session.root_dir.join("round-spills");
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            warn!(error = %err, "round-spill dir create failed");
+            return None;
+        }
+        let path = dir.join(format!("{panel}-{:016x}.txt", h.finish()));
+        match std::fs::write(&path, body) {
+            Ok(()) => Some(path),
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "round-spill write failed");
+                None
+            }
+        }
     }
 
     /// Render a panel's visible grid viewport as text, one row per line.
@@ -1953,6 +2037,82 @@ mod tests {
             "no persisted rounds means no notice and no injected turn",
         );
 
+        mux.shutdown();
+    }
+
+    /// An oversized captured-turn body is head/tail truncated in the report and
+    /// its full text spilled to `round-spills/`, so a `scrollback` read cannot
+    /// inflate the injected paste without bound. Boundary: a body twice the cap.
+    #[tokio::test]
+    async fn bound_round_body_truncates_and_spills_oversized_output() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let pid = PanelId::new();
+        let big = "x".repeat(MAX_ROUND_BODY_BYTES * 2);
+
+        let bounded = mux.bound_round_body(pid, &big);
+        assert!(
+            bounded.len() < big.len(),
+            "an oversized body must shrink: {} vs {}",
+            bounded.len(),
+            big.len()
+        );
+        assert!(
+            bounded.len() <= MAX_ROUND_BODY_BYTES + 256,
+            "the kept head+tail+marker must stay near the cap: {}",
+            bounded.len()
+        );
+        assert!(bounded.contains("elided"), "must mark the elision");
+        assert!(
+            bounded.contains("round-spills"),
+            "must point at the spill file"
+        );
+
+        // The spill file holds the *full* body — nothing is lost.
+        let dir = mux.session.root_dir.join("round-spills");
+        let spilled: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(spilled.len(), 1, "one spill file written");
+        assert_eq!(
+            std::fs::read_to_string(spilled[0].path()).unwrap().len(),
+            big.len(),
+            "the spill preserves the entire body"
+        );
+
+        mux.shutdown();
+    }
+
+    /// A body within the cap is returned verbatim and writes no spill file —
+    /// the common case pays nothing.
+    #[tokio::test]
+    async fn bound_round_body_leaves_small_output_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let small = "hello caucus";
+
+        assert_eq!(mux.bound_round_body(PanelId::new(), small), small);
+        assert!(
+            !mux.session.root_dir.join("round-spills").exists(),
+            "a within-cap body must not spill"
+        );
+
+        mux.shutdown();
+    }
+
+    /// Truncation lands on UTF-8 char boundaries: a body of multi-byte scalars
+    /// over the cap still yields a valid `String` (the test would panic on an
+    /// invalid slice). Guards the head/tail boundary math.
+    #[tokio::test]
+    async fn bound_round_body_truncates_on_char_boundaries() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        // '한' is 3 bytes in UTF-8; repeat past the cap so both cut points land
+        // inside multi-byte runs.
+        let big = "한".repeat(MAX_ROUND_BODY_BYTES);
+        let bounded = mux.bound_round_body(PanelId::new(), &big);
+        assert!(bounded.contains("elided"), "oversized body must be elided");
+        // Reaching here without a slice panic proves both cuts were on
+        // boundaries; assert the kept text is intact Hangul, never a mojibake.
+        assert!(bounded.starts_with('한'));
         mux.shutdown();
     }
 }
