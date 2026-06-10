@@ -369,21 +369,37 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
         }
 
         // A worktree-backed panel: re-attach a worktree on its persisted
-        // branch. The directory was removed on the prior shutdown; the branch
-        // (with the agent's commits) persisted.
+        // branch. The directory was removed on a clean shutdown; the branch
+        // (with the agent's commits) persisted. A *crash* leaves the prior
+        // directory and its git registration in place, so reconcile any stale
+        // caucus-owned checkout of the branch before attaching.
+        //
+        // A worktree-marked panel MUST resume inside a worktree — never in the
+        // repo root with full Edit/Bash, which would silently strip the
+        // isolation the user is relying on. So if attach fails (branch gone /
+        // unrecoverable), create a fresh isolated worktree instead; only if
+        // even that fails is the panel skipped, never run un-isolated.
         let worktree_path = match &panel.worktree_branch {
             Some(branch) => {
                 let path = resume_worktree_path(&record.repo_path, record.id, panel);
+                crate::worktree::manager::reconcile_stale(&record.repo_path, branch);
                 match crate::worktree::manager::attach(&record.repo_path, &path, branch) {
-                    Ok(handle) => Some((handle.path, branch.clone())),
+                    Ok(handle) => Some((handle.path, handle.branch)),
                     Err(err) => {
-                        // Branch gone (or path collision): spawn fresh rather
-                        // than abort the whole resume.
                         warn!(
                             role = %panel.role, branch = %branch, error = %format!("{err}"),
-                            "worktree branch unavailable on resume — spawning panel without it"
+                            "worktree branch unrecoverable on resume — creating a fresh isolated worktree"
                         );
-                        None
+                        match mux.create_role_worktree(&panel.role) {
+                            Ok(h) => Some((h.path, h.branch)),
+                            Err(e2) => {
+                                warn!(
+                                    role = %panel.role, error = %format!("{e2}"),
+                                    "could not create a fresh worktree — skipping this panel to preserve isolation"
+                                );
+                                continue;
+                            }
+                        }
                     }
                 }
             }

@@ -221,6 +221,81 @@ pub(crate) fn attach(
     })
 }
 
+/// Reconcile stale caucus-owned worktree state before a resume [`attach`].
+///
+/// An unclean exit (crash, `kill -9`) leaves a panel's worktree directory
+/// *and* its `git worktree` registration in place, so a later `attach` of the
+/// same `branch` to a fresh path fails with "branch already checked out". A
+/// clean exit removes the directory but can leave a dangling registration.
+/// This frees the branch for re-attach: `git worktree prune` drops
+/// registrations whose directory is gone, then any worktree still checked out
+/// on `branch` *under `<repo>/.caucus/worktrees/`* (i.e. caucus-owned, never a
+/// user's own worktree) is force-removed.
+///
+/// Best-effort: failures are logged, not returned — a genuine problem
+/// surfaces from the `attach` that follows.
+pub(crate) fn reconcile_stale(repo_root: &Path, branch: &str) {
+    // Drop registrations for directories that no longer exist (clean-exit case).
+    let _ = run_git(repo_root, &["worktree".to_string(), "prune".to_string()]);
+
+    // Free the branch if a *caucus-owned* stale worktree still holds it. A
+    // checkout outside `.caucus/worktrees/` is the user's own and left alone.
+    // Compare canonicalized paths: git reports the real path, while a plain
+    // join keeps the symlinked form (e.g. macOS `/var` → `/private/var`), so a
+    // naive `starts_with` would miss every caucus worktree on such systems.
+    let caucus_dir = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf())
+        .join(".caucus")
+        .join("worktrees");
+    if let Some(stale) = worktree_checkout_of(repo_root, branch)
+        && stale
+            .canonicalize()
+            .unwrap_or_else(|_| stale.clone())
+            .starts_with(&caucus_dir)
+    {
+        let args = vec![
+            "worktree".to_string(),
+            "remove".to_string(),
+            "--force".to_string(),
+            stale.display().to_string(),
+        ];
+        if let Err(err) = run_git(repo_root, &args) {
+            tracing::warn!(
+                branch = %branch, path = %stale.display(), error = %format!("{err}"),
+                "failed to remove a stale caucus worktree on resume"
+            );
+        }
+    }
+}
+
+/// The worktree directory currently checked out on `branch`, if any, parsed
+/// from `git worktree list --porcelain`. Returns `None` when the branch is not
+/// checked out anywhere (including when the branch no longer exists).
+fn worktree_checkout_of(repo_root: &Path, branch: &str) -> Option<PathBuf> {
+    let out = run_git(
+        repo_root,
+        &[
+            "worktree".to_string(),
+            "list".to_string(),
+            "--porcelain".to_string(),
+        ],
+    )
+    .ok()?;
+    // Porcelain output is per-worktree blocks: a `worktree <path>` line followed
+    // by (for a branch checkout) a `branch refs/heads/<name>` line.
+    let target = format!("refs/heads/{branch}");
+    let mut cur_path: Option<PathBuf> = None;
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            cur_path = Some(PathBuf::from(p));
+        } else if line.strip_prefix("branch ") == Some(target.as_str()) {
+            return cur_path;
+        }
+    }
+    None
+}
+
 /// Run a git subcommand in `repo` and return trimmed stdout. Stderr is folded
 /// into the error so the caller can classify it.
 pub(crate) fn run_git(repo: &Path, args: &[String]) -> Result<String, WorktreeError> {
@@ -252,6 +327,99 @@ pub(crate) fn run_git(repo: &Path, args: &[String]) -> Result<String, WorktreeEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A crash-survivor stale worktree (the branch still checked out at the
+    /// prior directory) blocks a fresh `attach` of that branch with "already
+    /// checked out". `reconcile_stale` force-removes the *caucus-owned* stale
+    /// checkout so the re-attach succeeds — the path that keeps a resumed
+    /// worktree panel isolated instead of silently dropping it into the repo
+    /// root.
+    #[test]
+    fn reconcile_stale_frees_a_caucus_owned_branch_for_reattach() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .expect("run git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "caucus-test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        // A worktree W1 on a fresh branch under .caucus/worktrees — the
+        // survivor a crash would leave behind (dir + git registration intact).
+        let req = WorktreeRequest {
+            repo_root: repo.to_path_buf(),
+            session_id: SessionId::new(),
+            role: "backend".into(),
+            branch: Some("caucus/test/backend-1".into()),
+            base_ref: None,
+            name_override: Some("s-backend-1".into()),
+        };
+        let w1 = create(&req).unwrap();
+        let branch = w1.branch.clone();
+
+        // A fresh attach of the same branch to a new path fails: the branch is
+        // already checked out at W1.
+        let p2 = repo
+            .join(".caucus")
+            .join("worktrees")
+            .join("s-backend-1-resume");
+        assert!(
+            attach(repo, &p2, &branch).is_err(),
+            "the branch is still checked out at the stale worktree"
+        );
+
+        // Reconcile frees the caucus-owned checkout, so the re-attach works.
+        reconcile_stale(repo, &branch);
+        let w2 = attach(repo, &p2, &branch).expect("re-attach after reconcile");
+        assert_eq!(w2.branch, branch);
+        assert!(p2.exists(), "the re-attached worktree directory exists");
+    }
+
+    /// `reconcile_stale` must not touch a checkout outside `.caucus/worktrees/`
+    /// — that is the user's own worktree, not caucus's to remove.
+    #[test]
+    fn reconcile_stale_leaves_a_user_owned_worktree_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .expect("run git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "caucus-test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        // A user worktree *outside* .caucus/worktrees on a branch.
+        let user_wt = tmp.path().join("user-wt");
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "feature/keep-me",
+                &user_wt.display().to_string(),
+            ])
+            .output()
+            .expect("git worktree add");
+        assert!(out.status.success(), "setup worktree add failed");
+
+        reconcile_stale(repo, "feature/keep-me");
+        assert!(
+            user_wt.exists(),
+            "a user-owned worktree must not be removed by reconcile"
+        );
+    }
 
     #[test]
     fn default_path_layout() {
