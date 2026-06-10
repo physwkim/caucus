@@ -68,6 +68,19 @@ pub struct PanelSummary {
     /// [`crate::agent::derive_state::DerivedState::as_str`].
     pub state: String,
     pub agent_cli: AgentCli,
+    /// Filesystem path of the panel's dedicated git worktree, if it was
+    /// spawned with one (`spawn_role(worktree=true)`); `None` for a panel that
+    /// shares the main repo checkout. This is the directory the sub-agent's
+    /// commits land in.
+    pub worktree_path: Option<String>,
+    /// Git branch the panel's worktree checked out, if any — the branch name
+    /// is generated internally at spawn, so this is the only way the main
+    /// worker learns it to merge/diff the sub-agent's work. `None` without a
+    /// worktree.
+    pub branch: Option<String>,
+    /// Model override the panel runs under (`spawn_role(model=...)`), if one
+    /// was set; `None` when the panel uses the backend's default model.
+    pub model: Option<String>,
 }
 
 /// Errors surfaced by MCP tool calls.
@@ -278,7 +291,12 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
         ToolDef {
             name: "list_panels",
             description: "List every live panel with its role and derived state \
-                          (working / idle / blocked_* / exited).",
+                          (working / idle / blocked_* / exited). Each row also \
+                          carries the panel's worktree_path and branch (where a \
+                          worktree sub-agent's commits land — the branch name is \
+                          generated internally, so this is how you find it to \
+                          merge/diff) and its model override, all null for a \
+                          panel without them.",
             input_schema: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {

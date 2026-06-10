@@ -112,12 +112,13 @@ impl McpToolSurface for Multiplexer {
         self.panels
             .iter()
             .map(|p| {
+                let manifest = self.manifests.get(&p.id);
                 // Prefer the manifest's derived_state (turn-signal fed); fall
                 // back to the coarse panel-state label before the first turn.
                 // A live grid-detected prompt (selection menu or `[y/n]`)
                 // overlays its blocked state — no Stop hook fires while one is
                 // open, so the signal-derived state alone would read `working`.
-                let (state, agent_cli) = match self.manifests.get(&p.id) {
+                let (state, agent_cli) = match manifest {
                     Some(m) => {
                         let st = Self::overlay_blocked_state(
                             m.derived_state(),
@@ -132,6 +133,14 @@ impl McpToolSurface for Multiplexer {
                     role: p.role.clone(),
                     state,
                     agent_cli,
+                    // The manifest holds the live worktree path and the model
+                    // override; the branch lives in `worktree_branches` (it
+                    // outlives the path, which is removed on shutdown).
+                    worktree_path: manifest
+                        .and_then(|m| m.worktree_path.as_ref())
+                        .map(|path| path.display().to_string()),
+                    branch: self.worktree_branches.get(&p.id).cloned(),
+                    model: manifest.and_then(|m| m.model.clone()),
                 }
             })
             .collect()
@@ -514,6 +523,45 @@ mod tests {
         assert_eq!(Multiplexer::menu_nav_bytes(2, 0), b"\x1b[A\x1b[A\r");
         // Already on target: just Enter, no arrows.
         assert_eq!(Multiplexer::menu_nav_bytes(1, 1), b"\r");
+    }
+
+    /// `list_panels` surfaces a worktree-backed panel's path, branch, and
+    /// model — the orchestration data the main worker needs to merge a
+    /// sub-agent's commits, since the branch name is generated internally at
+    /// spawn and is otherwise undiscoverable. A plain panel reports `None` for
+    /// the path/branch. Spawning needs a real agent CLI; the test is skipped
+    /// (not failed) when none is on PATH.
+    #[tokio::test]
+    async fn list_panels_reports_worktree_path_branch_and_model() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Ok(panel) = mux.spawn_panel("reviewer", None, None, None) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+
+        // A plain (non-worktree) panel: no path, no branch.
+        let plain = McpToolSurface::list_panels(&mux);
+        assert_eq!(plain[0].worktree_path, None);
+        assert_eq!(plain[0].branch, None);
+
+        // Simulate the worktree-backed spawn bookkeeping: the manifest carries
+        // the live worktree path and the model override; the branch lives in
+        // the side map (it outlives the path across shutdown/resume).
+        let wt = tmp.path().join("wt");
+        let mf = mux.manifests.get_mut(&panel).unwrap();
+        mf.worktree_path = Some(wt.clone());
+        mf.model = Some("opus".to_string());
+        mux.worktree_branches
+            .insert(panel, "caucus/reviewer-1".to_string());
+
+        let s = McpToolSurface::list_panels(&mux);
+        assert_eq!(s[0].worktree_path, Some(wt.display().to_string()));
+        assert_eq!(s[0].branch.as_deref(), Some("caucus/reviewer-1"));
+        assert_eq!(s[0].model.as_deref(), Some("opus"));
+
+        mux.shutdown();
     }
 
     /// `render_menu` lists the options and marks the highlighted one.
