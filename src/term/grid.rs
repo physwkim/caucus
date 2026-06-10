@@ -584,8 +584,23 @@ impl Grid {
             return;
         }
         // Flatten into a single index stream so multi-arg colours
-        // (`38;5;n`, `38;2;r;g;b`) can be consumed across iterator items.
-        let flat: Vec<u16> = params.iter().flat_map(|p| p.iter().copied()).collect();
+        // (`38;5;n`, `38;2;r;g;b`) can be consumed across iterator items —
+        // without the per-escape heap `Vec` a `collect()` would allocate on
+        // every coloured glyph run. vte caps a CSI at 32 parameter values, so a
+        // fixed stack buffer holds any real SGR; an (impossible) overflow just
+        // stops flattening, which only drops trailing params.
+        let mut buf = [0u16; 32];
+        let mut len = 0usize;
+        'flatten: for sub in params.iter() {
+            for &v in sub {
+                if len == buf.len() {
+                    break 'flatten;
+                }
+                buf[len] = v;
+                len += 1;
+            }
+        }
+        let flat = &buf[..len];
         let mut i = 0;
         while i < flat.len() {
             let p = flat[i];
