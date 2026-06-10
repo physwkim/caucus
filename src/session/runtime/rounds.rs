@@ -1821,40 +1821,35 @@ mod tests {
         mux.shutdown();
     }
 
-    /// Killing a panel keeps `main_panel_id` an accurate invariant — it points
-    /// to a live panel or is None. Boundary: killing a non-main panel leaves it
-    /// intact; killing main clears it, so a due round then *drops* (reaching the
-    /// no-main drop arm) instead of re-queuing forever — the leak this guards.
-    ///
-    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    /// The main worker panel cannot be killed through the destruction owner,
+    /// mirroring `restart_panel`'s guard: it owns the MCP control channel and is
+    /// the round-delivery target, so `kill_panel` over MCP / the control socket
+    /// must not tear it down. A non-main panel is killed normally and leaves
+    /// `main_panel_id` intact; killing main is refused and main stays live.
     #[tokio::test]
-    async fn kill_panel_clears_main_panel_id_only_for_main() {
+    async fn kill_panel_refuses_the_main_worker_but_kills_others() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        let Ok(main) = mux.spawn_panel("reviewer", None, None, None) else {
-            eprintln!("skipping: no agent CLI on PATH");
-            return;
-        };
-        let other = mux.spawn_panel("reviewer", None, None, None).unwrap();
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        let other = push_cat_panel(&mut mux, "other", PanelState::Idle);
         mux.main_panel_id = Some(main);
 
-        // Killing a non-main panel must not disturb main_panel_id.
+        // Killing a non-main panel succeeds and does not disturb main_panel_id.
         mux.kill_panel(other).unwrap();
+        assert!(!mux.panels().iter().any(|p| p.id == other));
         assert_eq!(mux.main_panel_id, Some(main));
 
-        // A round on a non-existent id is due immediately (a missing id counts
-        // as settled). Killing main clears the id, so the next poll drops it.
-        mux.register_round(vec![PanelId::new()], None, Some(600), None);
-        mux.kill_panel(main).unwrap();
+        // Killing main is refused; main_panel_id and the live panel are intact.
+        let err = mux.kill_panel(main).unwrap_err();
         assert!(
-            mux.main_panel_id.is_none(),
-            "killing main must clear main_panel_id"
+            err.to_string()
+                .contains("cannot kill the main worker panel"),
+            "got: {err}"
         );
-
-        mux.poll_pending_rounds();
+        assert_eq!(mux.main_panel_id, Some(main));
         assert!(
-            mux.pending_rounds.is_empty(),
-            "a due round must drop once main is gone, not re-queue forever"
+            mux.panels().iter().any(|p| p.id == main),
+            "the refused kill leaves the main panel running"
         );
 
         mux.shutdown();

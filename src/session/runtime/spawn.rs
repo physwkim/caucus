@@ -319,7 +319,18 @@ impl Multiplexer {
     /// itself lives in `Multiplexer::detach_panel`; `kill_panel` is the
     /// disposition that *deletes* the detached worktree. [`Multiplexer::restart_panel`]
     /// is the other disposition — it *reuses* the worktree in place.
+    ///
+    /// The MAIN worker panel cannot be killed here, mirroring
+    /// [`Multiplexer::restart_panel`]: it owns the MCP control channel and is
+    /// caucus's round-delivery target, so tearing it down through the tool
+    /// surface (`kill_panel` over MCP / the control socket) would orphan the
+    /// caller and wedge round delivery. Guarding the single owner protects every
+    /// kill entry at once. Whole-session teardown does not pass through here —
+    /// `shutdown` kills all panels, main included, via `lifecycle::kill`.
     pub fn kill_panel(&mut self, panel_id: PanelId) -> Result<()> {
+        if self.main_panel_id == Some(panel_id) {
+            anyhow::bail!("cannot kill the main worker panel");
+        }
         let detached = self.detach_panel(panel_id)?;
         self.retire_worktree(panel_id, detached.worktree_path);
         Ok(())
