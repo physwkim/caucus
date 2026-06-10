@@ -32,15 +32,26 @@ const COMPOSE_GRACE: Duration = Duration::from_secs(5);
 /// at most this often, so the safety net never floods its context every tick.
 const STRANDED_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// Per-captured-turn byte budget in a delivered round report
+/// Per-captured-turn byte budget in the **on-disk** round report
 /// ([`Multiplexer::assemble_round_report`]). A turn body over this is head/tail
 /// truncated in the report and its full text spilled to
 /// `<session_root>/round-spills/`. Without it a `scrollback` read (up to 10k
 /// rows × the panel width per panel) concatenated across a multi-panel round
-/// would inflate the report into a multi-hundred-KB bracketed paste injected
-/// into the main panel's PTY — a size that risks the backend's paste-handling
-/// pathologies. Split evenly between the head and tail kept around the elision.
+/// would inflate even the spilled report file without bound. (The report is no
+/// longer injected into the main PTY — finding 24: the main worker is handed
+/// the teaser-bounded [`Multiplexer::render_round_summary`] that points at the
+/// report file. This bound keeps the file itself readable.) Split evenly
+/// between the head and tail kept around the elision.
 const MAX_ROUND_BODY_BYTES: usize = 16 * 1024;
+
+/// Per-panel teaser budget in the *injected* round-delivery summary
+/// ([`Multiplexer::render_round_summary`]). The full assembled report is
+/// spilled to `<session_root>/rounds/<round_id>.md` and the main worker is
+/// handed only a compact summary that points at it — so the bracketed paste
+/// caucus injects into the main PTY stays small (per-panel teaser, not the
+/// whole report). Each panel contributes at most this many bytes of its latest
+/// output as a teaser; the rest is in the report file.
+const ROUND_SUMMARY_TEASER_BYTES: usize = 1024;
 
 /// Largest char-boundary byte index `<= idx` in `s` (stable stand-in for the
 /// unstable `str::floor_char_boundary`). Truncating a `&str` at this index
@@ -63,6 +74,51 @@ fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
         idx += 1;
     }
     idx.min(s.len())
+}
+
+/// Trim `body` to at most `budget` bytes for the injected round summary,
+/// landing on a UTF-8 char boundary and marking how much was elided. The full
+/// text lives in the spilled report file, so the teaser only needs to be
+/// enough for the main worker to judge whether to open it.
+fn summary_teaser(body: &str, budget: usize) -> String {
+    if body.len() <= budget {
+        return body.to_string();
+    }
+    let end = floor_char_boundary(body, budget);
+    format!(
+        "{}\n…[{} more byte(s) in the report file]…",
+        &body[..end],
+        body.len() - end
+    )
+}
+
+/// The shared opening line of both the full round report and the injected
+/// summary — panel count plus a fallback note when the deadline forced
+/// delivery before every panel settled.
+fn round_header(panel_count: usize, all_settled: bool) -> String {
+    format!(
+        "[caucus] Round complete — {panel_count} panel(s){}.\n",
+        if all_settled {
+            ""
+        } else {
+            " (fallback deadline reached; some panels did not finish)"
+        }
+    )
+}
+
+/// Append the per-panel trailing markers shared by the full report and the
+/// summary: a "still working" note for a panel the fallback deadline caught
+/// mid-turn, and a count of backlog tasks that never ran.
+fn push_round_panel_footer(out: &mut String, c: &RoundPanelContribution) {
+    if matches!(c.state, PanelState::Working | PanelState::Spawning) {
+        out.push_str("⏳ still working — did not finish within the fallback window.\n");
+    }
+    if c.pending_backlog > 0 {
+        out.push_str(&format!(
+            "⏳ {} queued backlog task(s) were not run before the fallback window closed.\n",
+            c.pending_backlog
+        ));
+    }
 }
 
 /// What a round panel is visibly waiting on, detected from its rendered grid
@@ -121,9 +177,10 @@ impl BlockedPrompt {
 /// Unlike a control request (each answered immediately), a round carries no
 /// reply channel — `register_round` already acked at registration. Instead
 /// the event loop watches it each tick and, once every panel has settled (or
-/// `fallback_deadline` passes), assembles the panels' results and *injects*
-/// them into the main worker's panel as a fresh turn. This is the caucus→main
-/// push that the pull-only MCP transport cannot do.
+/// `fallback_deadline` passes), assembles the panels' results, spills the full
+/// report to `<session_root>/rounds/<id>.md`, and *injects* a compact summary
+/// pointing at that file into the main worker's panel as a fresh turn. This is
+/// the caucus→main push that the pull-only MCP transport cannot do.
 pub(super) struct PendingRound {
     /// Stable identity handed back at registration ([`ControlResponse::RoundRegistered`]),
     /// the handle the main worker uses to poll ([`Multiplexer::round_status`]) or
@@ -157,6 +214,24 @@ pub(super) struct PendingRound {
     /// Wall-clock instant past which the round is delivered regardless of
     /// state — the safety net, marking still-`working` panels unfinished.
     fallback_deadline: Instant,
+}
+
+/// One round panel's contribution, collected once and rendered into both the
+/// full report ([`Multiplexer::render_round_report`]) and the injected summary
+/// ([`Multiplexer::render_round_summary`]) — so the two always show the *same*
+/// captured text (the per-panel `read_panel` happens exactly once, in
+/// [`Multiplexer::round_panel_contribution`]).
+struct RoundPanelContribution {
+    /// The panel's role label.
+    role: String,
+    /// The panel's coarse state at delivery time.
+    state: PanelState,
+    /// Every finished-turn body in order: the captured backlog turns, then the
+    /// final live read for a settled panel (a still-working panel contributes
+    /// only its captured turns — never a live read of a mid-turn panel).
+    bodies: Vec<String>,
+    /// Queued backlog tasks not yet run (non-zero only on a fallback delivery).
+    pending_backlog: usize,
 }
 
 impl Multiplexer {
@@ -358,10 +433,18 @@ impl Multiplexer {
                 continue;
             }
             if deliverable && !delivered {
+                // Spill the full per-panel report to disk and inject only a
+                // compact summary that points at it — never the whole
+                // unstructured report into the main PTY (a multi-panel round's
+                // results can run to hundreds of KB; one giant bracketed paste
+                // risks the backend's paste-handling pathologies).
                 let report = self.assemble_round_report(&round, all_settled);
+                let report_path = self.spill_round_report(round.id, &report);
+                let summary =
+                    self.render_round_summary(&round, all_settled, report_path.as_deref());
                 // `deliverable` implies a live, idle main panel exists.
                 let mid = main_id.expect("deliverable implies a main panel");
-                match McpToolSurface::send_keys(self, mid, &report, true) {
+                match McpToolSurface::send_keys(self, mid, &summary, true) {
                     Ok(()) => {
                         delivered = true;
                         changed = true;
@@ -871,56 +954,69 @@ impl Multiplexer {
         (pick, open_set)
     }
 
-    /// Assemble a round's delivery message: a self-describing block per panel
-    /// — role + current state, plus its result(s). A panel that ran a single
-    /// task contributes that one output read via `read_mode`; a panel that ran
-    /// a multi-task `backlog` contributes every finished turn — the outputs
+    /// Collect one round panel's contribution — its role, state, finished-turn
+    /// bodies (captured backlog turns, then the final live read for a settled
+    /// panel), and un-run backlog count — for the report and summary to render.
+    /// Returns `None` when the panel id is gone (killed). The single site of
+    /// the per-panel `read_panel`, so the full report and the injected summary
+    /// always render the same captured text.
+    fn round_panel_contribution(
+        &self,
+        round: &PendingRound,
+        id: PanelId,
+    ) -> Option<RoundPanelContribution> {
+        let panel = self.panels.iter().find(|p| p.id == id)?;
+        let state = panel.state();
+        // A still-working panel (fallback delivery) contributes only what it
+        // already finished — never a live read of a mid-turn panel.
+        let still_working = matches!(state, PanelState::Working | PanelState::Spawning);
+        // Every finished backlog turn, in feed order, captured the moment
+        // before its successor was fed.
+        let mut bodies = round.captured.get(&id).cloned().unwrap_or_default();
+        if !still_working {
+            bodies.push(
+                self.read_panel(id, round.read_mode)
+                    .unwrap_or_else(|e| format!("(could not read panel: {e})")),
+            );
+        }
+        Some(RoundPanelContribution {
+            role: panel.role.clone(),
+            state,
+            bodies,
+            pending_backlog: round.backlog.get(&id).map(VecDeque::len).unwrap_or(0),
+        })
+    }
+
+    /// Assemble a round's **full** report: a self-describing block per panel —
+    /// role + current state, plus its result(s). A panel that ran a single task
+    /// contributes that one output read via `read_mode`; a panel that ran a
+    /// multi-task `backlog` contributes every finished turn — the outputs
     /// captured in `captured` (each prior turn, in feed order) followed by its
     /// final turn read live — under `### task N` headers so the main worker can
     /// tell them apart. A panel still `working` when the fallback deadline
-    /// forced delivery contributes whatever it already finished (its captured
-    /// turns) plus an "unfinished" marker, never a live read of a mid-turn
-    /// panel. A panel id that no longer exists is reported as gone. This is the
-    /// text injected into the main worker's panel as a fresh turn.
+    /// forced delivery contributes whatever it already finished plus an
+    /// "unfinished" marker. A panel id that no longer exists is reported as
+    /// gone. This is the report spilled to disk
+    /// ([`Multiplexer::spill_round_report`]) and the one appended to
+    /// `dropped-rounds.log` when there is no main worker to deliver to; the
+    /// main worker is handed the compact [`Multiplexer::render_round_summary`]
+    /// that points at it, never this whole block.
     fn assemble_round_report(&self, round: &PendingRound, all_settled: bool) -> String {
-        let mut out = format!(
-            "[caucus] Round complete — {} panel(s){}.\n",
-            round.panels.len(),
-            if all_settled {
-                ""
-            } else {
-                " (fallback deadline reached; some panels did not finish)"
-            }
-        );
+        let mut out = round_header(round.panels.len(), all_settled);
         for &id in &round.panels {
-            let Some(panel) = self.panels.iter().find(|p| p.id == id) else {
+            let Some(c) = self.round_panel_contribution(round, id) else {
                 out.push_str(&format!("\n## panel {id} — gone (killed)\n"));
                 continue;
             };
-            let state = panel.state();
             out.push_str(&format!(
                 "\n## panel {id} (role: {}) — {}\n",
-                panel.role,
-                state.label()
+                c.role,
+                c.state.label()
             ));
-
-            // Every finished backlog turn, in feed order, captured the moment
-            // before its successor was fed.
-            let done = round.captured.get(&id).map(Vec::as_slice).unwrap_or(&[]);
-            // A settled panel adds its final turn (read live) after the
-            // captured turns; a still-working panel contributes only what it
-            // already finished, then the unfinished marker below — never a
-            // live read of a mid-turn panel.
-            let still_working = matches!(state, PanelState::Working | PanelState::Spawning);
-            let final_body = (!still_working).then(|| {
-                self.read_panel(id, round.read_mode)
-                    .unwrap_or_else(|e| format!("(could not read panel: {e})"))
-            });
-
             // One output stays header-less, identical to the pre-backlog
             // report; two or more get `### task N` headers.
-            let total = done.len() + final_body.is_some() as usize;
-            for (i, body) in done.iter().chain(final_body.as_ref()).enumerate() {
+            let total = c.bodies.len();
+            for (i, body) in c.bodies.iter().enumerate() {
                 if total > 1 {
                     out.push_str(&format!("\n### task {}\n", i + 1));
                 }
@@ -929,28 +1025,91 @@ impl Multiplexer {
                     out.push_str("(no output captured)\n");
                 } else {
                     // Bound each turn's body so a `scrollback` read cannot
-                    // inflate the injected paste without limit; the full text is
-                    // spilled to disk and pointed at.
+                    // inflate even the on-disk report without limit; the full
+                    // text is spilled to `round-spills/` and pointed at.
                     out.push_str(&self.bound_round_body(id, body));
                     out.push('\n');
                 }
             }
-
-            if still_working {
-                out.push_str("⏳ still working — did not finish within the fallback window.\n");
-            }
-            if let Some(pending) = round.backlog.get(&id).map(VecDeque::len)
-                && pending > 0
-            {
-                out.push_str(&format!(
-                    "⏳ {pending} queued backlog task(s) were not run before the fallback window closed.\n"
-                ));
-            }
+            push_round_panel_footer(&mut out, &c);
         }
         out
     }
 
-    /// Bound one captured turn's body for the injected round report. A body
+    /// Assemble the **compact** round-delivery message injected into the main
+    /// worker's panel: a one-line-per-panel summary (role, state, output count)
+    /// with a short teaser of each panel's latest output, plus a pointer to the
+    /// full report spilled to disk. This is the structural fix for "never inject
+    /// the whole unstructured report into the main PTY": a multi-panel round's
+    /// full results can run to hundreds of KB, and pasting that in one bracketed
+    /// paste risks the backend's paste-handling pathologies. The main worker
+    /// reads `report_path` when a teaser is not enough; `report_path` is `None`
+    /// only when the spill itself failed.
+    fn render_round_summary(
+        &self,
+        round: &PendingRound,
+        all_settled: bool,
+        report_path: Option<&std::path::Path>,
+    ) -> String {
+        let mut out = round_header(round.panels.len(), all_settled);
+        match report_path {
+            Some(path) => out.push_str(&format!(
+                "Full per-panel report: {} — read that file for each panel's complete output.\n",
+                path.display()
+            )),
+            None => out.push_str(
+                "(the full report could not be written to disk; the teasers below are all that is available)\n",
+            ),
+        }
+        for &id in &round.panels {
+            let Some(c) = self.round_panel_contribution(round, id) else {
+                out.push_str(&format!("\n## panel {id} — gone (killed)\n"));
+                continue;
+            };
+            out.push_str(&format!(
+                "\n## panel {id} (role: {}) — {} · {} output(s)\n",
+                c.role,
+                c.state.label(),
+                c.bodies.len()
+            ));
+            // Teaser: the panel's latest output (final live read, else last
+            // captured), trimmed to the teaser budget — the full text is in the
+            // report file.
+            let latest = c.bodies.last().map(|b| b.trim()).unwrap_or("");
+            if latest.is_empty() {
+                out.push_str("(no output captured)\n");
+            } else {
+                out.push_str(&summary_teaser(latest, ROUND_SUMMARY_TEASER_BYTES));
+                out.push('\n');
+            }
+            push_round_panel_footer(&mut out, &c);
+        }
+        out
+    }
+
+    /// Write a round's full assembled report to
+    /// `<session_root>/rounds/<round_id>.md` and return its path, so the
+    /// caucus→main delivery can inject a compact summary that points at it
+    /// rather than the whole report. The file name is the round's id (a ULID),
+    /// unique per round. Best-effort: a failure is logged and yields `None`, and
+    /// the summary then says the spill failed.
+    fn spill_round_report(&self, round_id: RoundId, report: &str) -> Option<std::path::PathBuf> {
+        let dir = self.session.root_dir.join("rounds");
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            warn!(error = %err, "round report dir create failed");
+            return None;
+        }
+        let path = dir.join(format!("{round_id}.md"));
+        match std::fs::write(&path, report) {
+            Ok(()) => Some(path),
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "round report write failed");
+                None
+            }
+        }
+    }
+
+    /// Bound one captured turn's body for the **on-disk** round report. A body
     /// within [`MAX_ROUND_BODY_BYTES`] is returned verbatim; a larger one is
     /// head/tail truncated around an elision marker and its **full** text
     /// spilled to `<session_root>/round-spills/`, so nothing is lost and the
@@ -1445,6 +1604,101 @@ mod tests {
         mux.shutdown();
     }
 
+    /// Finding 24: a round's full results are no longer injected wholesale into
+    /// the main PTY. `spill_round_report` writes the complete report to
+    /// `rounds/<round_id>.md`, and `render_round_summary` injects only a compact
+    /// summary that points at that file. A small body is teased inline so a
+    /// trivial round needs no file read. (A `Working` panel + a captured turn
+    /// stands in for a finished sub-agent turn without a live read of the
+    /// hermetic cat panel, which has no real output.)
+    #[tokio::test]
+    async fn round_summary_points_at_a_spilled_full_report() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let panel = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        let captured = HashMap::from([(panel, vec!["the full finding body".to_string()])]);
+        let round = pending_round(
+            vec![panel],
+            ReadPanelMode::LastMessage,
+            captured,
+            HashMap::new(),
+        );
+
+        let report = mux.assemble_round_report(&round, false);
+        let path = mux
+            .spill_round_report(round.id, &report)
+            .expect("report spilled");
+        assert!(
+            path.starts_with(mux.session.root_dir.join("rounds")),
+            "report must land in rounds/: {}",
+            path.display()
+        );
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("the full finding body"),
+            "the disk report must hold the full body: {on_disk}"
+        );
+
+        let summary = mux.render_round_summary(&round, false, Some(path.as_path()));
+        assert!(
+            summary.contains("Round complete"),
+            "summary header missing: {summary}"
+        );
+        assert!(
+            summary.contains(&path.display().to_string()),
+            "summary must point at the report file: {summary}"
+        );
+        assert!(
+            summary.contains("the full finding body"),
+            "a small body must be teased inline: {summary}"
+        );
+
+        mux.shutdown();
+    }
+
+    /// A body far over the teaser budget is bounded in the *injected* summary
+    /// (with an elision marker) while the spilled report file keeps it in full
+    /// — the whole point of finding 24: the main PTY gets a teaser, the file
+    /// gets the body.
+    #[tokio::test]
+    async fn round_summary_teases_a_large_body_kept_full_in_the_report() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let panel = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        let big = "x".repeat(ROUND_SUMMARY_TEASER_BYTES * 4);
+        let captured = HashMap::from([(panel, vec![big.clone()])]);
+        let round = pending_round(
+            vec![panel],
+            ReadPanelMode::LastMessage,
+            captured,
+            HashMap::new(),
+        );
+
+        let report = mux.assemble_round_report(&round, false);
+        let path = mux.spill_round_report(round.id, &report).unwrap();
+        let summary = mux.render_round_summary(&round, false, Some(path.as_path()));
+
+        // The injected summary is bounded — it must not inline the whole body.
+        assert!(
+            summary.len() < big.len(),
+            "summary ({} bytes) must be far smaller than the body ({} bytes)",
+            summary.len(),
+            big.len()
+        );
+        assert!(
+            summary.contains("more byte(s) in the report file"),
+            "the teaser must mark the elision: {summary}"
+        );
+        // The spilled report keeps the full body (under F6's 16K per-body bound).
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains(&big),
+            "the report file must hold the full body"
+        );
+
+        mux.shutdown();
+    }
+
     /// A due round with no main panel to deliver to is dropped — it would
     /// otherwise be stranded forever. (A non-existent id counts as settled, so
     /// the round is due immediately.)
@@ -1635,6 +1889,14 @@ mod tests {
             mux.panels().iter().find(|p| p.id == main).unwrap().state(),
             PanelState::Working,
             "delivery injects a turn into the main panel",
+        );
+        assert!(
+            mux.session
+                .root_dir
+                .join("rounds")
+                .read_dir()
+                .is_ok_and(|mut d| d.next().is_some()),
+            "delivering a round spills its full report to rounds/",
         );
 
         mux.shutdown();

@@ -166,10 +166,16 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
    등록된 라운드의 패널이 모두 settle했는지 확인한다.
 
 4. 라운드의 패널이 모두 idle이 되면 caucus가 각 패널 결과(read_mode 기본
-   last_message, since_last_turn도 가능)를 모아 **main worker 패널에 새 turn으로
-   주입**한다 — pull-only MCP가 못 하는 caucus→main push다(§8.5). main worker가
-   idle이고 사용자가 입력 중이 아닐 때 전달된다. 안전망: fallback_secs가 지나면
-   미완 패널을 "still working"으로 표시해 부분 결과를 전달한다.
+   last_message, since_last_turn도 가능)를 모아 **전체 보고서를
+   `<session_root>/rounds/<round-id>.md`에 spill**하고, 그 파일을 가리키는
+   **압축 요약**(패널별 한 줄 상태 + 최신 출력 teaser + 보고서 경로)만 main
+   worker 패널에 새 turn으로 주입한다 — pull-only MCP가 못 하는 caucus→main
+   push다(§8.5). 전체 보고서를 통째로 PTY에 붙여 넣지 않는 이유: 다중 패널
+   라운드 결과는 수백 KB까지 가고, 그 크기의 단일 bracketed paste는 백엔드의
+   paste 처리 병리를 건드린다. main worker는 teaser로 부족하면 보고서 파일을
+   Read한다. main worker가 idle이고 사용자가 입력 중이 아닐 때 전달된다. 안전망:
+   fallback_secs가 지나면 미완 패널을 "still working"으로 표시해 부분 결과를
+   전달한다.
 
 5. main worker가 주입된 라운드 결과를 받고 판단:
      - 라운드 더  → 새 안건으로 broadcast + register_round 반복
