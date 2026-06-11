@@ -306,11 +306,25 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                 }
                 None => None,
             };
+            let selection_hints = match args.get("selection_hints") {
+                Some(v) => Some(
+                    serde_json::from_value::<super::protocol::SelectionPolicy>(v.clone()).map_err(
+                        |e| {
+                            format!(
+                                "`selection_hints` must be an object with optional \
+                                 `prefer` / `avoid` string arrays: {e}"
+                            )
+                        },
+                    )?,
+                ),
+                None => None,
+            };
             Ok(ControlRequest::RegisterRound {
                 panels,
                 read_mode,
                 fallback_secs,
                 backlog,
+                selection_hints,
             })
         }
         "round_status" => Ok(ControlRequest::RoundStatus {
@@ -617,8 +631,50 @@ mod tests {
                 read_mode: Some(super::super::ReadPanelMode::SinceLastTurn),
                 fallback_secs: Some(90),
                 backlog: None,
+                selection_hints: None,
             }
         );
+    }
+
+    #[test]
+    fn build_register_round_parses_selection_hints() {
+        let a = PanelId::new();
+        let req = build_request(
+            "register_round",
+            &json!({
+                "panels": [a.to_string()],
+                "selection_hints": {
+                    "prefer": ["structural", "at source"],
+                    "avoid": ["broad refactor"]
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::RegisterRound {
+                panels: vec![a],
+                read_mode: None,
+                fallback_secs: None,
+                backlog: None,
+                selection_hints: Some(super::super::protocol::SelectionPolicy {
+                    prefer: vec!["structural".to_string(), "at source".to_string()],
+                    avoid: vec!["broad refactor".to_string()],
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn build_register_round_rejects_bad_selection_hints() {
+        let a = PanelId::new();
+        // `prefer` must be an array of strings, not a bare string.
+        let err = build_request(
+            "register_round",
+            &json!({"panels": [a.to_string()], "selection_hints": {"prefer": "structural"}}),
+        )
+        .unwrap_err();
+        assert!(err.contains("selection_hints"), "got: {err}");
     }
 
     #[test]
@@ -632,6 +688,7 @@ mod tests {
                 read_mode: None,
                 fallback_secs: None,
                 backlog: None,
+                selection_hints: None,
             }
         );
     }
@@ -657,6 +714,7 @@ mod tests {
                     a,
                     vec!["CA-SR-2".to_string(), "CA-SR-3".to_string()],
                 )])),
+                selection_hints: None,
             }
         );
     }

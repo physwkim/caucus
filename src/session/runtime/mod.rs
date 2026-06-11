@@ -123,6 +123,17 @@ pub struct Multiplexer {
     /// not every tick; an entry is dropped when its panel leaves the prompt, and
     /// replaced when the prompt's content changes.
     notified_blockers: HashMap<PanelId, u64>,
+    /// Round-panel selection menus caucus has already auto-answered on the main
+    /// worker's behalf, keyed by the panel — value is the answered menu's
+    /// content signature ([`rounds::BlockedPrompt::signature`]). Dedups the
+    /// auto-answer in [`Multiplexer::poll_round_blocked_panels`] so a menu that
+    /// is still on screen the tick after it was answered (before the agent
+    /// redraws) is not re-driven; the entry is dropped when the panel leaves the
+    /// prompt, so a later menu is resolved afresh. Distinct from
+    /// `notified_blockers`: that tracks prompts handed *to* the main worker,
+    /// this tracks prompts caucus answered *for* it under its pre-authorized
+    /// [`crate::mcp::protocol::SelectionPolicy`].
+    auto_answered: HashMap<PanelId, u64>,
     /// Instant of the last stranded-main nudge, or `None` while not stranded.
     /// caucus's only caucus→main pushes require a registered round; if the
     /// main worker ends its turn without one while sub-panels still run, no
@@ -307,6 +318,7 @@ impl Multiplexer {
                 main_panel_id: None,
                 main_compose_since: None,
                 notified_blockers: HashMap::new(),
+                auto_answered: HashMap::new(),
                 main_stranded_last_nudge: None,
                 layout_mode: LayoutMode::default(),
                 zoom: None,

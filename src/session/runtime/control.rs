@@ -78,7 +78,8 @@ impl Multiplexer {
                 read_mode,
                 fallback_secs,
                 backlog,
-            } => self.register_round(panels, read_mode, fallback_secs, backlog),
+                selection_hints,
+            } => self.register_round(panels, read_mode, fallback_secs, backlog, selection_hints),
             ControlRequest::RoundStatus { round } => self.round_status(round),
             ControlRequest::CancelRound { round } => self.cancel_round(round),
             ControlRequest::ReadMenu { panel } => match self.read_menu(panel) {

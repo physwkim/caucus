@@ -382,7 +382,12 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                           a panel busy across several tasks: caucus feeds it the \
                           next queued task each time it goes idle, so an early \
                           finisher never sits idle, and the panel settles only \
-                          once its queue drains.",
+                          once its queue drains. Use `selection_hints` to let \
+                          caucus answer a panel's recurring direction/approach \
+                          menus for you (by option-label keywords) without \
+                          interrupting your turn — it only auto-answers when the \
+                          keywords single out exactly one option, and escalates \
+                          anything ambiguous to you as usual.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -416,6 +421,30 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                                         settles only once its queue is empty. A \
                                         panel omitted here settles on its first \
                                         idle (one task)."
+                    },
+                    "selection_hints": {
+                        "type": "object",
+                        "properties": {
+                            "prefer": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "avoid": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            }
+                        },
+                        "description": "Optional keyword hints so caucus answers \
+                                        this round's selection menus for you \
+                                        instead of interrupting your turn. An \
+                                        option qualifies when its label contains \
+                                        (case-insensitively) a `prefer` keyword \
+                                        (empty `prefer` = any option) and no \
+                                        `avoid` keyword. caucus auto-selects ONLY \
+                                        when exactly one option qualifies; zero or \
+                                        several matches are escalated to you as a \
+                                        normal blocked-panel notice. Omit to \
+                                        escalate every menu."
                     }
                 },
                 "required": ["panels"]

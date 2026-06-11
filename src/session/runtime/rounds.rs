@@ -1,12 +1,12 @@
 use super::*;
 use crate::agent::derive_state::DerivedState;
-use crate::mcp::protocol::ControlResponse;
+use crate::mcp::protocol::{ControlResponse, SelectionPolicy};
 use crate::mcp::{McpToolSurface, ReadPanelMode};
 use crate::panel::lifecycle::{Panel, PanelState};
 use crate::session::id::{PanelId, RoundId};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{info, warn};
 
 // The round fallback default + hard cap live in `config::settings` (the default
 // is the `round_fallback_secs` tunable; the cap bounds it and per-call
@@ -170,6 +170,63 @@ impl BlockedPrompt {
     }
 }
 
+/// One queued auto-answer for a round panel's selection menu: the panel, the
+/// menu signature that authorized it (the dedup key in
+/// [`Multiplexer::auto_answered`]), and the chosen option's displayed number +
+/// label for the audit log.
+struct AutoAnswer {
+    pid: PanelId,
+    sig: u64,
+    number: usize,
+    label: String,
+}
+
+/// Resolve a selection `menu` against a round's [`SelectionPolicy`], returning
+/// the **displayed number** of the single option to auto-select, or `None` to
+/// escalate the choice to the main worker.
+///
+/// An option *qualifies* when its label contains at least one `prefer` keyword
+/// (an empty `prefer` list passes every option) and none of the `avoid`
+/// keywords. caucus acts only on a **unique** qualifier: zero or several
+/// qualifying options return `None`, so the existing notice path hands the
+/// choice to the main worker — the narrowed "never auto-answer what main did
+/// not pre-authorize, and only when the hints single out one option".
+fn resolve_selection(menu: &crate::term::Menu, policy: &SelectionPolicy) -> Option<usize> {
+    let mut qualifying = menu.options.iter().filter(|opt| {
+        let prefer_ok = policy.prefer.is_empty()
+            || policy
+                .prefer
+                .iter()
+                .any(|kw| label_contains_kw(&opt.label, kw));
+        let vetoed = policy
+            .avoid
+            .iter()
+            .any(|kw| label_contains_kw(&opt.label, kw));
+        prefer_ok && !vetoed
+    });
+    let first = qualifying.next()?;
+    // A second qualifier means the hints did not single out one option.
+    if qualifying.next().is_some() {
+        return None;
+    }
+    Some(first.number)
+}
+
+/// ASCII-case-insensitive substring test of `keyword` within `label`. Non-ASCII
+/// bytes (e.g. a Korean label) compare exactly, since `to_ascii_lowercase`
+/// touches only ASCII — keyword matching is case-insensitive for English labels
+/// and exact for the rest. An empty `keyword` never matches. Allocating here is
+/// fine: it runs only when a menu is actually detected on a round panel that
+/// carries hints.
+fn label_contains_kw(label: &str, keyword: &str) -> bool {
+    if keyword.is_empty() {
+        return false;
+    }
+    label
+        .to_ascii_lowercase()
+        .contains(&keyword.to_ascii_lowercase())
+}
+
 /// A round caucus is watching on the main worker's behalf
 /// ([`Multiplexer::poll_pending_rounds`]).
 ///
@@ -213,6 +270,13 @@ pub(super) struct PendingRound {
     /// Wall-clock instant past which the round is delivered regardless of
     /// state — the safety net, marking still-`working` panels unfinished.
     fallback_deadline: Instant,
+    /// Optional main-supplied keyword hints for auto-answering this round's
+    /// selection menus ([`SelectionPolicy`]). When a round panel stops on a
+    /// chooser, [`Multiplexer::poll_round_blocked_panels`] resolves it against
+    /// these; a unique keyword match is auto-selected (and noted in the
+    /// delivered report), anything else is escalated to the main worker as
+    /// before. `None` keeps every menu an escalation.
+    selection_hints: Option<SelectionPolicy>,
 }
 
 /// One round panel's contribution, collected once and rendered into both the
@@ -257,6 +321,7 @@ impl Multiplexer {
         read_mode: Option<ReadPanelMode>,
         fallback_secs: Option<u64>,
         backlog: Option<HashMap<PanelId, Vec<String>>>,
+        selection_hints: Option<SelectionPolicy>,
     ) -> ControlResponse {
         let budget = fallback_secs
             .unwrap_or(self.config.settings.round_fallback_secs)
@@ -279,6 +344,7 @@ impl Multiplexer {
             captured: HashMap::new(),
             read_mode: read_mode.unwrap_or(ReadPanelMode::LastMessage),
             fallback_deadline: Instant::now() + Duration::from_secs(budget),
+            selection_hints,
         });
         // Durably shadow the new round so a quit/crash before delivery surfaces
         // it on resume instead of losing it silently.
@@ -907,6 +973,19 @@ impl Multiplexer {
     /// prompt re-announces. At most one notice per tick (shares the
     /// deliverability gate with round completion, which a push closes by
     /// flipping the main panel to `Working`).
+    ///
+    /// A selection menu the round *pre-authorized* via its
+    /// [`SelectionPolicy`](crate::mcp::protocol::SelectionPolicy) is handled
+    /// first: when the hints' keywords single out exactly one option
+    /// ([`resolve_selection`]) caucus answers it itself with `select_option` and
+    /// pushes **no** notice — the main worker is never interrupted. This drives
+    /// only the sub-agent's panel, so it is *not* gated by `main_deliverable`
+    /// and is deduped separately (`Multiplexer::auto_answered`) so a menu still
+    /// on screen the tick after it was answered is not re-driven. Anything the
+    /// hints do not resolve (no hints, zero or several matches, or a `[y/n]`
+    /// prompt) falls through to the notice path above — the narrowed invariant
+    /// "caucus never auto-answers a prompt the main worker did not pre-authorize,
+    /// and only when the hints single out one option".
     pub fn poll_round_blocked_panels(&mut self) {
         let Some(main_id) = self.main_panel_id else {
             return;
@@ -938,19 +1017,87 @@ impl Multiplexer {
                     .map(|p| (pid, p.grid().generation()))
             })
             .collect();
+        // First pass (classify, no side effects): a selection menu this round
+        // pre-authorized to a *unique* keyword match is queued for auto-answer;
+        // everything else (no hints, no/several matches, or a yes/no prompt) is
+        // queued for the main-worker notice. `blocked_now` is every panel stuck
+        // on *any* prompt — the prune set for both dedup maps, a superset of the
+        // notice candidates so an auto-answered-but-not-yet-redrawn panel keeps
+        // its dedup entry instead of being re-answered every tick.
         let mut open: Vec<(PanelId, u64)> = Vec::new();
         let mut prompts: HashMap<PanelId, BlockedPrompt> = HashMap::new();
+        let mut to_auto: Vec<AutoAnswer> = Vec::new();
+        let mut blocked_now: std::collections::HashSet<PanelId> = std::collections::HashSet::new();
         for (pid, generation) in scan_targets {
-            if let Some(prompt) = self.panel_blocked_cached(pid, generation) {
-                open.push((pid, prompt.signature()));
-                prompts.insert(pid, prompt);
+            let Some(prompt) = self.panel_blocked_cached(pid, generation) else {
+                continue;
+            };
+            let sig = prompt.signature();
+            blocked_now.insert(pid);
+            if let BlockedPrompt::Selection(menu) = &prompt
+                && let Some(policy) = self.round_policy_for(pid)
+                && let Some(number) = resolve_selection(menu, &policy)
+            {
+                // Pre-authorized and uniquely resolved → auto-answer, never
+                // notify. Skip if we already answered *this exact menu* (same
+                // signature) and are waiting for the panel to redraw.
+                if self.auto_answered.get(&pid) != Some(&sig) {
+                    let label = menu
+                        .options
+                        .iter()
+                        .find(|o| o.number == number)
+                        .map(|o| o.label.clone())
+                        .unwrap_or_default();
+                    to_auto.push(AutoAnswer {
+                        pid,
+                        sig,
+                        number,
+                        label,
+                    });
+                }
+                continue;
+            }
+            open.push((pid, sig));
+            prompts.insert(pid, prompt);
+        }
+
+        // Forget dedup entries for panels no longer stuck on any prompt, so a
+        // future prompt re-announces (notice) or re-resolves (auto-answer).
+        self.notified_blockers
+            .retain(|pid, _| blocked_now.contains(pid));
+        self.auto_answered
+            .retain(|pid, _| blocked_now.contains(pid));
+
+        // Apply the auto-answers. Each drives a *sub-agent's* panel only and
+        // never touches the main worker, so they are not gated by
+        // `main_deliverable` and several independent panels may resolve in one
+        // tick. A failed select leaves the panel un-recorded so the next tick
+        // retries, mirroring the notice path's failed-push handling.
+        for ans in to_auto {
+            match McpToolSurface::select_option(self, ans.pid, ans.number) {
+                Ok(()) => {
+                    let role = self
+                        .panels
+                        .iter()
+                        .find(|p| p.id == ans.pid)
+                        .map(|p| p.role.clone())
+                        .unwrap_or_default();
+                    info!(
+                        panel = %ans.pid,
+                        role,
+                        option = ans.number,
+                        label = %ans.label,
+                        "auto-answered a round panel's selection menu per the main worker's hints"
+                    );
+                    self.auto_answered.insert(ans.pid, ans.sig);
+                }
+                Err(err) => {
+                    warn!(error = %err, panel = %ans.pid, "auto-answer select_option failed")
+                }
             }
         }
 
-        let (pick, open_set) = Self::pick_blocker_to_notify(&open, &self.notified_blockers);
-        // Forget panels that have left their prompt, so a future one re-announces.
-        self.notified_blockers
-            .retain(|pid, _| open_set.contains(pid));
+        let pick = Self::pick_blocker_to_notify(&open, &self.notified_blockers);
 
         // One notice per tick, only while the gate is open. Dedup state above
         // is updated regardless; the panel is marked notified only on a real
@@ -1010,20 +1157,29 @@ impl Multiplexer {
     /// Pick which round panel to announce a blocking prompt for this tick.
     ///
     /// Pure decision core of [`Multiplexer::poll_round_blocked_panels`]: given
-    /// the panels currently stuck on a prompt as `(panel, signature)` and the
-    /// already-notified set, return the first panel whose signature is new or
-    /// changed (the one to push), plus the set of panels stuck on a prompt now
-    /// (so the caller can prune stale dedup entries).
+    /// the panels whose prompt needs the main worker as `(panel, signature)` and
+    /// the already-notified set, return the first panel whose signature is new
+    /// or changed (the one to push). The caller prunes stale dedup entries with
+    /// its own `blocked_now` set (every panel on *any* prompt, a superset of
+    /// these notice candidates), so no panel set is returned here.
     fn pick_blocker_to_notify(
         open: &[(PanelId, u64)],
         notified: &HashMap<PanelId, u64>,
-    ) -> (Option<PanelId>, std::collections::HashSet<PanelId>) {
-        let open_set = open.iter().map(|(p, _)| *p).collect();
-        let pick = open
-            .iter()
+    ) -> Option<PanelId> {
+        open.iter()
             .find(|(p, sig)| notified.get(p) != Some(sig))
-            .map(|(p, _)| *p);
-        (pick, open_set)
+            .map(|(p, _)| *p)
+    }
+
+    /// The [`SelectionPolicy`] of the (first) pending round containing `pid`, if
+    /// that round carries selection hints. Cloned so the caller can drop the
+    /// `&self` borrow before answering the panel. A panel in no round, or in a
+    /// round with no hints, yields `None` (every menu escalates).
+    fn round_policy_for(&self, pid: PanelId) -> Option<SelectionPolicy> {
+        self.pending_rounds
+            .iter()
+            .find(|r| r.panels.contains(&pid))
+            .and_then(|r| r.selection_hints.clone())
     }
 
     /// Collect one round panel's contribution — its role, state, finished-turn
@@ -1377,6 +1533,7 @@ mod tests {
             captured,
             read_mode,
             fallback_deadline: Instant::now() + Duration::from_secs(600),
+            selection_hints: None,
         }
     }
 
@@ -1411,7 +1568,7 @@ mod tests {
         let mut mux = mux(&tmp);
         let ghost = PanelId::new();
 
-        let ack = mux.register_round(vec![ghost], None, Some(60), None);
+        let ack = mux.register_round(vec![ghost], None, Some(60), None, None);
         let acked_id = match ack {
             ControlResponse::RoundRegistered { round_id, panels } => {
                 assert!(panels.is_empty());
@@ -1433,7 +1590,7 @@ mod tests {
         let working = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
         let idle = push_cat_panel(&mut mux, "writer", PanelState::Idle);
 
-        let round_id = match mux.register_round(vec![working, idle], None, Some(600), None) {
+        let round_id = match mux.register_round(vec![working, idle], None, Some(600), None, None) {
             ControlResponse::RoundRegistered { round_id, .. } => round_id,
             other => panic!("expected RoundRegistered, got {other:?}"),
         };
@@ -1466,7 +1623,7 @@ mod tests {
         let mut mux = mux(&tmp);
         let panel = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
 
-        let round_id = match mux.register_round(vec![panel], None, Some(600), None) {
+        let round_id = match mux.register_round(vec![panel], None, Some(600), None, None) {
             ControlResponse::RoundRegistered { round_id, .. } => round_id,
             other => panic!("expected RoundRegistered, got {other:?}"),
         };
@@ -1514,6 +1671,7 @@ mod tests {
                 (empty, vec![]),                // in round but no work → dropped
                 (stray, vec!["x".to_string()]), // has work but not in round → dropped
             ])),
+            None,
         );
 
         let backlog = &mux.pending_rounds[0].backlog;
@@ -1780,7 +1938,7 @@ mod tests {
         let mut mux = mux(&tmp);
         assert!(mux.main_panel_id.is_none());
 
-        mux.register_round(vec![PanelId::new()], None, Some(600), None);
+        mux.register_round(vec![PanelId::new()], None, Some(600), None, None);
         assert_eq!(mux.pending_rounds.len(), 1);
 
         mux.poll_pending_rounds();
@@ -1805,7 +1963,7 @@ mod tests {
 
         // A round on a non-existent id is due immediately (a missing id counts
         // as settled).
-        mux.register_round(vec![PanelId::new()], None, Some(600), None);
+        mux.register_round(vec![PanelId::new()], None, Some(600), None, None);
         assert_eq!(mux.pending_rounds.len(), 1);
 
         mux.poll_pending_rounds();
@@ -1867,7 +2025,7 @@ mod tests {
         let main = push_cat_panel(&mut mux, "main", PanelState::Working);
         mux.main_panel_id = Some(main);
 
-        mux.register_round(vec![PanelId::new()], None, Some(600), None);
+        mux.register_round(vec![PanelId::new()], None, Some(600), None, None);
         mux.poll_pending_rounds();
         assert_eq!(
             mux.pending_rounds.len(),
@@ -1917,7 +2075,7 @@ mod tests {
             return;
         };
         mux.note_prompt_delivered(sub);
-        mux.register_round(vec![sub], None, Some(600), None);
+        mux.register_round(vec![sub], None, Some(600), None, None);
 
         // Sub still working -> round held.
         mux.poll_pending_rounds();
@@ -1999,6 +2157,7 @@ mod tests {
             None,
             Some(3600),
             Some(HashMap::from([(sub, vec!["only-task".to_string()])])),
+            None,
         );
 
         // Sub is idle with a task queued: the poll feeds it (→ Working), so the
@@ -2077,6 +2236,7 @@ mod tests {
                 sub,
                 vec!["task-1".to_string(), "task-2".to_string()],
             )])),
+            None,
         );
 
         // First feed: idle sub with task-1 queued → captures the pre-backlog turn.
@@ -2240,6 +2400,7 @@ mod tests {
             None,
             Some(3600),
             Some(HashMap::from([(sub, vec!["late task".to_string()])])),
+            None,
         );
         mux.pending_rounds[0].fallback_deadline = Instant::now() - Duration::from_secs(1);
 
@@ -2348,7 +2509,7 @@ mod tests {
             return;
         };
         mux.note_prompt_delivered(sub);
-        mux.register_round(vec![sub], None, Some(600), None);
+        mux.register_round(vec![sub], None, Some(600), None, None);
 
         mux.poll_stranded_main();
         assert_eq!(
@@ -2589,7 +2750,7 @@ mod tests {
             .unwrap()
             .grid
             .advance(b"Building...\r\nContinue? [y/N]");
-        mux.register_round(vec![sub], None, Some(600), None);
+        mux.register_round(vec![sub], None, Some(600), None, None);
 
         // Kill main's PTY: a send_keys to it now errors.
         mux.panels
@@ -2604,6 +2765,114 @@ mod tests {
         assert!(
             !mux.notified_blockers.contains_key(&sub),
             "a failed notice must leave the panel un-notified so it re-announces",
+        );
+
+        mux.shutdown();
+    }
+
+    /// A round panel stuck on a selection menu the round pre-authorized to a
+    /// *unique* keyword match is auto-answered by caucus — never escalated to
+    /// main — and the auto-answer is deduped so a second tick on the same menu
+    /// does not re-drive it.
+    #[tokio::test]
+    async fn poll_auto_answers_a_pre_authorized_selection_without_notifying_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        // Main is a live Idle panel so the notice gate is open — proving the
+        // auto-answer path does not depend on it (it drives the sub-panel only).
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+
+        // A round sub-panel showing a 3-option direction menu; only option 2's
+        // label matches the `structural` hint.
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        let screen = "Which fix approach?\r\n\
+❯ 1. Patch the call site\r\n\
+  2. Structural fix at source\r\n\
+  3. Defer for now\r\n\
+Enter to select - up/down to navigate - Esc to cancel";
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == sub)
+            .unwrap()
+            .grid
+            .advance(screen.as_bytes());
+
+        mux.register_round(
+            vec![sub],
+            None,
+            Some(600),
+            None,
+            Some(SelectionPolicy {
+                prefer: vec!["structural".to_string()],
+                avoid: vec![],
+            }),
+        );
+
+        mux.poll_round_blocked_panels();
+        assert!(
+            mux.auto_answered.contains_key(&sub),
+            "the uniquely-matched menu must be auto-answered",
+        );
+        assert!(
+            !mux.notified_blockers.contains_key(&sub),
+            "an auto-answered menu must not also escalate a notice to main",
+        );
+
+        // Second tick on the same (unchanged) menu must not re-drive it.
+        let sig = mux.auto_answered[&sub];
+        mux.poll_round_blocked_panels();
+        assert_eq!(
+            mux.auto_answered.get(&sub),
+            Some(&sig),
+            "the same menu must stay deduped, not be answered again",
+        );
+
+        mux.shutdown();
+    }
+
+    /// With hints that do *not* single out one option (no match), a menu falls
+    /// through to the normal notice path: main is told, nothing is auto-answered.
+    #[tokio::test]
+    async fn poll_escalates_a_selection_the_hints_do_not_resolve() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        let screen = "Which fix approach?\r\n\
+❯ 1. Patch the call site\r\n\
+  2. Rewrite the module\r\n\
+Enter to select - up/down to navigate - Esc to cancel";
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == sub)
+            .unwrap()
+            .grid
+            .advance(screen.as_bytes());
+
+        // No option label contains `structural` → no unique match → escalate.
+        mux.register_round(
+            vec![sub],
+            None,
+            Some(600),
+            None,
+            Some(SelectionPolicy {
+                prefer: vec!["structural".to_string()],
+                avoid: vec![],
+            }),
+        );
+
+        mux.poll_round_blocked_panels();
+        assert!(
+            !mux.auto_answered.contains_key(&sub),
+            "a menu the hints do not resolve must not be auto-answered",
+        );
+        assert!(
+            mux.notified_blockers.contains_key(&sub),
+            "an unresolved menu must escalate to main as a notice",
         );
 
         mux.shutdown();
@@ -2631,39 +2900,121 @@ mod tests {
     }
 
     /// `pick_blocker_to_notify` announces a panel's prompt once, re-announces on
-    /// a content change, stays silent while unchanged, and reports the open set
-    /// so the caller can prune panels that have left their prompts.
+    /// a content change, and stays silent while unchanged.
     #[test]
     fn pick_blocker_to_notify_announces_new_and_dedups() {
         let pid = PanelId::new();
         let sig_a = 11u64;
         let sig_b = 22u64;
 
-        // Nothing on screen → nothing to announce, empty open set.
-        let (pick, open) = Multiplexer::pick_blocker_to_notify(&[], &HashMap::new());
-        assert_eq!(pick, None);
-        assert!(open.is_empty());
+        // Nothing needing the main worker → nothing to announce.
+        assert_eq!(
+            Multiplexer::pick_blocker_to_notify(&[], &HashMap::new()),
+            None
+        );
 
-        // A prompt not yet notified → announce it; open set carries the panel.
-        let (pick, open) = Multiplexer::pick_blocker_to_notify(&[(pid, sig_a)], &HashMap::new());
-        assert_eq!(pick, Some(pid));
-        assert!(open.contains(&pid));
+        // A prompt not yet notified → announce it.
+        assert_eq!(
+            Multiplexer::pick_blocker_to_notify(&[(pid, sig_a)], &HashMap::new()),
+            Some(pid)
+        );
 
         // Same prompt already notified → silent.
         let notified = HashMap::from([(pid, sig_a)]);
-        let (pick, open) = Multiplexer::pick_blocker_to_notify(&[(pid, sig_a)], &notified);
-        assert_eq!(pick, None);
-        assert!(open.contains(&pid));
+        assert_eq!(
+            Multiplexer::pick_blocker_to_notify(&[(pid, sig_a)], &notified),
+            None
+        );
 
         // Prompt content changed under the same panel → re-announce.
-        let (pick, _) = Multiplexer::pick_blocker_to_notify(&[(pid, sig_b)], &notified);
-        assert_eq!(pick, Some(pid));
+        assert_eq!(
+            Multiplexer::pick_blocker_to_notify(&[(pid, sig_b)], &notified),
+            Some(pid)
+        );
+    }
 
-        // Panel left its prompt (not in `open`) → not in the open set, so the
-        // caller's retain drops its dedup entry.
-        let (pick, open) = Multiplexer::pick_blocker_to_notify(&[], &notified);
-        assert_eq!(pick, None);
-        assert!(!open.contains(&pid));
+    /// Build a menu from `(number, label)` pairs (cursor on the first row).
+    fn test_menu(options: &[(usize, &str)]) -> crate::term::Menu {
+        crate::term::Menu {
+            question: "pick an approach".to_string(),
+            options: options
+                .iter()
+                .map(|(number, label)| crate::term::MenuOption {
+                    number: *number,
+                    label: label.to_string(),
+                })
+                .collect(),
+            cursor: 0,
+        }
+    }
+
+    fn policy(prefer: &[&str], avoid: &[&str]) -> SelectionPolicy {
+        SelectionPolicy {
+            prefer: prefer.iter().map(|s| s.to_string()).collect(),
+            avoid: avoid.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// A `prefer` keyword that matches exactly one option (case-insensitively)
+    /// resolves to that option's displayed number.
+    #[test]
+    fn resolve_selection_unique_prefer_match_is_selected() {
+        let menu = test_menu(&[
+            (1, "Patch the call site"),
+            (2, "STRUCTURAL fix at source"),
+            (3, "Defer for now"),
+        ]);
+        assert_eq!(
+            resolve_selection(&menu, &policy(&["structural"], &[])),
+            Some(2)
+        );
+    }
+
+    /// Two options match `prefer` → the hints did not single one out → escalate.
+    #[test]
+    fn resolve_selection_ambiguous_prefer_escalates() {
+        let menu = test_menu(&[(1, "structural fix A"), (2, "structural fix B")]);
+        assert_eq!(
+            resolve_selection(&menu, &policy(&["structural"], &[])),
+            None
+        );
+    }
+
+    /// No option matches `prefer` → escalate.
+    #[test]
+    fn resolve_selection_no_prefer_match_escalates() {
+        let menu = test_menu(&[(1, "option a"), (2, "option b")]);
+        assert_eq!(
+            resolve_selection(&menu, &policy(&["structural"], &[])),
+            None
+        );
+    }
+
+    /// `avoid` vetoes the only `prefer` match → escalate (caucus stays out).
+    #[test]
+    fn resolve_selection_avoid_vetoes_the_only_match() {
+        let menu = test_menu(&[(1, "structural rewrite"), (2, "tiny patch")]);
+        assert_eq!(
+            resolve_selection(&menu, &policy(&["structural"], &["rewrite"])),
+            None
+        );
+    }
+
+    /// Empty `prefer` passes every option; `avoid` narrows. Exactly one survivor
+    /// is selected, two or more survivors escalate.
+    #[test]
+    fn resolve_selection_empty_prefer_narrows_by_avoid() {
+        let menu = test_menu(&[(1, "broad refactor"), (2, "rewrite"), (3, "targeted fix")]);
+        // Two vetoes leave exactly one survivor → select it.
+        assert_eq!(
+            resolve_selection(&menu, &policy(&[], &["broad refactor", "rewrite"])),
+            Some(3)
+        );
+        // One veto leaves two survivors → ambiguous → escalate.
+        assert_eq!(
+            resolve_selection(&menu, &policy(&[], &["broad refactor"])),
+            None
+        );
     }
 
     #[test]
@@ -2690,7 +3041,7 @@ mod tests {
         let mut mux = mux(&tmp);
         let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
 
-        mux.register_round(vec![sub], None, Some(600), None);
+        mux.register_round(vec![sub], None, Some(600), None, None);
 
         let recs = crate::session::round_record::read(&mux.session.root_dir);
         assert_eq!(recs.len(), 1, "the registered round must be persisted");
@@ -2714,7 +3065,7 @@ mod tests {
 
         // A round on a non-existent id is due immediately and delivers to the
         // idle main panel.
-        mux.register_round(vec![PanelId::new()], None, Some(600), None);
+        mux.register_round(vec![PanelId::new()], None, Some(600), None, None);
         assert!(
             crate::session::round_record::path(&mux.session.root_dir).exists(),
             "registration writes the snapshot"

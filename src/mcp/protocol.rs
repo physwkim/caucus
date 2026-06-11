@@ -21,6 +21,33 @@ use crate::session::id::{PanelId, RoundId};
 
 use super::{PanelSummary, ReadPanelMode};
 
+/// Main-supplied hints for auto-answering a round panel's selection menu
+/// without disturbing the main worker. Attached to a round via
+/// [`ControlRequest::RegisterRound`] and consulted by
+/// [`crate::session::Multiplexer::poll_round_blocked_panels`] when a round
+/// panel stops mid-turn on an `AskUserQuestion`-style chooser.
+///
+/// An option *qualifies* when its label contains (ASCII-case-insensitively) at
+/// least one `prefer` keyword (an empty `prefer` passes every option) **and**
+/// none of the `avoid` keywords. caucus auto-selects an option **only when
+/// exactly one qualifies** — zero or several qualifying options fall back to
+/// the existing "ask the main worker" notice. This keeps the narrowed
+/// invariant *"caucus never auto-answers a prompt the main worker did not
+/// pre-authorize"*: the main worker pre-authorizes by naming the keywords, and
+/// caucus acts only when they single out one option.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionPolicy {
+    /// Keywords that *select* an option (case-insensitive substring of its
+    /// label). Empty means "every option passes the positive test", so `avoid`
+    /// alone decides — useful for "pick whatever, just not these".
+    #[serde(default)]
+    pub prefer: Vec<String>,
+    /// Keywords that *veto* an option (case-insensitive substring of its
+    /// label). An option whose label matches any of these never qualifies.
+    #[serde(default)]
+    pub avoid: Vec<String>,
+}
+
 /// One control-socket request: an MCP tool call forwarded from `mcp-serve`.
 ///
 /// `snake_case` tag mirrors the MCP tool names exposed to the main worker so a wire
@@ -106,6 +133,12 @@ pub enum ControlRequest {
         fallback_secs: Option<u64>,
         #[serde(default)]
         backlog: Option<HashMap<PanelId, Vec<String>>>,
+        /// Optional keyword hints letting caucus auto-answer this round's
+        /// selection menus without interrupting the main worker — see
+        /// [`SelectionPolicy`]. Absent (default `None`) keeps the prior
+        /// behaviour: every selection menu is escalated to the main worker.
+        #[serde(default)]
+        selection_hints: Option<SelectionPolicy>,
     },
     /// Report the live status of a registered round by its id: which panels
     /// have settled vs are still working, the per-panel backlog remaining, and
@@ -294,6 +327,10 @@ mod tests {
                 panel,
                 vec!["CA-SR-2".to_string(), "CA-SR-3".to_string()],
             )])),
+            selection_hints: Some(SelectionPolicy {
+                prefer: vec!["structural".to_string()],
+                avoid: vec!["broad refactor".to_string()],
+            }),
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains("\"op\":\"register_round\""));
@@ -303,7 +340,8 @@ mod tests {
 
     #[test]
     fn register_round_optional_fields_default_to_none() {
-        // `read_mode`, `fallback_secs`, and `backlog` default to None when omitted.
+        // `read_mode`, `fallback_secs`, `backlog`, and `selection_hints` default
+        // to None when omitted.
         let id = PanelId::new();
         let req: ControlRequest =
             serde_json::from_str(&format!(r#"{{"op":"register_round","panels":["{id}"]}}"#))
@@ -315,7 +353,26 @@ mod tests {
                 read_mode: None,
                 fallback_secs: None,
                 backlog: None,
+                selection_hints: None,
             }
+        );
+    }
+
+    #[test]
+    fn selection_policy_defaults_empty_keyword_lists() {
+        // Either keyword list may be omitted; each defaults to an empty Vec.
+        let policy: SelectionPolicy = serde_json::from_str(r#"{"prefer":["structural"]}"#).unwrap();
+        assert_eq!(policy.prefer, vec!["structural".to_string()]);
+        assert!(policy.avoid.is_empty());
+        // And a full round-trip preserves both.
+        let full = SelectionPolicy {
+            prefer: vec!["structural".to_string(), "at source".to_string()],
+            avoid: vec!["rewrite".to_string()],
+        };
+        let line = serde_json::to_string(&full).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SelectionPolicy>(&line).unwrap(),
+            full
         );
     }
 
