@@ -1338,14 +1338,13 @@ impl Perform for Grid {
             return;
         };
         match code {
-            b"0" | b"2" => {
-                // Set window/icon title. The title may itself contain ';', which
-                // vte splits the OSC string on — so rejoin every param after the
-                // code rather than taking only the first (which would truncate
-                // the title at its first ';').
-                if params.len() > 1 {
-                    self.title = Some(osc_join(params, 1));
-                }
+            // Set window/icon title. The title may itself contain ';', which
+            // vte splits the OSC string on — so rejoin every param after the
+            // code rather than taking only the first (which would truncate the
+            // title at its first ';'). An OSC 0/2 with no title param is a no-op
+            // (falls through to the catch-all arm).
+            b"0" | b"2" if params.len() > 1 => {
+                self.title = Some(osc_join(params, 1));
             }
             b"8" => {
                 // Hyperlink: `OSC 8 ; params ; URI ST`. The URI is everything

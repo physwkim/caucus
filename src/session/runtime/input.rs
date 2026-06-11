@@ -122,13 +122,11 @@ impl Multiplexer {
                     self.scroll_by(-WHEEL_STEP);
                 }
             }
-            MouseEventKind::ScrollDown => {
-                // Only meaningful inside the pager — at the live bottom there is
-                // nothing newer to reveal.
-                if self.scroll_state().is_some() {
-                    self.view_epoch = self.view_epoch.wrapping_add(1);
-                    self.scroll_by(WHEEL_STEP);
-                }
+            // Only meaningful inside the pager — at the live bottom there is
+            // nothing newer to reveal, so an unguarded ScrollDown falls through.
+            MouseEventKind::ScrollDown if self.scroll_state().is_some() => {
+                self.view_epoch = self.view_epoch.wrapping_add(1);
+                self.scroll_by(WHEEL_STEP);
             }
             _ => {}
         }
