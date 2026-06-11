@@ -17,11 +17,15 @@ jobs:
       matrix:
         # caucus is Unix-only (Unix-domain control/turn-signal sockets, a
         # PTY per panel, POSIX signals), so Windows is not a build target.
-        # Both supported OSes are covered on x86_64 and arm64.
+        # Linux runs natively on x86_64 and arm64; macOS runs natively on
+        # arm64. x86_64 macOS test execution is dropped: GitHub's Intel
+        # (macos-13) runner pool is deprecated and queues for tens of minutes.
+        # It is replaced by a fast x86_64-apple-darwin build check on the
+        # arm64 runner (the cross-check step below). x86_64 the architecture
+        # is still test-executed on Linux, and macOS the OS on arm64.
         include:
           - os: ubuntu-24.04 # linux x86_64
           - os: ubuntu-24.04-arm # linux arm64
-          - os: macos-13 # macos x86_64 (Intel)
           - os: macos-15 # macos arm64
     steps:
       - uses: actions/checkout@v4
@@ -48,3 +52,15 @@ jobs:
       # or use /bin/sh stand-ins). Only git is needed.
       - name: Test
         run: cargo test --workspace --verbose
+
+      # x86_64 macOS gets build coverage without depending on the scarce,
+      # deprecated Intel (macos-13) runner pool: cross-check the x86_64
+      # target from the arm64 runner. Apple's toolchain targets both arches
+      # and `cargo check` does not link, so no extra linker is needed. caucus
+      # has no arch-cfg'd code, so a clean cross-check is strong evidence the
+      # x86_64 macOS build holds.
+      - name: Cross-check x86_64 macOS (build only)
+        if: matrix.os == 'macos-15'
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo check --workspace --all-targets --target x86_64-apple-darwin
