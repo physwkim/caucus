@@ -105,6 +105,28 @@ fn round_header(panel_count: usize, all_settled: bool) -> String {
     )
 }
 
+/// Append the "caucus auto-answered" audit block shared by the full report and
+/// the injected summary: one line per selection menu caucus resolved for this
+/// round under the main worker's pre-authorized [`SelectionPolicy`], so the
+/// delivered message shows which direction forks were taken on its behalf —
+/// without the main worker ever having been interrupted. Nothing is emitted
+/// when the round auto-answered no menu.
+fn push_auto_answers(out: &mut String, round: &PendingRound) {
+    if round.auto_answers.is_empty() {
+        return;
+    }
+    out.push_str(&format!(
+        "caucus auto-answered {} selection menu(s) per your hints (you were not interrupted):\n",
+        round.auto_answers.len()
+    ));
+    for a in &round.auto_answers {
+        out.push_str(&format!(
+            "  panel {} (role: {}) → option {} \"{}\"\n",
+            a.panel, a.role, a.number, a.label
+        ));
+    }
+}
+
 /// Append the per-panel trailing markers shared by the full report and the
 /// summary: a "still working" note for a panel the fallback deadline caught
 /// mid-turn, and a count of backlog tasks that never ran.
@@ -177,6 +199,17 @@ impl BlockedPrompt {
 struct AutoAnswer {
     pid: PanelId,
     sig: u64,
+    number: usize,
+    label: String,
+}
+
+/// One selection menu caucus auto-answered for a round, recorded on its
+/// [`PendingRound`] so the delivered report/summary names the direction forks
+/// caucus resolved under the main worker's pre-authorized hints — the
+/// transparency complement to never interrupting the main worker.
+struct AutoAnswerRecord {
+    panel: PanelId,
+    role: String,
     number: usize,
     label: String,
 }
@@ -277,6 +310,11 @@ pub(super) struct PendingRound {
     /// delivered report), anything else is escalated to the main worker as
     /// before. `None` keeps every menu an escalation.
     selection_hints: Option<SelectionPolicy>,
+    /// Selection menus caucus auto-answered for this round under
+    /// `selection_hints`, in answer order. Rendered into the delivered
+    /// report/summary ([`push_auto_answers`]) so the main worker sees which
+    /// forks were resolved on its behalf, without ever being interrupted.
+    auto_answers: Vec<AutoAnswerRecord>,
 }
 
 /// One round panel's contribution, collected once and rendered into both the
@@ -345,6 +383,7 @@ impl Multiplexer {
             read_mode: read_mode.unwrap_or(ReadPanelMode::LastMessage),
             fallback_deadline: Instant::now() + Duration::from_secs(budget),
             selection_hints,
+            auto_answers: Vec::new(),
         });
         // Durably shadow the new round so a quit/crash before delivery surfaces
         // it on resume instead of losing it silently.
@@ -1090,6 +1129,20 @@ impl Multiplexer {
                         "auto-answered a round panel's selection menu per the main worker's hints"
                     );
                     self.auto_answered.insert(ans.pid, ans.sig);
+                    // Record it on the round (the same one whose hints resolved
+                    // it) so the delivered report names the fork caucus took.
+                    if let Some(round) = self
+                        .pending_rounds
+                        .iter_mut()
+                        .find(|r| r.panels.contains(&ans.pid))
+                    {
+                        round.auto_answers.push(AutoAnswerRecord {
+                            panel: ans.pid,
+                            role,
+                            number: ans.number,
+                            label: ans.label,
+                        });
+                    }
                 }
                 Err(err) => {
                     warn!(error = %err, panel = %ans.pid, "auto-answer select_option failed")
@@ -1231,6 +1284,7 @@ impl Multiplexer {
     /// that points at it, never this whole block.
     fn assemble_round_report(&self, round: &PendingRound, all_settled: bool) -> String {
         let mut out = round_header(round.panels.len(), all_settled);
+        push_auto_answers(&mut out, round);
         for &id in &round.panels {
             let Some(c) = self.round_panel_contribution(round, id) else {
                 out.push_str(&format!("\n## panel {id} — gone (killed)\n"));
@@ -1280,6 +1334,7 @@ impl Multiplexer {
         report_path: Option<&std::path::Path>,
     ) -> String {
         let mut out = round_header(round.panels.len(), all_settled);
+        push_auto_answers(&mut out, round);
         match report_path {
             Some(path) => out.push_str(&format!(
                 "Full per-panel report: {} — read that file for each panel's complete output.\n",
@@ -1534,6 +1589,7 @@ mod tests {
             read_mode,
             fallback_deadline: Instant::now() + Duration::from_secs(600),
             selection_hints: None,
+            auto_answers: Vec::new(),
         }
     }
 
@@ -2819,6 +2875,18 @@ Enter to select - up/down to navigate - Esc to cancel";
             !mux.notified_blockers.contains_key(&sub),
             "an auto-answered menu must not also escalate a notice to main",
         );
+        // The round records the answered fork for the delivered report.
+        assert_eq!(
+            mux.pending_rounds[0].auto_answers.len(),
+            1,
+            "the auto-answer must be recorded on the round",
+        );
+        assert_eq!(mux.pending_rounds[0].auto_answers[0].number, 2);
+        assert!(
+            mux.pending_rounds[0].auto_answers[0]
+                .label
+                .contains("Structural")
+        );
 
         // Second tick on the same (unchanged) menu must not re-drive it.
         let sig = mux.auto_answered[&sub];
@@ -2997,6 +3065,41 @@ Enter to select - up/down to navigate - Esc to cancel";
         assert_eq!(
             resolve_selection(&menu, &policy(&["structural"], &["rewrite"])),
             None
+        );
+    }
+
+    /// `push_auto_answers` emits nothing for a round that auto-answered no menu,
+    /// and one line per recorded auto-answer otherwise.
+    #[test]
+    fn auto_answers_block_lists_each_resolved_menu() {
+        let mut round = pending_round(
+            vec![],
+            ReadPanelMode::LastMessage,
+            HashMap::new(),
+            HashMap::new(),
+        );
+
+        let mut out = String::new();
+        push_auto_answers(&mut out, &round);
+        assert!(out.is_empty(), "no auto-answers → no block");
+
+        let p = PanelId::new();
+        round.auto_answers.push(AutoAnswerRecord {
+            panel: p,
+            role: "reviewer".to_string(),
+            number: 2,
+            label: "Structural fix at source".to_string(),
+        });
+        push_auto_answers(&mut out, &round);
+        assert!(
+            out.contains("caucus auto-answered 1 selection menu(s)"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "panel {p} (role: reviewer) → option 2 \"Structural fix at source\""
+            )),
+            "got: {out}"
         );
     }
 

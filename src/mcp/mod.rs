@@ -443,8 +443,9 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                                         `avoid` keyword. caucus auto-selects ONLY \
                                         when exactly one option qualifies; zero or \
                                         several matches are escalated to you as a \
-                                        normal blocked-panel notice. Omit to \
-                                        escalate every menu."
+                                        normal blocked-panel notice. Each \
+                                        auto-answer is noted in the delivered \
+                                        round report. Omit to escalate every menu."
                     }
                 },
                 "required": ["panels"]
