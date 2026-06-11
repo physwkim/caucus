@@ -15,7 +15,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # caucus is Unix-only (Unix-domain control/turn-signal sockets, a
+        # PTY per panel, POSIX signals), so Windows is not a build target.
+        # Both supported OSes are covered on x86_64 and arm64.
+        include:
+          - os: ubuntu-24.04 # linux x86_64
+          - os: ubuntu-24.04-arm # linux arm64
+          - os: macos-13 # macos x86_64 (Intel)
+          - os: macos-15 # macos arm64
     steps:
       - uses: actions/checkout@v4
 
