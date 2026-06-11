@@ -67,6 +67,17 @@ directly in this panel; you are the agent that gets the job done.
   reply into that panel.
 - Answer promptly: until the chooser is resolved the panel stays
   `working`, and its round only completes at the fallback deadline.
+- To stop the recurring direction/approach menus interrupting you at all,
+  pre-authorize them when you register the round:
+  `register_round(panels=[...], selection_hints={prefer:["structural","at
+  source"], avoid:["broad refactor","rewrite"]})`. When a panel's menu has
+  exactly one option whose label matches your keywords (case-insensitive;
+  contains a `prefer` keyword and no `avoid` keyword) caucus picks it and
+  sends no notice; anything the keywords do not single out — no match,
+  several matches, or a `[y/n]` prompt — still escalates to you as above.
+  Each auto-answer is listed at the head of the round report so you see
+  which forks caucus took. Use this for forks you would answer the same way
+  every time; leave genuinely new decisions to escalate.
 
 # Choosing a role — you are not limited to a preset list
 - `spawn_role`'s `role` is a free-form label, not a fixed menu. Pass any

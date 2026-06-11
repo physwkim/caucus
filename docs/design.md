@@ -155,6 +155,7 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
      (패널별로 다른 sub-task면 send_keys를 패널마다)
      register_round(panels=[<worker-1>,<worker-2>,<worker-3>])
      (조기 완료 워커를 계속 돌리려면 backlog={<panel>:[후속 task,...]}도 함께 — 아래 **백로그** 참조)
+     (방향 메뉴를 main 방해 없이 caucus가 답하게 하려면 selection_hints={prefer:[...],avoid:[...]}도 — 아래 **선택 힌트** 참조)
    register_round는 즉시 반환한다 — 블로킹도 timeout 대기도 없다. main worker는
    턴을 끝내고 자유로워진다.
 
@@ -221,6 +222,22 @@ push 알림을 보낸다(round 완료 push와 같은 idle·quiet 게이트, tick
 묶이고 라운드가 settle하지 못하는 같은 부류이기 때문이다. main은 메뉴면
 `read_menu`/`select_option`으로, `[y/n]`이면 `send_keys`로 답해 패널을 풀어 준다 —
 §8.3.
+
+**선택 힌트(방향 메뉴 자동 응답)**: 위 감지·push는 main을 깨운다 —
+`dangerously-skip-permissions` 환경에선 permission 프롬프트가 사라져 남는 방해의
+대부분이 이 "방향 선택" 메뉴다. `register_round`에
+`selection_hints={prefer:[...], avoid:[...]}`(라운드당 단일 키워드 세트)를 함께
+넘기면, 라운드 패널에 선택 메뉴가 떴을 때 caucus가 옵션 라벨을 키워드로 매칭해
+(ASCII 대소문자 무시 부분일치; prefer 1개 이상 포함 — 빈 prefer는 전체 통과 — AND
+avoid 0개) **유일하게 하나로 좁혀질 때만** 그 옵션을 `select_option`으로 직접 골라
+준다 — push 알림 없이(`resolve_selection`). 0개·복수 매치, 또는 raw `[y/n]`
+프롬프트는 위 notice 경로로 그대로 escalate한다. 좁혀진 불변식은 "caucus는 main이
+사전승인하지 않은 프롬프트를 자동 응답하지 않으며, 힌트가 단 하나의 옵션으로 좁힐
+때만 응답한다". 자동 응답은 서브 패널만 구동하므로 main idle 게이트와 무관하고
+(tick당 여러 패널 가능), 같은 메뉴를 sub-agent가 리드로우하기 전에 다시 구동하지
+않도록 메뉴 시그니처로 dedup한다(`auto_answered`). 투명성: 자동 응답한 포크는
+전달 보고서·요약 머리에 `caucus auto-answered N selection menu(s)` 한 줄로 기록돼
+main이 어떤 방향을 택했는지 본다 — 추가 방해 없이(`push_auto_answers`).
 
 라이브 모델에는 `max_rounds` 같은 강제 캡이 없다 — main worker가 자기 토큰
 예산(§0 #12)에 맞춰 라운드를 몇 번 돌지 스스로 판단한다.

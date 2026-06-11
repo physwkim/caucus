@@ -5,6 +5,20 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [Unreleased]
+
+### Added
+
+- **Pre-authorized auto-answers for round selection menus.** `register_round`
+  accepts an optional `selection_hints={prefer:[…], avoid:[…]}`. When a round
+  panel stops on an AskUserQuestion-style direction chooser and the keywords
+  single out exactly one option (label contains a `prefer` keyword and no
+  `avoid` keyword, case-insensitive), caucus answers it for you and sends no
+  notice — only ambiguous or unmatched menus, and raw `[y/n]` prompts, still
+  escalate to the main worker. So the main worker is never interrupted for a
+  fork it pre-authorized, and each auto-answer is listed at the head of the
+  delivered round report.
+
 ## [0.5.0] — 2026-05-29
 
 Survives multi-monitor display switches, and lets you remap the prefix key.

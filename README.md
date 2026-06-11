@@ -155,7 +155,7 @@ calls them to spawn, drive, observe, and reap sub-agent panels:
 | `kill_panel`      | Kill a panel; its worktree (if any) is enqueued for cleanup.              |
 | `restart_panel`   | Restart a panel's agent CLI in place, reusing its role and worktree.      |
 | `list_panels`     | List every live panel with its role and derived state.                   |
-| `register_round`  | Register a round; caucus pushes the panels' results back when they settle (or `fallback_secs`). A per-panel `backlog` queue keeps early finishers working until their tasks drain. |
+| `register_round`  | Register a round; caucus pushes the panels' results back when they settle (or `fallback_secs`). A per-panel `backlog` queue keeps early finishers working until their tasks drain. Optional `selection_hints` let caucus auto-answer a panel's direction menus by option-label keyword, so a pre-authorized fork never interrupts you. |
 | `round_status`    | Report a registered round's progress — which panels have settled, which are still working. |
 | `cancel_round`    | Cancel a registered round so caucus stops awaiting it.                    |
 | `read_menu`       | Read a panel's interactive selection menu (question + numbered options).  |
