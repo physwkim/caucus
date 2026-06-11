@@ -5,19 +5,105 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
-## [Unreleased]
+## [0.6.0] — 2026-06-11
+
+Scrollback you can search and copy from, a larger MCP control plane,
+crash-durable rounds, and a session garbage collector.
 
 ### Added
 
+- **Scrollback pager copy mode, search, and mouse-wheel scroll.** The
+  in-session pager (`Ctrl-A [`) gains a tmux copy-mode-style selection that
+  yanks to the terminal clipboard over OSC 52, an incremental `/` search that
+  jumps between matches, and opt-out mouse capture so the wheel scrolls the
+  focused panel's scrollback directly.
+- **Four more MCP control tools — the surface is now fourteen.**
+  `round_status` / `cancel_round` give a registered round an identity the main
+  worker can poll and abort; `restart_panel` respawns a wedged agent in place;
+  `send_key` sends raw keys that `send_keys` cannot express; and `read_panel`
+  gains a turn mode for reading a panel's past-turn history. `PanelSummary` now
+  also reports each panel's worktree path, branch, and model.
 - **Pre-authorized auto-answers for round selection menus.** `register_round`
   accepts an optional `selection_hints={prefer:[…], avoid:[…]}`. When a round
   panel stops on an AskUserQuestion-style direction chooser and the keywords
   single out exactly one option (label contains a `prefer` keyword and no
   `avoid` keyword, case-insensitive), caucus answers it for you and sends no
   notice — only ambiguous or unmatched menus, and raw `[y/n]` prompts, still
-  escalate to the main worker. So the main worker is never interrupted for a
-  fork it pre-authorized, and each auto-answer is listed at the head of the
-  delivered round report.
+  escalate to the main worker, and each auto-answer is listed at the head of
+  the delivered round report.
+- **Crash-durable rounds.** In-flight rounds are persisted, so a restart
+  surfaces a round that was running rather than losing it, and round membership
+  now survives a panel restart. The main worker is also told about *any*
+  blocked panel mid-round, not only selection menus.
+- **`caucus gc`.** A new subcommand prunes old, not-running session state
+  (ageing a session by its last activity, not its creation time), reclaiming
+  disk that resumable sessions would otherwise hold — including orphaned
+  session directories with no readable record.
+- **Single-instance session lock.** A session root is locked
+  (`std::fs::File::try_lock`, the reason for the 1.89 MSRV) so two caucus
+  processes cannot drive the same session at once.
+- **`[settings]` config table** for the scrollback line cap, round-fallback
+  seconds, and capture tunables; **`--topic`** labels a session, defaulting to
+  the repo directory name.
+- **Round report spill-to-disk.** A round's full report is written to the
+  session dir and only a bounded summary is injected into the main worker's
+  turn, so a large fan-in cannot blow the context budget.
+- **`caucus doctor` reports the version and checks the cwd is a git repo**, and
+  **`caucus init` adds `.caucus/sessions/` to the project `.gitignore`.**
+
+### Changed
+
+- **MSRV raised to 1.89** for `std::fs::File::try_lock` (the session
+  single-instance lock).
+- **Sub-agent selection-menu stalls are prevented at the source** rather than
+  only detected after the menu is already drawn.
+
+### Fixed
+
+- **A monitor switch no longer ends a session, but a real `SIGHUP` still
+  does.** caucus verifies the controlling terminal on `SIGHUP` instead of
+  trusting the signal.
+- **A wedged agent can no longer stall the event loop.** PTY input is written
+  through a dedicated writer thread; the writer queue is bounded so a wedged
+  child cannot grow it without bound; and `kill()` tears down in bounded time
+  and reaps the child's process group.
+- **Round lifecycle holes closed.** A round settles when a panel exits with
+  undrained backlog; a due round is dropped and spilled when the main worker is
+  gone but kept on a delivery failure; the caucus→main push is marked notified
+  only once it lands; and the injected round-report body is bounded with the
+  overflow spilled.
+- **Resume is faithful.** Stale worktrees are reconciled so resumed panels stay
+  isolated; a crashed worktree's uncommitted work is salvaged; the per-role
+  spawn counter persists; the drop notice is persisted so a second crash cannot
+  lose it; resume never resurrects a gc-pruned session root; and a failed
+  replacement spawn retires its worktree.
+- **Terminal-grid correctness.** SGR colon sub-params are parsed instead of
+  flattened; alt-screen rows are kept out of primary scrollback on shrink; the
+  render cache is versioned by appended bytes rather than byte length; split
+  wide-glyph pairs are healed after row edits; the open capture turn is trimmed
+  at a clean replay boundary; and OSC title and hyperlink URIs keep their
+  semicolons.
+- **Input edges.** A bare Enter on empty main input no longer wedges the main
+  panel, and the deferred-submit hold scales with paste size.
+- **Bounded against abuse.** Inbound IPC line reads are capped so a peer cannot
+  OOM the reader; the OSC 52 yank is bounded to the terminal clipboard cap;
+  `scrollback_lines` is clamped to a ceiling on resolve; and `roles.toml`
+  rejects unknown fields.
+- **The main worker cannot be killed at the destruction owner**, and the pager
+  page height stays in sync with the area on resize.
+
+### Performance
+
+- **Rendering.** The redraw is dirty-gated on a render signature; the per-panel
+  liveness probe is throttled to 250 ms; and the `CAUCUS_DUMP_PTY` lookup is
+  cached instead of probed per pump.
+- **Grid hot paths.** SGR params are flattened on the stack instead of a
+  per-escape heap `Vec`; IL/DL line shifts and scroll-region shifts batch into
+  a single memmove, cloning the leaving row only when it is retained.
+- **Capture and I/O.** The `since_last_turn` render is memoized; a single open
+  turn's in-memory buffer is bounded; the PTY reader-thread channel is bounded
+  for back-pressure; `git worktree add` runs off the event loop with a deferred
+  reply; and the per-tick menu scan is gated on a grid generation counter.
 
 ## [0.5.0] — 2026-05-29
 
