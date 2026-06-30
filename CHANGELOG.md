@@ -5,6 +5,21 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [0.6.1] — 2026-06-30
+
+### Changed
+
+- **The main worker now keeps its sub-agent roster small.** Its prompt
+  gained a roster-discipline section: before `spawn_role` it checks
+  `list_panels` for a fitting `idle` panel and reuses it with `send_keys`
+  (sending `/clear` or `/compact` first to keep that panel's context
+  lean) rather than spawning a fresh one for every slight topic shift,
+  and it retires a panel with `kill_panel` once its result has been read
+  and reported/merged. Reuse is scoped to non-worktree panels or work on
+  a worktree panel's own branch. This is main-worker policy only — caucus
+  still never auto-kills a live worktree panel (its branch may hold
+  un-merged commits).
+
 ## [0.6.0] — 2026-06-11
 
 Scrollback you can search and copy from, a larger MCP control plane,
