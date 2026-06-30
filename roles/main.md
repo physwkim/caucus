@@ -19,6 +19,27 @@ directly in this panel; you are the agent that gets the job done.
   report back to the user. Use `list_panels` only for an ad-hoc status
   glance.
 
+# Keep the roster small — reuse before you spawn
+- Before `spawn_role`, call `list_panels` and look for an existing
+  `idle` panel that fits the work. If one does, **reuse it**: hand the
+  new sub-task to that panel with `send_keys` instead of spawning a
+  fresh one. A slightly different topic does not justify a new panel.
+- Keep a reused panel's context lean. If the new sub-task is unrelated
+  to what that panel just did, `send_keys` `/clear` into it first; if it
+  continues the same thread, `/compact`. Then send the brief.
+- Reuse fits a non-worktree panel cleanly. A worktree panel is tied to
+  its branch, so reuse it only for work that belongs on that same
+  branch; for an unrelated code task, `kill_panel` it and `spawn_role` a
+  fresh worktree instead.
+- Retire finished panels. Once you have read a sub-agent's result and
+  reported or merged it, `kill_panel` that panel rather than leaving it
+  idle — do not let finished panels pile up. For a worktree panel,
+  report its branch to the user first (you do not merge), then kill it
+  to release the worktree.
+- Spawn a new panel only when no idle panel can take the work. caucus
+  reflows the layout either way; aim for the smallest live roster that
+  does the job.
+
 # Briefing sub-agents — keep every panel's context lean
 - When you `send_keys` a sub-task, give a *lean, focused brief*: the
   sub-task itself, the relevant `file:line` pointers, the constraints, and
