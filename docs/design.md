@@ -710,7 +710,7 @@ caucus/
     ├── worktree/
     │   ├── manager.rs       (생성)
     │   └── cleanup.rs       (직렬 큐 + depth-desc 정렬, tokio::mpsc consumer)
-    └── doctor.rs            (caucus 버전·git·git-repo·claude/codex·hook + role allowlist `Task` 점검)
+    └── doctor.rs            (caucus 버전·git·git-repo·claude/codex·hook 경로 실재 + 시그널 E2E 셀프테스트 + role allowlist `Task` 점검)
 ```
 
 **폐기된 모듈**: `tmux/`(자체 멀티플렉서로 대체), `sentinel/`(turn-signal 소켓으로
@@ -831,7 +831,7 @@ caucus --topic "auth refactor"      # 세션 라벨 (caucus sessions 목록에 �
 caucus init [--install-hook]        # .caucus/ + bin/turn-signal 생성,
                                     # --install-hook 시 Claude Stop hook을
                                     # ~/.claude/settings.json에 merge
-caucus doctor                       # caucus 버전·git·git-repo·claude/codex·hook + role allowlist `Task` 점검
+caucus doctor                       # caucus 버전·git·git-repo·claude/codex·hook 경로 실재 + 시그널 E2E 셀프테스트 + role allowlist `Task` 점검
 caucus role list                    # 알려진 role 나열
 caucus role show <name>             # 한 role의 전체 spec 출력
 caucus sessions [--format json]     # resume 가능한 세션 나열 (최신순; §3.1)

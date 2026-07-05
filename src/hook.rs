@@ -31,15 +31,19 @@ pub(crate) fn current_hook_present(settings: &serde_json::Value, hook_command: &
         .any(|s| s == hook_command)
 }
 
-/// Whether *a* caucus turn-signal Stop hook is installed in `settings` — any
-/// command string under `hooks.Stop` that [`is_caucus_hook_command`]. Used by
-/// `caucus doctor`: it reports the hook present for the current path or any
-/// caucus hook command, but not for an unrelated command that merely mentions
-/// "caucus", so the health check cannot give a false OK.
-pub(crate) fn caucus_stop_hook_installed(settings: &serde_json::Value) -> bool {
+/// Every caucus Stop-hook command string in `settings`, in document order —
+/// any command under `hooks.Stop` that [`is_caucus_hook_command`], and not an
+/// unrelated command that merely mentions "caucus". Empty means no caucus
+/// Stop hook is installed. `caucus doctor` verifies each one actually runs on
+/// *this* machine: a synced `~/.claude/settings.json` can carry another
+/// machine's absolute `turn-signal` path, which passes a presence check while
+/// every turn signal silently dies.
+pub(crate) fn caucus_stop_hook_commands(settings: &serde_json::Value) -> Vec<String> {
     stop_strings(settings)
         .into_iter()
-        .any(is_caucus_hook_command)
+        .filter(|s| is_caucus_hook_command(s))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Every string under `settings.hooks.Stop`, gathered recursively so command
@@ -90,6 +94,17 @@ mod tests {
     }
 
     #[test]
+    fn caucus_stop_hook_commands_extracts_only_caucus_commands() {
+        let settings = serde_json::json!({
+            "hooks": { "Stop": [
+                { "hooks": [{ "command": THIRD_PARTY }, { "command": TURN_SIGNAL }] },
+            ] }
+        });
+        assert_eq!(caucus_stop_hook_commands(&settings), vec![TURN_SIGNAL]);
+        assert!(caucus_stop_hook_commands(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
     fn is_caucus_hook_command_matches_caucus_only() {
         assert!(is_caucus_hook_command(TURN_SIGNAL));
         assert!(is_caucus_hook_command(SENTINEL_STOP));
@@ -101,22 +116,22 @@ mod tests {
     }
 
     #[test]
-    fn caucus_stop_hook_installed_is_exact_family_not_substring() {
-        // The current hook → installed.
+    fn caucus_stop_hook_commands_matches_exact_family_not_substring() {
+        // The current hook → found.
         let with = serde_json::json!({
             "hooks": { "Stop": [{ "hooks": [{ "command": TURN_SIGNAL }] }] }
         });
-        assert!(caucus_stop_hook_installed(&with));
-        // A stale caucus hook still counts as installed (it is caucus's own).
+        assert_eq!(caucus_stop_hook_commands(&with), vec![TURN_SIGNAL]);
+        // A stale caucus hook still counts (it is caucus's own).
         let stale = serde_json::json!({
             "hooks": { "Stop": [{ "hooks": [{ "command": SENTINEL_STOP }] }] }
         });
-        assert!(caucus_stop_hook_installed(&stale));
+        assert_eq!(caucus_stop_hook_commands(&stale), vec![SENTINEL_STOP]);
         // No hooks at all → not installed.
-        assert!(!caucus_stop_hook_installed(&serde_json::json!({})));
-        assert!(!caucus_stop_hook_installed(
-            &serde_json::json!({ "hooks": { "Stop": [] } })
-        ));
+        assert!(caucus_stop_hook_commands(&serde_json::json!({})).is_empty());
+        assert!(
+            caucus_stop_hook_commands(&serde_json::json!({ "hooks": { "Stop": [] } })).is_empty()
+        );
         // The false-OK this guards: a Stop hook whose only command merely
         // *mentions* "caucus" but is not a caucus hook command must NOT be
         // reported installed (the loose-substring bug).
@@ -126,7 +141,7 @@ mod tests {
             }] }] }
         });
         assert!(
-            !caucus_stop_hook_installed(&unrelated),
+            caucus_stop_hook_commands(&unrelated).is_empty(),
             "a non-caucus command that mentions 'caucus' must not count as installed"
         );
     }
