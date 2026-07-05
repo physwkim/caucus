@@ -5,6 +5,21 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [0.7.1] — 2026-07-05
+
+Documentation-only release so the crates.io page carries the setup fix.
+
+### Changed
+
+- **README documents the per-machine turn-signal hook install.** The
+  only mention of `caucus init --install-hook` was one line in the CLI
+  reference — nothing told a new machine's user that the Stop hook is a
+  required setup step, or what its absence looks like (every panel
+  stuck at `working` forever while the TUI otherwise runs). Install
+  gains a first-run-setup section — install once per machine, why it is
+  per-machine, one install covers all repos, `caucus doctor` verifies
+  live delivery — and the turn-completion paragraph cross-references it.
+
 ## [0.7.0] — 2026-07-05
 
 A hardened session lifecycle: caucus now survives display-wake resize
