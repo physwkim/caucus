@@ -49,6 +49,11 @@ pub struct Settings {
     /// mouse behaviour (drag-to-select / copy). Default on — set `mouse = false`
     /// to keep native selection.
     pub mouse: bool,
+    /// The reserved prefix letter (`prefix = "b"` → `Ctrl-B`), or `None` when
+    /// unset. Sits between the CLI and the compiled default in the prefix
+    /// resolution chain (`--prefix`/`CAUCUS_PREFIX` > this > default `Ctrl-A`
+    /// with tmux auto-dodge — see [`crate::input::effective_prefix`]).
+    pub prefix: Option<char>,
 }
 
 impl Default for Settings {
@@ -62,6 +67,7 @@ impl Default for Settings {
             capture_turn_limit: crate::term::OutputCapture::DEFAULT_TURN_LIMIT,
             capture_open_turn_bytes: crate::term::OutputCapture::DEFAULT_OPEN_TURN_BYTES,
             mouse: true,
+            prefix: None,
         }
     }
 }
@@ -102,6 +108,23 @@ struct SettingsOverrides {
     capture_turn_limit: Option<usize>,
     capture_open_turn_bytes: Option<usize>,
     mouse: Option<bool>,
+    prefix: Option<PrefixOverride>,
+}
+
+/// The `prefix` settings value, validated at parse time through the same
+/// grammar as `--prefix` ([`crate::cli::PrefixKey`]: a bare letter or a
+/// `ctrl-`/`c-`/`^` form) so the two spellings of the one knob cannot drift.
+/// A bad value is a load error, matching the `deny_unknown_fields` posture of
+/// surfacing mistakes instead of silently doing nothing.
+#[derive(Debug, Clone, Copy)]
+struct PrefixOverride(char);
+
+impl<'de> serde::Deserialize<'de> for PrefixOverride {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        let key: crate::cli::PrefixKey = raw.parse().map_err(serde::de::Error::custom)?;
+        Ok(Self(key.0))
+    }
 }
 
 impl SettingsOverrides {
@@ -136,6 +159,7 @@ impl SettingsOverrides {
                 .capture_open_turn_bytes
                 .or(self.capture_open_turn_bytes),
             mouse: other.mouse.or(self.mouse),
+            prefix: other.prefix.or(self.prefix),
         }
     }
 
@@ -164,6 +188,10 @@ impl SettingsOverrides {
                 .unwrap_or(d.capture_open_turn_bytes)
                 .max(1),
             mouse: self.mouse.unwrap_or(d.mouse),
+            // Already validated at parse time; `None` stays `None` — the
+            // default-with-tmux-dodge is applied by `input::effective_prefix`,
+            // not here, so an unset key is distinguishable from a chosen one.
+            prefix: self.prefix.map(|p| p.0),
         }
     }
 }
@@ -288,6 +316,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load(None, tmp.path()).unwrap().scrollback_lines, 0);
+    }
+
+    #[test]
+    fn prefix_parses_the_cli_grammar_and_rejects_bad_values() {
+        let tmp = TempDir::new().unwrap();
+        // Unset → None: the default (with tmux auto-dodge) is applied later by
+        // `input::effective_prefix`, so unset must stay distinguishable.
+        assert_eq!(load(None, tmp.path()).unwrap().prefix, None);
+
+        // A bare letter and a `ctrl-` form parse alike (the `--prefix` grammar).
+        std::fs::write(
+            tmp.path().join("settings.toml"),
+            "[settings]\nprefix = \"B\"\n",
+        )
+        .unwrap();
+        assert_eq!(load(None, tmp.path()).unwrap().prefix, Some('b'));
+        std::fs::write(
+            tmp.path().join("settings.toml"),
+            "[settings]\nprefix = \"ctrl-g\"\n",
+        )
+        .unwrap();
+        assert_eq!(load(None, tmp.path()).unwrap().prefix, Some('g'));
+
+        // A non-letter is a load error, not a silent no-op.
+        std::fs::write(
+            tmp.path().join("settings.toml"),
+            "[settings]\nprefix = \"1\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            load(None, tmp.path()),
+            Err(SettingsError::Toml { .. })
+        ));
     }
 
     #[test]

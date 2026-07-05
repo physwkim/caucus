@@ -95,10 +95,15 @@ forwarded verbatim to the focused panel's PTY, so an agent CLI sees a real
 terminal.
 
 The prefix is configurable, so it can dodge a collision with an outer
-multiplexer — for example a tmux remapped to `Ctrl-A`. Pass `--prefix b` or set
-`CAUCUS_PREFIX=b` to use `Ctrl-B` instead (any letter; a bare `b` or a
-`ctrl-b` / `^b` form both work). The table below shows the default; substitute
-your prefix for `Ctrl-A`.
+multiplexer — for example a tmux remapped to `Ctrl-A`. Pass `--prefix b`, set
+`CAUCUS_PREFIX=b`, or persist it once with `prefix = "b"` in the `[settings]`
+table of `~/.caucus/settings.toml` (or per-repo in
+`<repo>/.caucus/settings.toml`) to use `Ctrl-B` instead (any letter; a bare
+`b` or a `ctrl-b` / `^b` form both work; flag/env beats settings). With no
+configuration at all, launching inside a tmux whose own prefix is `Ctrl-A`
+auto-dodges the default to `Ctrl-B` — otherwise tmux would swallow every
+caucus command — and the status bar shows the live prefix either way. The
+table below shows the default; substitute your prefix for `Ctrl-A`.
 
 | Key                           | Action                                   |
 |-------------------------------|------------------------------------------|

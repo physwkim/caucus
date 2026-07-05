@@ -257,12 +257,15 @@ pub fn run(
     repo: &std::path::Path,
     roles: &[String],
     main_cli: Option<AgentCli>,
-    prefix: char,
+    prefix: Option<char>,
     topic: Option<String>,
 ) -> Result<()> {
     init_logging(repo);
     require_tty()?;
     let config = Config::load(repo).context("load caucus configuration")?;
+    // Explicit --prefix/CAUCUS_PREFIX > `[settings] prefix` > the tmux-aware
+    // default. After `init_logging` so a dodge lands in caucus.log.
+    let prefix = crate::input::effective_prefix(prefix, config.settings.prefix);
     let topic = topic.unwrap_or_else(|| default_topic(repo));
     let session = Session::new(topic, repo.to_path_buf());
     let roles = roles.to_vec();
@@ -297,7 +300,7 @@ fn default_topic(repo: &std::path::Path) -> String {
 pub fn run_resumed(
     repo: &std::path::Path,
     session_id: crate::session::SessionId,
-    prefix: char,
+    prefix: Option<char>,
 ) -> Result<()> {
     // Resolve the record first — a missing/corrupt `session.json` fails with a
     // pointed message regardless of whether stdout is a tty.
@@ -311,6 +314,8 @@ pub fn run_resumed(
     init_logging(repo);
     require_tty()?;
     let config = Config::load(repo).context("load caucus configuration")?;
+    // Same resolution chain as a fresh launch (`tui::run`).
+    let prefix = crate::input::effective_prefix(prefix, config.settings.prefix);
     let session = Session::from_record(&record);
 
     let runtime = tokio::runtime::Runtime::new().context("start tokio runtime")?;

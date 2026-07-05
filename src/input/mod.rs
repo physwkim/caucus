@@ -14,9 +14,11 @@
 //! # Keymap
 //!
 //! caucus reserves a single **prefix key**, `Ctrl-A` by default, for its own
-//! commands. The prefix is configurable (`--prefix` / `CAUCUS_PREFIX`, see
-//! [`FocusRouter::with_prefix`]) so it can dodge a collision with an outer
-//! multiplexer — set `Ctrl-B` when tmux is remapped to `Ctrl-A`. The table
+//! commands. The prefix is configurable — `--prefix` / `CAUCUS_PREFIX`, then
+//! the `[settings] prefix` key, resolved by [`effective_prefix`] — so it can
+//! dodge a collision with an outer multiplexer; with no configuration at all,
+//! launching inside a tmux whose own prefix is `Ctrl-A` auto-dodges the
+//! default to `Ctrl-B` (tmux would otherwise swallow every command). The table
 //! below shows the default; substitute your prefix for `Ctrl-A`. Every other
 //! keystroke — including `Ctrl-C` — is encoded to terminal bytes and forwarded
 //! verbatim to the focused panel's PTY, so an agent CLI sees a real terminal.
@@ -63,6 +65,80 @@ use crate::session::id::PanelId;
 
 /// The default prefix letter — `Ctrl-A` — used when none is configured.
 const PREFIX_CHAR: char = 'a';
+
+/// The letter the default dodges to when an outer tmux already owns
+/// `Ctrl-<PREFIX_CHAR>` as its prefix. Safe by construction: the dodge fires
+/// only when tmux's prefix *is* `PREFIX_CHAR`, so the fallback can never be
+/// the colliding chord itself.
+const FALLBACK_PREFIX_CHAR: char = 'b';
+
+/// Resolve the effective prefix letter for this launch: an explicit
+/// `--prefix` / `CAUCUS_PREFIX` wins, then the `[settings] prefix` key, then
+/// the default `Ctrl-A` — auto-dodged to `Ctrl-B` when running inside a tmux
+/// whose own prefix is that same chord. Without the dodge, tmux swallows
+/// every caucus command: each one needs a `C-a C-a <key>` triple chord and a
+/// plain `C-a n`/`C-a p` switches tmux windows instead of caucus panels.
+///
+/// The dodge applies only to the *default*: a prefix the user chose anywhere
+/// explicitly is honoured even when it collides. The dodge is logged (the
+/// status bar always shows the live prefix either way).
+pub fn effective_prefix(explicit: Option<char>, configured: Option<char>) -> char {
+    let tmux = tmux_prefix_letter();
+    let resolved = resolve_prefix(explicit, configured, tmux);
+    if resolved != PREFIX_CHAR && explicit.or(configured).is_none() {
+        tracing::warn!(
+            "the outer tmux uses Ctrl-{} as its own prefix; caucus commands moved to Ctrl-{} \
+             (pin one with --prefix / CAUCUS_PREFIX / `[settings] prefix`)",
+            PREFIX_CHAR.to_ascii_uppercase(),
+            resolved.to_ascii_uppercase(),
+        );
+    }
+    resolved
+}
+
+/// Pure resolution core of [`effective_prefix`]: explicit > configured >
+/// default, with the default dodging a colliding outer-tmux prefix.
+fn resolve_prefix(
+    explicit: Option<char>,
+    configured: Option<char>,
+    tmux_prefix: Option<char>,
+) -> char {
+    if let Some(chosen) = explicit.or(configured) {
+        return chosen;
+    }
+    if tmux_prefix == Some(PREFIX_CHAR) {
+        FALLBACK_PREFIX_CHAR
+    } else {
+        PREFIX_CHAR
+    }
+}
+
+/// The outer tmux's prefix letter (`C-a` → `'a'`), or `None` when not inside
+/// tmux ($TMUX unset), the probe fails, or the tmux prefix is not a
+/// `Ctrl-<letter>` chord — only those can collide with a caucus prefix.
+fn tmux_prefix_letter() -> Option<char> {
+    std::env::var_os("TMUX")?;
+    let out = std::process::Command::new("tmux")
+        .args(["show-options", "-gqv", "prefix"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_tmux_prefix(std::str::from_utf8(&out.stdout).ok()?)
+}
+
+/// Parse tmux's `show-options -gqv prefix` output (`"C-a"`, `"C-b"`, ...) to
+/// the prefix letter. Non-`C-<letter>` prefixes (`` ` ``, `C-Space`, an empty
+/// probe) yield `None` — they cannot collide with a `Ctrl-<letter>` chord.
+fn parse_tmux_prefix(raw: &str) -> Option<char> {
+    let rest = raw.trim().strip_prefix("C-")?;
+    let mut chars = rest.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii_alphabetic() => Some(c.to_ascii_lowercase()),
+        _ => None,
+    }
+}
 
 /// Where a key event should go after focus routing.
 #[derive(Debug, Clone)]
@@ -699,6 +775,41 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    // Prefix resolution boundaries: one case per rung of the chain (explicit >
+    // configured > default) plus the two sides of the tmux-collision dodge.
+    #[test]
+    fn resolve_prefix_explicit_wins_even_when_it_collides() {
+        assert_eq!(resolve_prefix(Some('c'), Some('d'), Some('c')), 'c');
+        assert_eq!(resolve_prefix(Some('a'), None, Some('a')), 'a');
+    }
+
+    #[test]
+    fn resolve_prefix_configured_wins_over_the_dodge() {
+        // A settings-chosen prefix is the user's choice — honoured verbatim,
+        // even when it is exactly the colliding tmux chord.
+        assert_eq!(resolve_prefix(None, Some('a'), Some('a')), 'a');
+        assert_eq!(resolve_prefix(None, Some('g'), Some('a')), 'g');
+    }
+
+    #[test]
+    fn resolve_prefix_default_dodges_a_colliding_tmux_prefix_only() {
+        // Colliding tmux (C-a) → the default moves to the fallback.
+        assert_eq!(resolve_prefix(None, None, Some('a')), FALLBACK_PREFIX_CHAR);
+        // Non-colliding tmux (C-b) or no tmux at all → the plain default.
+        assert_eq!(resolve_prefix(None, None, Some('b')), PREFIX_CHAR);
+        assert_eq!(resolve_prefix(None, None, None), PREFIX_CHAR);
+    }
+
+    #[test]
+    fn parse_tmux_prefix_accepts_only_ctrl_letter_chords() {
+        assert_eq!(parse_tmux_prefix("C-a\n"), Some('a'));
+        assert_eq!(parse_tmux_prefix("C-B"), Some('b'));
+        // Chords that cannot collide with a Ctrl-<letter> prefix parse to None.
+        assert_eq!(parse_tmux_prefix("C-Space"), None);
+        assert_eq!(parse_tmux_prefix("`"), None);
+        assert_eq!(parse_tmux_prefix(""), None);
     }
 
     #[test]

@@ -42,13 +42,16 @@ pub struct Cli {
     pub agent_cli: Option<AgentCli>,
 
     /// caucus's reserved prefix key — `Ctrl-<letter>` selects caucus commands
-    /// (panel focus, zoom, layout, ...). Defaults to `a` (`Ctrl-A`). Set this
-    /// when `Ctrl-A` collides with an outer multiplexer — e.g. a tmux remapped
-    /// to `Ctrl-A`: `--prefix b` or `CAUCUS_PREFIX=b` reserves `Ctrl-B`
-    /// instead. Accepts a bare letter or a `ctrl-`/`c-`/`^` form. Only
-    /// meaningful when launching the TUI (fresh or `resume`).
-    #[arg(long, env = "CAUCUS_PREFIX", default_value = "a")]
-    pub prefix: PrefixKey,
+    /// (panel focus, zoom, layout, ...). Resolution order: this flag /
+    /// `CAUCUS_PREFIX`, then the `[settings] prefix` key
+    /// (`~/.caucus/settings.toml` < `<repo>/.caucus/settings.toml`), then the
+    /// default `a` (`Ctrl-A`) — which auto-dodges to `Ctrl-B` when launched
+    /// inside a tmux whose own prefix is `Ctrl-A`
+    /// ([`crate::input::effective_prefix`]). Accepts a bare letter or a
+    /// `ctrl-`/`c-`/`^` form. Only meaningful when launching the TUI (fresh
+    /// or `resume`).
+    #[arg(long, env = "CAUCUS_PREFIX")]
+    pub prefix: Option<PrefixKey>,
 
     /// A short human label for this session, shown in `caucus sessions` so the
     /// list distinguishes runs instead of reading "caucus session" for every
@@ -235,7 +238,9 @@ pub fn run() -> ExitCode {
 
 /// Dispatch a parsed [`Cli`]. No subcommand launches the TUI.
 fn dispatch(cli: Cli) -> Result<ExitCode> {
-    let prefix = cli.prefix.0;
+    // `None` = no --prefix/CAUCUS_PREFIX given; the TUI resolves it against
+    // `[settings] prefix` and the tmux-aware default (`input::effective_prefix`).
+    let prefix = cli.prefix.map(|p| p.0);
     match cli.command {
         None => run_tui(&cli.roles, cli.agent_cli, prefix, cli.topic),
         Some(Command::Init { install_hook }) => run_init(install_hook),
@@ -273,7 +278,7 @@ fn repo_root() -> Result<PathBuf> {
 fn run_tui(
     roles: &[String],
     main_cli: Option<AgentCli>,
-    prefix: char,
+    prefix: Option<char>,
     topic: Option<String>,
 ) -> Result<ExitCode> {
     let repo = repo_root()?;
@@ -482,7 +487,7 @@ fn humanize_age(d: chrono::Duration) -> String {
 }
 
 /// `caucus resume <session_id>` — relaunch the TUI restoring a session.
-fn run_resume(session_id: &str, prefix: char) -> Result<ExitCode> {
+fn run_resume(session_id: &str, prefix: Option<char>) -> Result<ExitCode> {
     let repo = repo_root()?;
     let id = SessionId::from_str(session_id)
         .with_context(|| format!("invalid session id '{session_id}'"))?;
@@ -560,9 +565,12 @@ mod tests {
     }
 
     #[test]
-    fn prefix_defaults_to_ctrl_a() {
+    fn prefix_flag_defaults_to_unset() {
+        // `None` = nothing explicit on the CLI/env — the TUI then resolves
+        // `[settings] prefix` and the tmux-aware default `Ctrl-A`
+        // (`input::effective_prefix`), so unset must survive parsing as-is.
         let cli = Cli::try_parse_from(["caucus"]).unwrap();
-        assert_eq!(cli.prefix.0, 'a');
+        assert!(cli.prefix.is_none());
     }
 
     #[test]
@@ -571,6 +579,7 @@ mod tests {
             Cli::try_parse_from(["caucus", "--prefix", "B"])
                 .unwrap()
                 .prefix
+                .unwrap()
                 .0,
             'b'
         );
@@ -583,6 +592,7 @@ mod tests {
                 Cli::try_parse_from(["caucus", "--prefix", spec])
                     .unwrap()
                     .prefix
+                    .unwrap()
                     .0,
                 'b',
                 "spec `{spec}` should parse to 'b'"
