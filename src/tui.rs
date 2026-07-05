@@ -5,8 +5,9 @@
 //! 1. enter raw mode + the alternate screen behind a `TerminalGuard` that
 //!    restores the terminal on *any* exit path, including a panic;
 //! 2. build the [`Multiplexer`], spawn the main worker panel (+ any `--roles`);
-//! 3. loop: poll crossterm input → route via `input/`; drain each panel's PTY
-//!    via `panel pump`; ingest turn signals; redraw on a ~60 Hz tick;
+//! 3. loop: receive crossterm input from the stdin reader thread → route via
+//!    `input/`; drain each panel's PTY via `panel pump`; ingest turn signals;
+//!    redraw on a ~60 Hz tick;
 //! 4. on quit, kill every panel and restore the terminal.
 //!
 //! Not a tty? [`run`] fails cleanly with a message rather than panicking, so
@@ -14,7 +15,7 @@
 
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -51,12 +52,13 @@ const TICK: Duration = Duration::from_millis(16);
 /// degrades to at most this much staleness rather than a frozen frame.
 const FORCED_REDRAW_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Slept after a terminal-I/O error before retrying, so a persistently failing
-/// terminal cannot hot-spin the loop (a failing `poll` returns immediately,
-/// with no timeout wait). Terminal I/O errors are *always* treated as transient
-/// (see [`event_loop`]), so this backoff is the only thing pacing the retry
-/// while a display wake or a monitor/DPI switch has the terminal briefly
-/// unavailable — the session itself is never ended by such an error.
+/// Slept by the stdin reader thread after a terminal-I/O error before
+/// retrying, so a persistently failing terminal cannot hot-spin that thread
+/// (a failing `read` returns immediately). Terminal I/O errors are *always*
+/// treated as transient (see [`spawn_input_reader`]), so this backoff is the
+/// only thing pacing the retry while a display wake or a monitor/DPI switch
+/// has the terminal briefly unavailable — the session itself is never ended
+/// by such an error.
 const TERMINAL_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
 /// How long the controlling terminal must stay unreachable after a `SIGHUP`
@@ -163,6 +165,71 @@ fn hangup_verdict(
     } else {
         HangupAction::Wait
     }
+}
+
+/// Spawn the dedicated stdin reader thread and return its event channel.
+///
+/// The event loop must never touch terminal input directly: crossterm treats
+/// a stdin EOF (the pty master closed under us — e.g. `tmux kill-server`) as
+/// "no data yet" and busy-loops *inside* `event::poll` without ever
+/// returning, which wedges whatever thread called it at 100% CPU. Confining
+/// the read to its own thread makes the loop's pacing the loop's own —
+/// whatever state the terminal is in, ticks keep running, so the
+/// hangup/orphan checks can still end the session in bounded time (the
+/// wedged reader thread dies with the process).
+///
+/// The thread forwards `event::read()` results as-is; on a read `Err` it
+/// backs off [`TERMINAL_ERROR_BACKOFF`] (transient wake/DPI-switch glitches,
+/// absorbed exactly as the loop always has) and keeps reading. It exits only
+/// when the receiver is gone. If the thread cannot be spawned at all, the
+/// returned channel reads as disconnected and the loop shuts down orderly.
+fn spawn_input_reader() -> mpsc::Receiver<std::io::Result<Event>> {
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("stdin-events".into())
+        .spawn(move || {
+            loop {
+                let result = event::read();
+                let errored = result.is_err();
+                if tx.send(result).is_err() {
+                    return;
+                }
+                if errored {
+                    std::thread::sleep(TERMINAL_ERROR_BACKOFF);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        warn!(error = %e, "failed to spawn the stdin reader thread");
+    }
+    rx
+}
+
+/// Current parent pid; the non-unix stub never reads as orphaned.
+#[cfg(unix)]
+fn parent_pid() -> u32 {
+    std::os::unix::process::parent_id()
+}
+#[cfg(not(unix))]
+fn parent_pid() -> u32 {
+    u32::MAX
+}
+
+/// Whether the hosting process is gone: caucus started under a live parent
+/// (shell, tmux server, terminal emulator) and has since been reparented to
+/// init. This is the death signal the `SIGHUP` machinery cannot see when
+/// caucus is its pty's *session leader* — tmux runs each pane command as the
+/// session leader of the pane's pty, and a pty is only revoked when its
+/// session leader exits, so after `tmux kill-server` the `/dev/tty` probe
+/// keeps succeeding forever while crossterm silently busy-loops on the
+/// stdin EOF (100% CPU, no error surfaced, panels left running headless).
+/// Reparenting is decisive the other way too: a *detached* tmux keeps its
+/// panes parented to the live server, so detach never reads as orphaned.
+/// A process legitimately started under init (`initial_ppid == 1`) can never
+/// trip this. (On Linux a subreaper may adopt orphans instead of init; there
+/// this check simply never fires, which is the pre-existing behaviour.)
+fn orphaned(initial_ppid: u32, current_ppid: u32) -> bool {
+    current_ppid == 1 && initial_ppid != 1
 }
 
 /// Install file logging at `<repo>/.caucus/caucus.log` plus a panic hook that
@@ -573,7 +640,32 @@ async fn event_loop(
     let hangup = Arc::new(AtomicBool::new(false));
     spawn_hangup_listener(hangup.clone());
     let mut hangup_suspect_since: Option<Instant> = None;
+    // Stdin events come through a dedicated reader thread so terminal I/O
+    // can never wedge this loop (see [`spawn_input_reader`]).
+    let input_rx = spawn_input_reader();
+    // Orphan watch: the hosting-process-death signal the `SIGHUP` machinery
+    // cannot see when caucus is its pty's session leader (see [`orphaned`]).
+    let initial_ppid = parent_pid();
+    let mut orphaned_since: Option<Instant> = None;
     loop {
+        // Hosting process gone (tmux server killed, terminal emulator died):
+        // confirm over the same window as a hangup, then end the session
+        // through the orderly shutdown path so panels are not left running
+        // headless.
+        if orphaned(initial_ppid, parent_pid()) {
+            let since = orphaned_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= HANGUP_CONFIRM_WINDOW {
+                warn!(
+                    initial_ppid,
+                    ?HANGUP_CONFIRM_WINDOW,
+                    "hosting process gone (reparented to init); shutting down"
+                );
+                break;
+            }
+        } else {
+            orphaned_since = None;
+        }
+
         // Begin — or restart — confirming a hangup whenever a `SIGHUP` arrives.
         if hangup.swap(false, Ordering::SeqCst) {
             hangup_suspect_since.get_or_insert_with(Instant::now);
@@ -605,48 +697,49 @@ async fn event_loop(
             }
         }
 
-        // 1. Input — poll without blocking the pump/redraw cadence. A poll/read
-        //    error here is always transient and recoverable: a display wake or a
-        //    monitor/DPI switch makes crossterm briefly fail `terminal::size()`
-        //    inside its SIGWINCH handler (the `TIOCGWINSZ` ioctl has no EINTR
-        //    retry, then the `tput` fallback also fails mid-transition), which
-        //    surfaces as an `Err` out of `poll`/`read`. Absorb it — warn, back
-        //    off, keep the session alive. Only a genuine SIGHUP (checked above)
-        //    ends the loop, and then via the orderly shutdown below.
-        match event::poll(Duration::from_millis(4)) {
-            Ok(true) => match event::read() {
-                Ok(Event::Key(key)) if key.kind == event::KeyEventKind::Press => {
-                    mux.handle_key(key);
-                }
-                Ok(Event::Paste(text)) => {
-                    // A host-side bracketed paste: deliver it to the focused
-                    // panel as one paste burst instead of letting it stream
-                    // key-by-key and submit at every newline.
-                    mux.handle_paste(&text);
-                }
-                Ok(Event::Mouse(mouse)) => {
-                    // Only delivered when mouse capture is on (`[settings]
-                    // mouse`). The scroll wheel drives the scrollback pager.
-                    mux.handle_mouse(mouse);
-                }
-                Ok(Event::Resize(w, h)) => {
-                    let _ = mux.resize(body_area(Rect {
-                        x: 0,
-                        y: 0,
-                        width: w,
-                        height: h,
-                    }));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(error = %e, "terminal read error; continuing");
-                    std::thread::sleep(TERMINAL_ERROR_BACKOFF);
-                }
-            },
-            Ok(false) => {}
-            Err(e) => {
-                warn!(error = %e, "terminal poll error; continuing");
-                std::thread::sleep(TERMINAL_ERROR_BACKOFF);
+        // 1. Input — received through the reader thread's channel, never by
+        //    touching the terminal from this loop (see [`spawn_input_reader`]:
+        //    crossterm can wedge inside `poll` on a dead stdin, and pacing is
+        //    this loop's own job). The timeout is the old poll window, so the
+        //    pump/redraw cadence is unchanged. A read error is transient and
+        //    recoverable (display wakes / monitor switches make crossterm
+        //    briefly fail inside its SIGWINCH handler): warn and keep the
+        //    session alive — the reader thread already backed off. Only a
+        //    confirmed hangup or orphaning (checked above) ends the loop.
+        match input_rx.recv_timeout(Duration::from_millis(4)) {
+            Ok(Ok(Event::Key(key))) if key.kind == event::KeyEventKind::Press => {
+                mux.handle_key(key);
+            }
+            Ok(Ok(Event::Paste(text))) => {
+                // A host-side bracketed paste: deliver it to the focused
+                // panel as one paste burst instead of letting it stream
+                // key-by-key and submit at every newline.
+                mux.handle_paste(&text);
+            }
+            Ok(Ok(Event::Mouse(mouse))) => {
+                // Only delivered when mouse capture is on (`[settings]
+                // mouse`). The scroll wheel drives the scrollback pager.
+                mux.handle_mouse(mouse);
+            }
+            Ok(Ok(Event::Resize(w, h))) => {
+                let _ = mux.resize(body_area(Rect {
+                    x: 0,
+                    y: 0,
+                    width: w,
+                    height: h,
+                }));
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(error = %e, "terminal read error; continuing");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The reader thread only ends when it cannot deliver (this
+                // receiver gone) or never started; either way stdin is lost
+                // for good — end the session through the orderly shutdown.
+                warn!("stdin reader gone; shutting down");
+                break;
             }
         }
 
@@ -971,5 +1064,27 @@ mod tests {
     #[test]
     fn controlling_terminal_probe_is_total() {
         let _alive: bool = controlling_terminal_alive();
+    }
+
+    /// Reparenting to init after starting under a live parent is the orphan
+    /// signal (tmux server killed, terminal emulator died).
+    #[test]
+    fn orphaned_detects_reparenting_to_init() {
+        assert!(orphaned(4242, 1));
+    }
+
+    /// While the original parent (or any non-init parent) is in place, the
+    /// session is hosted — never orphaned.
+    #[test]
+    fn orphaned_is_false_under_a_live_parent() {
+        assert!(!orphaned(4242, 4242));
+        assert!(!orphaned(4242, 7));
+    }
+
+    /// A process legitimately started under init can never read as orphaned;
+    /// otherwise it would confirm shutdown at the first loop iteration.
+    #[test]
+    fn orphaned_is_false_when_started_under_init() {
+        assert!(!orphaned(1, 1));
     }
 }
