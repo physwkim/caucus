@@ -5,6 +5,69 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [0.7.0] — 2026-07-05
+
+A hardened session lifecycle: caucus now survives display-wake resize
+storms, tears itself down when its hosting terminal dies, dodges tmux
+prefix collisions, presents a clean terminal identity to panels, and
+`caucus doctor` proves the turn-signal chain live instead of trusting
+configuration.
+
+### Added
+
+- **`prefix` settings key + tmux prefix-collision auto-dodge.** The
+  command prefix can now live in the `[settings]` table
+  (`~/.caucus/settings.toml` global, `<repo>/.caucus/settings.toml`
+  project), validated through the same grammar as `--prefix` so the two
+  spellings cannot drift; `--prefix` / `CAUCUS_PREFIX` still win. With
+  nothing configured, launch-time detection dodges the default to
+  Ctrl-B inside a tmux whose own prefix is Ctrl-A (previously every
+  caucus chord needed `C-a C-a <key>` and plain `C-a n`/`C-a p`
+  switched tmux windows instead of caucus panels). The dodge applies
+  only to the default — a chosen prefix is honoured even when it
+  collides — and the status bar always shows the live prefix.
+- **`caucus doctor` verifies the turn-signal chain end-to-end.** The
+  old check only asserted a caucus-shaped Stop-hook string exists in
+  `~/.claude/settings.json` — on a machine where that command cannot
+  run (settings synced from another machine carrying its absolute
+  `turn-signal` path, or a clone where `caucus init` never ran) it
+  reported ok while every worker panel sat at `working` forever.
+  Doctor now resolves the hook command on *this* machine and runs the
+  hook exactly as Claude Code would (`sh -c`, `CAUCUS_*` env, JSON on
+  stdin) against a throwaway socket, requiring the signal to actually
+  arrive; failures surface the hook's stderr.
+
+### Fixed
+
+- **Display-wake resize storms no longer kill the session.** Waking a
+  Mac with the terminal on an external monitor resizes the window in a
+  burst, and a lost Resize event left the layout tiling a stale, larger
+  area — the first cell write past the buffer edge panicked ratatui and
+  took the whole session down. `render::draw` now clips every slot rect
+  to the frame area (the buffer is the sole size authority at paint
+  time), the event loop reconciles the mux area against the real
+  terminal size each draw tick, and a reflowed layout repaints
+  immediately instead of waiting for child output.
+- **caucus ends the session when its hosting process dies.** After
+  `tmux kill-server` (or any death of the hosting terminal) caucus
+  survived headless at 100% CPU with all agent panels left running: as
+  its pane's session leader its pty was never revoked, and crossterm
+  busy-loops on the resulting stdin EOF without ever returning. Stdin
+  input now lives on a dedicated reader thread so terminal I/O can
+  never wedge the event loop, and the loop watches for reparenting to
+  init — the death signal that works even for a session leader — then
+  ends the session through the orderly shutdown path, reaping every
+  panel. Detaching tmux keeps panes parented to the live server, so
+  detach never trips this.
+- **Panel children see the grid's terminal identity, not the outer
+  terminal's.** Panels inherited the outer environment's `TERM`,
+  `$TMUX`, `WEZTERM_*`, `ITERM_SESSION_ID`, … while actually running
+  inside caucus's vte grid — under tmux this downgraded agents to
+  256-color output and handed them a live handle to the *host* tmux
+  session. `PtyCommand::to_builder` now owns the panel environment:
+  `TERM=xterm-256color` and the outer-terminal variables scrubbed,
+  with explicit per-command entries still winning.
+
 ## [0.6.1] — 2026-06-30
 
 ### Changed
