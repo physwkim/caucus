@@ -86,6 +86,8 @@ OAuth device-code prompt.
 **Turn completion is live.** Each agent's Claude `Stop` hook posts to a
 caucus socket the moment a turn ends — no polling, no sentinel files. The
 main worker sees "that sub-agent finished its turn" immediately and reacts.
+This hook is installed once per machine with `caucus init --install-hook`
+(see [Install](#install)); without it every panel stays `working` forever.
 
 ## Keymap
 
@@ -233,6 +235,37 @@ Requirements:
 - Rust 1.85+ (edition 2024)
 
 No tmux dependency — caucus is its own multiplexer.
+
+### First-run setup: install the turn-signal hook
+
+Once per machine, in a repo you keep around:
+
+```bash
+cd <your project repo>
+caucus init --install-hook   # writes .caucus/bin/turn-signal and merges the
+                             # Claude Stop hook into ~/.claude/settings.json
+caucus doctor                # verifies the chain with a live end-to-end signal test
+```
+
+The Stop hook is how caucus learns an agent's turn has finished. **Without
+it, every panel stays `working` forever and rounds never settle** — the TUI
+runs, agents work, but no result ever comes back. Plain `caucus init`
+(without `--install-hook`) writes the script but leaves your Claude
+settings untouched.
+
+The hook entry is an absolute path to this repo's `.caucus/bin/turn-signal`
+on *this* machine, and the script execs `caucus` by bare name, so:
+
+- run `caucus init --install-hook` on **every machine** you use caucus on —
+  a `~/.claude/settings.json` synced from another machine carries a path
+  that does not exist locally, and turn signals silently die;
+- re-run it if you delete or move the repo holding the script;
+- keep `caucus` on `PATH` (a `cargo install` already does).
+
+One install covers all repos on the machine — the script reads the session
+from `CAUCUS_*` env that caucus injects at panel spawn, so it is not tied
+to the repo it lives in. When in doubt, `caucus doctor` tests actual
+delivery, not just configuration.
 
 ## Roles
 
