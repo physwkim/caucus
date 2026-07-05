@@ -474,6 +474,15 @@ caucus는 기동 시 unix domain socket을 연다:
 그 agent 프로세스에 env를 주입한다 — `CAUCUS_SESSION_ID`, `CAUCUS_PANEL_ID`,
 `CAUCUS_SOCK`, `CAUCUS_SESSION_DIR`.
 
+주입과 함께 caucus는 패널 자식의 **터미널 신원**을 자기 것으로 바꾼다
+(`pty::PtyCommand::to_builder`, 단일 소유자): 패널의 터미널은 caucus의 vte
+grid이지 caucus가 떠 있는 바깥 터미널이 아니므로, `TERM=xterm-256color`(grid가
+에뮬레이트하는 레퍼토리)를 설정하고 바깥 터미널의 신원·제어 변수(`COLORTERM`,
+`TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `TMUX`, `TMUX_PANE`, `WEZTERM_PANE`,
+`WEZTERM_UNIX_SOCKET`, `ITERM_SESSION_ID`)는 제거한다. 이로써 패널 환경은
+caucus가 tmux 안에서 돌든 밖에서 돌든 구성상 동일하고, 패널 agent가 leaked
+제어 핸들로 호스트 tmux/WezTerm 세션을 조작하는 경로도 닫힌다.
+
 `CAUCUS_SESSION_DIR`는 세션 저장 루트 `<repo>/.caucus/sessions/<session_id>/`
 (`Session::root_dir`)를 가리킨다 — 모든 패널이 닿을 수 있는 공유 경로다.
 `worktree=true` 패널의 cwd는 격리된 워크트리라 다른 패널이 만든 파일이 보이지

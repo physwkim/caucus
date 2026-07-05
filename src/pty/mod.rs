@@ -34,6 +34,33 @@ use std::thread::JoinHandle;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use thiserror::Error;
 
+/// `TERM` presented to panel children. A panel's terminal is caucus's own
+/// grid ([`crate::term::grid`]) — a vte-driven emulator of the xterm-256color
+/// repertoire (true-colour SGR is accepted but approximated to the 256
+/// palette) — never the terminal caucus itself runs in. Advertising the outer
+/// terminal instead makes agents adapt to a terminal they cannot see: a
+/// tmux-hosted caucus leaks `TERM=tmux-256color` and the agent downgrades
+/// colours and drops synchronized-output framing.
+const PANEL_TERM: &str = "xterm-256color";
+
+/// Outer-terminal identity and control-channel variables scrubbed from panel
+/// children. Identity vars (`COLORTERM`, `TERM_PROGRAM`,
+/// `TERM_PROGRAM_VERSION`) describe the terminal caucus runs in, not the
+/// panel's grid. `TMUX`/`TMUX_PANE`/`WEZTERM_PANE`/`WEZTERM_UNIX_SOCKET`/
+/// `ITERM_SESSION_ID` are live control handles — leaked into a panel, an
+/// agent shelling out to `tmux`/`wezterm cli` would act on the *host*
+/// session, not anything of its own.
+const OUTER_TERMINAL_VARS: &[&str] = &[
+    "COLORTERM",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TMUX",
+    "TMUX_PANE",
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "ITERM_SESSION_ID",
+];
+
 /// How to launch the child process inside a PTY.
 #[derive(Debug, Clone)]
 pub struct PtyCommand {
@@ -66,8 +93,18 @@ impl PtyCommand {
         if let Some(cwd) = &self.cwd {
             builder.cwd(cwd);
         }
-        // The child inherits the caucus process environment by default;
-        // these entries (the `CAUCUS_*` vars, §7.1) are layered on top.
+        // The child inherits the caucus process environment by default, but
+        // its terminal is caucus's grid, not the terminal (or tmux) caucus
+        // runs in — so the outer terminal's identity is replaced with the
+        // grid's ([`PANEL_TERM`], [`OUTER_TERMINAL_VARS`]). This keeps a
+        // panel's environment identical whether caucus runs bare or inside
+        // tmux.
+        builder.env("TERM", PANEL_TERM);
+        for var in OUTER_TERMINAL_VARS {
+            builder.env_remove(var);
+        }
+        // These entries (the `CAUCUS_*` vars, §7.1) are layered on last, so
+        // an explicit entry wins over the defaults above.
         for (key, value) in &self.env {
             builder.env(key, value);
         }
@@ -497,6 +534,61 @@ mod tests {
         assert!(
             text.contains("panel-7"),
             "expected injected env in child output, got {text:?}"
+        );
+
+        pty.kill().unwrap();
+    }
+
+    /// The panel child sees the grid's terminal identity, not the outer
+    /// terminal's: `TERM` names what the grid emulates, and the host
+    /// identity/control vars are scrubbed even when caucus itself runs
+    /// inside tmux (the regression this guards: a tmux-hosted caucus leaked
+    /// `TERM=tmux-256color` + `$TMUX` into every panel agent).
+    #[test]
+    fn panel_child_sees_the_grid_terminal_identity_not_the_outer_one() {
+        // Simulate a tmux-hosted caucus. Safe under nextest (one process per
+        // test); no other test in this crate reads these vars.
+        unsafe {
+            std::env::set_var("TMUX", "/tmp/tmux-0/default,1,0");
+            std::env::set_var("TMUX_PANE", "%0");
+            std::env::set_var("COLORTERM", "truecolor");
+        }
+        let mut cmd = PtyCommand::new("/bin/sh");
+        cmd.args = vec![
+            "-c".into(),
+            "printf %s \"$TERM,${TMUX:-unset},${TMUX_PANE:-unset},${COLORTERM:-unset}\"".into(),
+        ];
+        let mut pty = Pty::spawn(&cmd, 80, 24).unwrap();
+
+        let out = drain_until_nonempty(&mut pty, Duration::from_secs(5));
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("xterm-256color,unset,unset,unset"),
+            "expected the grid identity with host vars scrubbed, got {text:?}"
+        );
+
+        pty.kill().unwrap();
+        unsafe {
+            std::env::remove_var("TMUX");
+            std::env::remove_var("TMUX_PANE");
+            std::env::remove_var("COLORTERM");
+        }
+    }
+
+    /// An explicit `PtyCommand::env` entry is layered after the identity
+    /// defaults, so a caller can still override `TERM` deliberately.
+    #[test]
+    fn explicit_env_entry_overrides_the_default_term() {
+        let mut cmd = PtyCommand::new("/bin/sh");
+        cmd.args = vec!["-c".into(), "printf %s \"$TERM\"".into()];
+        cmd.env.insert("TERM".to_string(), "dumb".to_string());
+        let mut pty = Pty::spawn(&cmd, 80, 24).unwrap();
+
+        let out = drain_until_nonempty(&mut pty, Duration::from_secs(5));
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("dumb"),
+            "expected the explicit TERM override, got {text:?}"
         );
 
         pty.kill().unwrap();
