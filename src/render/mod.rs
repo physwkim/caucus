@@ -361,17 +361,29 @@ fn ranges_overlap(a: u16, alen: u16, b: u16, blen: u16) -> bool {
 /// position; without it the terminal composes pre-edit text at a stale spot
 /// and CJK input renders detached.
 pub fn draw(frame: &mut Frame, layout: &Layout, panels: &[Panel], focused: Option<PanelId>) {
+    // The frame's buffer is the sole authority on the screen size at paint
+    // time. The layout's slots come from the multiplexer's `area`, which is
+    // fed by terminal Resize *events* — and during a display wake (external
+    // monitor re-attach) those events can lag or be lost outright while
+    // ratatui's autoresize has already shrunk the buffer. A stale slot then
+    // extends past the buffer and an unclamped cell write panics ratatui's
+    // indexing ("index outside of buffer"). Clipping every slot here makes
+    // that state unreachable: a stale frame renders clipped for one tick and
+    // the event loop's size reconcile reflows the layout right after.
+    let bounds = frame.area();
     for (id, rect) in &layout.slots {
         let Some(panel) = panels.iter().find(|p| p.id == *id) else {
             continue;
         };
-        draw_panel(frame, panel, *rect, focused == Some(*id));
+        let rect = TuiRect::from(*rect).intersection(bounds);
+        draw_panel(frame, panel, rect, focused == Some(*id));
     }
 
     // Park the hardware cursor at the focused panel's grid cursor. Grid
     // columns map 1:1 to screen columns (a wide glyph occupies two grid
     // columns and `grid_lines` renders it two columns wide), so the grid
-    // cursor column is also the screen column.
+    // cursor column is also the screen column. Skipped when the stale-rect
+    // clip above pushed the position off the frame — same authority rule.
     if let Some(fid) = focused
         && let Some(rect) = layout.rect_of(fid)
         && let Some(panel) = panels.iter().find(|p| p.id == fid)
@@ -381,15 +393,17 @@ pub fn draw(frame: &mut Frame, layout: &Layout, panels: &[Panel], focused: Optio
             let (crow, ccol) = panel.grid().cursor();
             let x = interior.x + (ccol as u16).min(interior.width - 1);
             let y = interior.y + (crow as u16).min(interior.height - 1);
-            frame.set_cursor_position((x, y));
+            if bounds.contains(ratatui::layout::Position::new(x, y)) {
+                frame.set_cursor_position((x, y));
+            }
         }
     }
 }
 
 /// Draw one panel: a bordered block titled with the role and derived state,
-/// the grid viewport painted into the interior.
-fn draw_panel(frame: &mut Frame, panel: &Panel, rect: Rect, focused: bool) {
-    let tui_rect: TuiRect = rect.into();
+/// the grid viewport painted into the interior. `rect` is already clipped to
+/// the frame's buffer by [`draw`] — the only caller.
+fn draw_panel(frame: &mut Frame, panel: &Panel, tui_rect: TuiRect, focused: bool) {
     if tui_rect.width < 2 || tui_rect.height < 2 {
         return;
     }
@@ -981,6 +995,97 @@ mod tests {
             covered.iter().all(|&c| c == 1),
             "every cell covered exactly once"
         );
+    }
+
+    /// A minimal live panel around `/bin/cat` (no agent CLI on PATH needed)
+    /// for frame-level draw tests — the same pattern as the panel lifecycle
+    /// tests.
+    fn cat_panel() -> Panel {
+        use crate::pty::{Pty, PtyCommand};
+        use crate::session::id::AgentId;
+        use crate::term::OutputCapture;
+        let pty = Pty::spawn(&PtyCommand::new("/bin/cat"), 78, 22).unwrap();
+        Panel {
+            id: PanelId::new(),
+            role: "reviewer".into(),
+            agent_id: AgentId::new(),
+            state: crate::panel::PanelState::Idle,
+            worktree_path: None,
+            pty,
+            grid: crate::term::Grid::new(78, 22),
+            capture: OutputCapture::new(),
+        }
+    }
+
+    /// Display-wake crash regression (ratatui `buffer.rs` "index outside of
+    /// buffer", logged 2026-06-25 with a 120x40 buffer and a write at x=120):
+    /// the layout can tile a *stale* area larger than the frame's buffer when
+    /// a Resize event is lost during a monitor wake, so `draw` must clip every
+    /// slot to the buffer instead of indexing past it. One case per invariant
+    /// boundary: a slot crossing the buffer edge, a slot entirely outside,
+    /// and an in-bounds slot (the clip must be a no-op there).
+    #[test]
+    fn draw_clips_stale_slots_to_the_frame_buffer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let panel = cat_panel();
+        let id = panel.id;
+        let panels = vec![panel];
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        // Crossing the right and bottom edges (the logged crash shape: the
+        // first out-of-buffer write lands at x = buffer width). Focused, so
+        // the cursor-park path runs against the stale rect too.
+        let crossing = Layout {
+            slots: vec![(
+                id,
+                Rect {
+                    x: 60,
+                    y: 0,
+                    width: 120,
+                    height: 60,
+                },
+            )],
+        };
+        terminal
+            .draw(|frame| draw(frame, &crossing, &panels, Some(id)))
+            .unwrap();
+
+        // Entirely outside the buffer: the slot is skipped, nothing drawn.
+        let outside = Layout {
+            slots: vec![(
+                id,
+                Rect {
+                    x: 130,
+                    y: 45,
+                    width: 40,
+                    height: 10,
+                },
+            )],
+        };
+        terminal
+            .draw(|frame| draw(frame, &outside, &panels, Some(id)))
+            .unwrap();
+
+        // In bounds: clipping must not disturb a normal draw — the panel's
+        // border corner is painted at its slot origin.
+        let inside = Layout {
+            slots: vec![(
+                id,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 120,
+                    height: 40,
+                },
+            )],
+        };
+        terminal
+            .draw(|frame| draw(frame, &inside, &panels, Some(id)))
+            .unwrap();
+        let cell = terminal.backend().buffer()[(0u16, 0u16)].clone();
+        assert_ne!(cell.symbol(), " ", "in-bounds slot draws its border");
     }
 
     #[test]

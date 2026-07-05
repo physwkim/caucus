@@ -720,6 +720,27 @@ async fn event_loop(
         //    write hiccup during a display wake or monitor switch does not tear
         //    the session down, and the TICK gate paces it with no extra backoff.
         if last_draw.elapsed() >= TICK {
+            // Reconcile the layout's basis with the terminal's *actual* size
+            // before deciding to paint. The Resize event is the fast path, but
+            // it can be lost: during a display wake crossterm's SIGWINCH-side
+            // size query fails mid-transition and the poll/read error is
+            // absorbed above — leaving the layout tiling a stale area while
+            // ratatui's autoresize already shrank the buffer (the draw layer
+            // clips such a frame instead of panicking; see `render::draw`).
+            // This probe heals the stale area within one tick. A size error
+            // here is the same transient class as a poll error — skip and
+            // retry next tick.
+            if let Ok(size) = terminal.size() {
+                let body = body_area(Rect {
+                    x: 0,
+                    y: 0,
+                    width: size.width,
+                    height: size.height,
+                });
+                if body != mux.area() {
+                    let _ = mux.resize(body);
+                }
+            }
             let sig = mux.render_signature();
             let forced = last_forced_draw.elapsed() >= FORCED_REDRAW_INTERVAL;
             if forced || Some(sig) != last_sig {

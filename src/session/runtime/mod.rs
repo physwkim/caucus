@@ -187,13 +187,14 @@ pub struct Multiplexer {
     /// per-panel `waitpid` every tick is pure overhead, and a child exit may
     /// surface up to one interval late without any user-visible cost.
     last_liveness_probe: Option<Instant>,
-    /// Monotonic counter bumped on every handled key event. The draw loop is
-    /// dirty-gated on [`Multiplexer::render_signature`], whose other inputs
-    /// (grid generations, panel set, derived states) cover everything that
-    /// changes off a PTY read or a turn signal. Key-driven view changes —
+    /// Monotonic counter bumped on every handled key event and on every
+    /// [`Multiplexer::resize`]. The draw loop is dirty-gated on
+    /// [`Multiplexer::render_signature`], whose other inputs (grid
+    /// generations, panel set, derived states) cover everything that changes
+    /// off a PTY read or a turn signal. View changes with no such counter —
     /// layout/zoom/scroll/transcript toggles, the prefix-armed status hint,
-    /// the close-confirm prompt — have no such counter, so this epoch is the
-    /// catch-all that forces exactly one redraw after any keystroke.
+    /// the close-confirm prompt, a terminal-resize reflow — go through this
+    /// epoch, the catch-all that forces exactly one redraw.
     view_epoch: u64,
     /// An OSC 52 set-clipboard escape sequence the pager's copy-mode yank
     /// queued, awaiting flush to the host terminal. The Multiplexer never
@@ -351,6 +352,14 @@ impl Multiplexer {
         &self.layout
     }
 
+    /// The whole-screen area the layout currently tiles — the basis of
+    /// [`Multiplexer::layout`]. The event loop compares this against the
+    /// terminal's actual size each tick to heal a Resize event lost during a
+    /// display wake (see `tui::event_loop`).
+    pub fn area(&self) -> Rect {
+        self.area
+    }
+
     /// The reserved prefix letter — caucus commands are `Ctrl-<this>`.
     pub fn prefix(&self) -> char {
         self.focus.prefix()
@@ -397,9 +406,9 @@ impl Multiplexer {
     /// - **Spawn/kill** change the panel set (ids + count).
     /// - **Turn signals / exit reaping** change `state_label` and the
     ///   manifest-derived state.
-    /// - **Keystrokes** change the view with no other counter, so they bump
-    ///   `view_epoch` (focus, layout, zoom, scroll,
-    ///   transcript, prefix hint, close-confirm).
+    /// - **Keystrokes and terminal resizes** change the view with no other
+    ///   counter, so they bump `view_epoch` (focus, layout, zoom, scroll,
+    ///   transcript, prefix hint, close-confirm, resize reflow).
     ///
     /// Per-panel and per-manifest contributions are XOR-folded so the
     /// non-deterministic `HashMap` iteration order of `manifests` cannot

@@ -640,6 +640,19 @@ mod tests {
         mux.focus.set_focus(Some(PanelId::new()));
         let s2 = mux.render_signature();
         assert_ne!(s1, s2, "a focus change must change the render signature");
+
+        // A resize reflows the layout with no key and possibly no PTY output
+        // (the display-wake heal path calls this directly) — it must repaint
+        // on the next tick, not wait for the forced-redraw safety net.
+        mux.resize(crate::render::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 30,
+        })
+        .unwrap();
+        let s3 = mux.render_signature();
+        assert_ne!(s2, s3, "a resize must change the render signature");
     }
 
     /// `pump_all` probes child liveness on its first call, then throttles:

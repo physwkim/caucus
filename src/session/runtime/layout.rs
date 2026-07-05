@@ -7,6 +7,11 @@ impl Multiplexer {
     /// Resize the whole-screen area and reflow every panel's PTY + grid.
     pub fn resize(&mut self, area: Rect) -> Result<()> {
         self.area = area;
+        // A resize is a view change with no other render-signature input (a
+        // panel's grid only bumps once its PTY child reacts to the SIGWINCH),
+        // so bump the epoch — the next tick repaints the reflowed layout
+        // instead of waiting on child output or the forced-redraw safety net.
+        self.view_epoch += 1;
         self.reflow();
         // An open scrollback pager draws full-screen over the tiled view; keep
         // its page height (scroll clamp + step) in sync with the new area, or
