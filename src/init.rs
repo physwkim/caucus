@@ -177,23 +177,30 @@ fn gitignore_covers_session_state(text: &str) -> bool {
     })
 }
 
-/// Write `content` to `path` and mark it executable (`0o755` on unix),
-/// atomically: fully write and chmod a sibling temp file, then `rename` it over
-/// `path`.
+/// Write `content` to `path` atomically, optionally with a unix `mode`: fully
+/// write (and chmod) a sibling temp file, then `rename` it over `path`.
 ///
-/// A plain `write` + `chmod` truncates `path` in place and only then restores
-/// the mode, opening two windows in which the script on disk is empty, partial,
-/// or not executable. The hook script is shared machine-wide and fires on every
-/// agent turn, so those windows are reachable: an `init --install-hook` (after a
-/// `cargo install` upgrade, say) would kill the turn signal of any panel in any
-/// *other* live caucus session that happened to fire during the rewrite.
+/// A plain `write` truncates `path` in place, and a following `chmod` restores
+/// the mode only afterwards — two windows in which the file on disk is empty,
+/// partial, or not executable. Both files caucus writes here are read
+/// concurrently by processes that take no lock:
 ///
-/// `rename(2)` swaps the directory entry to a new inode in one step. A hook
-/// already exec'ing the old inode runs it to completion; every hook after the
-/// rename sees a complete, executable script. There is no instant at which
-/// `path` names a broken one.
-fn write_executable(path: &Path, content: &str) -> Result<()> {
-    let dir = path.parent().context("hook script path has no parent")?;
+/// - the hook script fires on every agent turn of every live caucus session, so
+///   an `init --install-hook` (after a `cargo install` upgrade, say) could kill
+///   the turn signal of a panel in an unrelated session mid-rewrite;
+/// - `~/.claude/settings.json` is read by Claude Code itself, and by
+///   `caucus doctor`.
+///
+/// A lock cannot help those readers — they never take one. `rename(2)` can: it
+/// swaps the directory entry to a new inode in one step. A reader holding the
+/// old inode reads it to completion; every open after the rename sees the new
+/// file whole. No instant exists at which `path` names a broken file.
+fn write_atomic(path: &Path, content: &str, mode: Option<u32>) -> Result<()> {
+    let dir = path.parent().context("target path has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("target path has no file name")?;
     // Same directory, so the rename never crosses a filesystem boundary.
     //
     // The temp name must be unique per *call*, not per process: two writers in
@@ -202,22 +209,17 @@ fn write_executable(path: &Path, content: &str) -> Result<()> {
     // pid separates processes; the counter separates callers within one.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(
-        ".{}.tmp.{}.{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("turn-signal"),
-        std::process::id(),
-        seq
-    ));
+    let tmp = dir.join(format!(".{}.tmp.{}.{}", name, std::process::id(), seq));
 
     let write_tmp = || -> Result<()> {
         std::fs::write(&tmp, content)?;
         #[cfg(unix)]
-        {
+        if let Some(mode) = mode {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
         }
+        #[cfg(not(unix))]
+        let _ = mode;
         std::fs::rename(&tmp, path)?;
         Ok(())
     };
@@ -226,6 +228,40 @@ fn write_executable(path: &Path, content: &str) -> Result<()> {
         // Never leave the temp file behind on a partial write.
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// Basename of the lock file guarding `~/.claude/settings.json` against
+/// concurrent caucus writers.
+const SETTINGS_LOCK_FILENAME: &str = ".caucus-settings.lock";
+
+/// Take the exclusive caucus lock on `<claude_dir>/settings.json`, blocking
+/// until it is free. The returned [`File`] is the lock: dropping it (closing the
+/// descriptor) releases it, including on panic or early `?`.
+///
+/// Installing the hook is a read-modify-write of a file caucus does not own —
+/// the user's Claude settings carry unrelated hooks, permissions, and plugin
+/// config. Two concurrent `caucus init --install-hook` runs would otherwise both
+/// read the old file and both write their own edit, and the loser's changes —
+/// possibly a third-party hook added between the two reads — would vanish. The
+/// `.bak` would be overwritten by the second run too, so the original could not
+/// be recovered.
+///
+/// The lock lives in its own file rather than on `settings.json`, because
+/// [`write_atomic`] replaces that file's inode: a lock held on the old inode
+/// would guard nothing once the rename lands. A dedicated lock file has a stable
+/// inode for the whole transaction. It is never truncated, so it is safe to
+/// share with any other caucus process holding it open.
+fn lock_settings(claude_dir: &Path) -> Result<std::fs::File> {
+    let path = claude_dir.join(SETTINGS_LOCK_FILENAME);
+    let file = std::fs::File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("lock {}", path.display()))?;
+    Ok(file)
 }
 
 /// Write the turn-signal script under `claude_dir` and merge a caucus `Stop`
@@ -243,12 +279,24 @@ fn write_executable(path: &Path, content: &str) -> Result<()> {
 /// a prior `sentinel-stop`, or a legacy per-project `.caucus/bin/turn-signal`)
 /// is removed in the process so the new install replaces it rather than stacking
 /// a second, dead hook.
+///
+/// The whole settings read-modify-write runs under [`lock_settings`], so two
+/// concurrent installs serialize instead of racing: the second reads what the
+/// first wrote, finds its hook already present, and returns
+/// [`HookInstall::AlreadyPresent`] without touching the file.
 fn install_claude_hook(claude_dir: &Path) -> Result<(PathBuf, HookInstall)> {
     let hook_script = hook_script_path(claude_dir);
     let hooks_dir = hook_script.parent().expect("hook script has a parent dir");
     std::fs::create_dir_all(hooks_dir)
         .with_context(|| format!("create {}", hooks_dir.display()))?;
-    write_executable(&hook_script, TURN_SIGNAL_SCRIPT)
+
+    // Held for the rest of this function: the read of settings.json, the `.bak`
+    // copy, and the write must be one transaction, or a concurrent installer's
+    // edit — or a third-party hook added between our read and our write — is
+    // silently lost. Dropped on every exit path, including `?` and panic.
+    let _settings_lock = lock_settings(claude_dir)?;
+
+    write_atomic(&hook_script, TURN_SIGNAL_SCRIPT, Some(0o755))
         .with_context(|| format!("write {}", hook_script.display()))?;
     // The Stop hook fires in every Claude session regardless of cwd — the hook
     // command must be an absolute path, never relative to whatever directory a
@@ -291,7 +339,9 @@ fn install_claude_hook(claude_dir: &Path) -> Result<(PathBuf, HookInstall)> {
     let migrated = prune_stale_caucus_hooks(&mut settings, &hook_command) > 0;
     merge_stop_hook(&mut settings, &hook_command)?;
     let serialized = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&settings_path, serialized)
+    // Atomic, because Claude Code and `caucus doctor` read this file without
+    // taking the lock — a truncate-in-place write is visible to them.
+    write_atomic(&settings_path, &serialized, None)
         .with_context(|| format!("write {}", settings_path.display()))?;
 
     Ok((
@@ -378,6 +428,7 @@ fn merge_stop_hook(settings: &mut serde_json::Value, hook_command: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hook::GLOBAL_HOOK_FILENAME;
     use tempfile::TempDir;
 
     #[test]
@@ -596,6 +647,135 @@ mod tests {
         .unwrap();
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1, "no stacked duplicate hook: {stop:?}");
+    }
+
+    /// Every caucus Stop-hook command in a settings file, flattened.
+    fn stop_commands(settings: &serde_json::Value) -> Vec<String> {
+        settings["hooks"]["Stop"]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+                    .filter_map(|h| h["command"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn read_settings(claude_dir: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        serde_json::from_str(&text).expect("settings.json is always valid JSON")
+    }
+
+    #[test]
+    fn concurrent_installs_serialize_and_preserve_the_original_backup() {
+        // The race the lock closes. N installers each read the settings, see no
+        // caucus hook, and merge one in. Unlocked, several of them reach the
+        // "back up the prior file" step *after* another has already written its
+        // edit — so `.bak` captures a file that caucus itself modified, and the
+        // user's original is unrecoverable. That is the observable damage: the
+        // final settings.json looks fine either way, because every installer
+        // computes the same result from the same input.
+        //
+        // Under the lock, exactly one install performs the Merge (and backs up
+        // the true original); the rest read what it wrote and report
+        // AlreadyPresent without touching the file or the backup.
+        let claude = TempDir::new().unwrap();
+        let third_party = "/opt/other/hook.sh";
+        std::fs::write(
+            claude.path().join("settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "permissions": { "defaultMode": "dontAsk" },
+                "hooks": { "Stop": [{ "hooks": [
+                    { "type": "command", "command": third_party }
+                ] }] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Release every thread into the read-modify-write at once. Without the
+        // barrier, thread-spawn latency staggers them enough that they serialize
+        // by luck and the race never fires — the test would pass with no lock at
+        // all, which is the same as not having a test.
+        const WRITERS: usize = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let dir = claude.path().to_path_buf();
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let dir = dir.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    install_claude_hook(&dir)
+                })
+            })
+            .collect();
+        let results: Vec<(PathBuf, HookInstall)> = handles
+            .into_iter()
+            .map(|h| h.join().expect("no panic").expect("install succeeds"))
+            .collect();
+
+        // Every installer agrees on the script path.
+        assert!(results.windows(2).all(|w| w[0].0 == w[1].0));
+
+        // Exactly one installer wrote; the others read what it wrote and found
+        // the hook already present. Unlocked, several race past that check.
+        let merges = results
+            .iter()
+            .filter(|(_, i)| matches!(i, HookInstall::Merged { .. }))
+            .count();
+        assert_eq!(merges, 1, "exactly one install merges, {merges} did");
+
+        // The backup holds the user's ORIGINAL file, not one caucus already
+        // edited. This is the assertion a lost update actually breaks: the
+        // final settings.json looks correct either way, because every installer
+        // computes the same result from the same input.
+        let bak = std::fs::read_to_string(claude.path().join("settings.json.bak")).unwrap();
+        let bak: serde_json::Value = serde_json::from_str(&bak).unwrap();
+        let bak_commands = stop_commands(&bak);
+        assert_eq!(
+            bak_commands,
+            vec![third_party],
+            "backup is the pre-caucus original: {bak_commands:?}"
+        );
+
+        let settings = read_settings(claude.path());
+        let commands = stop_commands(&settings);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| c.as_str() == third_party)
+                .count(),
+            1,
+            "the third-party hook survives exactly once: {commands:?}"
+        );
+        let caucus_hooks: Vec<_> = commands
+            .iter()
+            .filter(|c| c.contains(GLOBAL_HOOK_FILENAME))
+            .collect();
+        assert_eq!(
+            caucus_hooks.len(),
+            1,
+            "exactly one caucus hook, not eight: {commands:?}"
+        );
+        // Unrelated config is not collateral damage of a lost update.
+        assert_eq!(settings["permissions"]["defaultMode"], "dontAsk");
+    }
+
+    #[test]
+    fn install_leaves_no_temp_files_in_the_claude_dir() {
+        // settings.json is written by rename too, so its temp file must not
+        // survive either — `~/.claude` is the user's directory, not a scratch pad.
+        let claude = TempDir::new().unwrap();
+        install_claude_hook(claude.path()).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(claude.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files left: {leftovers:?}");
     }
 
     #[test]
