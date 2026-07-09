@@ -194,14 +194,21 @@ fn gitignore_covers_session_state(text: &str) -> bool {
 /// `path` names a broken one.
 fn write_executable(path: &Path, content: &str) -> Result<()> {
     let dir = path.parent().context("hook script path has no parent")?;
-    // Same directory, so the rename never crosses a filesystem boundary. The
-    // pid keeps concurrent installs from clobbering each other's temp file.
+    // Same directory, so the rename never crosses a filesystem boundary.
+    //
+    // The temp name must be unique per *call*, not per process: two writers in
+    // one process (two threads, or two installs) would otherwise share a temp
+    // path, and each would rename or delete the other's half-written file. The
+    // pid separates processes; the counter separates callers within one.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(
-        ".{}.tmp.{}",
+        ".{}.tmp.{}.{}",
         path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("turn-signal"),
-        std::process::id()
+        std::process::id(),
+        seq
     ));
 
     let write_tmp = || -> Result<()> {
