@@ -334,7 +334,17 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
         ToolDef {
             name: "kill_panel",
             description: "Kill a panel: terminate its agent process and enqueue \
-                          any worktree for cleanup.",
+                          any worktree for cleanup. DESTRUCTIVE — the cleanup \
+                          runs `git worktree remove --force`, so uncommitted \
+                          changes in that worktree are discarded, not salvaged. \
+                          Verify the panel's work is committed on its branch \
+                          (with git, not by trusting its report) before killing \
+                          it. An idle panel is reusable, not a leak: hand it the \
+                          next sub-task with send_keys rather than killing it to \
+                          tidy the roster. Kill when a worktree panel's next task \
+                          belongs on a different branch, when the roster exceeds \
+                          the work in flight, or when a panel is wedged (prefer \
+                          restart_panel there, which keeps the worktree).",
             input_schema: json!({
                 "type": "object",
                 "properties": { "panel": panel_prop() },

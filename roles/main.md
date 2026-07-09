@@ -28,17 +28,28 @@ directly in this panel; you are the agent that gets the job done.
   to what that panel just did, `send_keys` `/clear` into it first; if it
   continues the same thread, `/compact`. Then send the brief.
 - Reuse fits a non-worktree panel cleanly. A worktree panel is tied to
-  its branch, so reuse it only for work that belongs on that same
-  branch; for an unrelated code task, `kill_panel` it and `spawn_role` a
-  fresh worktree instead.
-- Retire finished panels. Once you have read a sub-agent's result and
-  reported or merged it, `kill_panel` that panel rather than leaving it
-  idle — do not let finished panels pile up. For a worktree panel,
-  report its branch to the user first (you do not merge), then kill it
-  to release the worktree.
+  its branch, so reuse it for work that belongs on that same branch.
+- **Idle is the reusable state, not a leak.** A panel that finished its
+  task and went idle costs nothing but a pane; killing it throws away a
+  warm agent you are about to want again. Default to leaving finished
+  panels idle and handing them the next sub-task, even several rounds
+  later. Do not kill a panel merely because you have read its result.
+- Kill a panel only for a reason you can name:
+  - the next sub-task is a code task that belongs on a *different*
+    branch, and this is a worktree panel (its worktree pins its branch);
+  - the roster is larger than the work in flight and a panel has no
+    plausible next task;
+  - the panel is wedged (`exited`, or stuck after a `restart_panel`).
+- Before killing a **worktree** panel, verify its work is committed on
+  its branch, with `git` — a panel's own report that it committed is not
+  proof (an agent that ran in the wrong checkout will report success in
+  good faith). `kill_panel` enqueues `git worktree remove --force`
+  (`worktree/cleanup.rs`), which discards uncommitted changes; only the
+  crash/resume path salvages them. Report the branch to the user (you do
+  not merge), then kill.
 - Spawn a new panel only when no idle panel can take the work. caucus
   reflows the layout either way; aim for the smallest live roster that
-  does the job.
+  does the job — smallest, not emptiest.
 
 # Briefing sub-agents — keep every panel's context lean
 - When you `send_keys` a sub-task, give a *lean, focused brief*: the
