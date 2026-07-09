@@ -1,7 +1,7 @@
 //! `caucus signal post` / `caucus signal codex-notify` clients
 //! (`docs/design.md` §7.3).
 //!
-//! The Claude `Stop` hook script (`.caucus/bin/turn-signal`) `exec`s
+//! The Claude `Stop` hook script (`~/.claude/hooks/caucus-turn-signal`) `exec`s
 //! `caucus signal post`. This module is that subcommand's body: connect to
 //! the session's unix socket, read the hook payload from stdin, lift
 //! `last_message` out of it, and write one JSON line — a [`TurnSignal`] —

@@ -494,7 +494,20 @@ caucus가 tmux 안에서 돌든 밖에서 돌든 구성상 동일하고, 패널 
 설치한다 — Claude `~/.claude/settings.json`에 merge하고 `.bak` 백업을 남긴다.
 
 ### 7.3 hook 스크립트
-`caucus init`이 만드는 `.caucus/bin/turn-signal`:
+`caucus init --install-hook`이 만드는 `~/.claude/hooks/caucus-turn-signal`:
+
+Stop hook은 `~/.claude/settings.json`에 **전역**으로 설치되므로, 그 command는
+이 머신의 모든 Claude Code 세션에서 — 프로젝트를 가리지 않고 — 해석되어야
+한다. 따라서 스크립트는 프로젝트와 무관한 고정 경로에 하나만 둔다. 스크립트
+본문 역시 프로젝트 상태를 담지 않는다 (`CAUCUS_SOCK`을 env에서 읽고, 없으면
+no-op).
+
+과거에는 이 스크립트를 `<repo>/.caucus/bin/turn-signal`에 쓰고 전역 hook이 그
+절대 경로를 가리켰다. 그 결과 전역 hook의 유효성이 특정 프로젝트의 `.caucus/`
+존재 여부에 묶였다 — 그 프로젝트를 지우거나, 두 번째 프로젝트에서 `caucus init`을
+한 번 더 돌리는 것만으로, 머신의 모든 Claude Code 세션이 exit 127로 죽는 Stop
+hook을 실행하게 되어 어떤 패널도 신호를 보내지 못하고 어떤 round도 settle하지
+않았다.
 
 ```sh
 #!/bin/sh
@@ -828,9 +841,9 @@ caucus --roles architect,backend,reviewer
 caucus --topic "auth refactor"      # 세션 라벨 (caucus sessions 목록에 표시).
                                     # 생략 시 repo 디렉터리 이름이 기본값 (§3.1)
 
-caucus init [--install-hook]        # .caucus/ + bin/turn-signal 생성,
-                                    # --install-hook 시 Claude Stop hook을
-                                    # ~/.claude/settings.json에 merge
+caucus init [--install-hook]        # .caucus/ 생성. --install-hook 시
+                                    # ~/.claude/hooks/caucus-turn-signal을 쓰고
+                                    # Claude Stop hook을 ~/.claude/settings.json에 merge
 caucus doctor                       # caucus 버전·git·git-repo·claude/codex·hook 경로 실재 + 시그널 E2E 셀프테스트 + role allowlist `Task` 점검
 caucus role list                    # 알려진 role 나열
 caucus role show <name>             # 한 role의 전체 spec 출력

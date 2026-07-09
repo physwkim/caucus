@@ -1,8 +1,9 @@
-//! Detection of caucus's Claude `Stop` hook inside a `~/.claude/settings.json`
-//! value. The single owner of "is this string a caucus hook" and "is the
-//! caucus Stop hook present" — shared by [`crate::init`] (install/migrate) and
-//! [`crate::doctor`] (health check) so neither drifts back to a loose
-//! "mentions caucus" substring match.
+//! Where caucus's Claude `Stop` hook lives, and how it is recognized inside a
+//! `~/.claude/settings.json` value. The single owner of "where does the hook
+//! script go", "is this string a caucus hook", and "is the caucus Stop hook
+//! present" — shared by [`crate::init`] (install/migrate) and [`crate::doctor`]
+//! (health check) so neither drifts back to a loose "mentions caucus" substring
+//! match, nor re-invents the script's location.
 //!
 //! A loose `s.contains("caucus")` over the whole `hooks.Stop` subtree
 //! false-positives on any string that merely mentions caucus (a comment, an
@@ -10,13 +11,38 @@
 //! the *shape* of a caucus hook command, so a stale or unrelated hook is never
 //! mistaken for caucus's own.
 
-/// Whether a Stop-hook `command` belongs to caucus: it runs one of caucus's
-/// hook scripts (`.../.caucus/bin/...`) or a caucus signal subcommand. This is
-/// caucus-specific — it does *not* match an unrelated command that merely has
-/// "caucus" somewhere in its path — so migration prunes only caucus's own
-/// hooks and leaves third-party Stop hooks alone.
+use std::path::{Path, PathBuf};
+
+/// Basename of the machine-wide turn-signal hook script.
+pub(crate) const GLOBAL_HOOK_FILENAME: &str = "caucus-turn-signal";
+
+/// Absolute path of the turn-signal hook script, under a `~/.claude` directory.
+///
+/// The Stop hook is installed **globally** (`~/.claude/settings.json`), so its
+/// command must resolve in *every* Claude Code session on this machine — in any
+/// project, at any time. The script therefore lives at one project-independent
+/// path, and its body is project-independent too: it reads `CAUCUS_SOCK` from
+/// the panel's environment and no-ops when unset.
+///
+/// Earlier versions wrote it to `<repo>/.caucus/bin/turn-signal` and pointed the
+/// global hook at that absolute path. That made a global hook's validity depend
+/// on one project's `.caucus/` still existing: deleting that project — or
+/// merely running `caucus init` in a second one — left every Claude Code
+/// session on the machine running a Stop hook that exited 127, so no panel
+/// anywhere ever signalled and no round ever settled.
+pub(crate) fn hook_script_path(claude_dir: &Path) -> PathBuf {
+    claude_dir.join("hooks").join(GLOBAL_HOOK_FILENAME)
+}
+
+/// Whether a Stop-hook `command` belongs to caucus: it runs caucus's hook script
+/// (the current global one, or a legacy per-project `.../.caucus/bin/...`) or a
+/// caucus signal subcommand. This is caucus-specific — it does *not* match an
+/// unrelated command that merely has "caucus" somewhere in its path — so
+/// migration prunes only caucus's own hooks and leaves third-party Stop hooks
+/// alone.
 pub(crate) fn is_caucus_hook_command(cmd: &str) -> bool {
-    cmd.contains("/.caucus/bin/")
+    cmd.contains(GLOBAL_HOOK_FILENAME)
+        || cmd.contains("/.caucus/bin/")
         || cmd.contains("caucus signal post")
         || cmd.contains("caucus sentinel")
 }
@@ -71,6 +97,9 @@ fn collect_strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
 mod tests {
     use super::*;
 
+    /// The current, machine-wide hook script.
+    const GLOBAL_HOOK_SCRIPT: &str = "/home/me/.claude/hooks/caucus-turn-signal";
+    /// A legacy per-project hook script (pre-migration).
     const TURN_SIGNAL: &str = "/abs/repo/.caucus/bin/turn-signal";
     const SENTINEL_STOP: &str = "/abs/repo/.caucus/bin/sentinel-stop";
     const THIRD_PARTY: &str = "/Users/me/codes/claude-config/hooks/no-deferral-guard.py";
@@ -105,7 +134,22 @@ mod tests {
     }
 
     #[test]
+    fn hook_script_path_is_project_independent() {
+        let path = hook_script_path(Path::new("/home/me/.claude"));
+        assert_eq!(
+            path,
+            PathBuf::from("/home/me/.claude/hooks/caucus-turn-signal")
+        );
+        // Nothing about it names a project — that was the whole defect.
+        assert!(!path.to_string_lossy().contains("/.caucus/"));
+        assert!(is_caucus_hook_command(&path.display().to_string()));
+    }
+
+    #[test]
     fn is_caucus_hook_command_matches_caucus_only() {
+        assert!(is_caucus_hook_command(GLOBAL_HOOK_SCRIPT));
+        // A legacy per-project hook is still recognized, so it gets pruned
+        // rather than left stacked alongside the new global one.
         assert!(is_caucus_hook_command(TURN_SIGNAL));
         assert!(is_caucus_hook_command(SENTINEL_STOP));
         assert!(is_caucus_hook_command("caucus signal post --kind stop"));

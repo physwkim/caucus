@@ -97,7 +97,7 @@ impl FromStr for PrefixKey {
 /// Non-TUI subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create `.caucus/` + `bin/turn-signal`, optionally install the Stop hook.
+    /// Create `.caucus/`, optionally install the machine-wide Stop hook.
     Init {
         /// Also merge the Claude `Stop` hook into `~/.claude/settings.json`.
         #[arg(long)]
@@ -286,14 +286,16 @@ fn run_tui(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `caucus init [--install-hook]` — create `.caucus/` + `bin/turn-signal`,
-/// optionally merge the Claude Stop hook.
+/// `caucus init [--install-hook]` — create `.caucus/`, optionally write the
+/// machine-wide turn-signal script and merge the Claude Stop hook.
 fn run_init(install_hook: bool) -> Result<ExitCode> {
     let repo = repo_root()?;
     let outcome = crate::init::run(&repo, install_hook)?;
     eprintln!("caucus init:");
     eprintln!("  .caucus dir:   {}", outcome.caucus_dir.display());
-    eprintln!("  hook script:   {}", outcome.hook_script.display());
+    if let Some(script) = &outcome.hook_script {
+        eprintln!("  hook script:   {}", script.display());
+    }
     match &outcome.gitignore {
         crate::init::GitignoreOutcome::Updated {
             path,

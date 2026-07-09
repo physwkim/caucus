@@ -1,18 +1,24 @@
 //! `caucus init [--install-hook]` (`docs/design.md` §7.2, §7.3, §10).
 //!
-//! Creates the project's `.caucus/` directory and the `bin/turn-signal` hook
-//! script, and — with `--install-hook` — merges a Claude `Stop` hook into
-//! `~/.claude/settings.json` (keeping a `.bak` of the prior file).
+//! Creates the project's `.caucus/` directory, and — with `--install-hook` —
+//! writes the machine-wide turn-signal script to `~/.claude/hooks/` and merges a
+//! Claude `Stop` hook pointing at it into `~/.claude/settings.json` (keeping a
+//! `.bak` of the prior file).
+//!
+//! The hook script is deliberately *not* project-local: a global `Stop` hook
+//! that names one project's path dies the moment that project does. See
+//! [`crate::hook::hook_script_path`].
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::hook::{current_hook_present, is_caucus_hook_command};
+use crate::hook::{current_hook_present, hook_script_path, is_caucus_hook_command};
 
 /// The Stop-hook script body (`docs/design.md` §7.3). `CAUCUS_*` env vars are
 /// injected by caucus when it spawns the panel; the Claude hook payload
-/// arrives on stdin and is forwarded by `caucus signal post`.
+/// arrives on stdin and is forwarded by `caucus signal post`. The body carries
+/// no project-specific state, which is what lets one copy serve every project.
 const TURN_SIGNAL_SCRIPT: &str = "#!/bin/sh\n\
 # caucus turn-signal hook. CAUCUS_* env is injected by caucus at panel spawn;\n\
 # the Claude hook payload is read from stdin by `caucus signal post`.\n\
@@ -49,8 +55,10 @@ pub enum HookInstall {
 pub struct InitOutcome {
     /// The `.caucus/` directory created or confirmed.
     pub caucus_dir: PathBuf,
-    /// The turn-signal hook script written.
-    pub hook_script: PathBuf,
+    /// The machine-wide turn-signal hook script, written only when
+    /// `--install-hook` ran. `None` otherwise: without the hook install there is
+    /// no script to write, because it does not live in the project.
+    pub hook_script: Option<PathBuf>,
     /// What happened to the project `.gitignore`.
     pub gitignore: GitignoreOutcome,
     /// The Stop-hook install result, set when `--install-hook` ran.
@@ -70,38 +78,37 @@ pub enum GitignoreOutcome {
 
 /// Run `caucus init` for the project rooted at `repo`.
 ///
-/// Always creates `<repo>/.caucus/` (plus `bin/`, `sessions/`), writes
-/// `bin/turn-signal`, and ensures `<repo>/.gitignore` ignores
-/// `.caucus/sessions/` (per-session worktrees, panel logs, and round reports —
-/// local state that must never be committed). Project config under `.caucus/`
+/// Always creates `<repo>/.caucus/sessions/` and ensures `<repo>/.gitignore`
+/// ignores it (per-session worktrees, panel logs, and round reports — local
+/// state that must never be committed). Project config under `.caucus/`
 /// (`roles.toml`, `settings.toml`) is deliberately *not* ignored, so it stays
-/// committable. When `install_hook` is set, also merges the Stop hook into
-/// `~/.claude/settings.json`.
+/// committable.
+///
+/// When `install_hook` is set, writes the turn-signal script to
+/// `~/.claude/hooks/` and merges a Stop hook pointing at it into
+/// `~/.claude/settings.json`. Nothing about the hook is project-scoped: one
+/// script per machine serves every project, and installing from a second
+/// project is a no-op rather than a hijack of the first.
 pub fn run(repo: &Path, install_hook: bool) -> Result<InitOutcome> {
     let caucus_dir = repo.join(".caucus");
-    let bin_dir = caucus_dir.join("bin");
-    std::fs::create_dir_all(&bin_dir).with_context(|| format!("create {}", bin_dir.display()))?;
-    std::fs::create_dir_all(caucus_dir.join("sessions"))?;
-
-    let hook_script = bin_dir.join("turn-signal");
-    write_executable(&hook_script, TURN_SIGNAL_SCRIPT)
-        .with_context(|| format!("write {}", hook_script.display()))?;
-    // The Stop hook is installed globally and fires in every Claude session
-    // regardless of cwd — the hook command must be an absolute path, never
-    // relative to whatever directory a panel's agent happens to run in.
-    let hook_script = hook_script.canonicalize().unwrap_or(hook_script);
+    let sessions_dir = caucus_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir)
+        .with_context(|| format!("create {}", sessions_dir.display()))?;
 
     let gitignore = ensure_gitignore(repo)?;
 
     let mut outcome = InitOutcome {
         caucus_dir,
-        hook_script,
+        hook_script: None,
         gitignore,
         hook_install: None,
     };
 
     if install_hook {
-        outcome.hook_install = Some(install_claude_hook(&outcome.hook_script)?);
+        let home = std::env::var_os("HOME").context("$HOME not set — cannot locate ~/.claude")?;
+        let (script, install) = install_claude_hook(&PathBuf::from(home).join(".claude"))?;
+        outcome.hook_script = Some(script);
+        outcome.hook_install = Some(install);
     }
 
     Ok(outcome)
@@ -183,20 +190,33 @@ fn write_executable(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Merge the caucus `Stop` hook into `~/.claude/settings.json`.
+/// Write the turn-signal script under `claude_dir` and merge a caucus `Stop`
+/// hook pointing at it into `<claude_dir>/settings.json`. Returns the script's
+/// absolute path alongside the install result.
 ///
-/// Idempotent on the *current* hook: when the exact `turn-signal` command is
-/// already wired, the file is left untouched ([`HookInstall::AlreadyPresent`]).
+/// The script is rewritten on every install, so an upgraded caucus refreshes a
+/// stale script body in place; it carries no project state, so rewriting it can
+/// never clobber another project's configuration.
+///
+/// Idempotent on the *current* hook: when the exact command is already wired,
+/// the settings file is left untouched ([`HookInstall::AlreadyPresent`]).
 /// Otherwise the hook is merged ([`HookInstall::Merged`]) and any prior file is
-/// backed up to `.bak`. A *stale* caucus hook (a different caucus hook command,
-/// e.g. a prior `sentinel-stop`) is removed in the process so the new install
-/// replaces it rather than stacking a second, dead hook — the migration the
-/// loose "mentions caucus" check used to block.
-fn install_claude_hook(hook_script: &Path) -> Result<HookInstall> {
-    let home = std::env::var_os("HOME").context("$HOME not set — cannot locate ~/.claude")?;
-    let claude_dir = PathBuf::from(home).join(".claude");
-    std::fs::create_dir_all(&claude_dir)
-        .with_context(|| format!("create {}", claude_dir.display()))?;
+/// backed up to `.bak`. A *stale* caucus hook (a different caucus hook command —
+/// a prior `sentinel-stop`, or a legacy per-project `.caucus/bin/turn-signal`)
+/// is removed in the process so the new install replaces it rather than stacking
+/// a second, dead hook.
+fn install_claude_hook(claude_dir: &Path) -> Result<(PathBuf, HookInstall)> {
+    let hook_script = hook_script_path(claude_dir);
+    let hooks_dir = hook_script.parent().expect("hook script has a parent dir");
+    std::fs::create_dir_all(hooks_dir)
+        .with_context(|| format!("create {}", hooks_dir.display()))?;
+    write_executable(&hook_script, TURN_SIGNAL_SCRIPT)
+        .with_context(|| format!("write {}", hook_script.display()))?;
+    // The Stop hook fires in every Claude session regardless of cwd — the hook
+    // command must be an absolute path, never relative to whatever directory a
+    // panel's agent happens to run in.
+    let hook_script = hook_script.canonicalize().unwrap_or(hook_script);
+
     let settings_path = claude_dir.join("settings.json");
 
     let mut settings: serde_json::Value = match std::fs::read_to_string(&settings_path) {
@@ -209,9 +229,12 @@ fn install_claude_hook(hook_script: &Path) -> Result<HookInstall> {
     let hook_command = hook_script.display().to_string();
 
     if current_hook_present(&settings, &hook_command) {
-        return Ok(HookInstall::AlreadyPresent {
-            settings: settings_path,
-        });
+        return Ok((
+            hook_script,
+            HookInstall::AlreadyPresent {
+                settings: settings_path,
+            },
+        ));
     }
 
     // Back up the prior file before rewriting it.
@@ -233,11 +256,14 @@ fn install_claude_hook(hook_script: &Path) -> Result<HookInstall> {
     std::fs::write(&settings_path, serialized)
         .with_context(|| format!("write {}", settings_path.display()))?;
 
-    Ok(HookInstall::Merged {
-        settings: settings_path,
-        backup,
-        migrated,
-    })
+    Ok((
+        hook_script,
+        HookInstall::Merged {
+            settings: settings_path,
+            backup,
+            migrated,
+        },
+    ))
 }
 
 /// Remove every *stale* caucus Stop hook — a caucus hook command that is not
@@ -317,15 +343,23 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn init_creates_caucus_dir_and_hook_script() {
+    fn init_creates_caucus_dir_and_writes_no_project_local_hook() {
         let tmp = TempDir::new().unwrap();
         let outcome = run(tmp.path(), false).unwrap();
         assert!(outcome.caucus_dir.is_dir());
-        assert!(outcome.hook_script.is_file());
-        let body = std::fs::read_to_string(&outcome.hook_script).unwrap();
-        assert!(body.contains("caucus signal post"));
-        assert!(body.starts_with("#!/bin/sh"));
+        assert!(outcome.caucus_dir.join("sessions").is_dir());
         assert!(outcome.hook_install.is_none());
+        // The hook does not live in the project. Without --install-hook there is
+        // no script at all, and `.caucus/bin/` is never created: a global Stop
+        // hook must not be able to name a project-local path.
+        assert!(
+            outcome.hook_script.is_none(),
+            "no script without the install"
+        );
+        assert!(
+            !outcome.caucus_dir.join("bin").exists(),
+            "no project-local hook dir"
+        );
     }
 
     #[test]
@@ -444,15 +478,109 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn hook_script_is_executable() {
+    fn installed_hook_script_is_executable() {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = TempDir::new().unwrap();
-        let outcome = run(tmp.path(), false).unwrap();
-        let mode = std::fs::metadata(&outcome.hook_script)
-            .unwrap()
-            .permissions()
-            .mode();
+        let claude = TempDir::new().unwrap();
+        let (script, _) = install_claude_hook(claude.path()).unwrap();
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
         assert_ne!(mode & 0o111, 0, "turn-signal script must be executable");
+    }
+
+    #[test]
+    fn install_writes_the_script_outside_any_project() {
+        let claude = TempDir::new().unwrap();
+        let (script, install) = install_claude_hook(claude.path()).unwrap();
+
+        assert!(script.is_file());
+        let body = std::fs::read_to_string(&script).unwrap();
+        assert!(body.starts_with("#!/bin/sh"));
+        assert!(body.contains("caucus signal post"));
+        // The script's location names no project, and the wired command is the
+        // absolute path to that project-independent script.
+        assert!(!script.to_string_lossy().contains("/.caucus/"));
+        assert!(script.is_absolute(), "hook command must be absolute");
+        assert!(matches!(install, HookInstall::Merged { .. }));
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(claude.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(current_hook_present(
+            &settings,
+            &script.display().to_string()
+        ));
+    }
+
+    #[test]
+    fn install_is_idempotent_across_projects() {
+        // The defect this closes: `caucus init --install-hook` in project B used
+        // to repoint the global hook at B's `.caucus/bin/turn-signal`, killing
+        // every panel in project A. Installing twice — as two projects would —
+        // must leave one hook, wired to the same machine-wide script.
+        let claude = TempDir::new().unwrap();
+        let (first, _) = install_claude_hook(claude.path()).unwrap();
+        let (second, install) = install_claude_hook(claude.path()).unwrap();
+
+        assert_eq!(first, second, "both projects wire the same script");
+        assert!(
+            matches!(install, HookInstall::AlreadyPresent { .. }),
+            "the second project's install is a no-op, not a hijack"
+        );
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(claude.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "no stacked duplicate hook: {stop:?}");
+    }
+
+    #[test]
+    fn install_migrates_a_legacy_project_local_hook() {
+        // The exact failure seen in the field: the global Stop hook named a
+        // deleted project's script, so every Claude session's hook exited 127.
+        let claude = TempDir::new().unwrap();
+        let third_party = "/opt/other/hook.sh";
+        std::fs::write(
+            claude.path().join("settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": { "Stop": [{ "hooks": [
+                    { "type": "command", "command": "/gone/project/.caucus/bin/turn-signal" },
+                    { "type": "command", "command": third_party }
+                ] }] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (script, install) = install_claude_hook(claude.path()).unwrap();
+        assert!(
+            matches!(install, HookInstall::Merged { migrated: true, .. }),
+            "the dead project-local hook is reported as migrated"
+        );
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(claude.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        let commands: Vec<String> = settings["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|h| h["command"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !commands.iter().any(|c| c.contains("/.caucus/bin/")),
+            "the dead project-local hook is gone: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c == third_party),
+            "the third-party hook survives: {commands:?}"
+        );
+        assert!(current_hook_present(
+            &settings,
+            &script.display().to_string()
+        ));
     }
 
     const TURN_SIGNAL: &str = "/abs/repo/.caucus/bin/turn-signal";
