@@ -5,6 +5,29 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [Unreleased]
+
+### Fixed
+
+- **The turn-signal hook script moved out of the project.** `caucus init
+  --install-hook` wrote the script to `<repo>/.caucus/bin/turn-signal` and
+  pointed the *global* Claude `Stop` hook (`~/.claude/settings.json`) at that
+  absolute path. A global hook holding one project's path is only valid while
+  that project is: delete the repo — or merely run `caucus init --install-hook`
+  in a second one, which repoints the hook — and every Claude Code session on
+  the machine, in every project, ran a Stop hook that exited 127. No panel
+  signalled, no round ever settled, and the only symptom was panels stuck at
+  `working` forever.
+
+  The script now lives at `~/.claude/hooks/caucus-turn-signal`, one copy per
+  machine. Its body never held project state (it reads `CAUCUS_SOCK` from the
+  env and no-ops when unset), so nothing was lost by hoisting it. Installing
+  from a second project is now a no-op rather than a hijack of the first, and
+  `caucus init` without `--install-hook` no longer creates `.caucus/bin/` at
+  all. Re-running `caucus init --install-hook` once prunes a legacy per-project
+  hook entry and wires the machine-wide one; `caucus doctor` names that case
+  explicitly instead of blaming a settings file synced from another machine.
+
 ## [0.7.1] — 2026-07-05
 
 Documentation-only release so the crates.io page carries the setup fix.

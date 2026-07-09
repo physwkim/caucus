@@ -193,8 +193,9 @@ caucus --roles architect,backend,reviewer
 caucus --agent-cli codex            # run the main worker on codex instead of
                                     # claude (default); sub-agent backends are
                                     # still chosen per spawn_role
-caucus init [--install-hook]        # create .caucus/ + bin/turn-signal;
-                                    # --install-hook merges the Claude Stop hook
+caucus init [--install-hook]        # create .caucus/; --install-hook writes the
+                                    # machine-wide turn-signal script and merges
+                                    # the Claude Stop hook
 caucus doctor                       # check caucus version, git + repo, agent CLIs, hook, role allowlists
 caucus role list                    # list known roles
 caucus role show <name>             # show one role's full spec
@@ -238,34 +239,41 @@ No tmux dependency — caucus is its own multiplexer.
 
 ### First-run setup: install the turn-signal hook
 
-Once per machine, in a repo you keep around:
+Once per machine, from any git repo:
 
 ```bash
-cd <your project repo>
-caucus init --install-hook   # writes .caucus/bin/turn-signal and merges the
-                             # Claude Stop hook into ~/.claude/settings.json
+caucus init --install-hook   # writes ~/.claude/hooks/caucus-turn-signal and
+                             # merges the Claude Stop hook into ~/.claude/settings.json
 caucus doctor                # verifies the chain with a live end-to-end signal test
 ```
 
 The Stop hook is how caucus learns an agent's turn has finished. **Without
 it, every panel stays `working` forever and rounds never settle** — the TUI
 runs, agents work, but no result ever comes back. Plain `caucus init`
-(without `--install-hook`) writes the script but leaves your Claude
-settings untouched.
+(without `--install-hook`) creates `.caucus/` and leaves your Claude
+settings, and the hook script, untouched.
 
-The hook entry is an absolute path to this repo's `.caucus/bin/turn-signal`
-on *this* machine, and the script execs `caucus` by bare name, so:
+One install covers every repo on the machine. Both halves of that are
+deliberate: the script lives at a fixed path under `~/.claude/`, and its body
+reads the session from the `CAUCUS_*` env caucus injects at panel spawn, so it
+is tied to neither a repo nor a session. Running `caucus init --install-hook`
+again from a second project is a no-op, not a hijack of the first.
+
+The script execs `caucus` by bare name, and the hook entry is an absolute
+path on *this* machine, so:
 
 - run `caucus init --install-hook` on **every machine** you use caucus on —
-  a `~/.claude/settings.json` synced from another machine carries a path
+  a `~/.claude/settings.json` synced from another machine carries a `$HOME`
   that does not exist locally, and turn signals silently die;
-- re-run it if you delete or move the repo holding the script;
 - keep `caucus` on `PATH` (a `cargo install` already does).
 
-One install covers all repos on the machine — the script reads the session
-from `CAUCUS_*` env that caucus injects at panel spawn, so it is not tied
-to the repo it lives in. When in doubt, `caucus doctor` tests actual
-delivery, not just configuration.
+If you used caucus before this hook moved out of `.caucus/bin/`, re-run
+`caucus init --install-hook` once: it prunes the old per-project hook entry and
+wires the machine-wide one. Until then, deleting the project that happened to
+own the script left every Claude Code session — in every project — running a
+Stop hook that exits 127.
+
+When in doubt, `caucus doctor` tests actual delivery, not just configuration.
 
 ## Roles
 

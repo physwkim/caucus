@@ -283,14 +283,19 @@ fn stop_hook_checks() -> Vec<Check> {
     };
     let program = hook_program(command);
     if hook_program_resolves(program).is_none() {
+        // Two ways to get here: a `settings.json` synced from another machine,
+        // or a legacy per-project hook (`<repo>/.caucus/bin/turn-signal`) whose
+        // project was deleted or superseded. Re-installing fixes both, and now
+        // writes the script machine-wide so it cannot recur.
         return vec![Check {
             name,
             severity: Severity::Warn,
             detail: format!(
                 "Stop hook is configured but its command `{program}` does not \
-                 exist on this machine (settings.json synced from another \
-                 machine?) — run `caucus init --install-hook` here; until then \
-                 every panel stays `working` forever"
+                 exist on this machine (a settings.json synced from another \
+                 machine, or a legacy per-project hook whose project is gone) \
+                 — run `caucus init --install-hook`; until then every panel \
+                 stays `working` forever"
             ),
         }];
     }
