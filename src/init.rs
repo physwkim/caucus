@@ -177,17 +177,48 @@ fn gitignore_covers_session_state(text: &str) -> bool {
     })
 }
 
-/// Write `content` to `path` and mark it executable (`0o755` on unix).
+/// Write `content` to `path` and mark it executable (`0o755` on unix),
+/// atomically: fully write and chmod a sibling temp file, then `rename` it over
+/// `path`.
+///
+/// A plain `write` + `chmod` truncates `path` in place and only then restores
+/// the mode, opening two windows in which the script on disk is empty, partial,
+/// or not executable. The hook script is shared machine-wide and fires on every
+/// agent turn, so those windows are reachable: an `init --install-hook` (after a
+/// `cargo install` upgrade, say) would kill the turn signal of any panel in any
+/// *other* live caucus session that happened to fire during the rewrite.
+///
+/// `rename(2)` swaps the directory entry to a new inode in one step. A hook
+/// already exec'ing the old inode runs it to completion; every hook after the
+/// rename sees a complete, executable script. There is no instant at which
+/// `path` names a broken one.
 fn write_executable(path: &Path, content: &str) -> Result<()> {
-    std::fs::write(path, content)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms)?;
-    }
-    Ok(())
+    let dir = path.parent().context("hook script path has no parent")?;
+    // Same directory, so the rename never crosses a filesystem boundary. The
+    // pid keeps concurrent installs from clobbering each other's temp file.
+    let tmp = dir.join(format!(
+        ".{}.tmp.{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("turn-signal"),
+        std::process::id()
+    ));
+
+    let write_tmp = || -> Result<()> {
+        std::fs::write(&tmp, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    };
+
+    write_tmp().inspect_err(|_| {
+        // Never leave the temp file behind on a partial write.
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Write the turn-signal script under `claude_dir` and merge a caucus `Stop`
@@ -509,6 +540,32 @@ mod tests {
             &settings,
             &script.display().to_string()
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reinstalling_never_leaves_a_broken_script_behind() {
+        use std::os::unix::fs::PermissionsExt;
+        let claude = TempDir::new().unwrap();
+        let (script, _) = install_claude_hook(claude.path()).unwrap();
+
+        // Reinstall over the live script, as a `cargo install` upgrade would.
+        // The rewrite is a rename over a fully-written, already-chmod'd inode,
+        // so the path never names an empty or non-executable script.
+        install_claude_hook(claude.path()).unwrap();
+
+        let body = std::fs::read_to_string(&script).unwrap();
+        assert_eq!(body, TURN_SIGNAL_SCRIPT, "script is complete after rewrite");
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "script is executable after rewrite");
+
+        // No temp file is left in the hooks dir.
+        let leftovers: Vec<_> = std::fs::read_dir(script.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files left: {leftovers:?}");
     }
 
     #[test]
