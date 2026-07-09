@@ -7,6 +7,67 @@ versions.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-07-10
+
+A `worktree=true` sub-agent was isolated by cwd but never told so. Three of
+four panels in one round inferred the shared checkout's absolute path, worked
+there, and raced each other; the guidance then told the main worker to kill
+each panel as soon as it had read its result, and killing force-removed the
+worktree without preserving anything uncommitted. Isolation you are not told
+about is not isolation, and disposal that discards work is not cleanup.
+
+### Fixed
+
+- **A worktree sub-agent is told which checkout is its own.** The panel's cwd
+  was already its worktree, so relative paths were correct by construction.
+  Absolute paths were not: the repository is checked out twice — once at the
+  session root, once at the worktree — and nothing in a sub-agent's context
+  named which one it owned. An agent handed absolute reference paths in its
+  brief would infer a plausible sibling path into the *shared* checkout, then
+  read, edit, and commit there, racing every other panel. A worktree contract
+  now names the worktree by absolute path, appended at the same single spawn
+  path as the question contract, so it covers preset roles, free-form inline
+  prompts, promptless roles, and both the claude and codex backends.
+
+- **`--force` worktree removal no longer destroys uncommitted work**
+  (**Invariant I-8**). `kill_panel` and shutdown enqueued a bare `git worktree
+  remove --force`, so a panel killed before it committed lost its work with no
+  trace; only the crash/resume path (`reconcile_stale`) salvaged first. Both
+  force-remove sites now commit a dirty worktree onto its own branch before
+  removing it, and a worktree whose work *cannot* be salvaged is left on disk
+  rather than force-removed — a leaked worktree is recoverable by hand, a
+  force-removed one is not. The spawn-failure path deletes the branch in the
+  same job and so has nothing to preserve; a dirty worktree on a detached HEAD
+  has no branch to commit onto and is now a typed error that keeps the
+  directory.
+
+- **The main worker stops killing panels it is about to reuse.** The role
+  guidance pulled two ways — "reuse an idle panel before you spawn" and "once
+  you have read a sub-agent's result, `kill_panel` it rather than leaving it
+  idle". The second was unconditional, so no idle panel ever survived to be
+  reused and every round paid a fresh spawn. Idle is now the reusable state,
+  and killing needs a named reason: the next task belongs on a different
+  branch, the roster exceeds the work in flight, or the panel is wedged
+  (`restart_panel` is preferred there — it keeps the worktree).
+
+### Changed
+
+- **Breaking (library API).** `CleanupSummary` gained a
+  `salvaged_worktrees: Vec<(PathBuf, String)>` field reporting each worktree
+  whose work was committed before removal, as `(worktree, branch)`; a struct
+  literal that names every field no longer compiles. `WorktreeError` gained a
+  `DirtyDetachedHead(PathBuf)` variant; an exhaustive `match` over it no
+  longer compiles. The `caucus` binary is unaffected.
+
+- `kill_panel`'s MCP tool description now states what it does to uncommitted
+  work and when a panel is worth killing at all, instead of describing the
+  worktree as merely "enqueued for cleanup".
+
+- Invariant I-3 (`docs/design.md` §12) recorded a known exception it always
+  had: `reconcile_stale` force-removes outside the cleanup queue, because
+  `attach()` re-checks-out the same branch at a new path and the async queue
+  gives no ordering guarantee. Both removal sites enforce I-8.
+
 ## [0.7.2] — 2026-07-09
 
 A global Claude `Stop` hook pointed into one project's directory, so deleting
