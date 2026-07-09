@@ -28,6 +28,22 @@ versions.
   hook entry and wires the machine-wide one; `caucus doctor` names that case
   explicitly instead of blaming a settings file synced from another machine.
 
+- **Concurrent `caucus init --install-hook` runs no longer destroy the
+  settings backup.** Both installers read `~/.claude/settings.json`, both merged
+  their edit into their own copy, and both wrote. The final file looked correct
+  — each installer computes the same result from the same input — so the damage
+  hid in `.bak`: the second installer backed up a file the first had already
+  modified, leaving the user's original unrecoverable. The whole read → backup →
+  write is now one transaction under an exclusive file lock
+  (`std::fs::File::lock`, no new dependency). `settings.json` is written
+  atomically as well, so Claude Code and `caucus doctor` — which take no lock —
+  never read a truncated file. An external writer still races caucus; only
+  caucus-vs-caucus is ordered.
+
+- **`write_atomic`'s temp file is unique per call.** It was keyed on the pid
+  alone, so two writers in one process shared a temp path and could rename or
+  delete each other's half-written file.
+
 ## [0.7.1] — 2026-07-05
 
 Documentation-only release so the crates.io page carries the setup fix.
