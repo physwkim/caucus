@@ -7,6 +7,13 @@ versions.
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-07-09
+
+A global Claude `Stop` hook pointed into one project's directory, so deleting
+that repo — or merely installing from a second one — silently broke turn
+signalling for every Claude Code session on the machine. The hook is now
+per-machine, and the writes that install it are crash- and race-safe.
+
 ### Fixed
 
 - **The turn-signal hook script moved out of the project.** `caucus init
@@ -27,6 +34,16 @@ versions.
   all. Re-running `caucus init --install-hook` once prunes a legacy per-project
   hook entry and wires the machine-wide one; `caucus doctor` names that case
   explicitly instead of blaming a settings file synced from another machine.
+
+- **The hook script is written atomically.** It was written with `fs::write`,
+  which truncates in place, and only then chmod'd — two windows in which the
+  script on disk is empty, partial, or not executable. A per-project script hid
+  this, since the only session that could observe a window was the one running
+  `init`. A machine-wide one does not: the hook fires on every agent turn in
+  every live session, so `init --install-hook` — after a `cargo install`
+  upgrade, say — could kill the turn signal of a panel in an unrelated session
+  that fired mid-rewrite. caucus now writes and chmods a sibling temp file and
+  `rename(2)`s it over the target, so no instant names a broken script.
 
 - **Concurrent `caucus init --install-hook` runs no longer destroy the
   settings backup.** Both installers read `~/.claude/settings.json`, both merged
