@@ -53,6 +53,11 @@ pub enum WorktreeError {
         code: Option<i32>,
         stderr: String,
     },
+    /// A worktree with uncommitted changes sits on a detached HEAD, so there is
+    /// no branch to salvage that work onto before removing it
+    /// (`cleanup::salvage_before_removal`).
+    #[error("{0} is dirty on a detached HEAD: no branch to salvage its work onto")]
+    DirtyDetachedHead(PathBuf),
 }
 
 impl WorktreeRequest {
@@ -293,15 +298,20 @@ pub(crate) fn reconcile_stale(repo_root: &Path, branch: &str) {
 ///
 /// An *unreadable* status is treated as dirty: when in doubt, preserve the
 /// directory rather than risk force-removing live work.
-fn worktree_is_dirty(worktree: &Path) -> bool {
+pub(crate) fn worktree_is_dirty(worktree: &Path) -> bool {
     match run_git(worktree, &["status".to_string(), "--porcelain".to_string()]) {
         Ok(out) => !out.trim().is_empty(),
         Err(_) => true,
     }
 }
 
-/// Commit a crashed worktree's uncommitted changes onto its branch so they are
-/// preserved across the resume re-attach instead of being discarded.
+/// Commit a worktree's uncommitted changes onto its branch so they survive the
+/// worktree's disposal instead of being discarded.
+///
+/// Two callers, one rule — no uncommitted work is destroyed while its branch
+/// lives on: [`reconcile_stale`] runs this before re-attaching a crashed
+/// worktree, and [`crate::worktree::cleanup`] runs it before every
+/// `git worktree remove --force` whose branch is being kept.
 ///
 /// Stages everything `git status` reported (tracked changes, deletions, and
 /// non-ignored untracked files; `.gitignore` is honoured, so build artefacts
@@ -309,7 +319,10 @@ fn worktree_is_dirty(worktree: &Path) -> bool {
 /// the commit cannot fail on a repo without a configured `user.name`/`email`,
 /// and `--no-verify` skips hooks that have no business blocking crash recovery.
 /// The commit is plainly labelled and reversible with `git reset HEAD^`.
-fn salvage_uncommitted_work(worktree: &Path, branch: &str) -> Result<String, WorktreeError> {
+pub(crate) fn salvage_uncommitted_work(
+    worktree: &Path,
+    branch: &str,
+) -> Result<String, WorktreeError> {
     run_git(worktree, &["add".to_string(), "-A".to_string()])?;
     run_git(
         worktree,
@@ -321,7 +334,7 @@ fn salvage_uncommitted_work(worktree: &Path, branch: &str) -> Result<String, Wor
             "commit".to_string(),
             "--no-verify".to_string(),
             "-m".to_string(),
-            format!("caucus: recovered uncommitted work from a crashed worktree ({branch})"),
+            format!("caucus: recovered uncommitted work from a disposed worktree ({branch})"),
         ],
     )
 }

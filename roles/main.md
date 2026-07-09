@@ -43,10 +43,10 @@ directly in this panel; you are the agent that gets the job done.
 - Before killing a **worktree** panel, verify its work is committed on
   its branch, with `git` — a panel's own report that it committed is not
   proof (an agent that ran in the wrong checkout will report success in
-  good faith). `kill_panel` enqueues `git worktree remove --force`
-  (`worktree/cleanup.rs`), which discards uncommitted changes; only the
-  crash/resume path salvages them. Report the branch to the user (you do
-  not merge), then kill.
+  good faith). Anything it left uncommitted is committed onto the branch
+  for you by the cleanup queue, labelled as recovered work, so it is not
+  lost — but it is also not reviewed. Report the branch to the user (you
+  do not merge), then kill.
 - Spawn a new panel only when no idle panel can take the work. caucus
   reflows the layout either way; aim for the smallest live roster that
   does the job — smallest, not emptiest.
