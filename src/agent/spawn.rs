@@ -106,7 +106,9 @@ pub struct SpawnRequest {
     /// `-c instructions=<text>` (`build_command`). For a sub-agent panel,
     /// `build_command` appends the caucus question contract
     /// ([`crate::role::prompt::SUBAGENT_QUESTION_CONTRACT`]) to this text —
-    /// or injects it alone when `None`.
+    /// or injects it alone when `None` — followed, when the panel owns a
+    /// worktree, by the worktree contract
+    /// ([`crate::role::prompt::subagent_worktree_contract`]).
     pub system_prompt: Option<String>,
     /// caucus MCP server registration — set only for the main worker panel (the
     /// orchestrator). The codex backend consumes it via `-c mcp_servers.caucus.*`;
@@ -210,13 +212,23 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
     // path, so it covers preset roles, free-form inline prompts, and roles
     // with no prompt, on both backends. The main worker is exempt — its panel
     // is the one the human actually watches.
+    // A sub-agent with a worktree also carries the worktree contract: its cwd
+    // is the worktree, but the same repo is checked out at the session root
+    // too, and nothing else in its context says which checkout is its own — so
+    // an invented absolute path lands in the shared tree and races its
+    // siblings (`role::prompt::subagent_worktree_contract`, §5).
     let system_prompt = if request.is_main() {
         request.system_prompt.clone()
     } else {
-        Some(match &request.system_prompt {
-            Some(p) => format!("{p}\n\n{}", crate::role::prompt::SUBAGENT_QUESTION_CONTRACT),
-            None => crate::role::prompt::SUBAGENT_QUESTION_CONTRACT.to_string(),
-        })
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(p) = &request.system_prompt {
+            parts.push(p.clone());
+        }
+        parts.push(crate::role::prompt::SUBAGENT_QUESTION_CONTRACT.to_string());
+        if let Some(worktree) = &request.worktree_path {
+            parts.push(crate::role::prompt::subagent_worktree_contract(worktree));
+        }
+        Some(parts.join("\n\n"))
     };
 
     let args: Vec<OsString> = match cli {
@@ -604,6 +616,75 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--append-system-prompt" && w[1] == SUBAGENT_QUESTION_CONTRACT),
+            "args: {args:?}"
+        );
+    }
+
+    /// A sub-agent that owns a worktree is told which checkout is its own, by
+    /// absolute path. Without this it can only infer one, and the inference
+    /// lands in the shared session checkout that every sibling panel shares.
+    #[test]
+    fn claude_worktree_subagent_prompt_names_its_worktree() {
+        let wt = PathBuf::from("/repo/.caucus/worktrees/edge-1");
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "edge-1".into(),
+            system_prompt: Some("You are a porter.".into()),
+            worktree_path: Some(wt.clone()),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        let prompt = args
+            .windows(2)
+            .find(|w| w[0] == "--append-system-prompt")
+            .map(|w| w[1].clone())
+            .expect("system prompt injected");
+        assert!(prompt.starts_with("You are a porter."), "prompt: {prompt}");
+        assert!(
+            prompt.contains(SUBAGENT_QUESTION_CONTRACT),
+            "prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("/repo/.caucus/worktrees/edge-1"),
+            "prompt: {prompt}"
+        );
+    }
+
+    /// A sub-agent sharing the main checkout has no worktree to be confined to,
+    /// so it must NOT be handed the worktree contract — there is no second
+    /// checkout for it to confuse with its own.
+    #[test]
+    fn claude_subagent_without_worktree_gets_no_worktree_contract() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "reviewer-r1".into(),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--append-system-prompt" && w[1] == SUBAGENT_QUESTION_CONTRACT),
+            "args: {args:?}"
+        );
+    }
+
+    /// The worktree contract is backend-neutral: codex takes its instructions
+    /// through `-c instructions=<text>`, and must carry the same confinement.
+    #[test]
+    fn codex_worktree_subagent_prompt_names_its_worktree() {
+        let wt = PathBuf::from("/repo/.caucus/worktrees/edge-1");
+        let req = SpawnRequest {
+            role: role(),
+            agent_cli_override: Some(AgentCli::Codex),
+            agent_name: "edge-1".into(),
+            system_prompt: Some("You are a porter.".into()),
+            worktree_path: Some(wt),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        assert!(
+            args.iter()
+                .any(|a| a.contains("/repo/.caucus/worktrees/edge-1")),
             "args: {args:?}"
         );
     }
