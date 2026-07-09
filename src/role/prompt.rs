@@ -31,6 +31,47 @@ numbered options if there are concrete choices — and end your turn. The \
 main worker reads your panel output when your turn ends and answers with a \
 follow-up message.";
 
+/// The worktree contract appended to a **sub-agent that owns a git worktree**
+/// (`crate::agent::spawn::build_command`, `docs/design.md` §5).
+///
+/// The panel's process cwd is already its worktree, so relative paths are
+/// correct by construction. What is not correct by construction is an
+/// *absolute* path: the same repository is checked out twice — once at the
+/// session repo root, once at this worktree — and nothing in a sub-agent's
+/// context names which checkout it owns. An agent that infers a plausible
+/// absolute path (`/repo/crates/...`, sitting right next to the absolute
+/// reference paths its brief handed it) silently reads, edits, and commits in
+/// the *shared* checkout, racing every sibling panel. Naming the worktree
+/// removes the ambiguity rather than asking the model to resist it.
+///
+/// Backend-neutral, and injected at the single spawn path so it covers preset
+/// roles, free-form inline prompts, and roles with no prompt.
+pub fn subagent_worktree_contract(worktree: &Path) -> String {
+    format!(
+        "\
+# caucus: your worktree
+
+This panel owns a dedicated git worktree, and it is already your working \
+directory:
+
+    {}
+
+That path is the ONLY checkout you may touch. The same repository is also \
+checked out at the session repo root, shared with every other panel — \
+reading it is pointless and writing it corrupts your siblings' \
+in-progress work.
+
+- Prefer relative paths; your cwd is already the worktree.
+- Never `cd` out of the worktree, and never name another checkout of this \
+repository by absolute path. If you catch yourself typing an absolute path \
+into this repository, it must start with the path above.
+- Absolute paths to *other* projects (reference sources you were told to \
+read) are fine — the rule is about this repository.
+- Commit on your worktree's branch. Never push, merge, or rebase.",
+        worktree.display()
+    )
+}
+
 /// Embedded text of a default role template, keyed by its
 /// `system_prompt_template` value (`roles/<name>.md`). `None` for any template
 /// caucus does not ship — those are read from disk by [`resolve`].
