@@ -5,7 +5,7 @@
 //! `mpsc` receiver; jobs run sequentially so a slow removal cannot stall the
 //! rest of the system, and it never blocks the UI.
 //!
-//! **Invariant I-4**: no `git worktree remove --force` destroys uncommitted
+//! **Invariant I-8**: no `git worktree remove --force` destroys uncommitted
 //! work. Only a *clean* or *salvaged* worktree may be force-removed; a tree
 //! whose work could not be salvaged is left on disk instead.
 //!
@@ -158,7 +158,7 @@ fn run_one(job: &CleanupJob) -> CleanupSummary {
 }
 
 /// Commit a doomed worktree's uncommitted changes onto its own branch, so the
-/// `--force` removal that follows destroys nothing (**Invariant I-4**).
+/// `--force` removal that follows destroys nothing (**Invariant I-8**).
 ///
 /// `Ok(Some(branch))` when work was salvaged, `Ok(None)` when there was nothing
 /// to salvage or nowhere to salvage it to, `Err` when the tree is dirty and the
@@ -381,7 +381,7 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// **Invariant I-4**, the boundary that matters: a panel killed with
+    /// **Invariant I-8**, the boundary that matters: a panel killed with
     /// uncommitted work in its worktree must not lose it. The removal owner
     /// commits it onto the branch first, and the branch outlives the worktree.
     #[test]

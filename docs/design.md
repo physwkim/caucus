@@ -964,6 +964,10 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 - **Owner**: `worktree::cleanup::enqueue()` → `worktree::cleanup::run_one()`
 - **MUST**: `git worktree remove`는 cleanup task 안에서만.
 - **MUST NOT**: ad-hoc `git worktree remove` 호출 금지.
+- **알려진 예외**: `worktree::manager::reconcile_stale()` (`tui.rs`의 resume 경로) — 같은
+  브랜치를 새 경로에 `attach()` 하기 직전에 stale 체크아웃이 **동기적으로** 사라져야 하는데,
+  비동기 cleanup queue는 그 순서를 보장하지 않는다. 따라서 삭제 주체는 둘이고, I-8은 두 곳
+  모두에서 강제된다.
 - **Enforcement**: `worktree::cleanup::run_one()`은 module-private. 외부는 `enqueue()`만 호출 가능.
 - **Tests**: nested worktree 시나리오에서 depth-desc 순서로 삭제되는지.
 
@@ -993,6 +997,26 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 - **MUST NOT**: 어떤 role의 `allowed_tools`에도 `Task`를 포함. agent가 in-session sub-agent를 띄움.
 - **Enforcement**: role 로더가 `Task`를 거부, `caucus doctor`가 role 정의의 `Task`를 경고.
 - **Tests**: `Task` 포함 `roles.toml` 로드 시 거부/경고되는지.
+
+### Invariant I-8: `--force` worktree 삭제는 미커밋 작업을 파괴하지 않음
+- **Owner**: `worktree::manager::salvage_uncommitted_work()` — force-remove 하는 두 함수
+  (`worktree::cleanup::salvage_before_removal()`, `worktree::manager::reconcile_stale()`)가
+  모두 이 함수를 거침. I-3가 삭제를 cleanup queue로 모으지만 `reconcile_stale`(crash/resume
+  재부착)은 별도 삭제 주체이므로, 두 곳 다 명시적으로 지킨다.
+- **MUST**: `git worktree remove --force` 이전에 dirty worktree는 자기 브랜치에 커밋된다.
+  깨끗하거나 salvage된 worktree만 삭제 가능.
+- **MUST NOT**: salvage에 실패한 worktree를 삭제. 남겨진 worktree는 손으로 복구 가능하지만
+  force-remove된 것은 복구 불가 — 실패 시 디스크에 남긴다.
+- **예외 (보존할 것이 없는 경우)**: 같은 job이 브랜치까지 지우는 spawn-failure 경로
+  (`branches_to_delete`) — 곧 삭제될 브랜치에 커밋해도 보존되지 않고, 그 worktree는 agent에게
+  넘어간 적이 없다. dirty + detached HEAD는 커밋을 얹을 브랜치가 없으므로 삭제하지 않고
+  `WorktreeError::DirtyDetachedHead`로 실패한다.
+- **Enforcement**: `salvage_before_removal()`이 `Err`를 반환하면 `run_one()`은 해당 경로를
+  `continue` 하여 remove를 건너뛴다. salvage 결과는 `CleanupSummary.salvaged_worktrees`로
+  호출자에게 보고되어 조용히 일어나지 않는다.
+- **Tests**: dirty → 브랜치에 커밋 후 삭제(삭제 후 `git ls-tree <branch>`로 파일 존재 확인);
+  clean → 빈 salvage 커밋 없이 삭제(브랜치 tip 불변); dirty + 브랜치 삭제 예정 → salvage 없이
+  삭제; dirty + detached HEAD → 삭제 거부, 디렉터리 잔존.
 
 ---
 
