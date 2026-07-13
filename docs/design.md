@@ -368,7 +368,7 @@ scrollback_lines        = 10000  # 패널별 스크롤백 깊이(행)
 round_fallback_secs     = 600    # 라운드 안전망 데드라인 기본값([1, 3600]로 clamp)
 capture_turn_limit      = 64     # 패널당 메모리에 유지하는 닫힌 턴 수
 capture_open_turn_bytes = 4194304 # 열린(진행 중) 턴 하나의 메모리 바이트 상한
-mouse                   = true   # 마우스 캡처: on이면 스크롤 휠로 스크롤백 페이저 조작,
+mouse                   = true   # 마우스 캡처: on이면 스크롤 휠 = PageUp/PageDown 키,
                                  # off면 터미널의 네이티브 드래그-선택/복사 유지
 prefix                  = "a"    # 예약 prefix 키(Ctrl-<letter>). --prefix/CAUCUS_PREFIX가
                                  # 우선하고, 미설정이면 기본 Ctrl-A — 단 바깥 tmux의
@@ -773,7 +773,7 @@ caucus는 단 하나의 **프리픽스 키** `Ctrl-A`를 자기 명령용으로 
 | (복사 모드) `y` / `Enter` | 선택 줄을 클립보드(OSC 52)로 복사 후 종료 |
 | (복사 모드) `Esc` | 복사 모드 취소 |
 | (페이저 열림) `Esc` / `q` | 페이저 닫기 |
-| 마우스 휠 ↑ / ↓ | 페이저 진입·뒤로 / 앞으로 (라이브 하단에선 무동작; `[settings] mouse`) |
+| 마우스 휠 ↑ / ↓ | `PageUp` / `PageDown` 키와 동일 — 라이브 뷰에선 focus 패널 PTY로, 페이저 열림 시 페이저 페이징 (`[settings] mouse`) |
 | `Ctrl-A` 다음 `Ctrl-A` | 패널에 리터럴 `Ctrl-A` 전송 |
 
 프리픽스는 소비된다 — `Ctrl-A` 다음 키는 명령을 선택하고 forward되지 않으며,
@@ -800,6 +800,15 @@ PTY로는 한 바이트도 가지 않는다(`FocusRouter::scroll_open` 게이트
 진입 시점의 *고정 스냅샷*이다 — 패널은 밑에서 계속 돌고, 새 출력은 페이저를 닫은
 뒤에 보인다. 소스는 bounded grid 스크롤백이며, unbounded 턴 로그/디스크 spill
 페이징(`Turn N` 구분자 포함)은 향후 확장이다.
+
+**마우스 휠은 독자 매핑을 갖지 않는다.** 휠 노치 한 번은 `PageUp`/`PageDown`
+키 하나이며, 일반 키 경로(`Multiplexer::handle_mouse` → `handle_key` →
+`FocusRouter::route`)로 그대로 흘러간다. 따라서 라이브 뷰에서 휠은 focus 패널
+PTY로 `ESC [ 5 ~` / `ESC [ 6 ~`를 보내 **agent 자신의 스크롤백**을 페이징하고
+(패널 프로그램이 다시 그리므로 스크롤한 내용이 그대로 보인다), 페이저가 열려
+있을 때만 페이저를 페이징한다. 페이저는 `Ctrl-A [`로만 진입한다 — 휠은 caucus의
+고정 스냅샷 뷰를 열지 않는다. 모달 게이트(close-confirm, 페이저 캡처)는 키
+라우터에서 그대로 상속된다.
 
 페이저 안에서 `/`는 대소문자 무시 부분일치 검색을 열고(`Enter` 실행, `n`/`N`로
 매치 순회, 매치 줄 하이라이트), `v`는 줄 단위 **복사 모드**를 연다 —

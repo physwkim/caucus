@@ -44,10 +44,10 @@ pub struct Settings {
     pub capture_turn_limit: usize,
     /// In-memory byte cap for a single open (in-progress) turn.
     pub capture_open_turn_bytes: usize,
-    /// Whether caucus captures the mouse (`docs/design.md` §1). On, the scroll
-    /// wheel drives the scrollback pager; off, the terminal keeps its native
-    /// mouse behaviour (drag-to-select / copy). Default on — set `mouse = false`
-    /// to keep native selection.
+    /// Whether caucus captures the mouse (`docs/design.md` §1). On, a scroll
+    /// wheel notch reaches caucus as a `PageUp`/`PageDown` keypress; off, the
+    /// terminal keeps its native mouse behaviour (drag-to-select / copy).
+    /// Default on — set `mouse = false` to keep native selection.
     pub mouse: bool,
     /// The reserved prefix letter (`prefix = "b"` → `Ctrl-B`), or `None` when
     /// unset. Sits between the CLI and the compiled default in the prefix
