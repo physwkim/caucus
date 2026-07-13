@@ -120,7 +120,7 @@ table below shows the default; substitute your prefix for `Ctrl-A`.
 | `Ctrl-A` then `t`             | toggle the transcript overlay            |
 | `Esc` (overlay open)          | hide the transcript overlay              |
 | `Ctrl-A` then `[`             | open the scrollback pager (focused panel) |
-| scroll wheel                  | enter / page the scrollback pager (mouse capture on) |
+| scroll wheel                  | `PageUp` / `PageDown` — sent to the focused panel, or paged in the pager (mouse capture on) |
 | `Ctrl-A` then `Ctrl-A`        | send a literal `Ctrl-A` to the panel     |
 
 The layout modes cycled by `Ctrl-A Space` are **Tiled**, **EvenHorizontal**,
@@ -140,11 +140,15 @@ opens at the newest line; `↑/↓ k/j` scroll a line, `PgUp/PgDn` a page,
 Inside the pager, `/` searches (case-insensitive; `Enter` runs it, `n`/`N`
 step matches), and `v` starts a line-selection **copy mode** — move to extend
 the selection, then `y`/`Enter` copies it to your clipboard (via OSC 52),
-`Esc` cancels. With mouse capture on (the default; the `mouse` setting), the
-scroll wheel also enters and pages the pager. Unlike the transcript overlay,
-the pager **captures** input — keys drive scrolling and none reach the panel's
-PTY — and shows a frozen snapshot (the panel keeps running; new output appears
-after you exit).
+`Esc` cancels. Unlike the transcript overlay, the pager **captures** input —
+keys drive scrolling and none reach the panel's PTY — and shows a frozen
+snapshot (the panel keeps running; new output appears after you exit).
+
+The **scroll wheel** (with mouse capture on — the default; the `mouse` setting)
+has no binding of its own: a notch up/down is a `PageUp`/`PageDown` keypress. In
+the live view that goes to the focused panel, so the wheel scrolls the agent's
+own pager and you see what you scrolled to; while the caucus pager is open it
+pages the pager, exactly as the key does.
 
 ## MCP tools
 

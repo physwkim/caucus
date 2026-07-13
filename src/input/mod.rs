@@ -48,8 +48,7 @@
 //! | (copy mode) `y` / `Enter` | copy the selection (OSC 52) and exit    |
 //! | (copy mode) `Esc`         | cancel copy mode                        |
 //! | (pager open) `Esc` / `q`  | exit the scrollback pager               |
-//! | scroll wheel up           | enter / page back the scrollback pager  |
-//! | scroll wheel down         | page forward in the pager (off at live) |
+//! | scroll wheel up / down    | a `PageUp` / `PageDown` keypress — no mapping of its own |
 //! | `Ctrl-A` then `Ctrl-A`    | send a literal `Ctrl-A` to the panel    |
 //! | any other key             | forwarded to the focused panel's PTY    |
 //! | `Ctrl-C`                  | forwarded to the focused panel (§0 #11) |

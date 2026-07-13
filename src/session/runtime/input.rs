@@ -91,45 +91,26 @@ impl Multiplexer {
         }
     }
 
-    /// Apply a mouse event (`docs/design.md` §1). Only the scroll wheel is
-    /// acted on; it drives the scrollback pager. Delivered to the event loop
-    /// only when mouse capture is on (`[settings] mouse`).
+    /// Apply a mouse event (`docs/design.md` §1). The wheel has no mapping of
+    /// its own: a notch up/down *is* a `PageUp`/`PageDown` keypress, routed
+    /// through the ordinary key path ([`Multiplexer::handle_key`]). Delivered to
+    /// the event loop only when mouse capture is on (`[settings] mouse`).
     ///
-    /// Scrolling up from the live view opens the pager on the focused panel —
-    /// tmux copy-mode-on-scroll entry — and once it is open the wheel pages the
-    /// frozen snapshot. Scrolling down at the live bottom is a no-op: nothing is
-    /// newer than the live view. Clicks, drags, and moves are ignored. While the
-    /// close-confirm prompt owns the screen the wheel is swallowed, matching the
-    /// keyboard router's modal capture.
+    /// So in the live view the wheel pages the focused agent's own scrollback —
+    /// the panel program handles `PageUp`/`PageDown` and redraws, so the content
+    /// the user scrolled to is what they see. Caucus's frozen pager is opened
+    /// deliberately (`Ctrl-A [`) and never by a wheel notch; while it *is* open
+    /// the wheel pages it, because that is what the key does there. Every modal
+    /// gate (close-confirm capture, pager capture) comes free from the key
+    /// router. Clicks, drags, and moves have no key equivalent and are ignored.
     pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
-        use crossterm::event::MouseEventKind;
-        /// Rows the wheel moves per notch — a few lines, like a terminal.
-        const WHEEL_STEP: isize = 3;
-
-        // The close-confirm prompt is modal: do not scroll a pager underneath it.
-        if self.pending_close().is_some() {
-            return;
-        }
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                // Entering scrollback from the live view; a no-op when no panel
-                // is focused (the pager stays closed and the next branch skips).
-                if self.scroll_state().is_none() {
-                    self.enter_scroll();
-                }
-                if self.scroll_state().is_some() {
-                    self.view_epoch = self.view_epoch.wrapping_add(1);
-                    self.scroll_by(-WHEEL_STEP);
-                }
-            }
-            // Only meaningful inside the pager — at the live bottom there is
-            // nothing newer to reveal, so an unguarded ScrollDown falls through.
-            MouseEventKind::ScrollDown if self.scroll_state().is_some() => {
-                self.view_epoch = self.view_epoch.wrapping_add(1);
-                self.scroll_by(WHEEL_STEP);
-            }
-            _ => {}
-        }
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+        let code = match mouse.kind {
+            MouseEventKind::ScrollUp => KeyCode::PageUp,
+            MouseEventKind::ScrollDown => KeyCode::PageDown,
+            _ => return,
+        };
+        self.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
     /// Whether the reserved prefix key is armed (for a status hint).
@@ -445,8 +426,8 @@ mod tests {
         mux.shutdown();
     }
 
-    /// The scroll wheel pages an open scrollback by `WHEEL_STEP` lines and
-    /// clamps at the bottom; a non-scroll mouse event and the close-confirm
+    /// Inside an open pager the wheel *is* `PgUp`/`PgDn`: it moves a full page
+    /// and clamps at the bottom. A non-scroll mouse event and the close-confirm
     /// modal both leave the pager untouched.
     #[tokio::test]
     async fn mouse_wheel_pages_the_scrollback_and_respects_the_confirm_modal() {
@@ -467,10 +448,11 @@ mod tests {
             16,
             4,
         ));
+        mux.focus.set_scroll_open(true);
 
-        // Wheel up moves toward older output by WHEEL_STEP (3).
+        // Wheel up moves toward older output by one page (4).
         mux.handle_mouse(at(MouseEventKind::ScrollUp));
-        assert_eq!(mux.scroll_state().unwrap().offset, 13);
+        assert_eq!(mux.scroll_state().unwrap().offset, 12);
         // Wheel down moves back toward the newest.
         mux.handle_mouse(at(MouseEventKind::ScrollDown));
         assert_eq!(mux.scroll_state().unwrap().offset, 16);
@@ -481,8 +463,9 @@ mod tests {
         mux.handle_mouse(at(MouseEventKind::Down(MouseButton::Left)));
         assert_eq!(mux.scroll_state().unwrap().offset, 16);
 
-        // While the close-confirm prompt is up the wheel is swallowed.
-        mux.pending_close = Some(PanelId::new());
+        // While the close-confirm prompt is up the wheel is swallowed — the same
+        // modal capture the `PgUp` key hits, inherited from the key router.
+        mux.focus.set_confirm_open(true);
         mux.handle_mouse(at(MouseEventKind::ScrollUp));
         assert_eq!(
             mux.scroll_state().unwrap().offset,
@@ -491,13 +474,14 @@ mod tests {
         );
     }
 
-    /// Scrolling up from the live view opens the pager on the focused panel
-    /// (tmux copy-mode-on-scroll entry). With nothing focused it stays closed.
+    /// From the live view the wheel does NOT open caucus's frozen pager: it
+    /// forwards `PageUp`/`PageDown` to the focused panel so the agent's own
+    /// scrollback moves and stays visible. With nothing focused it is a no-op.
     #[tokio::test]
-    async fn mouse_wheel_up_enters_scrollback_on_the_focused_panel() {
+    async fn mouse_wheel_forwards_page_keys_to_the_focused_panel() {
         use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
-        let wheel_up = MouseEvent {
-            kind: MouseEventKind::ScrollUp,
+        let at = |kind| MouseEvent {
+            kind,
             column: 0,
             row: 0,
             modifiers: KeyModifiers::NONE,
@@ -505,18 +489,51 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        // Nothing focused → wheel up cannot open a pager (no panic).
-        mux.handle_mouse(wheel_up);
+        // Nothing focused → the wheel has nowhere to go (no panic, no pager).
+        mux.handle_mouse(at(MouseEventKind::ScrollUp));
         assert!(mux.scroll_state().is_none());
 
-        // Focus a panel → wheel up enters scrollback on it.
+        // Focus a `cat` panel: it echoes whatever is written to its PTY, so the
+        // wheel's bytes come back on the panel's own output. An open capture
+        // turn is what records them (`OutputCapture::push` only fills an open
+        // turn), so start one before scrolling.
         let panel = push_cat_panel(&mut mux, PanelState::Idle);
         mux.focus.set_focus(Some(panel));
-        mux.handle_mouse(wheel_up);
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == panel)
+            .unwrap()
+            .begin_turn();
+        mux.handle_mouse(at(MouseEventKind::ScrollUp));
+        mux.handle_mouse(at(MouseEventKind::ScrollDown));
         assert!(
-            mux.scroll_state().is_some(),
-            "wheel up opens the pager from the live view"
+            mux.scroll_state().is_none(),
+            "the wheel must not open the frozen pager from the live view"
         );
+
+        // Drain the echo and look for the xterm PageUp / PageDown sequences, in
+        // order. The `[5~` / `[6~` tails are matched rather than the full
+        // `ESC [ 5 ~`, so the assertion holds whether the tty echoes the ESC
+        // byte literally or as `^[` (ECHOCTL).
+        let mut echo = Vec::new();
+        for _ in 0..200 {
+            let p = mux.panels.iter_mut().find(|p| p.id == panel).unwrap();
+            p.pump().unwrap();
+            echo = p.capture().since_last_turn().to_vec();
+            if echo.windows(3).any(|w| w == b"[6~") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pos_up = echo
+            .windows(3)
+            .position(|w| w == b"[5~")
+            .expect("wheel up must forward the PageUp sequence to the panel");
+        let pos_down = echo
+            .windows(3)
+            .position(|w| w == b"[6~")
+            .expect("wheel down must forward the PageDown sequence to the panel");
+        assert!(pos_up < pos_down, "the wheel keys arrive in the order sent");
 
         mux.shutdown();
     }

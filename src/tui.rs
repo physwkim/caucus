@@ -285,7 +285,7 @@ impl TerminalGuard {
     /// newline — see [`Multiplexer::handle_paste`]).
     ///
     /// When `mouse` is set (the `[settings] mouse` default), also capture the
-    /// mouse so the scroll wheel drives the scrollback pager
+    /// mouse so the scroll wheel reaches caucus as `PageUp`/`PageDown`
     /// ([`Multiplexer::handle_mouse`]). Capture suppresses the terminal's native
     /// drag-to-select, so it is left off when the setting is disabled.
     fn enter(mouse: bool) -> Result<Self> {
@@ -718,7 +718,8 @@ async fn event_loop(
             }
             Ok(Ok(Event::Mouse(mouse))) => {
                 // Only delivered when mouse capture is on (`[settings]
-                // mouse`). The scroll wheel drives the scrollback pager.
+                // mouse`). A wheel notch is routed as a `PageUp`/`PageDown`
+                // keypress — no mapping of its own.
                 mux.handle_mouse(mouse);
             }
             Ok(Ok(Event::Resize(w, h))) => {
