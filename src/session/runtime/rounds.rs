@@ -931,8 +931,9 @@ impl Multiplexer {
     ///   finished turn and record the panel in `round.settled`. Its contribution
     ///   to this round is now frozen.
     ///
-    /// A `Blocked` panel with queued work and time still left is deliberately
-    /// neither fed nor latched: it can still be unblocked and drain its queue.
+    /// Those two arms are exhaustive: a panel that is neither `Working` nor
+    /// `Spawning` is `Idle` or `Exited`, and there is no third disposition. The
+    /// coarse state machine has no `Blocked` — see [`PanelState`].
     ///
     /// Every read happens at the instant the panel is observed idle, never at
     /// delivery time — see `PendingRound::captured` for why that is load-bearing
@@ -970,6 +971,9 @@ impl Multiplexer {
                 continue;
             }
             let backlog_empty = round.backlog.get(&id).is_none_or(VecDeque::is_empty);
+            // `state` is `Idle` or `Exited` here, so this is exhaustive: an idle
+            // panel with work left and time on the clock gets fed; everything
+            // else settles.
             let act = if state == PanelState::Idle && !backlog_empty && !fallback_due {
                 // The queue's front is cloned; popped only on a confirmed send.
                 let task = round.backlog[&id]
@@ -977,12 +981,8 @@ impl Multiplexer {
                     .expect("backlog is non-empty")
                     .clone();
                 Act::Feed(task)
-            } else if backlog_empty || state == PanelState::Exited || fallback_due {
-                Act::Latch(state)
             } else {
-                // Blocked with queued work and time left: it can still be
-                // unblocked and drained, so it is not yet settled for the round.
-                continue;
+                Act::Latch(state)
             };
             // Read the just-finished turn *now*, while the panel is still idle.
             let done = self

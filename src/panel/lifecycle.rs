@@ -33,6 +33,14 @@ fn dump_pty_enabled() -> bool {
 }
 
 /// Coarse panel state machine (`docs/design.md` §3).
+///
+/// Deliberately has no `Blocked`: a panel stopped on a permission prompt or a
+/// chooser fires no turn signal, so it stays `Working` here, and caucus detects
+/// the block by scanning the panel's grid at read time (`term::prompt_scan` →
+/// `Multiplexer::overlay_blocked_state`), surfacing it on the `DerivedState`
+/// the main worker reads (`docs/design.md` §8.3). Blocking lives there, on the
+/// grid-derived surface; a coarse `Blocked` here would be a second, weaker copy
+/// of that detection with nothing to write it.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PanelState {
     /// PTY allocated, agent process starting.
@@ -41,8 +49,6 @@ pub enum PanelState {
     Working,
     /// Turn signal received — waiting for the next instruction.
     Idle,
-    /// Agent is blocked (permission prompt / merge conflict / background job).
-    Blocked,
     /// Agent process has exited.
     Exited,
 }
@@ -54,7 +60,6 @@ impl PanelState {
             PanelState::Spawning => "spawning",
             PanelState::Working => "working",
             PanelState::Idle => "idle",
-            PanelState::Blocked => "blocked",
             PanelState::Exited => "exited",
         }
     }
@@ -202,21 +207,13 @@ pub enum PanelError {
 ///
 /// Legal moves: `Spawning -> Working | Idle` (a freshly-spawned agent goes to
 /// `Working` when a prompt is delivered, or to `Idle` once its CLI is up and
-/// awaiting one), `Working <-> Idle`, `Working|Idle -> Blocked`, `Blocked ->
-/// Working`, and any state `-> Exited`.
+/// awaiting one), `Working <-> Idle`, and any state `-> Exited`.
 pub(crate) fn transition(panel: &mut Panel, to: PanelState) -> Result<(), IllegalTransition> {
     use PanelState::*;
     let from = panel.state;
     let legal = matches!(
         (from, to),
-        (Spawning, Working)
-            | (Spawning, Idle)
-            | (Working, Idle)
-            | (Idle, Working)
-            | (Working, Blocked)
-            | (Idle, Blocked)
-            | (Blocked, Working)
-            | (_, Exited)
+        (Spawning, Working) | (Spawning, Idle) | (Working, Idle) | (Idle, Working) | (_, Exited)
     );
     if legal {
         panel.state = to;
@@ -359,17 +356,21 @@ mod tests {
     }
 
     #[test]
-    fn spawning_to_blocked_is_rejected() {
-        // `Spawning` may only advance to `Working` or `Idle`.
+    fn exited_is_terminal() {
+        // `Exited` is the only state with no way out — a reaped process cannot
+        // come back to `Working`/`Idle`.
         let mut p = cat_panel();
-        assert!(transition(&mut p, PanelState::Blocked).is_err());
+        transition(&mut p, PanelState::Exited).unwrap();
+        assert!(transition(&mut p, PanelState::Working).is_err());
+        assert!(transition(&mut p, PanelState::Idle).is_err());
+        assert_eq!(p.state(), PanelState::Exited);
     }
 
     #[test]
     fn anything_to_exited_is_legal() {
         let mut p = cat_panel();
         transition(&mut p, PanelState::Working).unwrap();
-        transition(&mut p, PanelState::Blocked).unwrap();
+        transition(&mut p, PanelState::Idle).unwrap();
         transition(&mut p, PanelState::Exited).unwrap();
         assert_eq!(p.state(), PanelState::Exited);
     }

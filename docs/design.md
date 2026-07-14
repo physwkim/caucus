@@ -109,13 +109,16 @@ caucus는 장기 실행 프로세스다. Session = 그 프로세스가 들고 �
 진짜 lifecycle은 **Panel(=Agent) 단위**에 있다:
 
 ```
-[spawning] ──► [live] ─────────► [exited]
-                 │   ▲
-          working │   │ idle      (turn signal로 working ⇄ idle 토글)
-                 ▼   │
-              [blocked]    (권한 프롬프트 / 머지 충돌 / 백그라운드 잡 —
-                            grid 관찰로 감지, §8.3)
+[spawning] ──► [working] ⇄ [idle] ──► [exited]
+                       turn signal로 토글
+                 (어느 상태에서든 exited로 갈 수 있다)
 ```
+
+coarse 상태에 `blocked`는 없다. 권한 프롬프트나 chooser에 멈춘 패널은 turn
+signal을 아예 내지 않으므로 여기서는 `working` 그대로고, caucus는 읽는 시점에
+grid를 훑어(`term::prompt_scan` → `overlay_blocked_state`) main worker가 보는
+`derived_state`에 `blocked_permission_prompt` / `awaiting_selection`으로
+얹는다(§8.3). 차단은 그 grid 파생 표면 하나에만 산다.
 
 worktree 실행은 패널의 한 속성(`worktree_path`)일 뿐 별도 상태가 아니다.
 
