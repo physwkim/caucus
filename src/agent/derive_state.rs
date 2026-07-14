@@ -15,6 +15,12 @@ use super::lane_event::{LaneEventBlocker, LaneFailureClass};
 use crate::signal::TurnSignal;
 
 /// Coarse state surface for the main worker (`docs/design.md` §8.3).
+///
+/// Every variant has exactly one producer, and there are only two: a blocker
+/// born from the turn signal ([`blocker_state`]) and a prompt seen on the live
+/// grid (`Multiplexer::overlay_blocked_state`). A variant with no producer is
+/// worse than absent — it tells the main worker caucus can report a condition
+/// it has no way to detect.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DerivedState {
@@ -22,20 +28,17 @@ pub enum DerivedState {
     Working,
     /// Turn signal received — waiting for the next instruction.
     Idle,
-    /// Grid shows a tool-permission `[y/n]` prompt. caucus never auto-answers.
+    /// A tool-permission `[y/n]` prompt: either the turn ended `tool_blocked`,
+    /// or the prompt is visible on the grid. caucus never auto-answers — the
+    /// main worker replies with `send_keys`.
     BlockedPermissionPrompt,
-    /// Grid shows a merge conflict.
-    BlockedMergeConflict,
-    /// Grid shows a stuck background job.
-    BlockedBackgroundJob,
     /// Grid shows an interactive selection menu (an `AskUserQuestion`-style
     /// chooser): the agent stopped mid-turn waiting for an option to be picked.
     /// No `Stop` hook fires here, so this is detected from the grid, not a
     /// turn signal. The main worker answers it with `select_option`.
     AwaitingSelection,
-    /// MCP handshake degraded.
-    DegradedMcp,
-    /// The transport to the agent was interrupted.
+    /// The turn ended on a transport-level error, or the agent's process is
+    /// flagged `failed`.
     InterruptedTransport,
     /// The agent process exited.
     Exited,
@@ -54,10 +57,7 @@ impl DerivedState {
             DerivedState::Working => "working",
             DerivedState::Idle => "idle",
             DerivedState::BlockedPermissionPrompt => "blocked_permission_prompt",
-            DerivedState::BlockedMergeConflict => "blocked_merge_conflict",
-            DerivedState::BlockedBackgroundJob => "blocked_background_job",
             DerivedState::AwaitingSelection => "awaiting_selection",
-            DerivedState::DegradedMcp => "degraded_mcp",
             DerivedState::InterruptedTransport => "interrupted_transport",
             DerivedState::Exited => "exited",
         }
@@ -129,10 +129,7 @@ mod tests {
             Working,
             Idle,
             BlockedPermissionPrompt,
-            BlockedMergeConflict,
-            BlockedBackgroundJob,
             AwaitingSelection,
-            DegradedMcp,
             InterruptedTransport,
             Exited,
         ] {

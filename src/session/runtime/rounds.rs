@@ -3183,10 +3183,6 @@ mod tests {
             Exited
         );
         assert_eq!(
-            Multiplexer::overlay_blocked_state(BlockedMergeConflict, Some(&menu)),
-            BlockedMergeConflict
-        );
-        assert_eq!(
             Multiplexer::overlay_blocked_state(InterruptedTransport, Some(&perm)),
             InterruptedTransport
         );
