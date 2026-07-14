@@ -7,6 +7,51 @@ versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A round panel's result is latched when it settles, not re-read when the round
+  is delivered** (Invariant I-9). caucus judged the round barrier — and read each
+  panel's result — from the panels' *live* state at delivery time, but delivery
+  waits for the main panel to go idle, so those two moments can be arbitrarily far
+  apart. A sub-agent that ends its turn with a background shell still running gets
+  woken by that shell finishing, and its CLI starts a fresh turn caucus never
+  prompted. Re-judging live state saw that panel back in `working` and un-settled
+  an already-finished round; worse, `working` made the report skip the panel's
+  output entirely and deliver a panel that had done all its work as "still working
+  — no output captured". The stray turn's `Stop` hook also overwrote the manifest's
+  `last_message`, so what *did* get reported was a line like "that was a leftover
+  wait-loop; nothing new came out of it" in place of the panel's actual result.
+  Each panel's contribution is now captured at the instant it settles and frozen:
+  no later state or output can change the round's dueness or what it delivers.
+
+- **A round can be collected by a main worker that stays inside its turn**
+  (Invariant I-10). Round delivery was push-only, and the push types the report
+  into the main panel, so it can only land while that panel is idle — i.e. only
+  after the main worker ends its turn. A main worker that instead polled
+  `round_status` from inside its turn was `working` for the whole poll, so the push
+  could never fire, and `fallback_secs` did not help: the deadline makes a round
+  *due*, not *deliverable*. Main waited for the round; the round waited for main to
+  stop waiting. `round_status` now returns the assembled report itself once the
+  round completes, and completes the round — so the poll that used to deadlock is
+  the collection. Delivery stays exactly-once: both halves complete the round
+  through one owner.
+
+### Added
+
+- **Every sub-agent is told that ending its turn claims the work is done** — the
+  contract caucus's completion signal has always assumed but never stated. caucus
+  knows a panel is finished only from its backend's turn-completion hook, and a
+  round now latches the panel's result at exactly that instant. An agent that
+  starts a long command in a background shell and ends its turn — or polls that
+  shell with a wait-loop across turns — therefore reports "done" while it is still
+  working, and gets a half-finished result captured. `SUBAGENT_TURN_CONTRACT` is
+  appended at the single spawn path (so it covers preset roles, inline prompts,
+  promptless roles, and both backends, alongside the question and worktree
+  contracts): do not end a turn with work in flight, wait for long commands in the
+  foreground, and if the work cannot finish in one turn say so in plain text rather
+  than leaving it running. The main worker is exempt — it registers rounds rather
+  than settling into them.
+
 ## [0.8.0] — 2026-07-10
 
 A `worktree=true` sub-agent was isolated by cwd but never told so. Three of

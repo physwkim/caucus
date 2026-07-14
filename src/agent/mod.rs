@@ -9,7 +9,7 @@ pub mod manifest;
 pub mod provenance;
 pub mod spawn;
 
-pub use derive_state::{DerivedState, GridHint, derive_agent_state};
+pub use derive_state::{DerivedState, derive_agent_state};
 pub use lane_event::{LaneEvent, LaneEventBlocker, LaneEventKind, LaneFailureClass};
 pub use manifest::{AgentManifest, AgentStatus};
 pub use provenance::{LaneCommitProvenance, extract_commit_sha};

@@ -636,10 +636,7 @@ fn derived_state_label(state: DerivedState) -> &'static str {
         DerivedState::Working => "working",
         DerivedState::Idle => "idle",
         DerivedState::BlockedPermissionPrompt => "blocked_permission",
-        DerivedState::BlockedMergeConflict => "blocked_merge",
-        DerivedState::BlockedBackgroundJob => "blocked_job",
         DerivedState::AwaitingSelection => "awaiting_selection",
-        DerivedState::DegradedMcp => "degraded_mcp",
         DerivedState::InterruptedTransport => "interrupted",
         DerivedState::Exited => "exited",
     }

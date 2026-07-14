@@ -109,13 +109,16 @@ caucus는 장기 실행 프로세스다. Session = 그 프로세스가 들고 �
 진짜 lifecycle은 **Panel(=Agent) 단위**에 있다:
 
 ```
-[spawning] ──► [live] ─────────► [exited]
-                 │   ▲
-          working │   │ idle      (turn signal로 working ⇄ idle 토글)
-                 ▼   │
-              [blocked]    (권한 프롬프트 / 머지 충돌 / 백그라운드 잡 —
-                            grid 관찰로 감지, §8.3)
+[spawning] ──► [working] ⇄ [idle] ──► [exited]
+                       turn signal로 토글
+                 (어느 상태에서든 exited로 갈 수 있다)
 ```
+
+coarse 상태에 `blocked`는 없다. 권한 프롬프트나 chooser에 멈춘 패널은 turn
+signal을 아예 내지 않으므로 여기서는 `working` 그대로고, caucus는 읽는 시점에
+grid를 훑어(`term::prompt_scan` → `overlay_blocked_state`) main worker가 보는
+`derived_state`에 `blocked_permission_prompt` / `awaiting_selection`으로
+얹는다(§8.3). 차단은 그 grid 파생 표면 하나에만 산다.
 
 worktree 실행은 패널의 한 속성(`worktree_path`)일 뿐 별도 상태가 아니다.
 
@@ -190,21 +193,38 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
 일찍 끝난 워커가 barrier에서 놀지 않고 자기 백로그를 계속 처리한다. 패널이
 라운드에 대해 settle하는 건 idle이고 *큐까지 빈* 순간뿐이다(백로그 없는 패널은
 첫 idle에 settle — 기존 단일 task 동작). 등록 시 라운드에 없는 패널의 큐와 빈
-큐는 버려진다. 큐의 task를 보내기 직전(패널이 아직 idle일 때) caucus가 막 끝난
-턴의 출력을 `read_mode`로 캡처해 둔다 — 전달 보고서가 마지막 턴만이 아니라 모든
-task 산출물을 담도록. settle해 전달될 때는 캡처분 + 최종 턴 라이브 read가 함께
-`### task N` 섹션으로 main에 주입된다(단일 task면 헤더 없이 기존과 동일; fallback
-시 미완 패널은 끝낸 task들 + "still working" 마커).
+큐는 버려진다. 라운드의 단일 owner `poll_round_panels`가 매 tick 이 판정을 하며,
+큐의 task를 보내기 직전(패널이 아직 idle일 때)과 패널이 최종 settle하는 순간에
+막 끝난 턴의 출력을 `read_mode`로 캡처해 latch한다(**Invariant I-9**) — 전달
+보고서가 마지막 턴만이 아니라 모든 task 산출물을 담도록, 그리고 배달 시점에
+패널을 다시 읽지 않도록. 전달 시에는 캡처분이 `### task N` 섹션으로 main에
+주입된다(단일 task면 헤더 없이 기존과 동일; fallback 시 미완 패널은 끝낸 task들
++ "still working" 마커).
 
 **라운드 식별(status·cancel)**: `register_round`는 라운드 id(ULID)를 반환한다.
 그 id로 main worker는 라운드를 들여다보거나(`round_status` — 패널별
 working/draining backlog/settled/gone 상태, 남은 백로그 수, fallback 데드라인까지
 남은 초) 취소할 수 있다(`cancel_round` — caucus가 그 라운드 감시·전달을 멈춘다;
 패널은 건드리지 않아 진행 중 작업은 계속 돌고 백로그 급여만 끊긴다). 정상 흐름은
-여전히 register 후 턴을 닫고 caucus의 완료 push를 기다리는 것 — `round_status`는
-sleep-poll 용이 아니라 out-of-band 점검용이다. 라운드 id는 **라이브 전용**:
-재시작을 못 넘기므로(sub-agent 프로세스가 새로 뜬다 — `ingest_resumed_rounds`)
-영속화하지 않고, caucus가 더 이상 감시하지 않는 id(전달 완료/취소됨)는 에러다.
+여전히 register 후 턴을 닫고 caucus의 완료 push를 기다리는 것이다 — 그게 더 싸다.
+다만 push는 main 패널이 idle일 때만 착지하므로(즉 main이 턴을 끝낸 뒤에만), 턴
+안에서 기다리는 main은 영원히 못 받는다. 그래서 `round_status`는 **pull 경로**를
+겸한다: 라운드가 완료됐으면 조립된 보고서를 그대로 반환하고 라운드를 완료시킨다
+(**Invariant I-10**). 라운드 id는 **라이브 전용**: 재시작을 못 넘기므로(sub-agent
+프로세스가 새로 뜬다 — `ingest_resumed_rounds`) 영속화하지 않고, caucus가 더 이상
+감시하지 않는 id(전달 완료/취소됨)는 에러다.
+
+**턴 계약(완료 신호의 전제)**: caucus가 패널의 완료를 아는 유일한 신호는 백엔드의
+turn-completion hook — 즉 **턴의 끝**이다. I-9에 따라 라운드는 바로 그 순간 패널의
+결과를 latch하므로, 턴을 끝내는 것은 "작업이 끝났다"는 주장이다. 이 신호는 에이전트의
+턴 규율만큼만 정확하다: 긴 명령을 백그라운드 셸에 던지고 턴을 끝내거나, 그 셸을 턴을
+넘겨 가며 폴링하는 wait-loop를 걸면, 작업이 도는 중에 "완료"를 신고하는 셈이고 caucus는
+반쯤 된 결과를 캡처한다. 나중에 셸이 끝나면 CLI가 caucus가 준 적 없는 턴을 스스로
+시작하는데, 그 출력은 어느 라운드에도 속하지 않는다. 그래서 모든 sub-agent의 시스템
+프롬프트에 턴 계약(`role::prompt::SUBAGENT_TURN_CONTRACT` — 작업이 도는 채로 턴을 끝내지
+말 것, 긴 명령은 foreground에서 기다릴 것, 한 턴에 못 끝내면 조용히 남겨 두지 말고 텍스트로
+보고하고 턴을 끝낼 것)이 덧붙는다(`agent::spawn::build_command`). main worker는 예외 —
+main은 라운드에 settle하는 쪽이 아니라 *등록하는* 쪽이다.
 
 **선택 프롬프트 엣지**: 라운드 패널의 sub-agent가 턴을 끝내지 않고 대화형
 선택 메뉴에서 멈추면 turn signal이 안 와 라운드가 settle하지
@@ -597,13 +617,17 @@ enum LaneEventKind {
 working                     (PromptDelivered 후, 다음 turn signal 전)
 idle                        (turn signal 수신 — 다음 지시 대기)
 awaiting_selection          (grid에 화살표-탐색 선택 메뉴 — turn signal 없이 중단, §8.3)
-blocked_permission_prompt   (grid 끝에 tool/shell `[y/n]` 프롬프트 — turn signal 없이 중단)
-blocked_merge_conflict
-blocked_background_job
-degraded_mcp
-interrupted_transport
+blocked_permission_prompt   (turn이 tool_blocked로 끝났거나, grid 끝에 tool/shell
+                             `[y/n]` 프롬프트가 보임)
+interrupted_transport       (turn이 error로 끝났거나 프로세스가 failed)
 exited
 ```
+
+**모든 변형에 생산자가 있어야 한다.** 생산자는 딱 둘 — turn signal에서 태어난
+blocker(`derive_state::blocker_state`)와 live grid에서 스캔한
+프롬프트(`overlay_blocked_state`). 생산자 없는 변형은 없느니만 못하다: main worker에게
+caucus가 감지할 수단조차 없는 상태를 보고할 수 있다고 광고하는 셈이다. 새 상태는
+그것을 만들어내는 신호와 *함께* 추가한다.
 
 파일 기반 `finished_cleanable` / `finished_pending_report`는 제거 — 라이브엔 응답
 파일이 없다. turn signal 수신 = `idle`, 다음 `PromptDelivered`부터 다시 `working`.
@@ -631,9 +655,13 @@ snake_case와 동일, 테스트로 고정)을 단일 소스로 쓴다.
 것은 주로 하네스가 그리는 chooser(plan-mode 승인, codex 승인 프롬프트 등)다 —
 감지·응답 경로는 그 fallback으로 유지된다.
 
-turn-completion hook이 없는 백엔드(codex가 hook 미지원 시): caucus가 grid
-관찰로 `idle`을 판정한다 — agent 프롬프트 복귀 패턴 매치. 휴리스틱이므로 hook
-경로보다 신뢰도가 낮다.
+**turn signal이 유일한 완료 신호다.** 지원 백엔드는 둘 다 신호를 낸다 — claude는
+`Stop` hook, codex는 `-c notify=[...]`가 `caucus signal codex-notify`를 호출해
+동일한 `TurnSignal{Stop}`을 post한다(§8.1, `agent::spawn`). grid를 프롬프트 복귀
+패턴으로 정규식 매치해 `idle`을 추정하는 fallback은 두지 않는다: 그런 백엔드가
+생기면 그때 *생산자와 함께* 도입한다. grid 관찰이 상태에 영향을 주는 유일한
+경로는 `overlay_blocked_state`(chooser / `[y/n]` — turn signal이 아예 안 오는
+구간)뿐이고, 이는 `derive_agent_state` 바깥에서 읽는 시점에 덮어씌운다.
 
 ### 8.4 derive 함수
 
@@ -643,11 +671,12 @@ fn derive_agent_state(
     last_turn_signal: Option<&TurnSignal>,
     error: Option<&str>,
     blocker: Option<&LaneEventBlocker>,
-    grid_hint: Option<&GridHint>,
 ) -> DerivedState
 ```
 
-turn signal 수신 또는 grid 변화 시 재계산.
+manifest만 보는 순수 함수 — turn signal 수신 시 재계산한다. grid에서만 보이는
+차단 상태(§8.3의 `awaiting_selection` / `blocked_permission_prompt`)는 여기가
+아니라 `overlay_blocked_state`가 읽는 시점에 얹는다.
 
 ### 8.5 패널 출력 캡처 — main worker가 화면을 경주하지 않게
 
@@ -718,7 +747,7 @@ caucus/
     │   ├── spawn.rs         (RoleSpec → 새 패널 + 새 AgentManifest)
     │   ├── manifest.rs      (AgentManifest 영속화: .json + .md 페어)
     │   ├── lane_event.rs    (LaneEvent enum + append)
-    │   ├── derive_state.rs  (turn signal + grid_hint → DerivedState)
+    │   ├── derive_state.rs  (status + turn signal + blocker → DerivedState)
     │   └── provenance.rs    (extract_commit_sha + git rev-parse → LaneCommitProvenance)
     ├── worktree/
     │   ├── manager.rs       (생성)
@@ -1026,6 +1055,44 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 - **Tests**: dirty → 브랜치에 커밋 후 삭제(삭제 후 `git ls-tree <branch>`로 파일 존재 확인);
   clean → 빈 salvage 커밋 없이 삭제(브랜치 tip 불변); dirty + 브랜치 삭제 예정 → salvage 없이
   삭제; dirty + detached HEAD → 삭제 거부, 디렉터리 잔존.
+
+### Invariant I-9: 라운드 패널의 기여는 정착 순간에 latch 된다
+- **Owner**: `Multiplexer::poll_round_panels()` — `PendingRound.settled` / `.captured`의 유일한 writer.
+- **MUST**: 패널이 이 라운드에 대해 정착하는 (working/spawning을 벗어났고 backlog가 비었거나
+  terminal) **첫 tick**에, 그 시점의 결과를 `read_mode`로 읽어 `captured`에 넣고 `settled`에
+  등록한다. 이후 그 패널의 상태나 출력은 라운드의 due 판정에도, 배달되는 기여에도 영향을 주지
+  않는다.
+- **MUST NOT**: 배달 시점에 패널을 다시 읽거나(`round_panel_contribution`), 라이브 상태로 배리어를
+  다시 판정하지 않는다(`round_settled`).
+- **왜**: 배달은 *메인* 패널이 idle이 되어야 일어나므로 정착과 배달 사이 간격은 무한정 커질 수 있다.
+  그 창에서 정착한 패널의 턴을 다시 여는 경로(MCP `send_keys`, auto-answer `select_option`, 사용자가
+  패널에 친 Enter, 그리고 **남은 백그라운드 셸이 끝나 CLI가 스스로 새 턴을 시작하는 것**)가 존재한다.
+  라이브 판정은 이때 (1) 끝난 라운드를 다시 미정착으로 되돌리고, (2) 패널이 `Working`이라는 이유로
+  읽기를 건너뛰어 완료된 작업을 "still working, no output captured"로 배달하며, (3) `last_message`를
+  뒤늦은 턴의 잡담("nothing new came out of it")으로 덮어썼다.
+- **Enforcement**: `PendingRound.settled` / `.captured`는 private 필드이고 `poll_round_panels`만
+  쓴다. `round_settled`는 latch만 읽고 `self.panels`의 상태를 보지 않는다.
+- **Tests**: latch 후 패널을 다시 `Working`으로 깨워도 라운드가 미정착으로 돌아가지 않고 기여가
+  남는지; latch 후 도착한 `Stop` 훅이 리포트의 `last_message`를 덮지 못하는지; backlog가 남은 채
+  fallback이 닫히면 latch는 되고 feed는 안 되는지.
+
+### Invariant I-10: 라운드는 정확히 한 번 배달된다 (push 또는 pull)
+- **Owner**: `Multiplexer::complete_round()` — assemble + spill + summary의 유일한 지점.
+  호출 전에 라운드는 이미 `pending_rounds`에서 제거되어 있어야 한다.
+- **MUST**: 두 배달 경로 모두 이 owner를 지난다. **push** =
+  `poll_pending_rounds()` (메인 패널이 idle일 때 요약을 타이핑해 넣음),
+  **pull** = `round_status()` (완료된 라운드면 조립된 리포트를 호출자에게 그대로 반환).
+- **MUST NOT**: pull이 라운드를 pending에 남겨 두지 않는다 (남기면 push가 두 번째로 배달한다).
+- **왜**: push는 메인 패널이 idle일 때만 착지한다 — 즉 메인 워커가 **턴을 끝낸 뒤에만**. 턴 안에서
+  기다리며 폴링하는 메인 워커는 내내 `Working`이므로 push는 영원히 못 온다: 메인은 라운드를 기다리고
+  라운드는 메인이 기다림을 멈추기를 기다린다. `fallback_deadline`은 이 라이브락을 못 끊는다 — 그것은
+  라운드를 *due*로 만들 뿐 *deliverable*로 만들지 않는다. pull이 구조적으로 끊는다.
+- **Enforcement**: 두 경로 다 라운드를 `pending_rounds`에서 꺼낸 뒤에만 `complete_round`를 부른다.
+  둘 다 같은 이벤트 루프 스레드에서 실행되므로 (control drain → poll) 겹칠 수 없다.
+- **Tests**: 메인이 `Working`인 채로 `round_status`가 리포트를 반환하고 라운드를 완료시키는지;
+  그 뒤 `poll_pending_rounds`가 아무것도 배달하지 않고 같은 id의 두 번째 `round_status`가 에러인지;
+  아직 안 끝난 라운드는 pull 되지 않고 상태 텍스트만 반환하며 pending으로 남는지.
+
 
 ---
 

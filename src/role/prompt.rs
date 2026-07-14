@@ -31,6 +31,43 @@ numbered options if there are concrete choices — and end your turn. The \
 main worker reads your panel output when your turn ends and answers with a \
 follow-up message.";
 
+/// The turn contract appended to every **sub-agent** system prompt
+/// (`crate::agent::spawn::build_command`, `docs/design.md` §4, §8.5).
+///
+/// caucus's only signal that a panel is done is its backend's turn-completion
+/// hook — the end of its turn. A round latches each panel's result at the
+/// instant it settles (Invariant I-9), so the end of the turn *is* the moment
+/// the panel's contribution is captured and frozen.
+///
+/// That signal is only as good as the agent's turn discipline. A sub-agent that
+/// starts a long command in a background shell and ends its turn — or that sets
+/// up a wait-loop polling that shell across turns — reports "done" while its
+/// work is still running: caucus captures a half-finished result. When the shell
+/// later completes, the CLI wakes itself into a turn caucus never prompted,
+/// whose output belongs to no round. This text is the backend-neutral statement
+/// of the contract the completion signal assumes, appended at the single spawn
+/// path so it covers preset roles, free-form inline prompts, and roles with no
+/// prompt.
+pub const SUBAGENT_TURN_CONTRACT: &str = "\
+# caucus: when your turn ends, your work is done
+
+caucus reads exactly one thing from this panel: the end of your turn. The \
+moment your turn ends, caucus captures your result and treats your task as \
+complete — so ending your turn is a claim that the work is finished.
+
+- Never end your turn with work still in flight. Do not start a long command \
+in a background shell and end the turn, and do not set up a wait-loop that \
+polls a background shell across turns.
+- Run long commands in the foreground and wait for them (raise the command \
+timeout if you need to). If you do background something, wait for it and \
+report its outcome *in the same turn*.
+- Nothing you produce after your turn ends counts. Your result is already \
+captured; a turn that starts on its own later — because a background shell \
+finished, say — is read by nobody.
+- If the work genuinely cannot finish in one turn, do not leave it running \
+silently: say so in plain text, with what you did and what remains, and end \
+the turn. The main worker decides what happens next.";
+
 /// The worktree contract appended to a **sub-agent that owns a git worktree**
 /// (`crate::agent::spawn::build_command`, `docs/design.md` §5).
 ///
