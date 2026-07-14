@@ -1047,6 +1047,24 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
   남는지; latch 후 도착한 `Stop` 훅이 리포트의 `last_message`를 덮지 못하는지; backlog가 남은 채
   fallback이 닫히면 latch는 되고 feed는 안 되는지.
 
+### Invariant I-10: 라운드는 정확히 한 번 배달된다 (push 또는 pull)
+- **Owner**: `Multiplexer::complete_round()` — assemble + spill + summary의 유일한 지점.
+  호출 전에 라운드는 이미 `pending_rounds`에서 제거되어 있어야 한다.
+- **MUST**: 두 배달 경로 모두 이 owner를 지난다. **push** =
+  `poll_pending_rounds()` (메인 패널이 idle일 때 요약을 타이핑해 넣음),
+  **pull** = `round_status()` (완료된 라운드면 조립된 리포트를 호출자에게 그대로 반환).
+- **MUST NOT**: pull이 라운드를 pending에 남겨 두지 않는다 (남기면 push가 두 번째로 배달한다).
+- **왜**: push는 메인 패널이 idle일 때만 착지한다 — 즉 메인 워커가 **턴을 끝낸 뒤에만**. 턴 안에서
+  기다리며 폴링하는 메인 워커는 내내 `Working`이므로 push는 영원히 못 온다: 메인은 라운드를 기다리고
+  라운드는 메인이 기다림을 멈추기를 기다린다. `fallback_deadline`은 이 라이브락을 못 끊는다 — 그것은
+  라운드를 *due*로 만들 뿐 *deliverable*로 만들지 않는다. pull이 구조적으로 끊는다.
+- **Enforcement**: 두 경로 다 라운드를 `pending_rounds`에서 꺼낸 뒤에만 `complete_round`를 부른다.
+  둘 다 같은 이벤트 루프 스레드에서 실행되므로 (control drain → poll) 겹칠 수 없다.
+- **Tests**: 메인이 `Working`인 채로 `round_status`가 리포트를 반환하고 라운드를 완료시키는지;
+  그 뒤 `poll_pending_rounds`가 아무것도 배달하지 않고 같은 id의 두 번째 `round_status`가 에러인지;
+  아직 안 끝난 라운드는 pull 되지 않고 상태 텍스트만 반환하며 pending으로 남는지.
+
+
 ---
 
 ## 13. 스코프와 non-goals

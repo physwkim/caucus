@@ -387,7 +387,13 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                           their assembled results to you as a new message. \
                           Returns immediately — after calling this, end your \
                           turn; caucus re-prompts you when the round completes. \
-                          Do NOT sleep-poll list_panels. Use `backlog` to keep \
+                          That push can only land while you are idle, so it \
+                          arrives only AFTER your turn ends: do NOT sleep-poll \
+                          list_panels waiting for it inside this turn — it will \
+                          never come and you will wait forever. If you must stay \
+                          in your turn, poll round_status instead: it hands you \
+                          the assembled report itself once the round completes. \
+                          Use `backlog` to keep \
                           a panel busy across several tasks: caucus feeds it the \
                           next queued task each time it goes idle, so an early \
                           finisher never sits idle, and the panel settles only \
@@ -463,14 +469,21 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
         ToolDef {
             name: "round_status",
             description: "Check on a round you registered, by the round id \
-                          register_round returned. Reports each panel's state \
-                          (working / draining backlog / settled / gone), its \
-                          remaining backlog count, and the seconds left on the \
-                          fallback deadline. Use this only if you must inspect a \
-                          round out-of-band — normally you end your turn after \
-                          register_round and caucus re-prompts you; do NOT \
-                          sleep-poll this. A round id caucus is no longer \
-                          watching (already delivered, or cancelled) is an error.",
+                          register_round returned — and collect it once it is \
+                          done. While the round is still running this reports \
+                          each panel's state (working / draining backlog / \
+                          settled / gone), its remaining backlog count, and the \
+                          seconds left on the fallback deadline. Once the round \
+                          COMPLETES (every panel settled, or the fallback \
+                          deadline passed) this returns the assembled round \
+                          report itself and completes the round — so a main \
+                          worker that must stay inside its turn can still collect \
+                          its results, instead of waiting on a caucus push that \
+                          can only land after the turn ends. Ending your turn and \
+                          letting caucus re-prompt you is still the cheaper path. \
+                          A round is delivered exactly once: an id already \
+                          collected (by either path), cancelled, or never \
+                          registered is an error.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

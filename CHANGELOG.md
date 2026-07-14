@@ -24,6 +24,18 @@ versions.
   Each panel's contribution is now captured at the instant it settles and frozen:
   no later state or output can change the round's dueness or what it delivers.
 
+- **A round can be collected by a main worker that stays inside its turn**
+  (Invariant I-10). Round delivery was push-only, and the push types the report
+  into the main panel, so it can only land while that panel is idle — i.e. only
+  after the main worker ends its turn. A main worker that instead polled
+  `round_status` from inside its turn was `working` for the whole poll, so the push
+  could never fire, and `fallback_secs` did not help: the deadline makes a round
+  *due*, not *deliverable*. Main waited for the round; the round waited for main to
+  stop waiting. `round_status` now returns the assembled report itself once the
+  round completes, and completes the round — so the poll that used to deadlock is
+  the collection. Delivery stays exactly-once: both halves complete the round
+  through one owner.
+
 ## [0.8.0] — 2026-07-10
 
 A `worktree=true` sub-agent was isolated by cwd but never told so. Three of

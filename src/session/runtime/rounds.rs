@@ -424,19 +424,38 @@ impl Multiplexer {
         }
     }
 
-    /// Report the live status of a registered round by id: per-panel state
+    /// Check on a registered round by id — and, once it is **complete**, hand
+    /// its assembled report straight back to the caller. This is the *pull* half
+    /// of round delivery (Invariant I-10).
+    ///
+    /// A complete round (every panel latched, or the fallback deadline passed)
+    /// is delivered right here: it is removed from `pending_rounds`, completed
+    /// through [`Multiplexer::complete_round`] — the same owner the push half
+    /// uses — and its summary returned as the response. Otherwise the round is
+    /// left pending and the caller gets its live status: per-panel state
     /// (working / draining backlog / settled / gone), remaining backlog count,
-    /// and seconds left on the fallback deadline. An unknown id is an error —
-    /// the round never existed, already delivered, or was cancelled/dropped.
+    /// and seconds left on the fallback deadline.
+    ///
+    /// The pull half exists because the *push* half
+    /// ([`Multiplexer::poll_pending_rounds`]) types the report into the main
+    /// panel, so it can only land while that panel is `Idle` — i.e. only after
+    /// the main worker ends its turn. A main worker that instead polls this from
+    /// inside its turn is `Working` for the whole poll, so the push can never
+    /// fire: main waits for the round, and the round waits for main to stop
+    /// waiting. The fallback deadline does not break that livelock — it makes a
+    /// round *due*, not *deliverable*. Handing the report to the poller does, by
+    /// construction. Completing the round here (rather than leaving it pending
+    /// for a push that would deliver it a second time) is what keeps delivery
+    /// exactly-once.
     ///
     /// The round's single owner ([`Multiplexer::poll_round_panels`]) is run
-    /// first, so the status reflects the *current* settle latch. Without it a
-    /// status call would lag the panels by a tick — the event loop drains
-    /// control requests before it polls rounds — and report a panel as `working`
-    /// that has already settled.
+    /// first, so both the status and the completion check see the *current*
+    /// settle latch. Without it they would lag the panels by a tick — the event
+    /// loop drains control requests before it polls rounds.
     ///
     /// Round ids are live-only (not persisted across a restart), so a status
-    /// poll only ever resolves rounds the current caucus instance is watching.
+    /// poll only ever resolves rounds the current caucus instance is watching. A
+    /// round already delivered — by either half — is an unknown id.
     pub(crate) fn round_status(&mut self, round_id: RoundId) -> ControlResponse {
         let Some(idx) = self.pending_rounds.iter().position(|r| r.id == round_id) else {
             return ControlResponse::error(format!(
@@ -444,10 +463,20 @@ impl Multiplexer {
             ));
         };
         // Take the round out so the owner poll can borrow `self`; it goes back
-        // at `idx` right after.
+        // at `idx` unless it completes here.
         let mut round = self.pending_rounds.remove(idx);
         let fallback_due = Instant::now() >= round.fallback_deadline;
         let changed = self.poll_round_panels(&mut round, fallback_due);
+        let all_settled = self.round_settled(&round);
+
+        if all_settled || fallback_due {
+            let summary = self.complete_round(&round, all_settled);
+            // `round` is already out of `pending_rounds`, so persisting now
+            // records it as delivered — and no push can deliver it again.
+            self.persist_pending_rounds();
+            return ControlResponse::Panel { text: summary };
+        }
+
         let text = self.render_round_status(&round);
         self.pending_rounds.insert(idx, round);
         if changed {
@@ -590,15 +619,7 @@ impl Multiplexer {
                 continue;
             }
             if deliverable && !delivered {
-                // Spill the full per-panel report to disk and inject only a
-                // compact summary that points at it — never the whole
-                // unstructured report into the main PTY (a multi-panel round's
-                // results can run to hundreds of KB; one giant bracketed paste
-                // risks the backend's paste-handling pathologies).
-                let report = self.assemble_round_report(&round, all_settled);
-                let report_path = self.spill_round_report(round.id, &report);
-                let summary =
-                    self.render_round_summary(&round, all_settled, report_path.as_deref());
+                let summary = self.complete_round(&round, all_settled);
                 // `deliverable` implies a live, idle main panel exists.
                 let mid = main_id.expect("deliverable implies a main panel");
                 match McpToolSurface::send_keys(self, mid, &summary, true) {
@@ -623,6 +644,25 @@ impl Multiplexer {
         if changed {
             self.persist_pending_rounds();
         }
+    }
+
+    /// Complete a round: assemble its full per-panel report, spill it to
+    /// `<session_root>/rounds/<id>.md`, and return the compact summary that
+    /// points at it. The single owner of round completion (Invariant I-10),
+    /// shared by both delivery halves — the push
+    /// ([`Multiplexer::poll_pending_rounds`], which types the summary into an
+    /// idle main panel) and the pull ([`Multiplexer::round_status`], which hands
+    /// it to a main worker polling from inside its own turn).
+    ///
+    /// The caller must already have removed the round from `pending_rounds`, so
+    /// a round is completed exactly once no matter which half reaches it first.
+    /// Never the whole report into the main PTY: a multi-panel round's results
+    /// can run to hundreds of KB, and one giant bracketed paste risks the
+    /// backend's paste-handling pathologies.
+    fn complete_round(&self, round: &PendingRound, all_settled: bool) -> String {
+        let report = self.assemble_round_report(round, all_settled);
+        let report_path = self.spill_round_report(round.id, &report);
+        self.render_round_summary(round, all_settled, report_path.as_deref())
     }
 
     /// Append a dropped round's assembled report to the session's
@@ -2738,6 +2778,121 @@ mod tests {
         assert!(
             !report.contains("leftover wait-loop"),
             "a turn started after the latch must not overwrite the round's result: {report}",
+        );
+
+        mux.shutdown();
+    }
+
+    /// A main worker polling from inside its own turn can **pull** a completed
+    /// round (Invariant I-10) — the escape from the livelock the push-only path
+    /// created.
+    ///
+    /// The push (`poll_pending_rounds`) can only type into an *idle* main panel.
+    /// A main worker that stays in its turn polling `round_status` is `Working`
+    /// for the whole poll, so the push never fires: main waits for the round and
+    /// the round waits for main to stop waiting. The fallback deadline does not
+    /// break it — that makes a round *due*, not *deliverable*. `round_status`
+    /// therefore returns the assembled report itself and completes the round.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn round_status_pulls_a_completed_round_for_a_busy_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Some(main) = spawn_idle(&mut mux, "main") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+        let Some(sub) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+
+        finish_turn(&mut mux, sub, "the sub-agent's result");
+        // Main never ends its turn — it polls, which is what an LLM main worker
+        // actually does.
+        mux.note_prompt_delivered(main);
+        let ControlResponse::RoundRegistered { round_id, .. } =
+            mux.register_round(vec![sub], None, Some(3600), None, None)
+        else {
+            panic!("register_round must ack with a round id");
+        };
+
+        // The push is dead while main is working: it will re-queue forever.
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "the push cannot land in a working main panel",
+        );
+
+        // The pull delivers the round to the poller instead.
+        let ControlResponse::Panel { text } = mux.round_status(round_id) else {
+            panic!("a completed round must answer with its report");
+        };
+        assert!(
+            text.contains("Round complete"),
+            "the poller must get the assembled report, not a status line: {text}",
+        );
+        assert!(
+            text.contains("the sub-agent's result"),
+            "the report must carry the panel's captured result: {text}",
+        );
+
+        // Exactly-once: the round is completed, not left for a second delivery.
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "a pulled round must be completed, not re-queued for the push",
+        );
+        mux.poll_pending_rounds();
+        assert!(matches!(
+            mux.round_status(round_id),
+            ControlResponse::Error { .. }
+        ));
+
+        mux.shutdown();
+    }
+
+    /// A round whose panels are still working is **not** pulled: `round_status`
+    /// answers with its live status and leaves it pending. The other side of the
+    /// pull boundary from `round_status_pulls_a_completed_round_for_a_busy_main`.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn round_status_leaves_an_unfinished_round_pending() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Some(sub) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        // Mid-turn: nothing to latch.
+        mux.note_prompt_delivered(sub);
+
+        let ControlResponse::RoundRegistered { round_id, .. } =
+            mux.register_round(vec![sub], None, Some(3600), None, None)
+        else {
+            panic!("register_round must ack with a round id");
+        };
+
+        let ControlResponse::Panel { text } = mux.round_status(round_id) else {
+            panic!("a live round must answer with its status");
+        };
+        assert!(
+            text.contains("working"),
+            "an unfinished panel must be reported as working: {text}",
+        );
+        assert!(
+            !text.contains("Round complete"),
+            "an unfinished round must not be delivered: {text}",
+        );
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "an unfinished round stays pending",
         );
 
         mux.shutdown();

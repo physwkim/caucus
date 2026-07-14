@@ -119,6 +119,11 @@ pub enum ControlRequest {
     /// read as, captured the instant each panel settles (default
     /// `last_message`).
     ///
+    /// That injection is the *push* half of delivery and can only land while
+    /// the main panel is idle. A main worker that instead waits inside its turn
+    /// collects the round with [`ControlRequest::RoundStatus`] — the *pull*
+    /// half (see it for why both exist).
+    ///
     /// `backlog` is an optional per-panel task queue keyed by panel id: while
     /// the round runs, a panel that goes idle with tasks still queued is fed
     /// its next task (so an early finisher keeps working instead of idling
@@ -141,13 +146,29 @@ pub enum ControlRequest {
         #[serde(default)]
         selection_hints: Option<SelectionPolicy>,
     },
-    /// Report the live status of a registered round by its id: which panels
-    /// have settled vs are still working, the per-panel backlog remaining, and
-    /// the seconds left until the fallback deadline. Each panel's status is read
-    /// from the round's settle latch, so a panel that finished and was later
-    /// re-woken still reads `settled`. Answered with a
-    /// [`ControlResponse::Panel`] (text), or an error if the id is unknown
-    /// (delivered, cancelled, or never registered).
+    /// Check a registered round by its id — and *collect* it once it is done.
+    /// This is the **pull** half of round delivery.
+    ///
+    /// While the round is live this reports which panels have settled vs are
+    /// still working, the per-panel backlog remaining, and the seconds left
+    /// until the fallback deadline. Each panel's status is read from the round's
+    /// settle latch, so a panel that finished and was later re-woken still reads
+    /// `settled`. Once the round is complete (every panel settled, or the
+    /// fallback deadline passed) this answers with the assembled round report
+    /// itself and completes the round.
+    ///
+    /// Both halves exist because the push
+    /// (`crate::session::runtime::Multiplexer::poll_pending_rounds`) types the
+    /// report into the main panel and so can only fire while that panel is
+    /// *idle* — i.e. after the main worker ends its turn. A main worker that
+    /// stays in its turn polling is `Working` throughout, so the push can never
+    /// land: main waits for the round and the round waits for main to stop
+    /// waiting. The fallback deadline does not break that livelock — it makes a
+    /// round *due*, not *deliverable*. Handing the report to the poller does.
+    ///
+    /// Either way answered with a [`ControlResponse::Panel`] (text). A round is
+    /// delivered exactly once: an id already collected (by either half),
+    /// cancelled, or never registered is an error.
     RoundStatus { round: RoundId },
     /// Cancel a registered round by its id: caucus stops watching it and never
     /// delivers its report. The sub-agent panels keep running — only the round
