@@ -157,6 +157,20 @@ pub fn detect_supersession(worktree: &Path, branch: &str, commit: &str) -> Optio
     }
 }
 
+/// The commit `branch` currently points at, or `None` if git cannot say.
+///
+/// Reachability from a branch can only change when the branch ref moves, so an
+/// unchanged tip is proof that no recorded commit left the branch since the last
+/// look. One process answers for every commit on the lane, which is why
+/// [`crate::session::runtime::Multiplexer::record_commit_supersessions`] asks
+/// this before asking [`detect_supersession`] anything.
+pub fn branch_tip(worktree: &Path, branch: &str) -> Option<String> {
+    if branch.is_empty() {
+        return None;
+    }
+    verify_commit(worktree, branch)
+}
+
 /// Is `rev` reachable from `branch`? `Some(true)` / `Some(false)` when git
 /// answers, `None` when it cannot — the branch does not exist, `repo` is not a
 /// worktree, git is missing, or caucus never learned the panel's branch (`""`).

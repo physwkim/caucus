@@ -171,6 +171,15 @@ pub struct Multiplexer {
     /// grid did not change. The cache recomputes only when a panel's grid
     /// generation advances; an entry is pruned when its panel is killed.
     blocked_scan_cache: HashMap<PanelId, (u64, Option<rounds::BlockedPrompt>)>,
+    /// The branch tip each panel's lane was last checked against for superseded
+    /// commits ([`Multiplexer::record_commit_supersessions`]). A commit's
+    /// reachability from a branch can only change when the branch ref moves, so
+    /// an unchanged tip means no recorded commit left the lane and the
+    /// per-commit `merge-base` calls can be skipped entirely: one `rev-parse`
+    /// (~2ms) answers for the whole lane, instead of one process per commit on
+    /// every turn signal. Absent means "never checked" — the next turn checks
+    /// everything. An entry is pruned when its panel is killed.
+    checked_branch_tips: HashMap<PanelId, String>,
     /// Notice to inject into the resumed main worker once it is idle: the
     /// in-flight rounds a prior caucus instance dropped on quit/crash. The
     /// main worker's claude conversation reloads still believing its
@@ -327,6 +336,7 @@ impl Multiplexer {
                 scroll: None,
                 worktree_branches: HashMap::new(),
                 blocked_scan_cache: HashMap::new(),
+                checked_branch_tips: HashMap::new(),
                 resume_round_notice: None,
                 last_liveness_probe: None,
                 view_epoch: 0,

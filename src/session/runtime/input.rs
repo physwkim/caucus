@@ -319,6 +319,13 @@ impl Multiplexer {
     /// Runs on the turn signal, after `record_commit_provenance`: a rewrite is
     /// something the agent did *during* the turn that just ended, and the turn
     /// signal is caucus's only notification that it did anything at all.
+    ///
+    /// Gated on the lane's branch tip. A commit's reachability from a branch can
+    /// only change when the branch ref moves, so a tip unchanged since the last
+    /// look is proof that nothing left the lane — one `rev-parse` (~2ms, measured)
+    /// answers for every commit on it, instead of a `merge-base` process per
+    /// recorded commit on every single turn signal. The turns that *did* rewrite
+    /// history pay the full check; the ordinary ones pay one process.
     fn record_commit_supersessions(&mut self, panel_id: PanelId) {
         let Some(manifest) = self.manifests.get(&panel_id) else {
             return;
@@ -326,8 +333,21 @@ impl Multiplexer {
         let Some(worktree) = manifest.worktree_path.clone() else {
             return;
         };
-        let retired: Vec<(String, SupersededBy)> = manifest
-            .live_commits()
+        let live = manifest.live_commits();
+        if live.is_empty() {
+            return; // No recorded commit on this lane — nothing can have left it.
+        }
+        let Some(branch) = self.worktree_branches.get(&panel_id).cloned() else {
+            return;
+        };
+        let Some(tip) = provenance::branch_tip(&worktree, &branch) else {
+            return; // git cannot say where the branch is; make no claim.
+        };
+        if self.checked_branch_tips.get(&panel_id) == Some(&tip) {
+            return;
+        }
+
+        let retired: Vec<(String, SupersededBy)> = live
             .into_iter()
             .filter_map(|p| {
                 provenance::detect_supersession(&worktree, &p.branch, &p.commit)
@@ -337,6 +357,9 @@ impl Multiplexer {
         for (commit, by) in retired {
             self.record_lane_event(panel_id, LaneEventKind::CommitSuperseded { commit, by });
         }
+        // Only after the checks ran: a turn that returned early above must
+        // re-check next time rather than trust a tip it never looked past.
+        self.checked_branch_tips.insert(panel_id, tip);
     }
 
     /// Mark a panel as having received a prompt: open a capture turn and flip
