@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::lane_event::{LaneEvent, LaneEventKind};
 use crate::agent::manifest;
 use crate::input::CaucusCommand;
 use crate::panel::lifecycle::{self, PanelState};
@@ -267,14 +268,47 @@ impl Multiplexer {
         if Some(panel_id) == self.main_panel_id {
             self.main_compose_since = None;
         }
-        if let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) {
-            panel.begin_turn();
-            match panel.state() {
-                PanelState::Spawning | PanelState::Idle => {
-                    let _ = lifecycle::transition(panel, PanelState::Working);
-                }
-                _ => {}
+        let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
+            return;
+        };
+        panel.begin_turn();
+        match panel.state() {
+            PanelState::Spawning | PanelState::Idle => {
+                let _ = lifecycle::transition(panel, PanelState::Working);
             }
+            _ => {}
+        }
+        // This is the only `Idle -> Working` path, so it is where a delivered
+        // prompt becomes a fact — the timeline's `PromptDelivered` is written
+        // here or nowhere.
+        self.record_lane_event(panel_id, LaneEventKind::PromptDelivered);
+    }
+
+    /// Single owner of lane-event appends for a live panel (Invariant I-2).
+    ///
+    /// Every timeline event a running session records goes through here: it
+    /// resolves the panel's manifest and hands the event to
+    /// `agent::manifest::write`, the single owner of manifest persistence. A
+    /// caller that reached into `self.manifests` to push an event itself would
+    /// leave the on-disk JSON stale until some later write happened to flush it.
+    ///
+    /// Best-effort: a failed manifest write is logged, not propagated. The
+    /// timeline is a record of the session, not a gate on it — losing an event
+    /// to a full disk must not fail the prompt that produced it.
+    ///
+    /// Not every event passes through here, and cannot: `WorktreeRemoved` is a
+    /// fact known only after the panel is detached and its manifest dropped from
+    /// this map, so the cleanup worker records it against the manifest on disk
+    /// (`worktree::cleanup`). That is the one writer outside this owner, and it
+    /// owns the manifest exclusively by then.
+    pub(crate) fn record_lane_event(&mut self, panel_id: PanelId, kind: LaneEventKind) {
+        let Some(manifest) = self.manifests.get_mut(&panel_id) else {
+            return;
+        };
+        if let Err(err) =
+            manifest::write(manifest, &self.session.root_dir, Some(LaneEvent::now(kind)))
+        {
+            warn!(panel = %panel_id, error = %err, "lane event write failed");
         }
     }
 }
@@ -302,6 +336,43 @@ mod tests {
             mux.main_compose_since.is_none(),
             "submitting the main line must clear the compose hold"
         );
+    }
+
+    /// A delivered prompt lands `PromptDelivered` on the panel's timeline, and
+    /// it is persisted — `record_lane_event` routes through
+    /// `agent::manifest::write`, so a reader of the on-disk manifest sees it
+    /// without waiting for some later write to flush it.
+    #[tokio::test]
+    async fn note_prompt_delivered_records_the_event_on_the_manifest() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Idle);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        let agent_id = mf.agent_id;
+        mux.manifests.insert(id, mf);
+
+        mux.note_prompt_delivered(id);
+
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert!(
+            on_disk
+                .lane_events()
+                .iter()
+                .any(|e| matches!(e.kind, LaneEventKind::PromptDelivered)),
+            "a delivered prompt is on the persisted timeline: {:?}",
+            on_disk.lane_events()
+        );
+        mux.shutdown();
     }
 
     /// Insert a hermetic `/bin/cat` panel so paste tests do not depend on a
