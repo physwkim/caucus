@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent::lane_event::{LaneEvent, LaneEventKind};
 use crate::agent::manifest;
-use crate::agent::provenance::{self, LaneCommitProvenance};
+use crate::agent::provenance::{self, LaneCommitProvenance, SupersededBy};
 use crate::input::CaucusCommand;
 use crate::panel::lifecycle::{self, PanelState};
 use crate::signal::TurnSignal;
@@ -258,6 +258,7 @@ impl Multiplexer {
             self.persist_record();
         }
         self.record_commit_provenance(signal.panel_id);
+        self.record_commit_supersessions(signal.panel_id);
     }
 
     /// Record a `CommitCreated` event when the turn that just ended named a real
@@ -299,6 +300,39 @@ impl Multiplexer {
                 },
             },
         );
+    }
+
+    /// Record a `CommitSuperseded` event for every commit the panel created that
+    /// its branch no longer holds (`docs/design.md` §8.2).
+    ///
+    /// An agent that amends or rebases leaves the sha it announced last turn
+    /// pointing at a commit no branch contains. Without this, the timeline keeps
+    /// claiming a commit that `git log` cannot show, and every later reader of
+    /// the lane — a review round, a human reading the manifest — chases a sha
+    /// that resolves to nothing. `provenance::detect_supersession` asks the
+    /// branch, so the timeline says what the repository says.
+    ///
+    /// Runs on the turn signal, after `record_commit_provenance`: a rewrite is
+    /// something the agent did *during* the turn that just ended, and the turn
+    /// signal is caucus's only notification that it did anything at all.
+    fn record_commit_supersessions(&mut self, panel_id: PanelId) {
+        let Some(manifest) = self.manifests.get(&panel_id) else {
+            return;
+        };
+        let Some(worktree) = manifest.worktree_path.clone() else {
+            return;
+        };
+        let retired: Vec<(String, SupersededBy)> = manifest
+            .live_commits()
+            .into_iter()
+            .filter_map(|p| {
+                provenance::detect_supersession(&worktree, &p.branch, &p.commit)
+                    .map(|by| (p.commit, by))
+            })
+            .collect();
+        for (commit, by) in retired {
+            self.record_lane_event(panel_id, LaneEventKind::CommitSuperseded { commit, by });
+        }
     }
 
     /// Mark a panel as having received a prompt: open a capture turn and flip
@@ -499,6 +533,113 @@ mod tests {
                 ),
             }
         }
+        mux.shutdown();
+    }
+
+    /// An agent that amends the commit it announced last turn leaves the
+    /// recorded SHA pointing at a commit no branch holds. The next turn signal
+    /// records `CommitSuperseded` naming the commit that carries the same patch,
+    /// and `live_commits` drops the dead SHA — so no reader of the lane chases a
+    /// commit `git log` cannot show.
+    #[tokio::test]
+    async fn an_amended_commit_is_recorded_as_superseded_on_the_next_turn() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::agent::provenance::tests::{amend_reword, branch_of, repo_with_commit};
+        use crate::agent::provenance::{SupersededBy, verify_commit};
+        use crate::role::spec::AgentCli;
+        use crate::signal::TurnKind;
+
+        let (repo, first) = repo_with_commit();
+        let branch = branch_of(repo.path());
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        mux.worktree_branches.insert(id, branch.clone());
+        let mut mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        mf.worktree_path = Some(repo.path().to_path_buf());
+        let agent_id = mf.agent_id;
+        mux.manifests.insert(id, mf);
+
+        let turn = |mux: &mut Multiplexer, message: String| {
+            mux.handle_signal(TurnSignal::now(
+                mux.session.id,
+                id,
+                TurnKind::Stop,
+                Some(message),
+                serde_json::Value::Null,
+            ));
+        };
+
+        // Turn one: the agent announces the commit it made.
+        turn(&mut mux, format!("Committed {}.", &first[..12]));
+        assert_eq!(
+            mux.manifests[&id]
+                .live_commits()
+                .iter()
+                .map(|p| p.commit.clone())
+                .collect::<Vec<_>>(),
+            vec![first.clone()],
+            "the announced commit is live while the branch holds it"
+        );
+
+        // The agent rewords it — same patch, new sha — and ends another turn.
+        amend_reword(repo.path(), "reworded");
+        let second = verify_commit(repo.path(), "HEAD").unwrap();
+        turn(&mut mux, format!("Reworded it: {}.", &second[..12]));
+
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        let superseded: Vec<_> = on_disk
+            .lane_events()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                LaneEventKind::CommitSuperseded { commit, by } => {
+                    Some((commit.clone(), by.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            superseded,
+            vec![(
+                first.clone(),
+                SupersededBy::Commit {
+                    commit: second.clone()
+                }
+            )],
+            "the dead SHA is retired exactly once, naming what replaced it"
+        );
+        assert_eq!(
+            on_disk
+                .live_commits()
+                .iter()
+                .map(|p| p.commit.clone())
+                .collect::<Vec<_>>(),
+            vec![second],
+            "only the commit the branch holds survives the derivation"
+        );
+
+        // A third turn adds nothing: the retired commit is no longer live, so
+        // it is not re-tested and not re-recorded.
+        turn(&mut mux, "Nothing new.".to_string());
+        let again = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(
+            again
+                .lane_events()
+                .iter()
+                .filter(|e| matches!(e.kind, LaneEventKind::CommitSuperseded { .. }))
+                .count(),
+            1,
+            "a supersession is recorded once, not on every later turn"
+        );
+
         mux.shutdown();
     }
 

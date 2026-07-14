@@ -17,6 +17,7 @@ use crate::session::id::{AgentId, PanelId, SessionId};
 
 use super::derive_state::DerivedState;
 use super::lane_event::{LaneEvent, LaneEventBlocker, LaneEventKind};
+use super::provenance::{LaneCommitProvenance, SupersededBy};
 
 /// Raw agent status, persisted in the manifest. Coarser than `DerivedState`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -124,6 +125,37 @@ impl AgentManifest {
     /// Read-only view of the lane-event timeline.
     pub fn lane_events(&self) -> &[LaneEvent] {
         &self.lane_events
+    }
+
+    /// The commits this agent created that its branch still holds, oldest first.
+    ///
+    /// A commit's standing is *derived* from the append-only timeline rather
+    /// than stored: `CommitCreated` announces it, a later `CommitSuperseded`
+    /// retires it, and what survives is live. A commit re-announced after being
+    /// superseded (the agent names the same sha again) does not resurrect — the
+    /// branch is what decides, and the supersession is what the branch said.
+    pub fn live_commits(&self) -> Vec<LaneCommitProvenance> {
+        let superseded: Vec<&str> = self
+            .lane_events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                LaneEventKind::CommitSuperseded { commit, .. } => Some(commit.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut live: Vec<LaneCommitProvenance> = Vec::new();
+        for event in &self.lane_events {
+            let LaneEventKind::CommitCreated { provenance } = &event.kind else {
+                continue;
+            };
+            if superseded.contains(&provenance.commit.as_str())
+                || live.iter().any(|p| p.commit == provenance.commit)
+            {
+                continue;
+            }
+            live.push(provenance.clone());
+        }
+        live
     }
 
     /// Current raw status.
@@ -332,6 +364,12 @@ fn event_label(kind: &LaneEventKind) -> String {
         LaneEventKind::CommitCreated { provenance } => {
             format!("commit_created ({})", provenance.commit)
         }
+        LaneEventKind::CommitSuperseded { commit, by } => match by {
+            SupersededBy::Commit { commit: by } => {
+                format!("commit_superseded ({commit} -> {by})")
+            }
+            SupersededBy::Unknown => format!("commit_superseded ({commit} -> unknown)"),
+        },
         LaneEventKind::WorktreeCreated { path } => {
             format!("worktree_created ({})", path.display())
         }

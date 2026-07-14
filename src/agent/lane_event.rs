@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::provenance::LaneCommitProvenance;
+use super::provenance::{LaneCommitProvenance, SupersededBy};
 
 /// Failure-class taxonomy for blockers (`docs/design.md` §8.3).
 ///
@@ -77,6 +77,18 @@ pub enum LaneEventKind {
     /// `Multiplexer::record_commit_provenance` from the turn signal's final
     /// message, verified with `git rev-parse`.
     CommitCreated { provenance: LaneCommitProvenance },
+    /// A commit this agent created is no longer on its branch: the agent
+    /// amended or rebased it away. Produced by
+    /// `Multiplexer::record_commit_supersessions`, from the branch itself.
+    ///
+    /// This is why `LaneCommitProvenance` has no `superseded_by` field. The
+    /// timeline is append-only, so a commit's later fate is a later event, not
+    /// a back-write into the `CommitCreated` that announced it. A commit's
+    /// standing is *read* from the pair: created and never named here → live;
+    /// named here → superseded, by the commit given or by something unnameable.
+    /// `AgentManifest::live_commits` is that derivation, and the chain of these
+    /// events is the lineage — neither is stored twice.
+    CommitSuperseded { commit: String, by: SupersededBy },
     /// A worktree was created for this agent. Produced at the manifest's first
     /// write in `Multiplexer::spawn_panel_inner`.
     WorktreeCreated { path: PathBuf },
@@ -169,6 +181,9 @@ mod tests {
                 LaneEventKind::Blocked { .. } => (manifest, "LaneEventKind::Blocked { blocker"),
                 LaneEventKind::Failed { .. } => (manifest, "LaneEventKind::Failed { blocker"),
                 LaneEventKind::CommitCreated { .. } => (input, "LaneEventKind::CommitCreated {"),
+                LaneEventKind::CommitSuperseded { .. } => {
+                    (input, "LaneEventKind::CommitSuperseded {")
+                }
                 LaneEventKind::WorktreeCreated { .. } => {
                     (spawn, "LaneEventKind::WorktreeCreated {")
                 }
@@ -194,6 +209,10 @@ mod tests {
                     branch: "b".into(),
                     worktree: None,
                 },
+            },
+            LaneEventKind::CommitSuperseded {
+                commit: "abc1234".into(),
+                by: SupersededBy::Unknown,
             },
             LaneEventKind::WorktreeCreated { path: path.clone() },
             LaneEventKind::WorktreeRemoved { path },

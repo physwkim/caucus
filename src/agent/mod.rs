@@ -12,6 +12,6 @@ pub mod spawn;
 pub use derive_state::{DerivedState, derive_agent_state};
 pub use lane_event::{LaneEvent, LaneEventBlocker, LaneEventKind, LaneFailureClass};
 pub use manifest::{AgentManifest, AgentStatus};
-pub use provenance::{LaneCommitProvenance, extract_commit_sha};
+pub use provenance::{LaneCommitProvenance, SupersededBy, extract_commit_sha};
 
 pub use crate::session::id::AgentId;
