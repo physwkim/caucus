@@ -1,7 +1,7 @@
 use super::*;
 use crate::panel::lifecycle;
 use crate::role::spec::AgentCli;
-use crate::worktree::cleanup::CleanupJob;
+use crate::worktree::cleanup::{CleanupJob, WorktreeOwner};
 use tracing::warn;
 
 impl Multiplexer {
@@ -69,12 +69,22 @@ impl Multiplexer {
         // avoided here: it enqueues worktree cleanup onto the async queue,
         // whose consumer task is aborted with the tokio runtime the instant
         // the event loop returns — so the worktrees would never be removed.
+        // Each worktree is credited to the agent that occupied it, so a panel's
+        // timeline records the removal even though the whole session is going
+        // away — the manifests outlive the process and are what a later reader
+        // has.
         let mut worktrees: Vec<PathBuf> = Vec::new();
+        let mut owners: Vec<WorktreeOwner> = Vec::new();
         for panel in &mut self.panels {
             if let Err(err) = lifecycle::kill(panel) {
                 warn!(panel = %panel.id, error = %err, "panel kill on shutdown failed");
             }
             if let Some(wt) = panel.worktree_path.clone() {
+                owners.push(WorktreeOwner {
+                    worktree: wt.clone(),
+                    session_root: self.session.root_dir.clone(),
+                    agent_id: panel.agent_id,
+                });
                 worktrees.push(wt);
             }
         }
@@ -89,6 +99,7 @@ impl Multiplexer {
                 repo_root: self.session.repo_path.clone(),
                 worktree_paths: worktrees,
                 branches_to_delete: Vec::new(),
+                owners,
                 done: None,
             });
             for (path, msg) in &summary.failed_worktrees {

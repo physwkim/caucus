@@ -29,6 +29,29 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use super::manager::{WorktreeError, run_git, salvage_uncommitted_work, worktree_is_dirty};
+use crate::agent::lane_event::{LaneEvent, LaneEventKind};
+use crate::agent::manifest;
+use crate::session::id::AgentId;
+
+/// The agent that owned a worktree in a [`CleanupJob`], so the worker can record
+/// the removal on that agent's timeline (`LaneEventKind::WorktreeRemoved`).
+///
+/// The removal is a fact only the worker knows: by the time a job runs, the
+/// owning panel is detached and its manifest is gone from the multiplexer's live
+/// map, and the removal can still fail or be refused (**Invariant I-8** leaves a
+/// worktree whose work could not be salvaged on disk). So the worker records it
+/// against the manifest on disk, from the outcome it actually got — never the
+/// intention the caller had. It holds that manifest exclusively; no live copy
+/// races it.
+///
+/// A job with no owner (an aborted spawn's orphan worktree — no agent ever ran
+/// in it) simply records nothing.
+#[derive(Debug, Clone)]
+pub struct WorktreeOwner {
+    pub worktree: PathBuf,
+    pub session_root: PathBuf,
+    pub agent_id: AgentId,
+}
 
 /// One unit of work for the cleanup task.
 #[derive(Debug)]
@@ -38,6 +61,9 @@ pub struct CleanupJob {
     pub worktree_paths: Vec<PathBuf>,
     /// Branch names to delete after the worktrees are gone.
     pub branches_to_delete: Vec<String>,
+    /// Agents to credit the removals to. Only worktrees that were *actually*
+    /// removed are recorded; see [`WorktreeOwner`].
+    pub owners: Vec<WorktreeOwner>,
     /// Optional channel for the caller to await the outcome.
     pub done: Option<oneshot::Sender<CleanupSummary>>,
 }
@@ -154,7 +180,41 @@ fn run_one(job: &CleanupJob) -> CleanupSummary {
         }
     }
 
+    record_removals(job, &summary);
     summary
+}
+
+/// Append `WorktreeRemoved` to the timeline of every agent whose worktree this
+/// job actually removed (see [`WorktreeOwner`]).
+///
+/// Keyed off `summary.removed_worktrees`, so a worktree left on disk by the
+/// I-8 salvage refusal — or one whose `git worktree remove` failed — records
+/// nothing: the event states what happened, not what was attempted. Salvaged
+/// trees are removed after their work is committed, so they are in that list and
+/// are recorded like any other.
+///
+/// Best-effort, like every other timeline append: a manifest that cannot be read
+/// or written is logged. The worktree is already gone either way, and failing the
+/// cleanup over its bookkeeping would strand the queue.
+fn record_removals(job: &CleanupJob, summary: &CleanupSummary) {
+    for owner in &job.owners {
+        if !summary.removed_worktrees.contains(&owner.worktree) {
+            continue;
+        }
+        let mut manifest = match manifest::read(&owner.session_root, owner.agent_id) {
+            Ok(m) => m,
+            Err(err) => {
+                warn!(agent = %owner.agent_id, error = %err, "worktree-removed manifest read failed");
+                continue;
+            }
+        };
+        let event = LaneEvent::now(LaneEventKind::WorktreeRemoved {
+            path: owner.worktree.clone(),
+        });
+        if let Err(err) = manifest::write(&mut manifest, &owner.session_root, Some(event)) {
+            warn!(agent = %owner.agent_id, error = %err, "worktree-removed manifest write failed");
+        }
+    }
 }
 
 /// Commit a doomed worktree's uncommitted changes onto its own branch, so the
@@ -275,6 +335,7 @@ mod tests {
                 repo_root: PathBuf::from("/tmp"),
                 worktree_paths: vec![],
                 branches_to_delete: vec![],
+                owners: Vec::new(),
                 done: Some(tx),
             })
             .unwrap();
@@ -328,6 +389,7 @@ mod tests {
                 repo_root: repo.path().to_path_buf(),
                 worktree_paths: vec![handle.path.clone()],
                 branches_to_delete: vec![handle.branch.clone()],
+                owners: Vec::new(),
                 done: Some(tx),
             })
             .unwrap();
@@ -395,6 +457,7 @@ mod tests {
             repo_root: repo.path().to_path_buf(),
             worktree_paths: vec![handle.path.clone()],
             branches_to_delete: Vec::new(),
+            owners: Vec::new(),
             done: None,
         });
 
@@ -422,6 +485,7 @@ mod tests {
             repo_root: repo.path().to_path_buf(),
             worktree_paths: vec![handle.path.clone()],
             branches_to_delete: Vec::new(),
+            owners: Vec::new(),
             done: None,
         });
 
@@ -444,6 +508,7 @@ mod tests {
             repo_root: repo.path().to_path_buf(),
             worktree_paths: vec![handle.path.clone()],
             branches_to_delete: vec![handle.branch.clone()],
+            owners: Vec::new(),
             done: None,
         });
 
@@ -469,11 +534,125 @@ mod tests {
             repo_root: repo.path().to_path_buf(),
             worktree_paths: vec![handle.path.clone()],
             branches_to_delete: Vec::new(),
+            owners: Vec::new(),
             done: None,
         });
 
         assert!(summary.removed_worktrees.is_empty(), "must not remove");
         assert_eq!(summary.failed_worktrees.len(), 1);
         assert!(handle.path.exists(), "worktree left on disk for recovery");
+    }
+
+    /// Seed a manifest on disk for an agent that owned `worktree`, and return
+    /// `(session_root, owner)`. The agent's panel is detached by the time a
+    /// cleanup job runs, so this mirrors what the worker actually finds: a
+    /// manifest with no live copy anywhere.
+    fn detached_owner(worktree: &std::path::Path) -> (tempfile::TempDir, WorktreeOwner) {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+        use crate::session::id::{PanelId, SessionId};
+
+        let session = tempfile::tempdir().unwrap();
+        let mut mf = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "worker",
+            "worker-1",
+            AgentCli::Claude,
+            None,
+        );
+        mf.worktree_path = Some(worktree.to_path_buf());
+        manifest::write(&mut mf, session.path(), None).unwrap();
+        let owner = WorktreeOwner {
+            worktree: worktree.to_path_buf(),
+            session_root: session.path().to_path_buf(),
+            agent_id: mf.agent_id,
+        };
+        (session, owner)
+    }
+
+    fn recorded_removals(owner: &WorktreeOwner) -> Vec<PathBuf> {
+        manifest::read(&owner.session_root, owner.agent_id)
+            .unwrap()
+            .lane_events()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                LaneEventKind::WorktreeRemoved { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The worker records `WorktreeRemoved` on the owning agent's timeline —
+    /// the removal is a fact only it knows, since the panel is long detached.
+    #[test]
+    fn a_removed_worktree_is_recorded_on_its_owners_timeline() {
+        let repo = repo_with_one_commit();
+        let handle = make_worktree(repo.path(), "ts-owned-1");
+        let (_session, owner) = detached_owner(&handle.path);
+
+        let summary = run_blocking(&CleanupJob {
+            repo_root: repo.path().to_path_buf(),
+            worktree_paths: vec![handle.path.clone()],
+            branches_to_delete: Vec::new(),
+            owners: vec![owner.clone()],
+            done: None,
+        });
+
+        assert_eq!(summary.removed_worktrees, vec![handle.path.clone()]);
+        assert_eq!(
+            recorded_removals(&owner),
+            vec![handle.path],
+            "the agent's timeline records the removal"
+        );
+    }
+
+    /// The event states what happened, not what was attempted: a worktree the
+    /// I-8 salvage refusal left on disk records nothing. Without this the
+    /// timeline would claim a removal for a directory still sitting there —
+    /// exactly the lie that recording at enqueue time would tell.
+    #[test]
+    fn a_worktree_left_on_disk_records_no_removal() {
+        let repo = repo_with_one_commit();
+        let handle = make_worktree(repo.path(), "ts-owned-kept-1");
+        git_in(&handle.path, &["checkout", "-q", "--detach"]);
+        std::fs::write(handle.path.join("wip.rs"), "fn uncommitted() {}").unwrap();
+        let (_session, owner) = detached_owner(&handle.path);
+
+        let summary = run_blocking(&CleanupJob {
+            repo_root: repo.path().to_path_buf(),
+            worktree_paths: vec![handle.path.clone()],
+            branches_to_delete: Vec::new(),
+            owners: vec![owner.clone()],
+            done: None,
+        });
+
+        assert!(summary.removed_worktrees.is_empty());
+        assert!(handle.path.exists(), "left on disk by I-8");
+        assert!(
+            recorded_removals(&owner).is_empty(),
+            "a worktree still on disk was not removed, so nothing is recorded"
+        );
+    }
+
+    /// A salvaged worktree *is* removed (its work is committed onto the branch
+    /// first), so it is recorded like any other removal.
+    #[test]
+    fn a_salvaged_worktree_is_recorded_as_removed() {
+        let repo = repo_with_one_commit();
+        let handle = make_worktree(repo.path(), "ts-owned-salvage-1");
+        std::fs::write(handle.path.join("wip.rs"), "fn uncommitted() {}").unwrap();
+        let (_session, owner) = detached_owner(&handle.path);
+
+        let summary = run_blocking(&CleanupJob {
+            repo_root: repo.path().to_path_buf(),
+            worktree_paths: vec![handle.path.clone()],
+            branches_to_delete: Vec::new(),
+            owners: vec![owner.clone()],
+            done: None,
+        });
+
+        assert_eq!(summary.salvaged_worktrees.len(), 1, "work was salvaged");
+        assert_eq!(recorded_removals(&owner), vec![handle.path]);
     }
 }
