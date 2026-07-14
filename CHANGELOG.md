@@ -7,6 +7,15 @@ versions.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-07-14
+
+A round could hang until its 3600s fallback and then deliver a report saying a
+panel that had done all its work was "still working — no output captured".
+caucus read each panel's result from the panel's *live* state at delivery time,
+but delivery waits for the main panel to go idle — an unbounded gap in which a
+finished panel can be woken back into `working` by a background shell it left
+running. A completion signal is only worth what the moment it is read is worth.
+
 ### Fixed
 
 - **A round panel's result is latched when it settles, not re-read when the round
@@ -51,6 +60,47 @@ versions.
   foreground, and if the work cannot finish in one turn say so in plain text rather
   than leaving it running. The main worker is exempt — it registers rounds rather
   than settling into them.
+
+### Removed
+
+**Breaking (library API).** Chasing the round bug turned up a state surface whose
+variants nothing constructs. Each one reads like a live classification path and is
+in truth a dead branch — and on a surface the main worker *reads*, an unproducible
+state is worse than an absent one: it advertises that caucus can report a condition
+it has no way to detect, so a main worker waits for a state that will never arrive
+instead of checking for the thing itself. All four are `pub` and were re-exported
+from `agent`; no removed name can appear in a persisted manifest, because no
+version of caucus could write one.
+
+- **`GridHint`**, and the `grid_hint` parameter of `derive_agent_state` (now four
+  arguments, not five). It was a regex fallback for a backend with no
+  turn-completion hook; caucus has no such backend — claude posts the `Stop` hook,
+  codex posts the same `TurnSignal{Stop}` through `-c notify=[...]`. Both callers
+  passed `None` and nothing ever built one. The one real grid→state path is
+  `overlay_blocked_state`, which scans the live grid at read time and never went
+  through `GridHint`.
+
+- **`PanelState::Blocked`**, its transitions (`Working|Idle -> Blocked`,
+  `Blocked -> Working`), and its `"blocked"` border label. No production
+  `transition()` ever named it, and it cannot be entered: a panel stopped on a
+  permission prompt or a chooser fires no turn signal, so nothing wakes to move it
+  — which is exactly why blocking is detected on the grid and surfaced on
+  `DerivedState`. Removing it makes the round owner's per-panel disposition total:
+  a panel that is not `Working`/`Spawning` is `Idle` or `Exited`, so "feed" and
+  "latch" are now exhaustive.
+
+- **`LaneFailureClass::{PromptDelivery, MergeConflict, BackgroundJob, McpHandshake,
+  Unknown}`.** A blocker is born in exactly one place, `record_turn_signal`, which
+  maps the turn signal's `kind` exhaustively: `tool_blocked -> PermissionPrompt`,
+  `error -> Transport`, `stop -> None`. The other five had no signal that produces
+  them, so `blocker_state` read as a seven-way classifier and was a two-way one
+  padded with five unreachable arms.
+
+- **`DerivedState::{BlockedMergeConflict, BlockedBackgroundJob, DegradedMcp}`**, and
+  their `list_panels` names `blocked_merge_conflict` / `blocked_background_job` /
+  `degraded_mcp`. Left with no producer once the above went. Every remaining variant
+  has one, and there are exactly two producers: a blocker born from the turn signal,
+  and a prompt seen on the live grid.
 
 ## [0.8.0] — 2026-07-10
 
