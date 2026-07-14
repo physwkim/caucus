@@ -602,8 +602,9 @@ enum LaneEventKind {
     Blocked { blocker: LaneEventBlocker },   // 같은 함수, tool_blocked 신호
     Failed  { blocker: LaneEventBlocker },   // 같은 함수, error 신호
     CommitCreated { provenance: LaneCommitProvenance },
-                       // Multiplexer::record_commit_provenance — last_message의 SHA를
-                       // 패널 자기 worktree에 대해 git rev-parse로 검증한 것만
+                       // Multiplexer::record_commit_provenance — last_message가 지목하고
+                       // git이 (a) 실재하는 커밋이고 (b) 이 패널의 브랜치 위에 있다고
+                       // 확인해 준 SHA만
     CommitSuperseded { commit: String, by: SupersededBy },
                        // Multiplexer::record_commit_supersessions — 브랜치가 더는
                        // 갖고 있지 않은, 앞서 기록된 커밋
@@ -625,6 +626,21 @@ enum LaneEventKind {
 "위임받은 작업을 끝냈다"와 "턴이 끝났다"는 한 번 도착하는 같은 사건이다 — 그래서
 caucus는 둘을 구별하는 척하는 대신 sub-agent 시스템 프롬프트에 계약으로 못박는다
 (`SUBAGENT_TURN_CONTRACT`: 턴을 끝내는 것은 일이 끝났다는 주장이다, §4).
+
+**provenance는 조인이지 언급이 아니다.** worktree는 메인 체크아웃 및 다른 모든 패널의
+worktree와 **object DB를 공유**한다. 그래서 `git rev-parse`만으로는 "실재하는 커밋"밖에
+증명되지 않는다 — 형제 패널이 만든 커밋도, `git log`에서 읽은 남의 커밋도 내 worktree에서
+그대로 resolve된다. `extract_branch_commit`은 두 번째 조건을 함께 요구한다: 그 커밋이
+**이 패널의 브랜치에서 도달 가능**할 것. 이게 빠지면 에이전트가 남의 커밋을 *언급*하기만
+해도 자기 작업으로 기록되고, 그 커밋은 이 브랜치에 있던 적이 없으므로 다음 턴에
+`CommitSuperseded{Unknown}`까지 찍힌다 — 검증하지 않은 조인 하나가 거짓 기록 둘을 낳는다.
+이것이 아래 supersession이 서 있는 전제이기도 하다: 기록된 커밋은 기록되는 시점에 그
+브랜치 위에 있었다. 그래야 나중의 "브랜치에 없다"가 애초에 없던 커밋이 아니라 진짜
+사라짐이 된다.
+
+SHA 후보는 메시지의 hex run **전부**를 본다. 십진수도 hex digit이라 "processed 1048576
+bytes, committed abc1234de" 같은 문장에서 첫 run은 커밋이 아니고, 첫 후보에서 멈추면
+뒤에 있는 진짜 SHA를 통째로 놓친다.
 
 **커밋 계보는 저장하지 않고 타임라인에서 파생한다.** 에이전트가 amend/rebase하면
 지난 턴에 announce한 SHA는 어느 브랜치도 갖지 않는 커밋을 가리킨다 — 그대로 두면

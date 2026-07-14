@@ -34,42 +34,68 @@ pub struct LaneCommitProvenance {
     pub worktree: Option<PathBuf>,
 }
 
+/// Every 7–40 character ascii-hex run in `text`, in order — each one a token
+/// that *could* be a SHA. A run longer than 40 characters yields its first 40.
+///
+/// All of them, not the first: a decimal number is also a run of hex digits, so
+/// "processed 1048576 bytes, committed abc1234de" leads with a token that is not
+/// a commit and follows with one that is. Stopping at the first candidate throws
+/// away the real SHA whenever an agent's final message counts anything.
+fn hex_runs(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut runs = Vec::new();
+    let mut start = None;
+    for i in 0..=bytes.len() {
+        match (i < bytes.len() && bytes[i].is_ascii_hexdigit(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                let end = i.min(s + 40);
+                if end - s >= 7 {
+                    runs.push(&text[s..end]);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    runs
+}
+
 /// Find the first 7–40 character ascii-hex run in `text`. Returns the SHA-like
 /// string, or `None`.
 pub fn extract_commit_sha(text: &str) -> Option<String> {
-    let mut run = String::new();
-    for ch in text.chars() {
-        if ch.is_ascii_hexdigit() {
-            run.push(ch);
-            if run.len() == 40 {
-                return Some(run);
-            }
-        } else {
-            if (7..=40).contains(&run.len()) {
-                return Some(run);
-            }
-            run.clear();
-        }
-    }
-    if (7..=40).contains(&run.len()) {
-        Some(run)
-    } else {
-        None
-    }
+    hex_runs(text).first().map(|s| (*s).to_string())
 }
 
-/// Scan a turn signal's `last_message` for the first SHA-like token and
-/// confirm it names a real commit object in `repo` via `git rev-parse`
-/// (`docs/design.md` §5).
+/// The commit an agent left on its own branch, named in the final message of the
+/// turn that just ended (`docs/design.md` §5). `None` when the message names no
+/// such commit.
 ///
-/// Returns the *full 40-char* canonical SHA git resolved (so callers record
-/// the unambiguous id), or `None` when the message carries no SHA-like token,
-/// or the token does not resolve to a commit in `repo`. A `false`-positive
-/// hex run from prose (e.g. `deadbeef` in a sentence) simply fails to resolve
-/// and yields `None` rather than an error.
-pub fn extract_verified_commit(repo: &Path, last_message: &str) -> Option<String> {
-    let candidate = extract_commit_sha(last_message)?;
-    verify_commit(repo, &candidate)
+/// Two things must hold before caucus records provenance, and the second is what
+/// makes it provenance at all:
+///
+/// 1. The token resolves to a real commit object (`git rev-parse`). Prose like
+///    `deadbeef` fails here.
+/// 2. That commit is **reachable from `branch`** — the panel's own lane branch.
+///    A worktree shares its object database with the main checkout and with every
+///    other panel's worktree, so *any* commit in the repository resolves in step
+///    one, including another agent's. Without this check an agent that merely
+///    *mentions* a commit — a sibling panel's, one it read out of `git log` —
+///    would have it recorded as work it created, and then, because that commit is
+///    not on its branch and never will be, retired a turn later as
+///    [`SupersededBy::Unknown`]. Two false claims from one unverified join.
+///
+/// This is also the premise [`detect_supersession`] rests on: a recorded commit
+/// was, at the moment it was recorded, on the branch. So a later "not on the
+/// branch" is a real disappearance and not a commit that was never there.
+///
+/// Returns the *full 40-char* canonical SHA git resolved, so callers record the
+/// unambiguous id.
+pub fn extract_branch_commit(worktree: &Path, branch: &str, last_message: &str) -> Option<String> {
+    hex_runs(last_message).into_iter().find_map(|candidate| {
+        let sha = verify_commit(worktree, candidate)?;
+        (reachable(worktree, &sha, branch) == Some(true)).then_some(sha)
+    })
 }
 
 /// What replaced a recorded commit that its branch no longer contains
@@ -109,7 +135,10 @@ pub enum SupersededBy {
 /// owns a worktree *and* has a recorded commit), and every git call here is a
 /// local object-database read.
 pub fn detect_supersession(worktree: &Path, branch: &str, commit: &str) -> Option<SupersededBy> {
-    if branch.is_empty() || is_ancestor(worktree, commit, branch) {
+    // Only git's explicit "no" retires a commit. Still reachable, or git unable
+    // to answer, are both "no claim" — recording "we cannot tell" as "it is gone"
+    // is the one direction that puts a false claim on the timeline.
+    if reachable(worktree, commit, branch) != Some(false) {
         return None;
     }
     // The old commit object survives the rewrite (git keeps it until gc), so
@@ -128,21 +157,31 @@ pub fn detect_supersession(worktree: &Path, branch: &str, commit: &str) -> Optio
     }
 }
 
-/// `true` if `rev` is reachable from `branch`.
+/// Is `rev` reachable from `branch`? `Some(true)` / `Some(false)` when git
+/// answers, `None` when it cannot — the branch does not exist, `repo` is not a
+/// worktree, git is missing, or caucus never learned the panel's branch (`""`).
 ///
-/// `merge-base --is-ancestor` exits 0 for yes and 1 for no; any other exit is
-/// git failing to answer (unknown branch, no repo, deleted object), and so is a
-/// spawn error. Both answer `true` — "we cannot tell" must never be recorded as
-/// "the commit is gone", which is the one direction that puts a false claim on
-/// the timeline.
-fn is_ancestor(repo: &Path, rev: &str, branch: &str) -> bool {
-    let status = Command::new("git")
+/// `merge-base --is-ancestor` exits 0 for yes, 1 for no, and anything else is a
+/// failure to answer. The three stay distinct here because the two callers need
+/// opposite defaults: recording provenance requires a definite yes, retiring a
+/// commit requires a definite no, and "cannot tell" must satisfy neither.
+fn reachable(repo: &Path, rev: &str, branch: &str) -> Option<bool> {
+    if branch.is_empty() {
+        return None;
+    }
+    let code = Command::new("git")
         .current_dir(repo)
         .args(["merge-base", "--is-ancestor", rev, branch])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
-    !matches!(status.map(|st| st.code()), Ok(Some(1)))
+        .status()
+        .ok()?
+        .code()?;
+    match code {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
 }
 
 /// `(patch_id, commit)` for every commit `branch` holds that is not an ancestor
@@ -334,23 +373,97 @@ pub(crate) mod tests {
     #[test]
     fn verifies_a_real_commit() {
         let (dir, sha) = repo_with_commit();
+        let branch = branch_of(dir.path());
         let msg = format!("Implemented feature. Commit {} on branch.", &sha[..12]);
-        let got = extract_verified_commit(dir.path(), &msg).unwrap();
+        let got = extract_branch_commit(dir.path(), &branch, &msg).unwrap();
         assert_eq!(got, sha);
     }
 
     #[test]
     fn rejects_a_bogus_sha() {
         let (dir, _sha) = repo_with_commit();
+        let branch = branch_of(dir.path());
         // `deadbeef` is hex-shaped but not a commit in this repo.
-        let got = extract_verified_commit(dir.path(), "see deadbeef please");
+        let got = extract_branch_commit(dir.path(), &branch, "see deadbeef please");
         assert!(got.is_none());
     }
 
     #[test]
     fn no_sha_in_message_yields_none() {
         let (dir, _sha) = repo_with_commit();
-        assert!(extract_verified_commit(dir.path(), "nothing hex here").is_none());
+        let branch = branch_of(dir.path());
+        assert!(extract_branch_commit(dir.path(), &branch, "nothing hex here").is_none());
+    }
+
+    /// A decimal number is a run of hex digits too, and agents count things.
+    /// Stopping at the first candidate — `1048576` here — threw away the SHA
+    /// that followed it and recorded no provenance at all.
+    #[test]
+    fn a_sha_is_found_past_a_candidate_that_is_not_a_commit() {
+        let (dir, sha) = repo_with_commit();
+        let branch = branch_of(dir.path());
+        let msg = format!(
+            "Processed 1048576 bytes across 30 files. Committed {}.",
+            &sha[..12]
+        );
+        assert_eq!(
+            extract_branch_commit(dir.path(), &branch, &msg).as_deref(),
+            Some(sha.as_str()),
+            "every hex run is a candidate, not just the first"
+        );
+    }
+
+    /// A commit that exists but is not on this panel's branch is not this
+    /// agent's work. Worktrees share one object database, so a sibling panel's
+    /// commit resolves here just as well as our own — an agent that merely
+    /// *mentions* one (read out of `git log`, quoted from another lane) would
+    /// otherwise have it recorded as work it created, and then retired a turn
+    /// later as superseded, because a commit that was never on the branch is
+    /// trivially "no longer on the branch". Two false claims from one unverified
+    /// join.
+    #[test]
+    fn a_commit_on_another_branch_is_not_this_agents_provenance() {
+        let (dir, first) = repo_with_commit();
+        let lane = branch_of(dir.path());
+
+        // A sibling lane commits in the shared object database.
+        git(dir.path(), &["checkout", "-q", "-b", "sibling"]);
+        std::fs::write(dir.path().join("s.txt"), "sibling work").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-q", "-m", "sibling work"]);
+        let sibling = verify_commit(dir.path(), "HEAD").unwrap();
+        git(dir.path(), &["checkout", "-q", &lane]);
+
+        // git resolves it — the object is right there — but it is not ours.
+        assert_eq!(
+            verify_commit(dir.path(), &sibling).as_deref(),
+            Some(sibling.as_str()),
+            "the object database is shared, so the sibling's commit resolves"
+        );
+        let msg = format!("Reviewed the change in {}; nothing to fix.", &sibling[..12]);
+        assert_eq!(
+            extract_branch_commit(dir.path(), &lane, &msg),
+            None,
+            "a commit that is not on our branch is not our provenance"
+        );
+
+        // And our own commit still is.
+        let msg = format!("Committed {}.", &first[..12]);
+        assert_eq!(
+            extract_branch_commit(dir.path(), &lane, &msg).as_deref(),
+            Some(first.as_str())
+        );
+    }
+
+    /// With no branch there is no join to verify, so there is nothing to record
+    /// and nothing to retire — never a claim built on a branch caucus does not
+    /// know.
+    #[test]
+    fn without_a_branch_nothing_is_recorded() {
+        let (dir, sha) = repo_with_commit();
+        let msg = format!("Committed {sha}.");
+        assert_eq!(extract_branch_commit(dir.path(), "", &msg), None);
+        assert_eq!(detect_supersession(dir.path(), "", &sha), None);
     }
 
     /// Run a git command in `dir`, asserting it succeeded.
@@ -367,6 +480,19 @@ pub(crate) mod tests {
             .status()
             .unwrap();
         assert!(st.success(), "git {args:?} failed");
+    }
+
+    /// Commit on a branch that is not `lane`, and return its sha — a sibling
+    /// panel's work, sitting in the same object database that every worktree of
+    /// this repository shares. Leaves `lane` checked out.
+    pub(crate) fn commit_on_a_sibling_branch(dir: &Path, lane: &str) -> String {
+        git(dir, &["checkout", "-q", "-b", "sibling-lane"]);
+        std::fs::write(dir.join("sibling.txt"), "sibling work").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "sibling work"]);
+        let sha = verify_commit(dir, "HEAD").unwrap();
+        git(dir, &["checkout", "-q", lane]);
+        sha
     }
 
     /// Reword `HEAD` in place: a new sha carrying the same patch, which is what
