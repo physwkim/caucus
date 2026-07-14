@@ -179,8 +179,12 @@ pub(crate) fn write(
 /// persists the JSON + Markdown pair.
 ///
 /// A non-`Stop` signal kind (`tool_blocked` / `error`) is recorded as a
-/// blocker so `derived_state` reflects it; a plain `Stop` clears any prior
-/// blocker and lands the agent in `Idle`.
+/// blocker so `derived_state` reflects it, *and* appended to the timeline as a
+/// `Blocked` / `Failed` event — one `match` on the signal's kind produces both,
+/// so the timeline and `current_blocker` cannot disagree about how the turn
+/// ended. `TurnCompleted` is appended for every kind: the turn *did* end, which
+/// is what the signal means and what the panel's turn counter counts. A plain
+/// `Stop` clears any prior blocker and lands the agent in `Idle`.
 pub(crate) fn record_turn_completed(
     manifest: &mut AgentManifest,
     session_root: &Path,
@@ -206,19 +210,30 @@ pub(crate) fn record_turn_completed(
         manifest.claude_session_id = Some(sid.to_string());
     }
 
-    // A non-Stop turn signal carries a failure; map it onto a blocker so the
-    // derived state shows the agent as blocked/interrupted rather than idle.
-    manifest.current_blocker = match signal.kind {
-        TurnKind::Stop => None,
-        TurnKind::ToolBlocked => Some(LaneEventBlocker::new(
-            LaneFailureClass::PermissionPrompt,
-            "turn signal: tool_blocked",
-        )),
-        TurnKind::Error => Some(LaneEventBlocker::new(
-            LaneFailureClass::Transport,
-            "turn signal: error",
-        )),
+    // A non-Stop turn signal carries a failure. One match produces both the
+    // blocker `derived_state` reads and the timeline event that records it, so
+    // the two cannot drift: a manifest showing a blocker always has the event
+    // that explains it, and vice versa.
+    let (blocker, event) = match signal.kind {
+        TurnKind::Stop => (None, None),
+        TurnKind::ToolBlocked => {
+            let b = LaneEventBlocker::new(
+                LaneFailureClass::PermissionPrompt,
+                "turn signal: tool_blocked",
+            );
+            let ev = LaneEventKind::Blocked { blocker: b.clone() };
+            (Some(b), Some(ev))
+        }
+        TurnKind::Error => {
+            let b = LaneEventBlocker::new(LaneFailureClass::Transport, "turn signal: error");
+            let ev = LaneEventKind::Failed { blocker: b.clone() };
+            (Some(b), Some(ev))
+        }
     };
+    if let Some(event) = event {
+        manifest.lane_events.push(LaneEvent::now(event));
+    }
+    manifest.current_blocker = blocker;
 
     manifest.derived_state = super::derive_state::derive_agent_state(
         manifest.status.as_str(),
@@ -504,6 +519,79 @@ mod tests {
             .as_ref()
             .expect("a tool_blocked signal must record a blocker");
         assert_eq!(blocker.failure_class, LaneFailureClass::PermissionPrompt);
+    }
+
+    /// Each turn-signal kind lands its own event on the timeline, and the event
+    /// carries the same blocker `current_blocker` holds — one `match` produces
+    /// both, so a manifest showing a blocker always has the event that explains
+    /// it. `TurnCompleted` is appended for every kind: the turn ended whichever
+    /// way it went, and that is what the panel's turn counter counts.
+    #[test]
+    fn record_turn_completed_appends_an_event_per_turn_kind() {
+        use crate::agent::lane_event::LaneFailureClass;
+        use crate::signal::{TurnKind, TurnSignal};
+        for kind in [TurnKind::Stop, TurnKind::ToolBlocked, TurnKind::Error] {
+            let tmp = TempDir::new().unwrap();
+            let mut manifest = AgentManifest::new(
+                SessionId::new(),
+                PanelId::new(),
+                "backend",
+                "backend-1",
+                AgentCli::Claude,
+                None,
+            );
+            let signal = TurnSignal::now(
+                manifest.session_id,
+                manifest.panel_id,
+                kind,
+                None,
+                serde_json::Value::Null,
+            );
+            record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
+
+            let kinds: Vec<&LaneEventKind> =
+                manifest.lane_events().iter().map(|e| &e.kind).collect();
+            assert!(
+                kinds
+                    .iter()
+                    .any(|k| matches!(k, LaneEventKind::TurnCompleted)),
+                "{kind:?}: every turn signal ends a turn"
+            );
+            match kind {
+                TurnKind::Stop => assert!(
+                    !kinds.iter().any(|k| matches!(
+                        k,
+                        LaneEventKind::Blocked { .. } | LaneEventKind::Failed { .. }
+                    )),
+                    "a clean stop records no blocker event"
+                ),
+                TurnKind::ToolBlocked => assert!(
+                    kinds.iter().any(|k| matches!(
+                        k,
+                        LaneEventKind::Blocked { blocker }
+                            if blocker.failure_class == LaneFailureClass::PermissionPrompt
+                    )),
+                    "tool_blocked records a Blocked event carrying its blocker"
+                ),
+                TurnKind::Error => assert!(
+                    kinds.iter().any(|k| matches!(
+                        k,
+                        LaneEventKind::Failed { blocker }
+                            if blocker.failure_class == LaneFailureClass::Transport
+                    )),
+                    "error records a Failed event carrying its blocker"
+                ),
+            }
+            // The event's blocker and `current_blocker` agree.
+            assert_eq!(
+                manifest.current_blocker.is_some(),
+                kinds.iter().any(|k| matches!(
+                    k,
+                    LaneEventKind::Blocked { .. } | LaneEventKind::Failed { .. }
+                )),
+                "{kind:?}: blocker and its explaining event travel together"
+            );
+        }
     }
 
     /// `render_md` emits every optional field that is set (model / worktree /
