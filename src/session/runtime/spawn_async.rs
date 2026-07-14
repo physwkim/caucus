@@ -76,6 +76,8 @@ impl Multiplexer {
                         repo_root: self.session.repo_path.clone(),
                         worktree_paths: vec![h.path],
                         branches_to_delete: vec![h.branch],
+                        // No agent ever ran in this worktree — nothing to credit.
+                        owners: Vec::new(),
                         done: None,
                     });
                 }
@@ -171,8 +173,10 @@ impl Multiplexer {
                 let summary = crate::worktree::cleanup::run_blocking(&CleanupJob {
                     repo_root: self.session.repo_path.clone(),
                     worktree_paths: vec![handle.path],
-                    // The agent never ran — delete the empty branch too.
+                    // The agent never ran — delete the empty branch too, and
+                    // credit the removal to nobody.
                     branches_to_delete: vec![handle.branch],
+                    owners: Vec::new(),
                     done: None,
                 });
                 for (path, msg) in &summary.failed_worktrees {

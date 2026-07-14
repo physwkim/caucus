@@ -1,12 +1,13 @@
 use super::*;
+use crate::agent::lane_event::{LaneEvent, LaneEventKind};
 use crate::agent::manifest::{self};
 use crate::agent::spawn::{CaucusMcp, SpawnRequest};
 use crate::mcp::McpError;
 use crate::panel::lifecycle;
 use crate::render::Layout;
 use crate::role::spec::{AgentCli, RoleSpec};
-use crate::session::id::PanelId;
-use crate::worktree::cleanup::CleanupJob;
+use crate::session::id::{AgentId, PanelId};
+use crate::worktree::cleanup::{CleanupJob, WorktreeOwner};
 use crate::worktree::manager::{
     WorktreeHandle, WorktreeRequest, create as create_worktree, role_worktree_stem,
 };
@@ -41,9 +42,15 @@ struct SpawnPanelOpts<'a> {
 /// in place on success and retires it if the replacement spawn fails — every
 /// path disposes of it. `worktree_path` is `None` for a panel sharing the main
 /// checkout.
+#[derive(Clone)]
 struct DetachedPanel {
     worktree_path: Option<PathBuf>,
     worktree_branch: Option<String>,
+    /// The agent that occupied the panel. Carried out of the detach because the
+    /// detach itself drops the manifest from the live map, and whoever disposes
+    /// of the worktree still has to credit its removal to this agent's timeline
+    /// (`worktree::cleanup::WorktreeOwner`).
+    agent_id: AgentId,
 }
 
 impl Multiplexer {
@@ -290,10 +297,18 @@ impl Multiplexer {
                 .join(format!("{panel_id}.log")),
         );
 
-        // Persist the manifest (Invariant I-2).
+        // Persist the manifest (Invariant I-2). A worktree panel opens its
+        // timeline with the worktree it owns: the directory already exists by
+        // now (`create_role_worktree` ran before the spawn), so the event is a
+        // fact at the manifest's first write rather than an intention recorded
+        // earlier and hoped for.
         let mut mf = outcome.manifest;
         mf.worktree_path = worktree_path;
-        if let Err(err) = manifest::write(&mut mf, &self.session.root_dir, None) {
+        let created = mf
+            .worktree_path
+            .clone()
+            .map(|path| LaneEvent::now(LaneEventKind::WorktreeCreated { path }));
+        if let Err(err) = manifest::write(&mut mf, &self.session.root_dir, created) {
             warn!(panel = %panel_id, error = %err, "manifest write failed");
         }
         self.manifests.insert(panel_id, mf);
@@ -332,7 +347,7 @@ impl Multiplexer {
             anyhow::bail!("cannot kill the main worker panel");
         }
         let detached = self.detach_panel(panel_id)?;
-        self.retire_worktree(panel_id, detached.worktree_path);
+        self.retire_worktree(&detached, panel_id);
         Ok(())
     }
 
@@ -345,14 +360,22 @@ impl Multiplexer {
     /// disposition: every exit path that leaves a worktree ownerless — a
     /// [`Self::kill_panel`], or a [`Self::restart_panel`] that fails *after* its
     /// teardown — routes the orphan through here, so none can leak on disk.
-    fn retire_worktree(&mut self, panel_id: PanelId, worktree: Option<PathBuf>) {
-        let Some(worktree) = worktree else {
+    fn retire_worktree(&mut self, detached: &DetachedPanel, panel_id: PanelId) {
+        let Some(worktree) = detached.worktree_path.clone() else {
             return;
         };
         let job = CleanupJob {
             repo_root: self.session.repo_path.clone(),
-            worktree_paths: vec![worktree],
+            worktree_paths: vec![worktree.clone()],
             branches_to_delete: Vec::new(),
+            // The agent is gone from the live map, so the worker records the
+            // removal on its behalf — from what actually happened, not from this
+            // enqueue (Invariant I-8 can refuse the removal outright).
+            owners: vec![WorktreeOwner {
+                worktree,
+                session_root: self.session.root_dir.clone(),
+                agent_id: detached.agent_id,
+            }],
             done: None,
         };
         if self.cleanup.enqueue(job).is_err() {
@@ -396,7 +419,7 @@ impl Multiplexer {
         // it (the old panel is already gone and unpersisted), or it orphans on
         // disk — a leaked directory no live panel or resume record references.
         let detached = self.detach_panel(panel_id)?;
-        let orphan_worktree = detached.worktree_path.clone();
+        let orphan = detached.clone();
 
         let new_id = match self.spawn_panel_resume(
             &role,
@@ -415,7 +438,7 @@ impl Multiplexer {
                 // torn down. Retire the now-ownerless worktree (same disposition
                 // as a kill — directory reclaimed, branch + commits kept), then
                 // surface the spawn failure.
-                self.retire_worktree(panel_id, orphan_worktree);
+                self.retire_worktree(&orphan, panel_id);
                 return Err(err);
             }
         };
@@ -450,6 +473,7 @@ impl Multiplexer {
         let detached = DetachedPanel {
             worktree_path: panel.worktree_path.clone(),
             worktree_branch: self.worktree_branches.remove(&panel_id),
+            agent_id: panel.agent_id,
         };
         self.manifests.remove(&panel_id);
         self.blocked_scan_cache.remove(&panel_id);
@@ -767,6 +791,7 @@ mod tests {
                 repo_root: tmp.path().to_path_buf(),
                 worktree_paths: vec![first.path, second.path],
                 branches_to_delete: vec![first.branch, second.branch],
+                owners: Vec::new(),
                 done: None,
             });
         assert!(summary.failed_worktrees.is_empty(), "{summary:?}");
@@ -834,6 +859,64 @@ mod tests {
                 .contains("cannot restart the main worker panel"),
             "got: {err}"
         );
+    }
+
+    /// A panel spawned onto a worktree opens its timeline with the worktree it
+    /// owns — persisted at the manifest's first write, so the directory the
+    /// agent worked in is recoverable from its record alone. A panel with no
+    /// worktree records no such event. Spawning needs a real agent CLI; the test
+    /// is skipped when none is on PATH.
+    #[tokio::test]
+    async fn spawn_records_the_worktree_a_panel_owns() {
+        use crate::agent::lane_event::LaneEventKind;
+        use crate::agent::manifest;
+
+        // A temp git repo so `git worktree add` succeeds.
+        let tmp = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(tmp.path())
+                .args(args)
+                .output()
+                .expect("run git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "caucus-test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        let mut mux = mux(&tmp);
+
+        let handle = mux.create_role_worktree("reviewer").unwrap();
+        let wt = handle.path.clone();
+        let Ok(id) = mux.spawn_panel("reviewer", None, None, Some(wt.clone())) else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        let agent_id = mux.manifests[&id].agent_id;
+        let on_disk = manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert!(
+            on_disk.lane_events().iter().any(|e| matches!(
+                &e.kind,
+                LaneEventKind::WorktreeCreated { path } if *path == wt
+            )),
+            "the worktree the panel owns is on its persisted timeline: {:?}",
+            on_disk.lane_events()
+        );
+
+        // A panel with no worktree records no WorktreeCreated.
+        let plain = mux.spawn_panel("reviewer", None, None, None).unwrap();
+        let plain_agent = mux.manifests[&plain].agent_id;
+        let plain_disk = manifest::read(&mux.session.root_dir, plain_agent).unwrap();
+        assert!(
+            !plain_disk
+                .lane_events()
+                .iter()
+                .any(|e| matches!(e.kind, LaneEventKind::WorktreeCreated { .. })),
+            "a panel with no worktree has nothing to record"
+        );
+
+        mux.shutdown();
     }
 
     /// Restarting a sub-agent panel replaces it with a fresh PTY (a new id) in

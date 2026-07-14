@@ -596,20 +596,39 @@ exec caucus signal post \
 
 ```rust
 enum LaneEventKind {
-    Started,
-    PromptDelivered,   // main worker가 send_keys로 안건 전달
-    TurnCompleted,     // Stop hook turn signal 수신
-    Blocked { blocker: LaneEventBlocker },
-    Failed  { blocker: LaneEventBlocker },
-    Finished { detail: String },
+    Started,           // AgentManifest::new
+    PromptDelivered,   // Multiplexer::note_prompt_delivered (유일한 Idle→Working 경로)
+    TurnCompleted,     // manifest::record_turn_completed — turn signal 수신 (kind 무관)
+    Blocked { blocker: LaneEventBlocker },   // 같은 함수, tool_blocked 신호
+    Failed  { blocker: LaneEventBlocker },   // 같은 함수, error 신호
     CommitCreated { provenance: LaneCommitProvenance },
-    WorktreeCreated { path: PathBuf },
-    WorktreeRemoved { path: PathBuf },
+                       // Multiplexer::record_commit_provenance — last_message의 SHA를
+                       // 패널 자기 worktree에 대해 git rev-parse로 검증한 것만
+    WorktreeCreated { path: PathBuf },       // Multiplexer::spawn_panel_inner
+    WorktreeRemoved { path: PathBuf },       // worktree::cleanup::record_removals
 }
 ```
 
 `SentinelReceived` → `TurnCompleted`로 교체, `ResponseFileWritten`은 제거(라이브엔
 응답 파일이 없다).
+
+**모든 변형에 프로덕션 생산자가 있어야 한다.** 위 주석이 그 생산자이며,
+`every_lane_event_kind_is_written_by_a_production_site` 테스트가 고정한다 —
+변형을 추가하면 exhaustive match가 컴파일을 막고, 생산자를 지우면(테스트 코드에만
+남으면) 실패한다. 방출하지 않는 이벤트를 열거하는 타임라인은 없느니만 못하다:
+읽는 쪽이 영영 오지 않을 기록을 기다린다. §8.3의 `DerivedState`와 같은 규칙이다.
+
+`Finished`는 없다. caucus의 유일한 완료 신호는 백엔드의 turn-completion hook이라
+"위임받은 작업을 끝냈다"와 "턴이 끝났다"는 한 번 도착하는 같은 사건이다 — 그래서
+caucus는 둘을 구별하는 척하는 대신 sub-agent 시스템 프롬프트에 계약으로 못박는다
+(`SUBAGENT_TURN_CONTRACT`: 턴을 끝내는 것은 일이 끝났다는 주장이다, §4).
+
+`WorktreeRemoved`만 multiplexer가 쓸 수 없다. cleanup job이 도는 시점엔 패널이 이미
+detach돼 manifest가 live 맵에서 사라졌고, 제거는 거부될 수도 있다(I-8: 살릴 수 없는
+작업이 든 worktree는 디스크에 남긴다). 그래서 cleanup 워커가 `CleanupJob.owners`
+(`WorktreeOwner`)를 받아 **실제로 지운 것**(`summary.removed_worktrees`)만 디스크의
+manifest에 append한다 — 의도가 아니라 결과를 적는다. 그 시점에 워커가 그 manifest의
+유일한 소유자라 경합이 없다.
 
 ### 8.3 derived_state
 

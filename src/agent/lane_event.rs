@@ -42,26 +42,47 @@ impl LaneEventBlocker {
 }
 
 /// Discriminant + payload for a lane event (`docs/design.md` §8.2).
+///
+/// Every variant is produced by exactly one place in the running session, named
+/// in its doc below. A variant with no producer does not belong here: a timeline
+/// that *could* say something it never says is worse than one that cannot, since
+/// a reader waits for a record that will never appear. `LANE_EVENT_PRODUCERS` in
+/// the tests pins that, one line per variant.
+///
+/// There is deliberately no `Finished`. caucus's only completion signal is the
+/// backend's turn-completion hook, so "the agent finished its task" and "the
+/// agent's turn ended" are the same event arriving once — which is why a
+/// sub-agent's system prompt states the contract outright (`SUBAGENT_TURN_CONTRACT`:
+/// ending your turn claims the work is done) instead of caucus pretending it can
+/// tell the two apart.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LaneEventKind {
-    /// Agent process started.
+    /// Agent process started. Produced by `AgentManifest::new`.
     Started,
-    /// The main worker delivered an agenda to the panel via `send_keys`.
+    /// A prompt was delivered to the panel — by the main worker's `send_keys`,
+    /// or by the user typing into it. Produced by
+    /// `Multiplexer::note_prompt_delivered`, the only `Idle -> Working` path.
     PromptDelivered,
-    /// A `Stop`-hook turn signal was received for this panel.
+    /// A turn signal was received for this panel, whatever kind it carried: the
+    /// turn ended. Produced by `manifest::record_turn_completed`.
     TurnCompleted,
-    /// The agent is blocked (recoverable) — see `blocker`.
+    /// The turn ended blocked (recoverable) — see `blocker`. Produced by
+    /// `manifest::record_turn_completed` from a `tool_blocked` signal.
     Blocked { blocker: LaneEventBlocker },
-    /// The agent failed (terminal for this turn) — see `blocker`.
+    /// The turn ended in failure — see `blocker`. Produced by
+    /// `manifest::record_turn_completed` from an `error` signal.
     Failed { blocker: LaneEventBlocker },
-    /// The agent finished its delegated task.
-    Finished { detail: String },
-    /// A commit was created in the agent's worktree.
+    /// The agent named a commit that exists in its own worktree. Produced by
+    /// `Multiplexer::record_commit_provenance` from the turn signal's final
+    /// message, verified with `git rev-parse`.
     CommitCreated { provenance: LaneCommitProvenance },
-    /// A worktree was created for this agent.
+    /// A worktree was created for this agent. Produced at the manifest's first
+    /// write in `Multiplexer::spawn_panel_inner`.
     WorktreeCreated { path: PathBuf },
-    /// The agent's worktree was removed.
+    /// The agent's worktree was removed. Produced by the cleanup worker
+    /// (`worktree::cleanup::record_removals`) from what it actually removed —
+    /// the multiplexer cannot write this one; see `WorktreeOwner`.
     WorktreeRemoved { path: PathBuf },
 }
 
@@ -111,5 +132,81 @@ mod tests {
         let s = serde_json::to_string(&ev).unwrap();
         let back: LaneEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(ev, back);
+    }
+
+    /// Every variant is written by a real production site — the invariant this
+    /// enum exists under (see its doc). Two ways to break it, both caught here:
+    ///
+    /// - **Add a variant with no producer.** The `match` is exhaustive, so it
+    ///   fails to compile until someone names the site that writes it.
+    /// - **Delete the producer, keep the variant.** Each arm names the source it
+    ///   is written from, and this searches that file's *production* half — the
+    ///   text before `#[cfg(test)]` — so a producer that survives only in a test
+    ///   does not count.
+    ///
+    /// The alternative is what this enum used to be: seven variants no code
+    /// constructed, a timeline that advertised events it never emitted, and a
+    /// `render_md` that formatted labels no reader would ever see.
+    #[test]
+    fn every_lane_event_kind_is_written_by_a_production_site() {
+        /// The half of a source file before its `#[cfg(test)]` module.
+        fn production(src: &str) -> &str {
+            src.split("#[cfg(test)]").next().unwrap()
+        }
+        let manifest = production(include_str!("manifest.rs"));
+        let input = production(include_str!("../session/runtime/input.rs"));
+        let spawn = production(include_str!("../session/runtime/spawn.rs"));
+        let cleanup = production(include_str!("../worktree/cleanup.rs"));
+
+        // (variant, the file that writes it, the text that writes it)
+        let producer = |kind: &LaneEventKind| -> (&str, &str) {
+            match kind {
+                LaneEventKind::Started => (manifest, "LaneEvent::started(now)"),
+                LaneEventKind::PromptDelivered => (input, "LaneEventKind::PromptDelivered"),
+                LaneEventKind::TurnCompleted => {
+                    (manifest, "LaneEvent::now(LaneEventKind::TurnCompleted)")
+                }
+                LaneEventKind::Blocked { .. } => (manifest, "LaneEventKind::Blocked { blocker"),
+                LaneEventKind::Failed { .. } => (manifest, "LaneEventKind::Failed { blocker"),
+                LaneEventKind::CommitCreated { .. } => (input, "LaneEventKind::CommitCreated {"),
+                LaneEventKind::WorktreeCreated { .. } => {
+                    (spawn, "LaneEventKind::WorktreeCreated {")
+                }
+                LaneEventKind::WorktreeRemoved { .. } => {
+                    (cleanup, "LaneEventKind::WorktreeRemoved {")
+                }
+            }
+        };
+
+        let blocker = LaneEventBlocker::new(LaneFailureClass::Transport, "x");
+        let path = PathBuf::from("/tmp/wt");
+        for kind in [
+            LaneEventKind::Started,
+            LaneEventKind::PromptDelivered,
+            LaneEventKind::TurnCompleted,
+            LaneEventKind::Blocked {
+                blocker: blocker.clone(),
+            },
+            LaneEventKind::Failed { blocker },
+            LaneEventKind::CommitCreated {
+                provenance: LaneCommitProvenance {
+                    commit: "abc1234".into(),
+                    branch: "b".into(),
+                    worktree: None,
+                    canonical_commit: None,
+                    superseded_by: None,
+                    lineage: Vec::new(),
+                },
+            },
+            LaneEventKind::WorktreeCreated { path: path.clone() },
+            LaneEventKind::WorktreeRemoved { path },
+        ] {
+            let (src, needle) = producer(&kind);
+            assert!(
+                src.contains(needle),
+                "{kind:?} has no production site writing {needle:?} — a lane event \
+                 nothing emits must not exist"
+            );
+        }
     }
 }
