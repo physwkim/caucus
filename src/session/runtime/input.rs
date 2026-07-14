@@ -294,6 +294,13 @@ impl Multiplexer {
         else {
             return;
         };
+        // An agent that keeps referring to the commit it made ("still working on
+        // top of abc1234") names it again every turn. The commit was created
+        // once, so it is recorded once — a timeline that repeats the same
+        // creation reads like repeated work.
+        if manifest.live_commits().iter().any(|p| p.commit == commit) {
+            return;
+        }
         self.record_lane_event(
             panel_id,
             LaneEventKind::CommitCreated {
@@ -622,6 +629,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first.clone()],
             "the announced commit is live while the branch holds it"
+        );
+
+        // Naming it again next turn does not re-create it: the commit was made
+        // once, and the timeline says so once.
+        turn(&mut mux, format!("Still building on {}.", &first[..12]));
+        assert_eq!(
+            mux.manifests[&id]
+                .lane_events()
+                .iter()
+                .filter(|e| matches!(e.kind, LaneEventKind::CommitCreated { .. }))
+                .count(),
+            1,
+            "a commit named across several turns is recorded once"
         );
 
         // The agent rewords it — same patch, new sha — and ends another turn.
