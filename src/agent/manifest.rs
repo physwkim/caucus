@@ -329,7 +329,6 @@ fn event_label(kind: &LaneEventKind) -> String {
         LaneEventKind::Failed { blocker } => {
             format!("failed ({:?}: {})", blocker.failure_class, blocker.detail)
         }
-        LaneEventKind::Finished { detail } => format!("finished ({detail})"),
         LaneEventKind::CommitCreated { provenance } => {
             format!("commit_created ({})", provenance.commit)
         }
@@ -625,9 +624,6 @@ mod tests {
             LaneEventKind::Failed {
                 blocker: LaneEventBlocker::new(LaneFailureClass::Transport, "pipe"),
             },
-            LaneEventKind::Finished {
-                detail: "done".into(),
-            },
             LaneEventKind::CommitCreated {
                 provenance: LaneCommitProvenance {
                     commit: "abc1234".into(),
@@ -667,7 +663,6 @@ mod tests {
             "turn_completed",
             "blocked (PermissionPrompt: Allow? [y/n])",
             "failed (Transport: pipe)",
-            "finished (done)",
             "commit_created (abc1234)",
             "worktree_created (/tmp/wt/backend-1)",
             "worktree_removed (/tmp/wt/backend-1)",
