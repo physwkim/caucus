@@ -88,12 +88,6 @@ pub enum SupersededBy {
     Unknown,
 }
 
-/// How many commits ahead of the superseded one we search for its patch. A lane
-/// branch is one agent's work, so its rewrite window is small; a rebase that
-/// moved a commit further back than this is reported as
-/// [`SupersededBy::Unknown`] rather than searched indefinitely on the UI loop.
-const SUPERSESSION_SEARCH_DEPTH: &str = "64";
-
 /// Decide whether `commit` — recorded earlier by [`extract_verified_commit`] —
 /// is still the commit its `branch` holds (`docs/design.md` §8.2).
 ///
@@ -103,10 +97,13 @@ const SUPERSESSION_SEARCH_DEPTH: &str = "64";
 /// facts and the absence of an event is not a claim that nothing happened.
 ///
 /// `Some(..)` means the branch no longer contains the commit. An amend or a
-/// rebase leaves the *patch* intact, so we look for it: the commit whose
-/// `git patch-id` matches, among those the branch gained since the old commit's
-/// parent. That names a rebase exactly. An amend that rewrote the content has
-/// no matching patch anywhere, and yields [`SupersededBy::Unknown`].
+/// rebase leaves the *patch* intact, so we look for it: the commit on the branch
+/// whose `git patch-id` matches, among everything the branch gained since the
+/// old commit's parent. That names a rebase exactly, however far back it landed
+/// — the search is not depth-capped, because it does not cost per candidate:
+/// [`patch_ids_since`] prices the whole set at three git processes. An amend that
+/// rewrote the content has no matching patch anywhere, and yields
+/// [`SupersededBy::Unknown`].
 ///
 /// Blocking, on the same narrow gate as [`extract_verified_commit`] (the panel
 /// owns a worktree *and* has a recorded commit), and every git call here is a
@@ -120,12 +117,15 @@ pub fn detect_supersession(worktree: &Path, branch: &str, commit: &str) -> Optio
     let Some(want) = patch_id(worktree, commit) else {
         return Some(SupersededBy::Unknown);
     };
-    for candidate in commits_since(worktree, branch, commit) {
-        if patch_id(worktree, &candidate).as_deref() == Some(want.as_str()) {
-            return Some(SupersededBy::Commit { commit: candidate });
-        }
+    match patch_ids_since(worktree, branch, commit)
+        .into_iter()
+        .find(|(patch, _)| *patch == want)
+    {
+        Some((_, replacement)) => Some(SupersededBy::Commit {
+            commit: replacement,
+        }),
+        None => Some(SupersededBy::Unknown),
     }
-    Some(SupersededBy::Unknown)
 }
 
 /// `true` if `rev` is reachable from `branch`.
@@ -145,30 +145,66 @@ fn is_ancestor(repo: &Path, rev: &str, branch: &str) -> bool {
     !matches!(status.map(|st| st.code()), Ok(Some(1)))
 }
 
-/// The commits `branch` holds that are not ancestors of `commit`'s parent —
-/// i.e. everything that could have replaced it — newest first, capped at
-/// [`SUPERSESSION_SEARCH_DEPTH`].
-fn commits_since(repo: &Path, branch: &str, commit: &str) -> Vec<String> {
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args([
-            "rev-list",
-            "-n",
-            SUPERSESSION_SEARCH_DEPTH,
-            branch,
-            "--not",
-            &format!("{commit}^@"),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok();
-    let Some(output) = output.filter(|o| o.status.success()) else {
+/// `(patch_id, commit)` for every commit `branch` holds that is not an ancestor
+/// of `commit`'s parent — i.e. everything that could have replaced it, newest
+/// first. Empty when git cannot answer.
+///
+/// This is git's own patch-id pipeline, `rev-list | diff-tree --stdin -p |
+/// patch-id --stable`, and it is why the search needs no depth cap: three
+/// processes price the whole candidate set, not two per candidate. A merge
+/// commit yields no patch under `diff-tree -p` and so simply does not appear —
+/// correct, since a merge cannot be the rebase of a single commit.
+fn patch_ids_since(repo: &Path, branch: &str, commit: &str) -> Vec<(String, String)> {
+    let git = |args: &[&str], stdin: Stdio| {
+        Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    // `<commit>^@` is "all parents of <commit>", so this is every commit the
+    // branch reached after the one that was rewritten away.
+    let Ok(mut revs) = git(
+        &["rev-list", branch, "--not", &format!("{commit}^@")],
+        Stdio::null(),
+    ) else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&output.stdout)
+    let out = revs
+        .stdout
+        .take()
+        // `--root` so a rewritten *first* commit still produces a patch to
+        // match; without it `diff-tree` prints nothing for a parentless commit
+        // and the replacement is silently unnameable.
+        .and_then(|revs| {
+            git(
+                &["diff-tree", "--stdin", "-p", "--no-color", "--root"],
+                revs.into(),
+            )
+            .ok()
+        })
+        .and_then(|mut diffs| {
+            let patches = diffs.stdout.take()?;
+            let out = git(&["patch-id", "--stable"], patches.into())
+                .ok()?
+                .wait_with_output()
+                .ok()?;
+            let _ = diffs.wait();
+            Some(out)
+        });
+    let _ = revs.wait();
+    let Some(out) = out.filter(|o| o.status.success()) else {
+        return Vec::new();
+    };
+    // One `<patch-id> <commit-sha>` line per commit that produced a patch.
+    String::from_utf8_lossy(&out.stdout)
         .lines()
-        .map(str::to_string)
+        .filter_map(|line| {
+            let (patch, sha) = line.split_once(' ')?;
+            Some((patch.to_string(), sha.trim().to_string()))
+        })
         .collect()
 }
 
@@ -415,6 +451,32 @@ pub(crate) mod tests {
         assert_eq!(
             detect_supersession(dir.path(), &branch, &second),
             Some(SupersededBy::Unknown)
+        );
+    }
+
+    /// The commit that replaced a rewritten one is named however deep it now
+    /// sits. The search used to stop at 64 commits and report `Unknown` past
+    /// that — a wrong answer dressed as an honest one. `patch_ids_since` prices
+    /// the whole branch in three git processes, so there is no depth to cap:
+    /// here the replacement sits 100 commits behind the tip and is still named.
+    #[test]
+    fn a_replacement_is_named_however_far_behind_the_tip_it_sits() {
+        let (dir, sha) = repo_with_commit();
+        let branch = branch_of(dir.path());
+        amend_reword(dir.path(), "reworded");
+        let replacement = verify_commit(dir.path(), "HEAD").unwrap();
+
+        for i in 0..100 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), i.to_string()).unwrap();
+            git(dir.path(), &["add", "."]);
+            git(dir.path(), &["commit", "-q", "-m", &format!("later {i}")]);
+        }
+
+        assert_eq!(
+            detect_supersession(dir.path(), &branch, &sha),
+            Some(SupersededBy::Commit {
+                commit: replacement
+            })
         );
     }
 
