@@ -109,15 +109,7 @@ pub fn derive_agent_state(
 fn blocker_state(class: LaneFailureClass) -> DerivedState {
     match class {
         LaneFailureClass::PermissionPrompt => DerivedState::BlockedPermissionPrompt,
-        LaneFailureClass::MergeConflict => DerivedState::BlockedMergeConflict,
-        LaneFailureClass::BackgroundJob => DerivedState::BlockedBackgroundJob,
-        LaneFailureClass::McpHandshake => DerivedState::DegradedMcp,
         LaneFailureClass::Transport => DerivedState::InterruptedTransport,
-        // PromptDelivery / Unknown have no dedicated state surface; treat as
-        // transport-interrupted so the main worker still sees a non-Idle panel.
-        LaneFailureClass::PromptDelivery | LaneFailureClass::Unknown => {
-            DerivedState::InterruptedTransport
-        }
     }
 }
 
@@ -201,21 +193,13 @@ mod tests {
 
     /// Every `LaneFailureClass` maps onto its `DerivedState` via `blocker_state`
     /// — enumerated in full so a newly added failure class fails to compile here
-    /// until it is listed (and thus checked). `BackgroundJob`, `Transport`,
-    /// `PromptDelivery`, and `Unknown` had no prior coverage.
+    /// until it is listed (and thus checked).
     #[test]
     fn blocker_maps_every_failure_class() {
         use LaneFailureClass::*;
         let cases = [
             (PermissionPrompt, DerivedState::BlockedPermissionPrompt),
-            (MergeConflict, DerivedState::BlockedMergeConflict),
-            (BackgroundJob, DerivedState::BlockedBackgroundJob),
-            (McpHandshake, DerivedState::DegradedMcp),
             (Transport, DerivedState::InterruptedTransport),
-            // No dedicated state surface — treated as transport-interrupted so
-            // the main worker still sees a non-Idle panel.
-            (PromptDelivery, DerivedState::InterruptedTransport),
-            (Unknown, DerivedState::InterruptedTransport),
         ];
         for (class, expected) in cases {
             let blk = LaneEventBlocker::new(class, "detail");

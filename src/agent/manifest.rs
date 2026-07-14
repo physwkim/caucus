@@ -532,7 +532,7 @@ mod tests {
             LaneEventKind::PromptDelivered,
             LaneEventKind::TurnCompleted,
             LaneEventKind::Blocked {
-                blocker: LaneEventBlocker::new(LaneFailureClass::MergeConflict, "conflict in a.rs"),
+                blocker: LaneEventBlocker::new(LaneFailureClass::PermissionPrompt, "Allow? [y/n]"),
             },
             LaneEventKind::Failed {
                 blocker: LaneEventBlocker::new(LaneFailureClass::Transport, "pipe"),
@@ -577,7 +577,7 @@ mod tests {
             "started",
             "prompt_delivered",
             "turn_completed",
-            "blocked (MergeConflict: conflict in a.rs)",
+            "blocked (PermissionPrompt: Allow? [y/n])",
             "failed (Transport: pipe)",
             "finished (done)",
             "commit_created (abc1234)",

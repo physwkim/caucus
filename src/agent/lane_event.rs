@@ -8,17 +8,21 @@ use serde::{Deserialize, Serialize};
 
 use super::provenance::LaneCommitProvenance;
 
-/// Failure-class taxonomy for blockers, used to choose a retry strategy.
+/// Failure-class taxonomy for blockers (`docs/design.md` §8.3).
+///
+/// One variant per way a turn can end badly, and caucus learns that only from
+/// the turn signal's `kind` (`crate::signal::TurnKind`) — so this enum is the
+/// image of the non-`Stop` kinds, nothing more. `tool_blocked` is a
+/// [`Self::PermissionPrompt`]; `error` is a [`Self::Transport`]. Do not add a
+/// class ahead of a signal that produces it: an unproducible class is a dead
+/// branch in `derive_state::blocker_state` that reads like a live one.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaneFailureClass {
-    PromptDelivery,
+    /// The agent's turn stopped on a tool-permission prompt (`tool_blocked`).
     PermissionPrompt,
-    MergeConflict,
-    BackgroundJob,
-    McpHandshake,
+    /// The turn ended on a transport-level error (`error`).
     Transport,
-    Unknown,
 }
 
 /// A blocker attached to a `Blocked` or `Failed` lane event.
