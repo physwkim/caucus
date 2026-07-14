@@ -1636,9 +1636,9 @@ impl Multiplexer {
     /// state the round-watch push announces. A visible menu or `[y/n]` prompt
     /// means the agent stopped mid-turn needing the main worker — which the
     /// `Stop`-hook state cannot see — so it outranks the signal-derived
-    /// `Working`/`Idle` (mirroring `derive_agent_state`, where a grid hint is
-    /// weighed before the turn signal). It never masks a stronger state
-    /// (`Exited`/`Blocked*`/`Interrupted`/`Degraded`).
+    /// `Working`/`Idle`. This is the *only* path from a grid observation into a
+    /// `DerivedState`: `derive_agent_state` is manifest-pure. It never masks a
+    /// stronger state (`Exited`/`Blocked*`/`Interrupted`/`Degraded`).
     pub(crate) fn overlay_blocked_state(
         base: DerivedState,
         blocked: Option<&BlockedPrompt>,

@@ -648,9 +648,13 @@ snake_case와 동일, 테스트로 고정)을 단일 소스로 쓴다.
 것은 주로 하네스가 그리는 chooser(plan-mode 승인, codex 승인 프롬프트 등)다 —
 감지·응답 경로는 그 fallback으로 유지된다.
 
-turn-completion hook이 없는 백엔드(codex가 hook 미지원 시): caucus가 grid
-관찰로 `idle`을 판정한다 — agent 프롬프트 복귀 패턴 매치. 휴리스틱이므로 hook
-경로보다 신뢰도가 낮다.
+**turn signal이 유일한 완료 신호다.** 지원 백엔드는 둘 다 신호를 낸다 — claude는
+`Stop` hook, codex는 `-c notify=[...]`가 `caucus signal codex-notify`를 호출해
+동일한 `TurnSignal{Stop}`을 post한다(§8.1, `agent::spawn`). grid를 프롬프트 복귀
+패턴으로 정규식 매치해 `idle`을 추정하는 fallback은 두지 않는다: 그런 백엔드가
+생기면 그때 *생산자와 함께* 도입한다. grid 관찰이 상태에 영향을 주는 유일한
+경로는 `overlay_blocked_state`(chooser / `[y/n]` — turn signal이 아예 안 오는
+구간)뿐이고, 이는 `derive_agent_state` 바깥에서 읽는 시점에 덮어씌운다.
 
 ### 8.4 derive 함수
 
@@ -660,11 +664,12 @@ fn derive_agent_state(
     last_turn_signal: Option<&TurnSignal>,
     error: Option<&str>,
     blocker: Option<&LaneEventBlocker>,
-    grid_hint: Option<&GridHint>,
 ) -> DerivedState
 ```
 
-turn signal 수신 또는 grid 변화 시 재계산.
+manifest만 보는 순수 함수 — turn signal 수신 시 재계산한다. grid에서만 보이는
+차단 상태(§8.3의 `awaiting_selection` / `blocked_permission_prompt`)는 여기가
+아니라 `overlay_blocked_state`가 읽는 시점에 얹는다.
 
 ### 8.5 패널 출력 캡처 — main worker가 화면을 경주하지 않게
 
@@ -735,7 +740,7 @@ caucus/
     │   ├── spawn.rs         (RoleSpec → 새 패널 + 새 AgentManifest)
     │   ├── manifest.rs      (AgentManifest 영속화: .json + .md 페어)
     │   ├── lane_event.rs    (LaneEvent enum + append)
-    │   ├── derive_state.rs  (turn signal + grid_hint → DerivedState)
+    │   ├── derive_state.rs  (status + turn signal + blocker → DerivedState)
     │   └── provenance.rs    (extract_commit_sha + git rev-parse → LaneCommitProvenance)
     ├── worktree/
     │   ├── manager.rs       (생성)

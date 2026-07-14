@@ -1,8 +1,13 @@
 //! Derived agent state (`docs/design.md` §8.3, §8.4).
 //!
-//! A coarse-grained state surface the main worker inspects via `list_panels`, computed
-//! from `(status, last turn signal, error, blocker, grid hint)`. Recomputed on
-//! every turn-signal ingest and on grid changes.
+//! A coarse-grained state surface the main worker inspects via `list_panels`,
+//! computed from `(status, last turn signal, error, blocker)`. Recomputed on
+//! every turn-signal ingest.
+//!
+//! A blocking prompt caucus sees on the *grid* rather than in a turn signal (a
+//! chooser, a `[y/n]`) does not enter here: it is overlaid onto the derived
+//! state at read time by `Multiplexer::overlay_blocked_state`, which scans the
+//! live grid. This module is the pure, manifest-only half.
 
 use serde::{Deserialize, Serialize};
 
@@ -59,51 +64,27 @@ impl DerivedState {
     }
 }
 
-/// Hint extracted from a panel's grid by the regex fallback in `term/`.
-/// `None` means caucus has no opinion. Used for backends without a
-/// turn-completion hook, and for blocked-state detection (`docs/design.md`
-/// §8.3).
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GridHint {
-    /// The agent is back at a bare input prompt (turn likely done).
-    PromptReady,
-    /// A `Allow this tool? [y/n]`-style permission prompt is visible.
-    PermissionPromptVisible,
-    /// An interactive selection menu (`AskUserQuestion`-style chooser) is
-    /// visible — the agent is waiting for an option to be picked.
-    SelectionMenuVisible,
-    /// A merge-conflict marker is visible.
-    MergeConflictVisible,
-    /// A long-running background job appears stuck.
-    BackgroundJobVisible,
-}
-
 /// Pure function deriving the coarse state (`docs/design.md` §8.4).
 ///
 /// `status` is the raw agent status string from the manifest
-/// (`live` / `exited` / `failed`). A visible blocking grid hint dominates;
-/// otherwise a received turn signal means `Idle`, and `live` with no signal
-/// means `Working`.
+/// (`live` / `exited` / `failed`). A recorded blocker dominates; otherwise a
+/// received turn signal means `Idle`, and `live` with no signal means
+/// `Working`.
 pub fn derive_agent_state(
     status: &str,
     last_turn_signal: Option<&TurnSignal>,
     error: Option<&str>,
     blocker: Option<&LaneEventBlocker>,
-    grid_hint: Option<&GridHint>,
 ) -> DerivedState {
     // Classification precedence (`docs/design.md` §8.3):
     //   1. `exited` status is terminal — overrides everything.
     //   2. A live `error` string puts the agent in a transport-interrupted
     //      state (the process is alive but its turn ended badly).
     //   3. A recorded `blocker` maps onto its blocked/degraded variant.
-    //   4. A blocking grid hint (the heuristic fallback for backends without
-    //      a turn-completion hook) maps the same way — lower-confidence than
-    //      the hook-fed `blocker`, so it is weighed after it.
-    //   5. Otherwise: a received turn signal means `Idle`, a live agent with
+    //   4. Otherwise: a received turn signal means `Idle`, a live agent with
     //      no signal yet means `Working`.
 
-    // `exited` is terminal regardless of any pending blocker or hint.
+    // `exited` is terminal regardless of any pending blocker.
     if status == "exited" {
         return DerivedState::Exited;
     }
@@ -114,16 +95,6 @@ pub fn derive_agent_state(
 
     if let Some(blocker) = blocker {
         return blocker_state(blocker.failure_class);
-    }
-
-    if let Some(hint) = grid_hint {
-        match hint {
-            GridHint::PermissionPromptVisible => return DerivedState::BlockedPermissionPrompt,
-            GridHint::SelectionMenuVisible => return DerivedState::AwaitingSelection,
-            GridHint::MergeConflictVisible => return DerivedState::BlockedMergeConflict,
-            GridHint::BackgroundJobVisible => return DerivedState::BlockedBackgroundJob,
-            GridHint::PromptReady => {}
-        }
     }
 
     match status {
@@ -192,7 +163,7 @@ mod tests {
     #[test]
     fn live_with_no_signal_is_working() {
         assert_eq!(
-            derive_agent_state("live", None, None, None, None),
+            derive_agent_state("live", None, None, None),
             DerivedState::Working
         );
     }
@@ -200,38 +171,8 @@ mod tests {
     #[test]
     fn exited_status_is_exited() {
         assert_eq!(
-            derive_agent_state("exited", None, None, None, None),
+            derive_agent_state("exited", None, None, None),
             DerivedState::Exited
-        );
-    }
-
-    #[test]
-    fn permission_prompt_hint_dominates() {
-        assert_eq!(
-            derive_agent_state(
-                "live",
-                None,
-                None,
-                None,
-                Some(&GridHint::PermissionPromptVisible)
-            ),
-            DerivedState::BlockedPermissionPrompt
-        );
-    }
-
-    #[test]
-    fn selection_menu_hint_is_awaiting_selection() {
-        // A visible selection menu means the agent stopped mid-turn for a
-        // choice — distinct from a [y/n] permission prompt.
-        assert_eq!(
-            derive_agent_state(
-                "live",
-                None,
-                None,
-                None,
-                Some(&GridHint::SelectionMenuVisible)
-            ),
-            DerivedState::AwaitingSelection
         );
     }
 
@@ -245,7 +186,7 @@ mod tests {
             serde_json::Value::Null,
         );
         assert_eq!(
-            derive_agent_state("live", Some(&sig), None, None, None),
+            derive_agent_state("live", Some(&sig), None, None),
             DerivedState::Idle
         );
     }
@@ -253,7 +194,7 @@ mod tests {
     #[test]
     fn error_string_is_interrupted_transport() {
         assert_eq!(
-            derive_agent_state("live", None, Some("pipe broke"), None, None),
+            derive_agent_state("live", None, Some("pipe broke"), None),
             DerivedState::InterruptedTransport
         );
     }
@@ -279,20 +220,20 @@ mod tests {
         for (class, expected) in cases {
             let blk = LaneEventBlocker::new(class, "detail");
             assert_eq!(
-                derive_agent_state("live", None, None, Some(&blk), None),
+                derive_agent_state("live", None, None, Some(&blk)),
                 expected,
                 "failure class {class:?} must map to {expected:?}"
             );
         }
     }
 
-    /// A `failed` status with no blocker or hint is transport-interrupted (the
+    /// A `failed` status with no blocker is transport-interrupted (the
     /// `match status` `"failed"` arm) — the path `record_*` takes when an
     /// agent's process is flagged failed rather than cleanly exited.
     #[test]
     fn failed_status_is_interrupted_transport() {
         assert_eq!(
-            derive_agent_state("failed", None, None, None, None),
+            derive_agent_state("failed", None, None, None),
             DerivedState::InterruptedTransport
         );
     }
@@ -309,48 +250,35 @@ mod tests {
             serde_json::Value::Null,
         );
         assert_eq!(
-            derive_agent_state("failed", Some(&sig), None, None, None),
+            derive_agent_state("failed", Some(&sig), None, None),
             DerivedState::InterruptedTransport
         );
     }
 
     #[test]
-    fn exited_dominates_blocker_and_hint() {
+    fn exited_dominates_error_and_blocker() {
         let blk = LaneEventBlocker::new(LaneFailureClass::PermissionPrompt, "y/n");
         assert_eq!(
-            derive_agent_state(
-                "exited",
-                None,
-                Some("err"),
-                Some(&blk),
-                Some(&GridHint::PermissionPromptVisible),
-            ),
+            derive_agent_state("exited", None, Some("err"), Some(&blk)),
             DerivedState::Exited
         );
     }
 
+    /// A blocker outranks a received turn signal: an agent whose turn ended on
+    /// `tool_blocked` is blocked, not `Idle`.
     #[test]
-    fn blocker_outranks_grid_hint() {
-        // Hook-fed blocker (merge conflict) beats a lower-confidence grid
-        // hint (permission prompt).
-        let blk = LaneEventBlocker::new(LaneFailureClass::MergeConflict, "conflict");
-        assert_eq!(
-            derive_agent_state(
-                "live",
-                None,
-                None,
-                Some(&blk),
-                Some(&GridHint::PermissionPromptVisible),
-            ),
-            DerivedState::BlockedMergeConflict
+    fn blocker_outranks_a_turn_signal() {
+        let sig = TurnSignal::now(
+            crate::session::id::SessionId::new(),
+            crate::session::id::PanelId::new(),
+            crate::signal::TurnKind::ToolBlocked,
+            None,
+            serde_json::Value::Null,
         );
-    }
-
-    #[test]
-    fn prompt_ready_hint_does_not_block() {
+        let blk = LaneEventBlocker::new(LaneFailureClass::PermissionPrompt, "y/n");
         assert_eq!(
-            derive_agent_state("live", None, None, None, Some(&GridHint::PromptReady)),
-            DerivedState::Working
+            derive_agent_state("live", Some(&sig), None, Some(&blk)),
+            DerivedState::BlockedPermissionPrompt
         );
     }
 }

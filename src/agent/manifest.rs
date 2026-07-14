@@ -225,7 +225,6 @@ pub(crate) fn record_turn_completed(
         Some(signal),
         manifest.error.as_deref(),
         manifest.current_blocker.as_ref(),
-        None,
     );
     to_disk(manifest, session_root)
 }
@@ -245,7 +244,6 @@ pub(crate) fn record_exited(
         None,
         manifest.error.as_deref(),
         manifest.current_blocker.as_ref(),
-        None,
     );
     to_disk(manifest, session_root)
 }
