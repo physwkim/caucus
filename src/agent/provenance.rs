@@ -10,14 +10,28 @@ use serde::{Deserialize, Serialize};
 /// Provenance metadata recorded when an agent creates a commit in its
 /// worktree. Attached to a [`crate::agent::lane_event::LaneEventKind::CommitCreated`]
 /// event.
+///
+/// Three fields the design once listed here are deliberately absent, for the
+/// same reason `LaneEventKind` has no `Finished`: nothing could produce them.
+///
+/// - `canonical_commit` — the commit as it lands on the integration branch.
+///   caucus never integrates: it runs `worktree add/remove`, never `merge`,
+///   `rebase`, or `cherry-pick`. A human merges the lane branch outside the
+///   session, possibly squashed, possibly after caucus has exited. There is no
+///   moment at which caucus could observe the answer, so the field would be
+///   `None` forever. If caucus ever owns the integration step, it comes back as
+///   a `CommitIntegrated` event written by whoever performs the merge.
+/// - `superseded_by` — the timeline is append-only, so a commit's fate cannot
+///   be back-written into the `CommitCreated` event that announced it. It is a
+///   later fact and therefore a later event:
+///   [`crate::agent::lane_event::LaneEventKind::CommitSuperseded`].
+/// - `lineage` — the chain of supersessions is the transitive closure of those
+///   events. Storing it too would put one fact in two places, free to disagree.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LaneCommitProvenance {
     pub commit: String,
     pub branch: String,
     pub worktree: Option<PathBuf>,
-    pub canonical_commit: Option<String>,
-    pub superseded_by: Option<String>,
-    pub lineage: Vec<String>,
 }
 
 /// Find the first 7–40 character ascii-hex run in `text`. Returns the SHA-like

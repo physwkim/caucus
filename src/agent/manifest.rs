@@ -629,9 +629,6 @@ mod tests {
                     commit: "abc1234".into(),
                     branch: "feat/x".into(),
                     worktree: None,
-                    canonical_commit: None,
-                    superseded_by: None,
-                    lineage: vec![],
                 },
             },
             LaneEventKind::WorktreeCreated {

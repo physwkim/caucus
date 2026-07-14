@@ -296,9 +296,6 @@ impl Multiplexer {
                     commit,
                     branch,
                     worktree: Some(worktree),
-                    canonical_commit: None,
-                    superseded_by: None,
-                    lineage: Vec::new(),
                 },
             },
         );
