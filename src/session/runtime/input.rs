@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent::lane_event::{LaneEvent, LaneEventKind};
 use crate::agent::manifest;
+use crate::agent::provenance::{self, LaneCommitProvenance};
 use crate::input::CaucusCommand;
 use crate::panel::lifecycle::{self, PanelState};
 use crate::signal::TurnSignal;
@@ -256,6 +257,51 @@ impl Multiplexer {
         if session_id_changed {
             self.persist_record();
         }
+        self.record_commit_provenance(signal.panel_id);
+    }
+
+    /// Record a `CommitCreated` event when the turn that just ended named a real
+    /// commit in the panel's own worktree (`docs/design.md` §5).
+    ///
+    /// A sub-agent's commits live on its worktree's branch and outlive the panel,
+    /// but nothing tied them back to the agent that made them: `git log` on the
+    /// branch shows the commit, and the manifest showed the branch, and no record
+    /// joined the two. The turn signal's `last_message` is where an agent says
+    /// what it did, so a SHA it names there — *verified* against the worktree, so
+    /// prose like `deadbeef` cannot fabricate provenance — is the join.
+    ///
+    /// Panels with no worktree are skipped: they commit in the shared checkout if
+    /// they commit at all, and a SHA there names no work this panel owns.
+    fn record_commit_provenance(&mut self, panel_id: PanelId) {
+        let Some(manifest) = self.manifests.get(&panel_id) else {
+            return;
+        };
+        let (Some(worktree), Some(last_message)) =
+            (manifest.worktree_path.clone(), manifest.last_message())
+        else {
+            return;
+        };
+        let Some(commit) = provenance::extract_verified_commit(&worktree, last_message) else {
+            return;
+        };
+        let branch = self
+            .worktree_branches
+            .get(&panel_id)
+            .cloned()
+            .unwrap_or_default();
+        self.record_lane_event(
+            panel_id,
+            LaneEventKind::CommitCreated {
+                provenance: LaneCommitProvenance {
+                    commit,
+                    branch,
+                    worktree: Some(worktree),
+                    canonical_commit: None,
+                    superseded_by: None,
+                    lineage: Vec::new(),
+                },
+            },
+        );
     }
 
     /// Mark a panel as having received a prompt: open a capture turn and flip
@@ -372,6 +418,90 @@ mod tests {
             "a delivered prompt is on the persisted timeline: {:?}",
             on_disk.lane_events()
         );
+        mux.shutdown();
+    }
+
+    /// A turn signal whose final message names a real commit in the panel's own
+    /// worktree records `CommitCreated` — the join between an agent and the
+    /// commits it left on its branch. A hex-shaped token that resolves to
+    /// nothing (`deadbeef` in prose) must not fabricate provenance, and a panel
+    /// with no worktree records nothing at all.
+    #[tokio::test]
+    async fn a_turn_that_names_a_real_commit_records_its_provenance() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::agent::provenance::tests::repo_with_commit;
+        use crate::role::spec::AgentCli;
+        use crate::signal::TurnKind;
+
+        let (repo, sha) = repo_with_commit();
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        // Three panels: one on a worktree naming a real commit, one on a
+        // worktree naming a bogus SHA, one with no worktree at all.
+        let cases = [
+            (
+                Some(repo.path().to_path_buf()),
+                format!("Done. Committed {} on my branch.", &sha[..12]),
+                Some(sha.clone()),
+            ),
+            (
+                Some(repo.path().to_path_buf()),
+                "Done. See deadbeef for details.".to_string(),
+                None,
+            ),
+            (None, format!("Done. Committed {}.", &sha[..12]), None),
+        ];
+
+        for (worktree, message, expected) in cases {
+            let id = push_cat_panel(&mut mux, PanelState::Working);
+            if let Some(wt) = worktree.clone() {
+                mux.panels
+                    .iter_mut()
+                    .find(|p| p.id == id)
+                    .unwrap()
+                    .worktree_path = Some(wt.clone());
+                mux.worktree_branches
+                    .insert(id, "caucus/x/reviewer-1".into());
+            }
+            let mut mf = AgentManifest::new(
+                mux.session.id,
+                id,
+                "reviewer",
+                "reviewer-1",
+                AgentCli::Claude,
+                None,
+            );
+            mf.worktree_path = worktree.clone();
+            let agent_id = mf.agent_id;
+            mux.manifests.insert(id, mf);
+
+            mux.handle_signal(TurnSignal::now(
+                mux.session.id,
+                id,
+                TurnKind::Stop,
+                Some(message),
+                serde_json::Value::Null,
+            ));
+
+            let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+            let recorded = on_disk.lane_events().iter().find_map(|e| match &e.kind {
+                LaneEventKind::CommitCreated { provenance } => Some(provenance.clone()),
+                _ => None,
+            });
+            match expected {
+                Some(want) => {
+                    let got = recorded.expect("a verified commit is recorded");
+                    assert_eq!(got.commit, want, "the full canonical SHA is recorded");
+                    assert_eq!(got.branch, "caucus/x/reviewer-1");
+                    assert_eq!(got.worktree, worktree);
+                }
+                None => assert!(
+                    recorded.is_none(),
+                    "an unverifiable SHA (or a panel with no worktree) records nothing: {recorded:?}"
+                ),
+            }
+        }
         mux.shutdown();
     }
 
