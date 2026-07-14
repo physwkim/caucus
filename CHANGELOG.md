@@ -7,6 +7,23 @@ versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A round panel's result is latched when it settles, not re-read when the round
+  is delivered** (Invariant I-9). caucus judged the round barrier — and read each
+  panel's result — from the panels' *live* state at delivery time, but delivery
+  waits for the main panel to go idle, so those two moments can be arbitrarily far
+  apart. A sub-agent that ends its turn with a background shell still running gets
+  woken by that shell finishing, and its CLI starts a fresh turn caucus never
+  prompted. Re-judging live state saw that panel back in `working` and un-settled
+  an already-finished round; worse, `working` made the report skip the panel's
+  output entirely and deliver a panel that had done all its work as "still working
+  — no output captured". The stray turn's `Stop` hook also overwrote the manifest's
+  `last_message`, so what *did* get reported was a line like "that was a leftover
+  wait-loop; nothing new came out of it" in place of the panel's actual result.
+  Each panel's contribution is now captured at the instant it settles and frozen:
+  no later state or output can change the round's dueness or what it delivers.
+
 ## [0.8.0] — 2026-07-10
 
 A `worktree=true` sub-agent was isolated by cwd but never told so. Three of

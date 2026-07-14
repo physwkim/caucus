@@ -116,7 +116,8 @@ pub enum ControlRequest {
     /// panels: the round runs in the background, so the main worker ends its
     /// turn and is re-prompted by caucus on completion (no blocking, no
     /// timeout-shaped wait). `read_mode` selects what each panel's result is
-    /// read as on delivery (default `last_message`).
+    /// read as, captured the instant each panel settles (default
+    /// `last_message`).
     ///
     /// `backlog` is an optional per-panel task queue keyed by panel id: while
     /// the round runs, a panel that goes idle with tasks still queued is fed
@@ -142,7 +143,9 @@ pub enum ControlRequest {
     },
     /// Report the live status of a registered round by its id: which panels
     /// have settled vs are still working, the per-panel backlog remaining, and
-    /// the seconds left until the fallback deadline. Answered with a
+    /// the seconds left until the fallback deadline. Each panel's status is read
+    /// from the round's settle latch, so a panel that finished and was later
+    /// re-woken still reads `settled`. Answered with a
     /// [`ControlResponse::Panel`] (text), or an error if the id is unknown
     /// (delivered, cancelled, or never registered).
     RoundStatus { round: RoundId },

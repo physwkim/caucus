@@ -2,7 +2,6 @@ use super::*;
 use crate::mcp::control_server::{ControlJob, ControlServer};
 use crate::mcp::protocol::{ControlRequest, ControlResponse};
 use crate::mcp::{McpToolSurface, PanelSummary};
-use crate::panel::lifecycle::PanelState;
 use crate::session::id::PanelId;
 
 impl Multiplexer {
@@ -133,19 +132,6 @@ impl Multiplexer {
         }
     }
 
-    /// Whether every panel id counts as "settled" for a round: its
-    /// `PanelState` is `Idle`/`Blocked`/`Exited` — i.e. NOT `Working` and NOT
-    /// `Spawning`. A panel id that does not exist counts as settled (there is
-    /// nothing left to wait for — it was killed or never spawned).
-    pub(crate) fn wait_panels_settled(&self, panels: &[PanelId]) -> bool {
-        panels
-            .iter()
-            .all(|id| match self.panels.iter().find(|p| p.id == *id) {
-                Some(p) => !matches!(p.state(), PanelState::Working | PanelState::Spawning),
-                None => true,
-            })
-    }
-
     /// Type the same `text` into every panel in `panels` — a round's fan-out
     /// (`docs/design.md` §4). Each panel is driven exactly as the MCP
     /// `send_keys` tool would drive it: the text is written, a `\r` appended
@@ -185,6 +171,7 @@ impl Multiplexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::panel::lifecycle::PanelState;
     use crate::session::runtime::test_support::*;
     use tempfile::TempDir;
 

@@ -1027,6 +1027,26 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
   clean → 빈 salvage 커밋 없이 삭제(브랜치 tip 불변); dirty + 브랜치 삭제 예정 → salvage 없이
   삭제; dirty + detached HEAD → 삭제 거부, 디렉터리 잔존.
 
+### Invariant I-9: 라운드 패널의 기여는 정착 순간에 latch 된다
+- **Owner**: `Multiplexer::poll_round_panels()` — `PendingRound.settled` / `.captured`의 유일한 writer.
+- **MUST**: 패널이 이 라운드에 대해 정착하는 (working/spawning을 벗어났고 backlog가 비었거나
+  terminal) **첫 tick**에, 그 시점의 결과를 `read_mode`로 읽어 `captured`에 넣고 `settled`에
+  등록한다. 이후 그 패널의 상태나 출력은 라운드의 due 판정에도, 배달되는 기여에도 영향을 주지
+  않는다.
+- **MUST NOT**: 배달 시점에 패널을 다시 읽거나(`round_panel_contribution`), 라이브 상태로 배리어를
+  다시 판정하지 않는다(`round_settled`).
+- **왜**: 배달은 *메인* 패널이 idle이 되어야 일어나므로 정착과 배달 사이 간격은 무한정 커질 수 있다.
+  그 창에서 정착한 패널의 턴을 다시 여는 경로(MCP `send_keys`, auto-answer `select_option`, 사용자가
+  패널에 친 Enter, 그리고 **남은 백그라운드 셸이 끝나 CLI가 스스로 새 턴을 시작하는 것**)가 존재한다.
+  라이브 판정은 이때 (1) 끝난 라운드를 다시 미정착으로 되돌리고, (2) 패널이 `Working`이라는 이유로
+  읽기를 건너뛰어 완료된 작업을 "still working, no output captured"로 배달하며, (3) `last_message`를
+  뒤늦은 턴의 잡담("nothing new came out of it")으로 덮어썼다.
+- **Enforcement**: `PendingRound.settled` / `.captured`는 private 필드이고 `poll_round_panels`만
+  쓴다. `round_settled`는 latch만 읽고 `self.panels`의 상태를 보지 않는다.
+- **Tests**: latch 후 패널을 다시 `Working`으로 깨워도 라운드가 미정착으로 돌아가지 않고 기여가
+  남는지; latch 후 도착한 `Stop` 훅이 리포트의 `last_message`를 덮지 못하는지; backlog가 남은 채
+  fallback이 닫히면 latch는 되고 feed는 안 되는지.
+
 ---
 
 ## 13. 스코프와 non-goals
