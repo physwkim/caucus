@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent::lane_event::{LaneEvent, LaneEventKind};
 use crate::agent::manifest;
-use crate::agent::provenance::{self, LaneCommitProvenance};
+use crate::agent::provenance::{self, LaneCommitProvenance, SupersededBy};
 use crate::input::CaucusCommand;
 use crate::panel::lifecycle::{self, PanelState};
 use crate::signal::TurnSignal;
@@ -258,20 +258,26 @@ impl Multiplexer {
             self.persist_record();
         }
         self.record_commit_provenance(signal.panel_id);
+        self.record_commit_supersessions(signal.panel_id);
     }
 
-    /// Record a `CommitCreated` event when the turn that just ended named a real
-    /// commit in the panel's own worktree (`docs/design.md` §5).
+    /// Record a `CommitCreated` event when the turn that just ended named a
+    /// commit this agent left on its own branch (`docs/design.md` §5).
     ///
     /// A sub-agent's commits live on its worktree's branch and outlive the panel,
     /// but nothing tied them back to the agent that made them: `git log` on the
     /// branch shows the commit, and the manifest showed the branch, and no record
     /// joined the two. The turn signal's `last_message` is where an agent says
-    /// what it did, so a SHA it names there — *verified* against the worktree, so
-    /// prose like `deadbeef` cannot fabricate provenance — is the join.
+    /// what it did, so a SHA it names there is the join — but only once git has
+    /// confirmed both halves of it (`provenance::extract_branch_commit`): the
+    /// commit exists, *and* it is on this panel's branch. A worktree shares its
+    /// object database with every other worktree, so the first half alone would
+    /// let an agent claim a sibling panel's commit merely by mentioning it.
     ///
     /// Panels with no worktree are skipped: they commit in the shared checkout if
-    /// they commit at all, and a SHA there names no work this panel owns.
+    /// they commit at all, and a SHA there names no work this panel owns. So are
+    /// panels whose branch caucus never learned — with no branch there is no join
+    /// to verify, and an unverified join is what this exists to prevent.
     fn record_commit_provenance(&mut self, panel_id: PanelId) {
         let Some(manifest) = self.manifests.get(&panel_id) else {
             return;
@@ -281,14 +287,20 @@ impl Multiplexer {
         else {
             return;
         };
-        let Some(commit) = provenance::extract_verified_commit(&worktree, last_message) else {
+        let Some(branch) = self.worktree_branches.get(&panel_id).cloned() else {
             return;
         };
-        let branch = self
-            .worktree_branches
-            .get(&panel_id)
-            .cloned()
-            .unwrap_or_default();
+        let Some(commit) = provenance::extract_branch_commit(&worktree, &branch, last_message)
+        else {
+            return;
+        };
+        // An agent that keeps referring to the commit it made ("still working on
+        // top of abc1234") names it again every turn. The commit was created
+        // once, so it is recorded once — a timeline that repeats the same
+        // creation reads like repeated work.
+        if manifest.live_commits().iter().any(|p| p.commit == commit) {
+            return;
+        }
         self.record_lane_event(
             panel_id,
             LaneEventKind::CommitCreated {
@@ -296,12 +308,65 @@ impl Multiplexer {
                     commit,
                     branch,
                     worktree: Some(worktree),
-                    canonical_commit: None,
-                    superseded_by: None,
-                    lineage: Vec::new(),
                 },
             },
         );
+    }
+
+    /// Record a `CommitSuperseded` event for every commit the panel created that
+    /// its branch no longer holds (`docs/design.md` §8.2).
+    ///
+    /// An agent that amends or rebases leaves the sha it announced last turn
+    /// pointing at a commit no branch contains. Without this, the timeline keeps
+    /// claiming a commit that `git log` cannot show, and every later reader of
+    /// the lane — a review round, a human reading the manifest — chases a sha
+    /// that resolves to nothing. `provenance::detect_supersession` asks the
+    /// branch, so the timeline says what the repository says.
+    ///
+    /// Runs on the turn signal, after `record_commit_provenance`: a rewrite is
+    /// something the agent did *during* the turn that just ended, and the turn
+    /// signal is caucus's only notification that it did anything at all.
+    ///
+    /// Gated on the lane's branch tip. A commit's reachability from a branch can
+    /// only change when the branch ref moves, so a tip unchanged since the last
+    /// look is proof that nothing left the lane — one `rev-parse` (~2ms, measured)
+    /// answers for every commit on it, instead of a `merge-base` process per
+    /// recorded commit on every single turn signal. The turns that *did* rewrite
+    /// history pay the full check; the ordinary ones pay one process.
+    fn record_commit_supersessions(&mut self, panel_id: PanelId) {
+        let Some(manifest) = self.manifests.get(&panel_id) else {
+            return;
+        };
+        let Some(worktree) = manifest.worktree_path.clone() else {
+            return;
+        };
+        let live = manifest.live_commits();
+        if live.is_empty() {
+            return; // No recorded commit on this lane — nothing can have left it.
+        }
+        let Some(branch) = self.worktree_branches.get(&panel_id).cloned() else {
+            return;
+        };
+        let Some(tip) = provenance::branch_tip(&worktree, &branch) else {
+            return; // git cannot say where the branch is; make no claim.
+        };
+        if self.checked_branch_tips.get(&panel_id) == Some(&tip) {
+            return;
+        }
+
+        let retired: Vec<(String, SupersededBy)> = live
+            .into_iter()
+            .filter_map(|p| {
+                provenance::detect_supersession(&worktree, &p.branch, &p.commit)
+                    .map(|by| (p.commit, by))
+            })
+            .collect();
+        for (commit, by) in retired {
+            self.record_lane_event(panel_id, LaneEventKind::CommitSuperseded { commit, by });
+        }
+        // Only after the checks ran: a turn that returned early above must
+        // re-check next time rather than trust a tip it never looked past.
+        self.checked_branch_tips.insert(panel_id, tip);
     }
 
     /// Mark a panel as having received a prompt: open a capture turn and flip
@@ -421,24 +486,27 @@ mod tests {
         mux.shutdown();
     }
 
-    /// A turn signal whose final message names a real commit in the panel's own
-    /// worktree records `CommitCreated` — the join between an agent and the
-    /// commits it left on its branch. A hex-shaped token that resolves to
-    /// nothing (`deadbeef` in prose) must not fabricate provenance, and a panel
-    /// with no worktree records nothing at all.
+    /// A turn signal whose final message names a commit this agent left on its
+    /// own branch records `CommitCreated` — the join between an agent and the
+    /// commits on its lane. Everything that is not that join records nothing: a
+    /// hex-shaped token resolving to no commit (`deadbeef` in prose), a real
+    /// commit that belongs to a *sibling* lane and is merely mentioned (the
+    /// worktrees share one object database, so it resolves here too), and a panel
+    /// with no worktree at all.
     #[tokio::test]
     async fn a_turn_that_names_a_real_commit_records_its_provenance() {
         use crate::agent::manifest::AgentManifest;
         use crate::agent::provenance::tests::repo_with_commit;
+        use crate::agent::provenance::tests::{branch_of, commit_on_a_sibling_branch};
         use crate::role::spec::AgentCli;
         use crate::signal::TurnKind;
 
         let (repo, sha) = repo_with_commit();
+        let lane = branch_of(repo.path());
+        let sibling = commit_on_a_sibling_branch(repo.path(), &lane);
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
 
-        // Three panels: one on a worktree naming a real commit, one on a
-        // worktree naming a bogus SHA, one with no worktree at all.
         let cases = [
             (
                 Some(repo.path().to_path_buf()),
@@ -448,6 +516,11 @@ mod tests {
             (
                 Some(repo.path().to_path_buf()),
                 "Done. See deadbeef for details.".to_string(),
+                None,
+            ),
+            (
+                Some(repo.path().to_path_buf()),
+                format!("Reviewed {}; it looks right to me.", &sibling[..12]),
                 None,
             ),
             (None, format!("Done. Committed {}.", &sha[..12]), None),
@@ -461,8 +534,7 @@ mod tests {
                     .find(|p| p.id == id)
                     .unwrap()
                     .worktree_path = Some(wt.clone());
-                mux.worktree_branches
-                    .insert(id, "caucus/x/reviewer-1".into());
+                mux.worktree_branches.insert(id, lane.clone());
             }
             let mut mf = AgentManifest::new(
                 mux.session.id,
@@ -493,7 +565,7 @@ mod tests {
                 Some(want) => {
                     let got = recorded.expect("a verified commit is recorded");
                     assert_eq!(got.commit, want, "the full canonical SHA is recorded");
-                    assert_eq!(got.branch, "caucus/x/reviewer-1");
+                    assert_eq!(got.branch, lane);
                     assert_eq!(got.worktree, worktree);
                 }
                 None => assert!(
@@ -502,6 +574,126 @@ mod tests {
                 ),
             }
         }
+        mux.shutdown();
+    }
+
+    /// An agent that amends the commit it announced last turn leaves the
+    /// recorded SHA pointing at a commit no branch holds. The next turn signal
+    /// records `CommitSuperseded` naming the commit that carries the same patch,
+    /// and `live_commits` drops the dead SHA — so no reader of the lane chases a
+    /// commit `git log` cannot show.
+    #[tokio::test]
+    async fn an_amended_commit_is_recorded_as_superseded_on_the_next_turn() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::agent::provenance::tests::{amend_reword, branch_of, repo_with_commit};
+        use crate::agent::provenance::{SupersededBy, verify_commit};
+        use crate::role::spec::AgentCli;
+        use crate::signal::TurnKind;
+
+        let (repo, first) = repo_with_commit();
+        let branch = branch_of(repo.path());
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        mux.worktree_branches.insert(id, branch.clone());
+        let mut mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        mf.worktree_path = Some(repo.path().to_path_buf());
+        let agent_id = mf.agent_id;
+        mux.manifests.insert(id, mf);
+
+        let turn = |mux: &mut Multiplexer, message: String| {
+            mux.handle_signal(TurnSignal::now(
+                mux.session.id,
+                id,
+                TurnKind::Stop,
+                Some(message),
+                serde_json::Value::Null,
+            ));
+        };
+
+        // Turn one: the agent announces the commit it made.
+        turn(&mut mux, format!("Committed {}.", &first[..12]));
+        assert_eq!(
+            mux.manifests[&id]
+                .live_commits()
+                .iter()
+                .map(|p| p.commit.clone())
+                .collect::<Vec<_>>(),
+            vec![first.clone()],
+            "the announced commit is live while the branch holds it"
+        );
+
+        // Naming it again next turn does not re-create it: the commit was made
+        // once, and the timeline says so once.
+        turn(&mut mux, format!("Still building on {}.", &first[..12]));
+        assert_eq!(
+            mux.manifests[&id]
+                .lane_events()
+                .iter()
+                .filter(|e| matches!(e.kind, LaneEventKind::CommitCreated { .. }))
+                .count(),
+            1,
+            "a commit named across several turns is recorded once"
+        );
+
+        // The agent rewords it — same patch, new sha — and ends another turn.
+        amend_reword(repo.path(), "reworded");
+        let second = verify_commit(repo.path(), "HEAD").unwrap();
+        turn(&mut mux, format!("Reworded it: {}.", &second[..12]));
+
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        let superseded: Vec<_> = on_disk
+            .lane_events()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                LaneEventKind::CommitSuperseded { commit, by } => {
+                    Some((commit.clone(), by.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            superseded,
+            vec![(
+                first.clone(),
+                SupersededBy::Commit {
+                    commit: second.clone()
+                }
+            )],
+            "the dead SHA is retired exactly once, naming what replaced it"
+        );
+        assert_eq!(
+            on_disk
+                .live_commits()
+                .iter()
+                .map(|p| p.commit.clone())
+                .collect::<Vec<_>>(),
+            vec![second],
+            "only the commit the branch holds survives the derivation"
+        );
+
+        // A third turn adds nothing: the retired commit is no longer live, so
+        // it is not re-tested and not re-recorded.
+        turn(&mut mux, "Nothing new.".to_string());
+        let again = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(
+            again
+                .lane_events()
+                .iter()
+                .filter(|e| matches!(e.kind, LaneEventKind::CommitSuperseded { .. }))
+                .count(),
+            1,
+            "a supersession is recorded once, not on every later turn"
+        );
+
         mux.shutdown();
     }
 

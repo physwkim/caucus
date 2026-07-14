@@ -61,6 +61,31 @@ running. A completion signal is only worth what the moment it is read is worth.
   than leaving it running. The main worker is exempt — it registers rounds rather
   than settling into them.
 
+- **The lane-event timeline is written, not just declared.** `LaneEventKind` had
+  seven variants no code constructed: a per-agent timeline that named the events it
+  could report and then reported only `Started` and `TurnCompleted`. Six now have a
+  producer, each in exactly one place. `Blocked` / `Failed` are born from the same
+  `match` on the turn signal that builds `current_blocker`, so the timeline and the
+  derived state cannot disagree about how a turn ended. `PromptDelivered` is written
+  by `note_prompt_delivered`, the only `Idle -> Working` path. `CommitCreated`
+  records a SHA the agent named in its final message *and* git verified against the
+  panel's own worktree — the join between an agent and the commits it left on its
+  branch, which nothing recorded before. `WorktreeCreated` is written at the
+  manifest's first write; `WorktreeRemoved` only by the cleanup worker, from what it
+  actually removed, because a removal can be refused (I-8) and recording the
+  intention would claim a removal for a directory still on disk.
+
+- **`LaneEventKind::CommitSuperseded`** — an agent that amends or rebases leaves the
+  SHA it announced pointing at a commit no branch holds, and the timeline went on
+  claiming it, so every later reader chased a commit `git log` cannot show. On each
+  turn signal caucus asks the branch about the commits still live on the timeline
+  (`merge-base --is-ancestor`) and retires the ones that are gone. What replaced a
+  commit is found by patch identity (`git patch-id --stable`), which an amend or
+  rebase preserves — so a reworded or rebased commit is named exactly, at any depth,
+  while an amend that rewrote the content is recorded as `SupersededBy::Unknown`
+  rather than guessed at. Caucus never claims a disappearance git did not confirm:
+  a git call that fails to answer means the commit stays live.
+
 ### Removed
 
 **Breaking (library API).** Chasing the round bug turned up a state surface whose
@@ -101,6 +126,26 @@ version of caucus could write one.
   `degraded_mcp`. Left with no producer once the above went. Every remaining variant
   has one, and there are exactly two producers: a blocker born from the turn signal,
   and a prompt seen on the live grid.
+
+- **`LaneEventKind::Finished`.** The only completion signal caucus has is the
+  backend's turn-completion hook, so "the agent finished the work" and "the agent's
+  turn ended" are one event arriving once — there is no second signal that could
+  distinguish them, and no honest producer for a variant claiming the difference.
+  The claim is stated to the agent instead, as a contract in its system prompt
+  (`SUBAGENT_TURN_CONTRACT`), rather than pretended in the timeline.
+
+- **`LaneCommitProvenance::{canonical_commit, superseded_by, lineage}`.** All three
+  were recorded as `None`/`vec![]` at the one site that builds a provenance record.
+  `canonical_commit` — the commit as it lands on the integration branch — has no
+  producer even in principle: caucus runs `worktree add/remove` and never `merge`,
+  `rebase` or `cherry-pick`, so the identity of a lane commit after integration is
+  decided by a human outside the session, possibly squashed, possibly after caucus
+  has exited. It returns as a `CommitIntegrated` event if caucus ever owns that step.
+  `superseded_by` and `lineage` *are* observable, but not as fields: the timeline is
+  append-only, so a commit's later fate is a later event (`CommitSuperseded`, above),
+  and the lineage is the chain of those events. A commit's standing — live, replaced
+  by a named commit, or replaced by something unnameable — is derived from the
+  timeline (`AgentManifest::live_commits`), so one fact lives in one place.
 
 ## [0.8.0] — 2026-07-10
 
