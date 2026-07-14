@@ -190,21 +190,38 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
 일찍 끝난 워커가 barrier에서 놀지 않고 자기 백로그를 계속 처리한다. 패널이
 라운드에 대해 settle하는 건 idle이고 *큐까지 빈* 순간뿐이다(백로그 없는 패널은
 첫 idle에 settle — 기존 단일 task 동작). 등록 시 라운드에 없는 패널의 큐와 빈
-큐는 버려진다. 큐의 task를 보내기 직전(패널이 아직 idle일 때) caucus가 막 끝난
-턴의 출력을 `read_mode`로 캡처해 둔다 — 전달 보고서가 마지막 턴만이 아니라 모든
-task 산출물을 담도록. settle해 전달될 때는 캡처분 + 최종 턴 라이브 read가 함께
-`### task N` 섹션으로 main에 주입된다(단일 task면 헤더 없이 기존과 동일; fallback
-시 미완 패널은 끝낸 task들 + "still working" 마커).
+큐는 버려진다. 라운드의 단일 owner `poll_round_panels`가 매 tick 이 판정을 하며,
+큐의 task를 보내기 직전(패널이 아직 idle일 때)과 패널이 최종 settle하는 순간에
+막 끝난 턴의 출력을 `read_mode`로 캡처해 latch한다(**Invariant I-9**) — 전달
+보고서가 마지막 턴만이 아니라 모든 task 산출물을 담도록, 그리고 배달 시점에
+패널을 다시 읽지 않도록. 전달 시에는 캡처분이 `### task N` 섹션으로 main에
+주입된다(단일 task면 헤더 없이 기존과 동일; fallback 시 미완 패널은 끝낸 task들
++ "still working" 마커).
 
 **라운드 식별(status·cancel)**: `register_round`는 라운드 id(ULID)를 반환한다.
 그 id로 main worker는 라운드를 들여다보거나(`round_status` — 패널별
 working/draining backlog/settled/gone 상태, 남은 백로그 수, fallback 데드라인까지
 남은 초) 취소할 수 있다(`cancel_round` — caucus가 그 라운드 감시·전달을 멈춘다;
 패널은 건드리지 않아 진행 중 작업은 계속 돌고 백로그 급여만 끊긴다). 정상 흐름은
-여전히 register 후 턴을 닫고 caucus의 완료 push를 기다리는 것 — `round_status`는
-sleep-poll 용이 아니라 out-of-band 점검용이다. 라운드 id는 **라이브 전용**:
-재시작을 못 넘기므로(sub-agent 프로세스가 새로 뜬다 — `ingest_resumed_rounds`)
-영속화하지 않고, caucus가 더 이상 감시하지 않는 id(전달 완료/취소됨)는 에러다.
+여전히 register 후 턴을 닫고 caucus의 완료 push를 기다리는 것이다 — 그게 더 싸다.
+다만 push는 main 패널이 idle일 때만 착지하므로(즉 main이 턴을 끝낸 뒤에만), 턴
+안에서 기다리는 main은 영원히 못 받는다. 그래서 `round_status`는 **pull 경로**를
+겸한다: 라운드가 완료됐으면 조립된 보고서를 그대로 반환하고 라운드를 완료시킨다
+(**Invariant I-10**). 라운드 id는 **라이브 전용**: 재시작을 못 넘기므로(sub-agent
+프로세스가 새로 뜬다 — `ingest_resumed_rounds`) 영속화하지 않고, caucus가 더 이상
+감시하지 않는 id(전달 완료/취소됨)는 에러다.
+
+**턴 계약(완료 신호의 전제)**: caucus가 패널의 완료를 아는 유일한 신호는 백엔드의
+turn-completion hook — 즉 **턴의 끝**이다. I-9에 따라 라운드는 바로 그 순간 패널의
+결과를 latch하므로, 턴을 끝내는 것은 "작업이 끝났다"는 주장이다. 이 신호는 에이전트의
+턴 규율만큼만 정확하다: 긴 명령을 백그라운드 셸에 던지고 턴을 끝내거나, 그 셸을 턴을
+넘겨 가며 폴링하는 wait-loop를 걸면, 작업이 도는 중에 "완료"를 신고하는 셈이고 caucus는
+반쯤 된 결과를 캡처한다. 나중에 셸이 끝나면 CLI가 caucus가 준 적 없는 턴을 스스로
+시작하는데, 그 출력은 어느 라운드에도 속하지 않는다. 그래서 모든 sub-agent의 시스템
+프롬프트에 턴 계약(`role::prompt::SUBAGENT_TURN_CONTRACT` — 작업이 도는 채로 턴을 끝내지
+말 것, 긴 명령은 foreground에서 기다릴 것, 한 턴에 못 끝내면 조용히 남겨 두지 말고 텍스트로
+보고하고 턴을 끝낼 것)이 덧붙는다(`agent::spawn::build_command`). main worker는 예외 —
+main은 라운드에 settle하는 쪽이 아니라 *등록하는* 쪽이다.
 
 **선택 프롬프트 엣지**: 라운드 패널의 sub-agent가 턴을 끝내지 않고 대화형
 선택 메뉴에서 멈추면 turn signal이 안 와 라운드가 settle하지

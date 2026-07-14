@@ -212,6 +212,13 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
     // path, so it covers preset roles, free-form inline prompts, and roles
     // with no prompt, on both backends. The main worker is exempt — its panel
     // is the one the human actually watches.
+    // Every sub-agent prompt also carries the caucus turn contract (when your
+    // turn ends, your work is done — `role::prompt::SUBAGENT_TURN_CONTRACT`):
+    // caucus's only completion signal is the backend's turn-completion hook, and
+    // a round latches a panel's result the instant it settles (Invariant I-9).
+    // An agent that backgrounds a long command and ends its turn — or waits on
+    // one across turns — therefore reports done while still working, and caucus
+    // captures a half-finished result (§4, §8.5).
     // A sub-agent with a worktree also carries the worktree contract: its cwd
     // is the worktree, but the same repo is checked out at the session root
     // too, and nothing else in its context says which checkout is its own — so
@@ -225,6 +232,7 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
             parts.push(p.clone());
         }
         parts.push(crate::role::prompt::SUBAGENT_QUESTION_CONTRACT.to_string());
+        parts.push(crate::role::prompt::SUBAGENT_TURN_CONTRACT.to_string());
         if let Some(worktree) = &request.worktree_path {
             parts.push(crate::role::prompt::subagent_worktree_contract(worktree));
         }
@@ -482,7 +490,7 @@ pub(crate) fn spawn(request: &SpawnRequest) -> Result<SpawnOutcome, SpawnError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::role::prompt::SUBAGENT_QUESTION_CONTRACT;
+    use crate::role::prompt::{SUBAGENT_QUESTION_CONTRACT, SUBAGENT_TURN_CONTRACT};
 
     fn role() -> RoleSpec {
         RoleSpec {
@@ -582,9 +590,17 @@ mod tests {
         assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
-    /// A sub-agent's resolved role prompt is injected with the caucus question
-    /// contract appended — ask in plain text and end the turn, never through
-    /// an interactive chooser (`build_command`).
+    /// The contracts every sub-agent carries, in the order `build_command`
+    /// appends them: ask in plain text and end the turn
+    /// ([`SUBAGENT_QUESTION_CONTRACT`]), and do not end that turn with work
+    /// still running ([`SUBAGENT_TURN_CONTRACT`]).
+    fn subagent_contracts() -> String {
+        format!("{SUBAGENT_QUESTION_CONTRACT}\n\n{SUBAGENT_TURN_CONTRACT}")
+    }
+
+    /// A sub-agent's resolved role prompt is injected with the caucus contracts
+    /// appended — ask in plain text rather than through an interactive chooser,
+    /// and never end a turn with work still in flight (`build_command`).
     #[test]
     fn claude_argv_injects_resolved_system_prompt_with_question_contract() {
         let req = SpawnRequest {
@@ -594,7 +610,7 @@ mod tests {
             ..SpawnRequest::default()
         };
         let args = args_of(&build_command(&req, PanelId::new()));
-        let expected = format!("You are a reviewer.\n\n{SUBAGENT_QUESTION_CONTRACT}");
+        let expected = format!("You are a reviewer.\n\n{}", subagent_contracts());
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "--append-system-prompt" && w[1] == expected),
@@ -602,9 +618,8 @@ mod tests {
         );
     }
 
-    /// A sub-agent whose role configures no prompt still gets the question
-    /// contract — the contract matters most exactly when the role gives no
-    /// guidance of its own.
+    /// A sub-agent whose role configures no prompt still gets both contracts —
+    /// they matter most exactly when the role gives no guidance of its own.
     #[test]
     fn claude_subagent_without_role_prompt_still_gets_the_contract() {
         let req = SpawnRequest {
@@ -615,9 +630,55 @@ mod tests {
         let args = args_of(&build_command(&req, PanelId::new()));
         assert!(
             args.windows(2)
-                .any(|w| w[0] == "--append-system-prompt" && w[1] == SUBAGENT_QUESTION_CONTRACT),
+                .any(|w| w[0] == "--append-system-prompt" && w[1] == subagent_contracts()),
             "args: {args:?}"
         );
+    }
+
+    /// The turn contract is what caucus's completion signal rests on: the panel
+    /// settles the moment its turn ends, and a round latches its result there
+    /// (Invariant I-9). A sub-agent that backgrounds a long command and ends the
+    /// turn — the failure that made a round deliver a half-finished result and
+    /// then be corrupted by the wake-up turn — must be told so at spawn.
+    #[test]
+    fn every_subagent_carries_the_turn_contract() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "reviewer-r1".into(),
+            system_prompt: Some("You are a reviewer.".into()),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        let prompt = args
+            .windows(2)
+            .find(|w| w[0] == "--append-system-prompt")
+            .map(|w| w[1].clone())
+            .expect("system prompt injected");
+        assert!(prompt.contains(SUBAGENT_TURN_CONTRACT), "prompt: {prompt}");
+    }
+
+    /// The main worker is exempt: it is the panel a human watches, and it is the
+    /// one that *registers* rounds rather than settling into them. Handing it a
+    /// sub-agent turn contract would be a lie about how its panel is read.
+    #[test]
+    fn the_main_worker_gets_no_turn_contract() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "main-1".into(),
+            system_prompt: Some("You are the main worker.".into()),
+            caucus_mcp: Some(CaucusMcp {
+                caucus_bin: PathBuf::from("/usr/local/bin/caucus"),
+                control_sock: PathBuf::from("/repo/.caucus/sessions/S1/control.sock"),
+            }),
+            ..SpawnRequest::default()
+        };
+        let args = args_of(&build_command(&req, PanelId::new()));
+        let prompt = args
+            .windows(2)
+            .find(|w| w[0] == "--append-system-prompt")
+            .map(|w| w[1].clone())
+            .expect("system prompt injected");
+        assert_eq!(prompt, "You are the main worker.", "prompt: {prompt}");
     }
 
     /// A sub-agent that owns a worktree is told which checkout is its own, by
@@ -652,7 +713,8 @@ mod tests {
 
     /// A sub-agent sharing the main checkout has no worktree to be confined to,
     /// so it must NOT be handed the worktree contract — there is no second
-    /// checkout for it to confuse with its own.
+    /// checkout for it to confuse with its own. It still carries the two
+    /// unconditional contracts.
     #[test]
     fn claude_subagent_without_worktree_gets_no_worktree_contract() {
         let req = SpawnRequest {
@@ -663,7 +725,7 @@ mod tests {
         let args = args_of(&build_command(&req, PanelId::new()));
         assert!(
             args.windows(2)
-                .any(|w| w[0] == "--append-system-prompt" && w[1] == SUBAGENT_QUESTION_CONTRACT),
+                .any(|w| w[0] == "--append-system-prompt" && w[1] == subagent_contracts()),
             "args: {args:?}"
         );
     }
@@ -785,9 +847,11 @@ mod tests {
         // No claude flag leaks onto a codex invocation.
         assert!(!args.contains(&"--append-system-prompt".to_string()));
         assert!(!args.contains(&"--disallowedTools".to_string()));
-        // The prompt rides as `-c instructions=<raw text>`, contract appended.
-        let expected =
-            format!("instructions=ROLE GUIDANCE\nsecond line\n\n{SUBAGENT_QUESTION_CONTRACT}");
+        // The prompt rides as `-c instructions=<raw text>`, contracts appended.
+        let expected = format!(
+            "instructions=ROLE GUIDANCE\nsecond line\n\n{}",
+            subagent_contracts()
+        );
         assert!(
             args.windows(2).any(|w| w[0] == "-c" && w[1] == expected),
             "codex argv must carry the role prompt via -c instructions=: {args:?}"
@@ -828,10 +892,10 @@ mod tests {
             ..SpawnRequest::default()
         };
         let args = args_of(&build_command(&req, PanelId::new()));
-        let expected = format!("instructions={SUBAGENT_QUESTION_CONTRACT}");
+        let expected = format!("instructions={}", subagent_contracts());
         assert!(
             args.windows(2).any(|w| w[0] == "-c" && w[1] == expected),
-            "codex argv must carry the contract via -c instructions=: {args:?}"
+            "codex argv must carry the contracts via -c instructions=: {args:?}"
         );
     }
 

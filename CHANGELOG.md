@@ -36,6 +36,22 @@ versions.
   the collection. Delivery stays exactly-once: both halves complete the round
   through one owner.
 
+### Added
+
+- **Every sub-agent is told that ending its turn claims the work is done** — the
+  contract caucus's completion signal has always assumed but never stated. caucus
+  knows a panel is finished only from its backend's turn-completion hook, and a
+  round now latches the panel's result at exactly that instant. An agent that
+  starts a long command in a background shell and ends its turn — or polls that
+  shell with a wait-loop across turns — therefore reports "done" while it is still
+  working, and gets a half-finished result captured. `SUBAGENT_TURN_CONTRACT` is
+  appended at the single spawn path (so it covers preset roles, inline prompts,
+  promptless roles, and both backends, alongside the question and worktree
+  contracts): do not end a turn with work in flight, wait for long commands in the
+  foreground, and if the work cannot finish in one turn say so in plain text rather
+  than leaving it running. The main worker is exempt — it registers rounds rather
+  than settling into them.
+
 ## [0.8.0] — 2026-07-10
 
 A `worktree=true` sub-agent was isolated by cwd but never told so. Three of
