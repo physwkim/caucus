@@ -427,7 +427,13 @@ fn run_signal(cmd: SignalCommand) -> Result<ExitCode> {
                 .with_context(|| format!("invalid --session id '{session}'"))?;
             let panel_id = PanelId::from_str(&panel)
                 .with_context(|| format!("invalid --panel id '{panel}'"))?;
-            crate::signal::post::run(&sock, session_id, panel_id, kind.into())?;
+            // Reply capability is negotiated by env, never by flag
+            // (`docs/design.md` §7.6): the hook script body stays fixed, and a
+            // caucus that can answer injects `CAUCUS_HOOK_REPLY=1` into the
+            // claude main panel alone — any other combination of binary ages
+            // degrades to today's fire-and-forget post.
+            let wants_reply = std::env::var("CAUCUS_HOOK_REPLY").as_deref() == Ok("1");
+            crate::signal::post::run(&sock, session_id, panel_id, kind.into(), wants_reply)?;
             Ok(ExitCode::SUCCESS)
         }
         SignalCommand::Note {

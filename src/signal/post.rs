@@ -16,12 +16,26 @@
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use crate::session::id::{PanelId, SessionId};
 
-use super::{AgentNote, NoteKind, TurnKind, TurnSignal};
+use super::{AgentNote, NoteKind, SignalReply, TurnKind, TurnSignal};
+
+/// How long the client waits for the server's one reply line — the client
+/// half of the reply-timeout ladder (`docs/design.md` §7.6): above the
+/// server's own wait (`server::HOOK_REPLY_WAIT`, 1500ms), so on a slow tick
+/// the *server* resolves first with an explicit allow line and this timeout
+/// only fires when caucus is truly gone; far below Claude's hook timeout
+/// (600s default).
+const HOOK_REPLY_READ_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Longest reply line the client will buffer before giving up (fail-open to
+/// allow). Reply lines are one small JSON object — a round summary teaser is
+/// ~1 KiB per panel — so the cap only guards a corrupted or hostile server.
+const MAX_REPLY_LINE_BYTES: usize = 256 * 1024;
 
 /// Run `caucus signal post`.
 ///
@@ -30,6 +44,14 @@ use super::{AgentNote, NoteKind, TurnKind, TurnSignal};
 /// JSON from `stdin`, builds a [`TurnSignal`], and writes it as one
 /// newline-terminated JSON line to the socket at `sock_path`.
 ///
+/// With `wants_reply` (the `CAUCUS_HOOK_REPLY=1` env caucus injects into the
+/// claude main panel, §7.6) the signal asks the server for a directive and
+/// one reply line is read back: a `deliver` reply prints Claude's Stop-hook
+/// block JSON on stdout — Claude then continues the same turn with the reply's
+/// `reason` (a due round's summary) as feedback. Every other outcome — allow,
+/// timeout, EOF, an unparseable or unknown reply — prints nothing, and the
+/// turn ends exactly as it does today (fail-open).
+///
 /// This is a short-lived client process invoked once per turn by the hook;
 /// it uses blocking std sockets — no async runtime is needed.
 pub(crate) fn run(
@@ -37,6 +59,7 @@ pub(crate) fn run(
     session_id: SessionId,
     panel_id: PanelId,
     kind: TurnKind,
+    wants_reply: bool,
 ) -> Result<()> {
     let mut payload_text = String::new();
     std::io::stdin()
@@ -50,8 +73,20 @@ pub(crate) fn run(
 
     let last_message = extract_last_message(&raw_hook_payload);
 
-    let signal = TurnSignal::now(session_id, panel_id, kind, last_message, raw_hook_payload);
-    send_line(sock_path, &signal)
+    let mut signal = TurnSignal::now(session_id, panel_id, kind, last_message, raw_hook_payload);
+    signal.wants_reply = wants_reply;
+    if !wants_reply {
+        return send_line(sock_path, &signal);
+    }
+    let stream = send_line_on(sock_path, &signal)?;
+    if let Some(reason) = read_deliver_reason(stream) {
+        // Claude's Stop-hook block JSON: `reason` continues the same turn.
+        println!(
+            "{}",
+            serde_json::json!({ "decision": "block", "reason": reason })
+        );
+    }
+    Ok(())
 }
 
 /// Run `caucus signal note` — post one mid-turn [`AgentNote`].
@@ -106,6 +141,13 @@ pub(crate) fn run_codex_notify(
 /// ([`run`]), codex notify ([`run_codex_notify`]), and mid-turn notes
 /// ([`run_note`]).
 fn send_line<T: serde::Serialize>(sock_path: &Path, value: &T) -> Result<()> {
+    send_line_on(sock_path, value).map(drop)
+}
+
+/// [`send_line`], returning the connected stream so a reply-reading caller
+/// ([`run`] under `wants_reply`) can keep the connection open for the server's
+/// reply line.
+fn send_line_on<T: serde::Serialize>(sock_path: &Path, value: &T) -> Result<UnixStream> {
     let mut line = serde_json::to_string(value).context("serialise signal line")?;
     line.push('\n');
 
@@ -113,7 +155,42 @@ fn send_line<T: serde::Serialize>(sock_path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("connect to caucus socket {}", sock_path.display()))?;
     std::io::Write::write_all(&mut stream, line.as_bytes())
         .context("write signal line to caucus socket")?;
-    Ok(())
+    Ok(stream)
+}
+
+/// Read the server's one reply line off `stream` and extract a deliver reason.
+///
+/// Fail-open by construction: returns `None` — meaning "allow, print nothing"
+/// — on a read timeout, EOF before a full line, an oversized line, a parse
+/// failure, an unknown `action`, or an explicit allow. The hook must never
+/// wedge or fail the main worker's turn because the caucus that answers is
+/// old, gone, or slow; the only path that changes anything is a well-formed
+/// deliver reply.
+fn read_deliver_reason(stream: UnixStream) -> Option<String> {
+    stream
+        .set_read_timeout(Some(HOOK_REPLY_READ_TIMEOUT))
+        .ok()?;
+    let mut stream = stream;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while !buf.contains(&b'\n') {
+        if buf.len() > MAX_REPLY_LINE_BYTES {
+            return None;
+        }
+        match stream.read(&mut chunk) {
+            // EOF: judge whatever arrived (a reply without a trailing newline).
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            // Timeout or transport error.
+            Err(_) => return None,
+        }
+    }
+    let line = buf.split(|&b| b == b'\n').next()?;
+    match serde_json::from_slice(line) {
+        Ok(SignalReply::Deliver { reason }) => Some(reason),
+        // Allow, an unknown action, or garbage: nothing to inject.
+        _ => None,
+    }
 }
 
 /// Lift the agent's final assistant message out of a Claude hook payload.
@@ -229,11 +306,11 @@ mod tests {
         .await
         .unwrap();
 
-        let crate::signal::SignalEvent::Turn(sig) =
-            server.signals().recv().await.expect("signal received")
-        else {
+        let (event, reply) = server.signals().recv().await.expect("signal received");
+        let crate::signal::SignalEvent::Turn(sig) = event else {
             panic!("expected a turn signal");
         };
+        assert!(reply.is_none(), "codex notify never asks for a reply");
         assert_eq!(sig.session_id, session_id);
         assert_eq!(sig.panel_id, panel_id);
         assert_eq!(sig.kind, TurnKind::Stop);
@@ -267,11 +344,11 @@ mod tests {
         .await
         .unwrap();
 
-        let crate::signal::SignalEvent::Note(note) =
-            server.signals().recv().await.expect("note received")
-        else {
+        let (event, reply) = server.signals().recv().await.expect("note received");
+        let crate::signal::SignalEvent::Note(note) = event else {
             panic!("expected a note");
         };
+        assert!(reply.is_none(), "a note never asks for a reply");
         assert_eq!(note.session_id, session_id);
         assert_eq!(note.panel_id, panel_id);
         assert_eq!(note.kind, NoteKind::Artifact);
@@ -308,14 +385,71 @@ mod tests {
         .await
         .unwrap();
 
-        let crate::signal::SignalEvent::Turn(sig) =
-            server.signals().recv().await.expect("signal received")
-        else {
+        let (event, _) = server.signals().recv().await.expect("signal received");
+        let crate::signal::SignalEvent::Turn(sig) = event else {
             panic!("expected a turn signal");
         };
         assert_eq!(sig.session_id, session_id);
         assert_eq!(sig.panel_id, panel_id);
         assert_eq!(sig.kind, TurnKind::Stop);
         assert_eq!(sig.last_message.as_deref(), Some("reviewer pass complete"));
+    }
+
+    /// Write `reply` to one end of a socket pair, close it, and run
+    /// [`read_deliver_reason`] on the other end.
+    fn deliver_reason_for(reply: &[u8]) -> Option<String> {
+        use std::io::Write as _;
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        writer.write_all(reply).unwrap();
+        drop(writer);
+        read_deliver_reason(reader)
+    }
+
+    /// The client fail-open matrix (`docs/design.md` §7.6): only a well-formed
+    /// deliver reply injects anything; allow, garbage, and an unknown action
+    /// all print nothing. The deliver case has no trailing newline — a reply
+    /// finished by EOF is still judged.
+    #[test]
+    fn read_deliver_reason_fail_open_matrix() {
+        assert_eq!(
+            deliver_reason_for(br#"{"action":"deliver","reason":"round done"}"#).as_deref(),
+            Some("round done"),
+            "a deliver reply carries its reason"
+        );
+        assert_eq!(
+            deliver_reason_for(b"{\"action\":\"allow\"}\n"),
+            None,
+            "an explicit allow injects nothing"
+        );
+        assert_eq!(
+            deliver_reason_for(b"not json\n"),
+            None,
+            "garbage injects nothing"
+        );
+        assert_eq!(
+            deliver_reason_for(b"{\"action\":\"reticulate\"}\n"),
+            None,
+            "an unknown action injects nothing"
+        );
+        assert_eq!(
+            deliver_reason_for(b""),
+            None,
+            "EOF with no reply injects nothing"
+        );
+    }
+
+    /// A server that never answers is cut off by the client's read timeout —
+    /// the hook exits open rather than wedging the main worker's turn. Takes
+    /// [`HOOK_REPLY_READ_TIMEOUT`] (2.5s) of real time by design.
+    #[test]
+    fn read_deliver_reason_times_out_to_allow() {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(read_deliver_reason(reader), None);
+        assert!(
+            started.elapsed() >= HOOK_REPLY_READ_TIMEOUT,
+            "the read must wait out the full timeout before failing open"
+        );
+        drop(writer);
     }
 }

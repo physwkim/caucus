@@ -46,6 +46,15 @@ pub struct TurnSignal {
     /// hence the serde default.
     #[serde(default)]
     pub transcript_path: Option<PathBuf>,
+    /// Whether the poster waits for a one-line [`SignalReply`] on the same
+    /// connection before its hook exits (`docs/design.md` §7.6). Set only by
+    /// `caucus signal post` running under `CAUCUS_HOOK_REPLY=1` — which caucus
+    /// injects into the claude **main** panel alone. `false` serialises to
+    /// nothing at all, so every other poster's wire line stays byte-identical
+    /// to the pre-reply protocol, and a line from an older binary parses with
+    /// `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wants_reply: bool,
     /// The raw Claude hook payload, retained verbatim for diagnostics.
     pub raw_hook_payload: serde_json::Value,
 }
@@ -69,6 +78,7 @@ impl TurnSignal {
             kind,
             last_message,
             transcript_path,
+            wants_reply: false,
             raw_hook_payload,
         }
     }
@@ -163,6 +173,50 @@ pub enum SignalEvent {
     Note(AgentNote),
 }
 
+/// What the runtime tells a waiting main-panel Stop hook to do
+/// (`docs/design.md` §7.6): sent through the per-signal oneshot the server
+/// pairs with a `wants_reply` turn signal, and serialised by the server as the
+/// connection's [`SignalReply`] line.
+///
+/// There is deliberately no `Allow` variant. Every non-deliver path — the
+/// panel is not main, no round is due, the human is mid-compose, the runtime
+/// is gone — expresses itself by *dropping the sender*, which the server turns
+/// into [`SignalReply::Allow`]. Allow is the absence of a directive, so no
+/// code path can forget to send it.
+#[derive(Debug)]
+pub enum StopDirective {
+    /// Deliver `reason` into the main worker's continuing turn: the hook
+    /// prints Claude's Stop-hook block JSON (`{"decision":"block","reason":…}`),
+    /// and Claude receives `reason` as feedback in the same turn.
+    Deliver {
+        /// The round summary to inject (`Multiplexer::take_due_round_summary`).
+        reason: String,
+    },
+}
+
+/// One reply line on the signal socket, server → `caucus signal post`
+/// (`docs/design.md` §7.6). Internally tagged by `action` so a future action
+/// this binary does not know fails the parse — and the client treats a failed
+/// parse as allow (fail-open).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum SignalReply {
+    /// Nothing to inject: the hook exits silently and the turn ends normally.
+    Allow,
+    /// Print the Stop-hook block JSON so `reason` continues the turn.
+    Deliver { reason: String },
+}
+
+/// One parsed signal-socket event plus its reply slot. The sender is `Some`
+/// only for a turn signal that asked for a reply (`TurnSignal::wants_reply`);
+/// the server holds the matching receiver and answers the connection with
+/// whatever arrives — or [`SignalReply::Allow`] when the sender is dropped or
+/// the wait times out.
+pub type SignalEnvelope = (
+    SignalEvent,
+    Option<tokio::sync::oneshot::Sender<StopDirective>>,
+);
+
 /// Lift the conversation-transcript path out of a hook payload. Claude Code's
 /// Stop hook documents the `transcript_path` field; codex's notify JSON has no
 /// counterpart, so codex signals carry `None`.
@@ -221,6 +275,55 @@ mod tests {
         assert!(
             kept.chars().all(|c| c == '한'),
             "the cut must not split a char"
+        );
+    }
+
+    /// A signal that does not ask for a reply serialises with no `wants_reply`
+    /// key at all — byte-identical to the pre-reply wire — and a line without
+    /// the key (an older binary) parses as `false`.
+    #[test]
+    fn wants_reply_false_is_absent_from_the_wire() {
+        let signal = TurnSignal::now(
+            SessionId::new(),
+            PanelId::new(),
+            TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        );
+        let line = serde_json::to_string(&signal).unwrap();
+        assert!(
+            !line.contains("wants_reply"),
+            "false must serialise to nothing: {line}"
+        );
+
+        let back: TurnSignal = serde_json::from_str(&line).unwrap();
+        assert!(!back.wants_reply);
+    }
+
+    /// The reply line round-trips both actions, and an action this binary does
+    /// not know fails the parse — which the client treats as allow.
+    #[test]
+    fn signal_reply_wire_forms() {
+        let allow = serde_json::to_string(&SignalReply::Allow).unwrap();
+        assert_eq!(allow, r#"{"action":"allow"}"#);
+        let deliver = serde_json::to_string(&SignalReply::Deliver {
+            reason: "round done".into(),
+        })
+        .unwrap();
+        assert_eq!(deliver, r#"{"action":"deliver","reason":"round done"}"#);
+
+        assert!(matches!(
+            serde_json::from_str::<SignalReply>(&allow).unwrap(),
+            SignalReply::Allow
+        ));
+        let SignalReply::Deliver { reason } = serde_json::from_str(&deliver).unwrap() else {
+            panic!("deliver line must parse as Deliver");
+        };
+        assert_eq!(reason, "round done");
+
+        assert!(
+            serde_json::from_str::<SignalReply>(r#"{"action":"reticulate"}"#).is_err(),
+            "an unknown action must fail the parse (client fails open to allow)"
         );
     }
 

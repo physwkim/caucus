@@ -757,8 +757,9 @@ async fn event_loop(
 
         // 2. Signal events — drain whatever the socket server has queued: turn
         //    signals settle panels, mid-turn notes are recorded without any
-        //    state transition.
-        while let Ok(event) = signal_server.signals().try_recv() {
+        //    state transition. Dropping a turn signal's reply slot answers its
+        //    waiting hook with allow.
+        while let Ok((event, _reply)) = signal_server.signals().try_recv() {
             match event {
                 crate::signal::SignalEvent::Turn(signal) => mux.handle_signal(signal),
                 crate::signal::SignalEvent::Note(note) => mux.handle_note(note),
