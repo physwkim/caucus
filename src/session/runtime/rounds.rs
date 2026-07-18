@@ -1249,7 +1249,7 @@ impl Multiplexer {
         let Some(notice) = self.pending_question_notices.front() else {
             return;
         };
-        let text = Self::question_notice(notice);
+        let text = self.question_notice(notice);
         // `main_live` + `main_deliverable` imply the main panel exists.
         let main_id = self
             .main_panel_id
@@ -1265,12 +1265,44 @@ impl Multiplexer {
     }
 
     /// Render one question notice for injection into the main panel.
-    fn question_notice(notice: &QuestionNotice) -> String {
+    ///
+    /// The guidance clause reports the questioning panel's state **as of
+    /// delivery**, not as of the note's arrival. A notice can wait behind a
+    /// round push for a whole main turn (both share the one-push-per-tick
+    /// gate), and the panel may settle or exit in that window — an
+    /// enqueue-time "still mid-turn, it queues input" claim would then send
+    /// the main worker to open a spurious new turn on an idle panel, or to
+    /// answer into a dead one. The notice itself is never suppressed: whether
+    /// the question is already resolved is knowledge caucus does not have
+    /// (the main worker may have pre-answered from `last_note`), and a
+    /// question from a panel that died may explain why it died.
+    fn question_notice(&self, notice: &QuestionNotice) -> String {
+        let state = self
+            .panels
+            .iter()
+            .find(|p| p.id == notice.panel)
+            .map(|p| p.state());
+        let guidance = match state {
+            Some(PanelState::Working) | Some(PanelState::Spawning) => format!(
+                "(answer with send_keys({}, \"<your answer>\"); the panel is \
+                 still mid-turn — its agent queues input that arrives while it \
+                 works.)",
+                notice.panel
+            ),
+            Some(PanelState::Idle) => format!(
+                "(the panel has since ended its turn — check its result first \
+                 (read_panel / list_panels last_note); it may have moved past \
+                 this question. Answering with send_keys({}, ...) starts a new \
+                 turn.)",
+                notice.panel
+            ),
+            Some(PanelState::Exited) | None => "(the panel has since exited — there is no \
+                 turn to answer into; the question may explain why it stopped.)"
+                .to_string(),
+        };
         format!(
-            "[caucus] panel {} (role: {}) asks:\n{}\n(answer with send_keys({}, \
-             \"<your answer>\"); the panel is still mid-turn — its agent queues \
-             input that arrives while it works.)",
-            notice.panel, notice.role, notice.body, notice.panel
+            "[caucus] panel {} (role: {}) asks:\n{}\n{}",
+            notice.panel, notice.role, notice.body, guidance
         )
     }
 
@@ -3205,6 +3237,45 @@ mod tests {
         // Same tick again: the gate is now closed (main `Working`).
         mux.poll_question_notices();
         assert_eq!(mux.pending_question_notices.len(), 1);
+        mux.shutdown();
+    }
+
+    /// The notice's guidance clause reports the questioning panel's state at
+    /// delivery time, one boundary per state. The observed live-session edge:
+    /// a notice that waited behind a round push landed after its panel had
+    /// settled, still claiming the panel "queues input" — a main worker
+    /// following that literally opens a spurious new turn on an idle panel.
+    #[tokio::test]
+    async fn question_notice_guidance_tracks_the_panel_state_at_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        let notice = QuestionNotice {
+            panel: sub,
+            role: "reviewer".into(),
+            body: "which schema?".into(),
+        };
+
+        // Still mid-turn: the queue-input claim holds.
+        let text = mux.question_notice(&notice);
+        assert!(text.contains("still mid-turn"), "working: {text}");
+
+        // Settled before delivery: the mid-turn claim must not survive, and
+        // the reader is told an answer opens a fresh turn.
+        let panel = mux.panels.iter_mut().find(|p| p.id == sub).unwrap();
+        crate::panel::lifecycle::transition(panel, PanelState::Idle).unwrap();
+        let text = mux.question_notice(&notice);
+        assert!(!text.contains("still mid-turn"), "idle: {text}");
+        assert!(text.contains("starts a new turn"), "idle: {text}");
+
+        // Gone before delivery: no answer path is advertised at all.
+        let text = mux.question_notice(&QuestionNotice {
+            panel: PanelId::new(),
+            role: "reviewer".into(),
+            body: "which schema?".into(),
+        });
+        assert!(!text.contains("send_keys"), "gone: {text}");
+        assert!(text.contains("exited"), "gone: {text}");
         mux.shutdown();
     }
 

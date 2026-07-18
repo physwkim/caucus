@@ -607,8 +607,14 @@ caucus signal note --kind progress "sweep half done: 40/80 files"
   (cap 32, drop-oldest)에 쌓이고, round 배달과 동일한 deliverability gate
   (main `Idle` + compose hold 없음, `main_deliverable`)에서 tick당 하나씩
   `send_keys`로 들어간다. main이 사라지면(패널 없음/`Exited`) 큐를 버린다 —
-  round 배달과 같은 규칙. 답은 main이 해당 패널에 `send_keys`로 보낸다;
-  패널 agent는 작업 중 도착한 입력을 큐잉했다가 읽는다.
+  round 배달과 같은 규칙.
+- notice의 안내 절은 **배달 시점의 패널 상태**를 보고한다. notice는 round
+  push 뒤에서 main 턴 하나를 통째로 기다릴 수 있고(같은 push-per-tick 게이트),
+  그 창에서 질문한 패널이 정착하거나 종료할 수 있다: `Working`이면 "mid-turn,
+  입력은 큐잉된다", `Idle`이면 "턴이 끝났다 — 결과부터 확인하라, 답하면 새 턴이
+  열린다", 소멸/`Exited`면 "패널이 종료됐다 — 질문이 그 이유를 설명할 수 있다".
+  notice 자체는 억제하지 않는다: 질문이 이미 해소됐는지(main이 `last_note`를
+  보고 선답했는지)는 caucus가 모르는 지식이다.
 
 모든 sub-agent system prompt에는 note contract
 (`role::prompt::SUBAGENT_NOTE_CONTRACT`)가 부착된다 — question contract
