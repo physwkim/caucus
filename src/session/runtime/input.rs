@@ -4,7 +4,7 @@ use crate::agent::manifest;
 use crate::agent::provenance::{self, LaneCommitProvenance, SupersededBy};
 use crate::input::CaucusCommand;
 use crate::panel::lifecycle::{self, PanelState};
-use crate::signal::TurnSignal;
+use crate::signal::{AgentNote, NoteKind, TurnSignal};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -261,6 +261,31 @@ impl Multiplexer {
         self.record_commit_supersessions(signal.panel_id);
     }
 
+    /// Ingest a mid-turn note: cap its body once (`AgentNote::truncated`, so
+    /// the manifest record and any notice see the same text) and record it on
+    /// the panel's manifest via `agent::manifest::record_note` (Invariant
+    /// I-2). Deliberately NO panel state transition — a note arrives mid-turn;
+    /// the turn is talking, not ending, so `Working` survives it. A
+    /// `question` note is additionally queued for the main worker
+    /// ([`Multiplexer::poll_question_notices`]).
+    pub fn handle_note(&mut self, note: AgentNote) {
+        // A note for a panel caucus does not know (already killed, or a stray
+        // client) has nowhere to be recorded and no one to be forwarded for.
+        let Some(panel) = self.panels.iter().find(|p| p.id == note.panel_id) else {
+            return;
+        };
+        let role = panel.role.clone();
+        let note = note.truncated();
+        if let Some(manifest) = self.manifests.get_mut(&note.panel_id)
+            && let Err(err) = manifest::record_note(manifest, &self.session.root_dir, &note)
+        {
+            warn!(panel = %note.panel_id, error = %err, "manifest note write failed");
+        }
+        if note.kind == NoteKind::Question {
+            self.enqueue_question_notice(note.panel_id, role, note.body);
+        }
+    }
+
     /// Record a `CommitCreated` event when the turn that just ended named a
     /// commit this agent left on its own branch (`docs/design.md` §5).
     ///
@@ -484,6 +509,88 @@ mod tests {
             on_disk.lane_events()
         );
         mux.shutdown();
+    }
+
+    /// A mid-turn note records on the panel's manifest and does NOT end the
+    /// turn: the panel stays `Working` (contrast `handle_signal`, which flips
+    /// it `Idle`). A non-`question` note queues nothing for the main worker.
+    #[tokio::test]
+    async fn handle_note_records_without_ending_the_turn() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        let agent_id = mf.agent_id;
+        mux.manifests.insert(id, mf);
+
+        mux.handle_note(AgentNote::now(
+            mux.session.id,
+            id,
+            NoteKind::Progress,
+            "halfway through the sweep".into(),
+        ));
+
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == id).unwrap().state(),
+            PanelState::Working,
+            "a note must not end the turn"
+        );
+        assert!(
+            mux.pending_question_notices.is_empty(),
+            "a progress note queues nothing for main"
+        );
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(
+            on_disk.last_note(),
+            Some("[progress] halfway through the sweep")
+        );
+        mux.shutdown();
+    }
+
+    /// A `question` note is additionally queued for the main worker; delivery
+    /// itself is `poll_question_notices`' job (tested in `rounds`).
+    #[tokio::test]
+    async fn handle_note_queues_a_question_for_the_main_worker() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+
+        mux.handle_note(AgentNote::now(
+            mux.session.id,
+            id,
+            NoteKind::Question,
+            "which API version should I target?".into(),
+        ));
+
+        assert_eq!(mux.pending_question_notices.len(), 1);
+        mux.shutdown();
+    }
+
+    /// A note for a panel caucus does not know (already killed, or a stray
+    /// client) is dropped whole: nothing to record on, no one to forward for.
+    #[tokio::test]
+    async fn handle_note_for_an_unknown_panel_is_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        mux.handle_note(AgentNote::now(
+            mux.session.id,
+            PanelId::new(),
+            NoteKind::Question,
+            "does anyone hear me?".into(),
+        ));
+
+        assert!(mux.pending_question_notices.is_empty());
     }
 
     /// A turn signal whose final message names a commit this agent left on its

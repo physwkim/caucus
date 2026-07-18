@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 
 use crate::session::id::{PanelId, SessionId};
 
-use super::{TurnKind, TurnSignal};
+use super::{AgentNote, NoteKind, TurnKind, TurnSignal};
 
 /// Run `caucus signal post`.
 ///
@@ -51,7 +51,25 @@ pub(crate) fn run(
     let last_message = extract_last_message(&raw_hook_payload);
 
     let signal = TurnSignal::now(session_id, panel_id, kind, last_message, raw_hook_payload);
-    send_signal(sock_path, &signal)
+    send_line(sock_path, &signal)
+}
+
+/// Run `caucus signal note` — post one mid-turn [`AgentNote`].
+///
+/// Invoked by an agent from its own shell (the `--sock`/`--session`/`--panel`
+/// flags default to the `CAUCUS_*` env caucus injects into every panel), so
+/// unlike the hook clients above a human-readable error is worth surfacing:
+/// the agent sees it and can tell the difference between a typo and a dead
+/// session.
+pub(crate) fn run_note(
+    sock_path: &Path,
+    session_id: SessionId,
+    panel_id: PanelId,
+    kind: NoteKind,
+    body: String,
+) -> Result<()> {
+    let note = AgentNote::now(session_id, panel_id, kind, body);
+    send_line(sock_path, &note)
 }
 
 /// Run `caucus signal codex-notify` — the codex counterpart of [`run`].
@@ -80,20 +98,21 @@ pub(crate) fn run_codex_notify(
 
     let last_message = extract_last_message(&raw);
     let signal = TurnSignal::now(session_id, panel_id, TurnKind::Stop, last_message, raw);
-    send_signal(sock_path, &signal)
+    send_line(sock_path, &signal)
 }
 
-/// Write one newline-terminated [`TurnSignal`] JSON line to the socket at
-/// `sock_path`. The single socket-write shared by both the claude ([`run`]) and
-/// codex ([`run_codex_notify`]) post paths.
-fn send_signal(sock_path: &Path, signal: &TurnSignal) -> Result<()> {
-    let mut line = serde_json::to_string(signal).context("serialise turn signal")?;
+/// Write one newline-terminated JSON line to the socket at `sock_path`. The
+/// single socket-write shared by every post path — the claude Stop hook
+/// ([`run`]), codex notify ([`run_codex_notify`]), and mid-turn notes
+/// ([`run_note`]).
+fn send_line<T: serde::Serialize>(sock_path: &Path, value: &T) -> Result<()> {
+    let mut line = serde_json::to_string(value).context("serialise signal line")?;
     line.push('\n');
 
     let mut stream = UnixStream::connect(sock_path)
         .with_context(|| format!("connect to caucus socket {}", sock_path.display()))?;
     std::io::Write::write_all(&mut stream, line.as_bytes())
-        .context("write turn signal to caucus socket")?;
+        .context("write signal line to caucus socket")?;
     Ok(())
 }
 
@@ -210,11 +229,53 @@ mod tests {
         .await
         .unwrap();
 
-        let sig = server.signals().recv().await.expect("signal received");
+        let crate::signal::SignalEvent::Turn(sig) =
+            server.signals().recv().await.expect("signal received")
+        else {
+            panic!("expected a turn signal");
+        };
         assert_eq!(sig.session_id, session_id);
         assert_eq!(sig.panel_id, panel_id);
         assert_eq!(sig.kind, TurnKind::Stop);
         assert_eq!(sig.last_message.as_deref(), Some("3 findings, all fixed"));
+    }
+
+    /// `run_note` connects, posts, and the server's channel yields the note —
+    /// the sub-agent backchannel end to end.
+    #[tokio::test]
+    async fn run_note_delivers_note_to_server() {
+        use crate::signal::server::SignalServer;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("caucus.sock");
+        let mut server = SignalServer::bind(&sock).unwrap();
+
+        let session_id = SessionId::new();
+        let panel_id = PanelId::new();
+
+        let sock_for_client = sock.clone();
+        tokio::task::spawn_blocking(move || {
+            run_note(
+                &sock_for_client,
+                session_id,
+                panel_id,
+                NoteKind::Artifact,
+                "wrote design draft to doc/draft.md".to_string(),
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let crate::signal::SignalEvent::Note(note) =
+            server.signals().recv().await.expect("note received")
+        else {
+            panic!("expected a note");
+        };
+        assert_eq!(note.session_id, session_id);
+        assert_eq!(note.panel_id, panel_id);
+        assert_eq!(note.kind, NoteKind::Artifact);
+        assert_eq!(note.body, "wrote design draft to doc/draft.md");
     }
 
     /// `run` connects, posts, and the server's channel yields the signal.
@@ -247,7 +308,11 @@ mod tests {
         .await
         .unwrap();
 
-        let sig = server.signals().recv().await.expect("signal received");
+        let crate::signal::SignalEvent::Turn(sig) =
+            server.signals().recv().await.expect("signal received")
+        else {
+            panic!("expected a turn signal");
+        };
         assert_eq!(sig.session_id, session_id);
         assert_eq!(sig.panel_id, panel_id);
         assert_eq!(sig.kind, TurnKind::Stop);

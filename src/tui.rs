@@ -755,9 +755,14 @@ async fn event_loop(
             warn!(error = %e, "clipboard OSC 52 write failed");
         }
 
-        // 2. Turn signals — drain whatever the socket server has queued.
-        while let Ok(signal) = signal_server.signals().try_recv() {
-            mux.handle_signal(signal);
+        // 2. Signal events — drain whatever the socket server has queued: turn
+        //    signals settle panels, mid-turn notes are recorded without any
+        //    state transition.
+        while let Ok(event) = signal_server.signals().try_recv() {
+            match event {
+                crate::signal::SignalEvent::Turn(signal) => mux.handle_signal(signal),
+                crate::signal::SignalEvent::Note(note) => mux.handle_note(note),
+            }
         }
 
         // 3. Control jobs — execute the main worker's queued MCP tool calls against
@@ -798,6 +803,12 @@ async fn event_loop(
         //    (or its fallback deadline passed), assemble their results and
         //    inject them into the main worker's panel (the caucus→main push).
         mux.poll_pending_rounds();
+
+        // 6b. Question notices — a panel agent posted a `question` note
+        //     (`caucus signal note`); announce it to the main worker. After
+        //     round delivery: a finished round is the primary deliverable, and
+        //     all pushes share the one-push-per-tick gate.
+        mux.poll_question_notices();
 
         // 7. Stranded-main guard — if the main worker went idle with no round
         //    registered while sub-panels still run, nothing above can ever

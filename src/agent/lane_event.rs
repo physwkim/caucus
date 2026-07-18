@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::provenance::{LaneCommitProvenance, SupersededBy};
+use crate::signal::NoteKind;
 
 /// Failure-class taxonomy for blockers (`docs/design.md` §8.3).
 ///
@@ -89,6 +90,10 @@ pub enum LaneEventKind {
     /// `AgentManifest::live_commits` is that derivation, and the chain of these
     /// events is the lineage — neither is stored twice.
     CommitSuperseded { commit: String, by: SupersededBy },
+    /// A mid-turn note the agent posted (`caucus signal note`) — progress, an
+    /// artifact reference, or a question. Produced by `manifest::record_note`.
+    /// Deliberately transition-free: the panel stays `Working`.
+    NoteRecorded { note_kind: NoteKind, body: String },
     /// A worktree was created for this agent. Produced at the manifest's first
     /// write in `Multiplexer::spawn_panel_inner`.
     WorktreeCreated { path: PathBuf },
@@ -184,6 +189,7 @@ mod tests {
                 LaneEventKind::CommitSuperseded { .. } => {
                     (input, "LaneEventKind::CommitSuperseded {")
                 }
+                LaneEventKind::NoteRecorded { .. } => (manifest, "LaneEventKind::NoteRecorded {"),
                 LaneEventKind::WorktreeCreated { .. } => {
                     (spawn, "LaneEventKind::WorktreeCreated {")
                 }
@@ -213,6 +219,10 @@ mod tests {
             LaneEventKind::CommitSuperseded {
                 commit: "abc1234".into(),
                 by: SupersededBy::Unknown,
+            },
+            LaneEventKind::NoteRecorded {
+                note_kind: NoteKind::Progress,
+                body: "half done".into(),
             },
             LaneEventKind::WorktreeCreated { path: path.clone() },
             LaneEventKind::WorktreeRemoved { path },

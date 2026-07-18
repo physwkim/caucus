@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::doctor::{self, Severity};
 use crate::role::spec::AgentCli;
 use crate::session::id::{PanelId, SessionId};
-use crate::signal::TurnKind;
+use crate::signal::{NoteKind, TurnKind};
 
 /// Exit code for an environment error (`docs/design.md` §10.1).
 const EXIT_ENV_ERROR: u8 = 3;
@@ -171,6 +171,27 @@ pub enum SignalCommand {
         #[arg(long, value_enum, default_value = "stop")]
         kind: SignalKindArg,
     },
+    /// Post a mid-turn note — structured progress, an artifact reference, or a
+    /// question — without ending the turn. Invoked by an agent from its own
+    /// shell: the socket and ids default to the `CAUCUS_*` env caucus injects
+    /// into every panel, so a panel agent just runs
+    /// `caucus signal note --kind progress "half done, 3 files left"`.
+    Note {
+        /// Path to the caucus turn-signal socket.
+        #[arg(long, env = "CAUCUS_SOCK")]
+        sock: PathBuf,
+        /// Session id (`CAUCUS_SESSION_ID`).
+        #[arg(long, env = "CAUCUS_SESSION_ID")]
+        session: String,
+        /// Panel id (`CAUCUS_PANEL_ID`).
+        #[arg(long, env = "CAUCUS_PANEL_ID")]
+        panel: String,
+        /// Note kind. `question` is forwarded to the main worker.
+        #[arg(long, value_enum, default_value = "progress")]
+        kind: NoteKindArg,
+        /// The note body.
+        body: String,
+    },
     /// Post a turn signal from codex's `notify` program. codex has no `Stop`
     /// hook; it invokes this on `agent-turn-complete`, appending the event JSON
     /// as the final positional argument (not stdin, unlike the claude hook).
@@ -207,6 +228,24 @@ impl From<SignalKindArg> for TurnKind {
             SignalKindArg::Stop => TurnKind::Stop,
             SignalKindArg::ToolBlocked => TurnKind::ToolBlocked,
             SignalKindArg::Error => TurnKind::Error,
+        }
+    }
+}
+
+/// CLI spelling of [`NoteKind`].
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum NoteKindArg {
+    Progress,
+    Artifact,
+    Question,
+}
+
+impl From<NoteKindArg> for NoteKind {
+    fn from(arg: NoteKindArg) -> Self {
+        match arg {
+            NoteKindArg::Progress => NoteKind::Progress,
+            NoteKindArg::Artifact => NoteKind::Artifact,
+            NoteKindArg::Question => NoteKind::Question,
         }
     }
 }
@@ -389,6 +428,20 @@ fn run_signal(cmd: SignalCommand) -> Result<ExitCode> {
             let panel_id = PanelId::from_str(&panel)
                 .with_context(|| format!("invalid --panel id '{panel}'"))?;
             crate::signal::post::run(&sock, session_id, panel_id, kind.into())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        SignalCommand::Note {
+            sock,
+            session,
+            panel,
+            kind,
+            body,
+        } => {
+            let session_id = SessionId::from_str(&session)
+                .with_context(|| format!("invalid --session id '{session}'"))?;
+            let panel_id = PanelId::from_str(&panel)
+                .with_context(|| format!("invalid --panel id '{panel}'"))?;
+            crate::signal::post::run_note(&sock, session_id, panel_id, kind.into(), body)?;
             Ok(ExitCode::SUCCESS)
         }
         SignalCommand::CodexNotify {
@@ -632,6 +685,34 @@ mod tests {
             cli.command,
             Some(Command::Signal(SignalCommand::Post { .. }))
         ));
+    }
+
+    /// `signal note` parses with explicit flags, and the kind defaults to
+    /// `progress`. (The env-var defaults are clap `env = "CAUCUS_*"` wiring;
+    /// exercising them here would mutate process-global env in a parallel test
+    /// run, so only the flag form is parsed.)
+    #[test]
+    fn signal_note_parses_with_default_kind() {
+        let cli = Cli::try_parse_from([
+            "caucus",
+            "signal",
+            "note",
+            "--sock",
+            "/tmp/c.sock",
+            "--session",
+            "S",
+            "--panel",
+            "P",
+            "wrote the draft",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Signal(SignalCommand::Note { kind, body, .. })) => {
+                assert!(matches!(kind, NoteKindArg::Progress));
+                assert_eq!(body, "wrote the draft");
+            }
+            other => panic!("expected signal note, got {other:?}"),
+        }
     }
 
     #[test]

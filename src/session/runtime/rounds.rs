@@ -31,6 +31,13 @@ const COMPOSE_GRACE: Duration = Duration::from_secs(5);
 /// at most this often, so the safety net never floods its context every tick.
 const STRANDED_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Most `question` notices queued for the main worker at once
+/// (`Multiplexer::pending_question_notices`). Delivery drains one per tick and
+/// needs an idle main, so a runaway agent posting questions in a loop would
+/// otherwise grow the queue without bound; past the cap the oldest is dropped
+/// with a warning — the newest question is the one still worth answering.
+pub(super) const QUESTION_NOTICE_CAP: usize = 32;
+
 /// Per-captured-turn byte budget in the **on-disk** round report
 /// ([`Multiplexer::assemble_round_report`]). A turn body over this is head/tail
 /// truncated in the report and its full text spilled to
@@ -149,6 +156,17 @@ fn push_round_panel_footer(out: &mut String, c: &RoundPanelContribution) {
 /// per-tick round watch ([`Multiplexer::poll_round_blocked_panels`]) pushes a
 /// deduped interim notice for each so the main worker can act before the
 /// fallback deadline rather than the round silently stalling.
+/// One queued `question` note awaiting announcement to the main worker
+/// (`Multiplexer::pending_question_notices` →
+/// [`Multiplexer::poll_question_notices`]). The role is captured at enqueue —
+/// the panel may be gone by delivery time.
+#[derive(Debug, Clone)]
+pub(super) struct QuestionNotice {
+    pub(super) panel: PanelId,
+    pub(super) role: String,
+    pub(super) body: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum BlockedPrompt {
     /// A numbered selection menu — answered with `select_option`.
@@ -1121,6 +1139,81 @@ impl Multiplexer {
             Ok(()) => self.main_stranded_last_nudge = Some(Instant::now()),
             Err(err) => warn!(error = %err, "stranded-main nudge to main panel failed"),
         }
+    }
+
+    /// Queue a `question` note for announcement to the main worker
+    /// ([`Multiplexer::poll_question_notices`]). The role is captured now —
+    /// the panel may be gone by delivery time, and the question can still be
+    /// worth answering (it may explain *why* the panel died).
+    pub(super) fn enqueue_question_notice(&mut self, panel: PanelId, role: String, body: String) {
+        if self.pending_question_notices.len() >= QUESTION_NOTICE_CAP {
+            let dropped = self.pending_question_notices.pop_front();
+            warn!(
+                panel = %panel,
+                dropped = ?dropped.map(|n| n.panel),
+                "question-notice queue full; dropped the oldest notice"
+            );
+        }
+        self.pending_question_notices
+            .push_back(QuestionNotice { panel, role, body });
+    }
+
+    /// Announce queued `question` notes to the main worker, one per tick,
+    /// under the same deliverability gate as every other caucus→main push
+    /// ([`Multiplexer::main_deliverable`]). Called once per event-loop tick,
+    /// after round delivery — a finished round is the primary deliverable.
+    ///
+    /// A failed injection keeps the notice queued so a later tick retries
+    /// (mirroring round delivery). If the main worker is gone — no main panel,
+    /// or it `Exited` — the queue is dropped with a warning: no wake path will
+    /// ever exist, exactly the round-delivery rule.
+    pub fn poll_question_notices(&mut self) {
+        if self.pending_question_notices.is_empty() {
+            return;
+        }
+        let main_live = self.main_panel_id.is_some_and(|id| {
+            self.panels
+                .iter()
+                .find(|p| p.id == id)
+                .is_some_and(|p| p.state() != PanelState::Exited)
+        });
+        if !main_live {
+            warn!(
+                dropped = self.pending_question_notices.len(),
+                "main worker gone; dropping queued question notices"
+            );
+            self.pending_question_notices.clear();
+            return;
+        }
+        if !self.main_deliverable() {
+            return;
+        }
+        let Some(notice) = self.pending_question_notices.front() else {
+            return;
+        };
+        let text = Self::question_notice(notice);
+        // `main_live` + `main_deliverable` imply the main panel exists.
+        let main_id = self
+            .main_panel_id
+            .expect("deliverable implies a main panel");
+        match McpToolSurface::send_keys(self, main_id, &text, true) {
+            Ok(()) => {
+                self.pending_question_notices.pop_front();
+            }
+            Err(err) => {
+                warn!(error = %err, "question notice delivery to main panel failed; will retry")
+            }
+        }
+    }
+
+    /// Render one question notice for injection into the main panel.
+    fn question_notice(notice: &QuestionNotice) -> String {
+        format!(
+            "[caucus] panel {} (role: {}) asks:\n{}\n(answer with send_keys({}, \
+             \"<your answer>\"); the panel is still mid-turn — its agent queues \
+             input that arrives while it works.)",
+            notice.panel, notice.role, notice.body, notice.panel
+        )
     }
 
     /// Announce to the main worker when a panel in a pending round has stopped
@@ -3019,6 +3112,106 @@ mod tests {
         );
 
         mux.shutdown();
+    }
+
+    /// A queued question notice is injected into an idle main — which flips
+    /// it `Working` (the injected turn), closing the deliverability gate: at
+    /// most one notice lands per tick, the rest stay queued.
+    #[tokio::test]
+    async fn poll_question_notices_delivers_one_notice_per_tick_to_idle_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let sub = PanelId::new();
+        mux.enqueue_question_notice(sub, "reviewer".into(), "first question?".into());
+        mux.enqueue_question_notice(sub, "reviewer".into(), "second question?".into());
+
+        mux.poll_question_notices();
+        assert_eq!(
+            mux.pending_question_notices.len(),
+            1,
+            "one notice delivered, the other queued"
+        );
+        assert_eq!(
+            mux.pending_question_notices.front().unwrap().body,
+            "second question?",
+            "delivery is FIFO"
+        );
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the injected notice is a turn: main flips Working"
+        );
+
+        // Same tick again: the gate is now closed (main `Working`).
+        mux.poll_question_notices();
+        assert_eq!(mux.pending_question_notices.len(), 1);
+        mux.shutdown();
+    }
+
+    /// An un-submitted human keystroke in the main panel holds notice
+    /// delivery — the same `COMPOSE_GRACE` gate as round delivery. The notice
+    /// stays queued for a later tick.
+    #[tokio::test]
+    async fn poll_question_notices_holds_while_the_user_composes() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        mux.enqueue_question_notice(PanelId::new(), "reviewer".into(), "held?".into());
+        mux.main_compose_since = Some(Instant::now());
+
+        mux.poll_question_notices();
+        assert_eq!(
+            mux.pending_question_notices.len(),
+            1,
+            "the compose hold must keep the notice queued"
+        );
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "nothing was injected into the composed-on panel"
+        );
+        mux.shutdown();
+    }
+
+    /// With the main worker gone (its panel `Exited`) no wake path will ever
+    /// exist: the queue is dropped rather than accreting forever — the same
+    /// rule round delivery applies.
+    #[tokio::test]
+    async fn poll_question_notices_drops_the_queue_when_main_is_gone() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Exited);
+        mux.main_panel_id = Some(main);
+        mux.enqueue_question_notice(PanelId::new(), "reviewer".into(), "anyone?".into());
+
+        mux.poll_question_notices();
+        assert!(
+            mux.pending_question_notices.is_empty(),
+            "no main worker will ever answer; the queue must not accrete"
+        );
+        mux.shutdown();
+    }
+
+    /// The notice queue is bounded: past `QUESTION_NOTICE_CAP` the oldest is
+    /// dropped, so a chatty sub cannot grow caucus memory without bound while
+    /// the main worker is busy.
+    #[tokio::test]
+    async fn enqueue_question_notice_caps_the_queue_dropping_the_oldest() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let sub = PanelId::new();
+        for i in 0..=QUESTION_NOTICE_CAP {
+            mux.enqueue_question_notice(sub, "reviewer".into(), format!("q{i}"));
+        }
+        assert_eq!(mux.pending_question_notices.len(), QUESTION_NOTICE_CAP);
+        assert_eq!(
+            mux.pending_question_notices.front().unwrap().body,
+            "q1",
+            "the oldest notice is the one dropped"
+        );
     }
 
     /// A pending round is itself a wake path, so a main idle with a `Working`

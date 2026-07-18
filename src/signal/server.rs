@@ -13,7 +13,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use super::TurnSignal;
+use super::SignalEvent;
 use crate::line_io::{CappedLine, MAX_IPC_LINE_BYTES, read_capped_line};
 
 /// Errors from the turn-signal server.
@@ -32,10 +32,10 @@ pub enum SignalServerError {
 /// Handle to the running turn-signal server.
 ///
 /// The server owns the `UnixListener`; consumers receive parsed
-/// [`TurnSignal`]s via [`SignalServer::signals`].
+/// [`SignalEvent`]s via [`SignalServer::signals`].
 pub struct SignalServer {
     sock_path: PathBuf,
-    rx: mpsc::UnboundedReceiver<TurnSignal>,
+    rx: mpsc::UnboundedReceiver<SignalEvent>,
 }
 
 impl SignalServer {
@@ -70,8 +70,8 @@ impl SignalServer {
         &self.sock_path
     }
 
-    /// Stream of parsed turn signals. Consumers call `ingest` per signal.
-    pub fn signals(&mut self) -> &mut mpsc::UnboundedReceiver<TurnSignal> {
+    /// Stream of parsed signal events — turn signals and mid-turn notes.
+    pub fn signals(&mut self) -> &mut mpsc::UnboundedReceiver<SignalEvent> {
         &mut self.rx
     }
 }
@@ -91,7 +91,7 @@ impl Drop for SignalServer {
 ///
 /// Runs until the listener errors unrecoverably or every receiver for `tx`
 /// is dropped; the listener is owned here and nowhere else (Invariant I-6).
-async fn accept_loop(listener: UnixListener, tx: mpsc::UnboundedSender<TurnSignal>) {
+async fn accept_loop(listener: UnixListener, tx: mpsc::UnboundedSender<SignalEvent>) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -109,11 +109,11 @@ async fn accept_loop(listener: UnixListener, tx: mpsc::UnboundedSender<TurnSigna
 }
 
 /// Read newline-delimited JSON from one connection, parsing each line via
-/// [`ingest`] and forwarding the resulting [`TurnSignal`]s on `tx`.
+/// [`ingest`] and forwarding the resulting [`SignalEvent`]s on `tx`.
 ///
 /// A malformed line is dropped (the connection continues); a closed receiver
 /// ends the connection early.
-async fn handle_connection(stream: UnixStream, tx: mpsc::UnboundedSender<TurnSignal>) {
+async fn handle_connection(stream: UnixStream, tx: mpsc::UnboundedSender<SignalEvent>) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
@@ -147,21 +147,22 @@ async fn handle_connection(stream: UnixStream, tx: mpsc::UnboundedSender<TurnSig
     }
 }
 
-/// Single owner of turn-signal ingestion (Invariant I-6).
+/// Single owner of signal ingestion (Invariant I-6).
 ///
-/// Parses one line of socket JSON into a [`TurnSignal`] and is the only path
-/// by which a turn signal reaches the rest of caucus.
+/// Parses one line of socket JSON into a [`SignalEvent`] — a turn signal or a
+/// mid-turn note — and is the only path by which either reaches the rest of
+/// caucus.
 ///
-/// Ingestion is parse-only by design: applying the signal — appending a
-/// `TurnCompleted` lane event and recomputing `derived_state` — requires the
+/// Ingestion is parse-only by design: applying an event — appending a lane
+/// event and (for a turn signal) recomputing `derived_state` — requires the
 /// per-panel [`crate::agent::AgentManifest`], whose single owner is the
 /// [`crate::session::Multiplexer`] (Invariant I-2). The server forwards the
-/// parsed signal; `Multiplexer::handle_signal` applies it through
-/// `agent::manifest::record_turn_completed`. Splitting it this way keeps the
+/// parsed event; `Multiplexer::handle_signal` / `Multiplexer::handle_note`
+/// apply it through the manifest owners. Splitting it this way keeps the
 /// socket listener free of any manifest dependency.
-pub(crate) fn ingest(line: &str) -> Result<TurnSignal, SignalServerError> {
-    let signal: TurnSignal = serde_json::from_str(line)?;
-    Ok(signal)
+pub(crate) fn ingest(line: &str) -> Result<SignalEvent, SignalServerError> {
+    let event: SignalEvent = serde_json::from_str(line)?;
+    Ok(event)
 }
 
 #[cfg(test)]
@@ -183,12 +184,40 @@ mod tests {
             "raw_hook_payload": {}
         })
         .to_string();
-        let sig = ingest(&line).unwrap();
+        let SignalEvent::Turn(sig) = ingest(&line).unwrap() else {
+            panic!("a turn-signal line must ingest as Turn");
+        };
         assert_eq!(sig.kind, TurnKind::Stop);
         assert_eq!(sig.last_message.as_deref(), Some("done"));
         // The line predates `transcript_path` (an old `caucus` binary posted
         // it): the field defaults to None rather than failing the parse.
         assert_eq!(sig.transcript_path, None);
+    }
+
+    /// A mid-turn note line ingests as `Note` — the untagged discrimination
+    /// cannot confuse it with a turn signal (disjoint `kind` vocabularies,
+    /// `body` vs `raw_hook_payload`).
+    #[test]
+    fn ingest_parses_an_agent_note_line() {
+        use crate::signal::NoteKind;
+        let session_id = SessionId::new();
+        let panel_id = PanelId::new();
+        let line = serde_json::json!({
+            "session_id": session_id,
+            "panel_id": panel_id,
+            "ts": "2026-07-18T09:00:00Z",
+            "kind": "question",
+            "body": "which API version should the new endpoint target?"
+        })
+        .to_string();
+        let SignalEvent::Note(note) = ingest(&line).unwrap() else {
+            panic!("a note line must ingest as Note");
+        };
+        assert_eq!(note.kind, NoteKind::Question);
+        assert_eq!(
+            note.body,
+            "which API version should the new endpoint target?"
+        );
     }
 
     /// Dropping the server removes its socket file, so it does not accumulate
@@ -230,11 +259,64 @@ mod tests {
         stream.write_all(b"\n").await.unwrap();
         stream.shutdown().await.unwrap();
 
-        let sig = server.signals().recv().await.expect("signal received");
+        let SignalEvent::Turn(sig) = server.signals().recv().await.expect("signal received") else {
+            panic!("expected a turn signal");
+        };
         assert_eq!(sig.session_id, session_id);
         assert_eq!(sig.panel_id, panel_id);
         assert_eq!(sig.kind, TurnKind::Stop);
         assert_eq!(sig.last_message.as_deref(), Some("raw write"));
+    }
+
+    /// One connection interleaving a note line, a malformed line, and a turn
+    /// line delivers `Note` then `Turn` in order — the mixed stream a live
+    /// session produces when a sub posts mid-turn notes while another's Stop
+    /// hook fires on the same socket.
+    #[tokio::test]
+    async fn server_forwards_interleaved_note_and_turn_lines() {
+        use crate::signal::NoteKind;
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("caucus.sock");
+        let mut server = SignalServer::bind(&sock).unwrap();
+
+        let session_id = SessionId::new();
+        let panel_id = PanelId::new();
+        let note = serde_json::json!({
+            "session_id": session_id,
+            "panel_id": panel_id,
+            "ts": "2026-07-18T09:00:00Z",
+            "kind": "progress",
+            "body": "halfway through the sweep"
+        })
+        .to_string();
+        let turn = serde_json::json!({
+            "session_id": session_id,
+            "panel_id": panel_id,
+            "ts": "2026-07-18T09:01:00Z",
+            "kind": "stop",
+            "last_message": "done",
+            "raw_hook_payload": {}
+        })
+        .to_string();
+
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        let payload = format!("{note}\nnot json\n{turn}\n");
+        stream.write_all(payload.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let SignalEvent::Note(got) = server.signals().recv().await.expect("note received") else {
+            panic!("first line must arrive as Note");
+        };
+        assert_eq!(got.kind, NoteKind::Progress);
+        assert_eq!(got.body, "halfway through the sweep");
+
+        let SignalEvent::Turn(sig) = server.signals().recv().await.expect("turn received") else {
+            panic!("last line must arrive as Turn");
+        };
+        assert_eq!(sig.kind, TurnKind::Stop);
+        assert_eq!(sig.last_message.as_deref(), Some("done"));
     }
 
     /// A malformed line is skipped without killing the connection: a valid
@@ -265,7 +347,9 @@ mod tests {
         stream.write_all(b"\n").await.unwrap();
         stream.shutdown().await.unwrap();
 
-        let sig = server.signals().recv().await.expect("signal received");
+        let SignalEvent::Turn(sig) = server.signals().recv().await.expect("signal received") else {
+            panic!("expected a turn signal");
+        };
         assert_eq!(sig.kind, TurnKind::Error);
         assert_eq!(sig.session_id, session_id);
     }
