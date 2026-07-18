@@ -18,7 +18,7 @@ macro_rules! ulid_newtype {
         impl $name {
             /// Generate a fresh id from the current time + cryptographic randomness.
             pub fn new() -> Self {
-                Self(Ulid::new())
+                Self(Ulid::generate())
             }
         }
 
