@@ -664,13 +664,61 @@ impl Multiplexer {
         }
     }
 
+    /// Complete and take the first *due* pending round, returning its summary
+    /// — the hook-reply half of round delivery (`docs/design.md` §7.6),
+    /// called by [`Multiplexer::handle_signal_with_reply`] when the main
+    /// worker's own Stop hook is waiting for a directive.
+    ///
+    /// The [`Multiplexer::round_status`] pull generalised from one named round
+    /// to the whole queue: each round's latch is refreshed first
+    /// ([`Multiplexer::poll_round_panels`], Invariant I-9 — the judgement must
+    /// see panels that settled this very tick), then judged by the same due
+    /// predicate as the keystroke push (`fallback_due || all_settled`, so a
+    /// partial fallback report travels this path too). The first due round is
+    /// removed, completed ([`Multiplexer::complete_round`], Invariant I-10 —
+    /// removal-before-completion is what makes delivery exactly-once across
+    /// all three paths), and the changed set is persisted before the summary
+    /// is returned. Rounds that are not due stay pending, exactly as the push
+    /// leaves them.
+    pub(super) fn take_due_round_summary(&mut self) -> Option<String> {
+        if self.pending_rounds.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        let mut changed = false;
+        let mut summary = None;
+        let rounds = std::mem::take(&mut self.pending_rounds);
+        for mut round in rounds {
+            if summary.is_some() {
+                // One directive carries one round; the rest keep their place.
+                self.pending_rounds.push(round);
+                continue;
+            }
+            let fallback_due = now >= round.fallback_deadline;
+            changed |= self.poll_round_panels(&mut round, fallback_due);
+            let all_settled = self.round_settled(&round);
+            if fallback_due || all_settled {
+                summary = Some(self.complete_round(&round, all_settled));
+                changed = true;
+            } else {
+                self.pending_rounds.push(round);
+            }
+        }
+        if changed {
+            self.persist_pending_rounds();
+        }
+        summary
+    }
+
     /// Complete a round: assemble its full per-panel report, spill it to
     /// `<session_root>/rounds/<id>.md`, and return the compact summary that
     /// points at it. The single owner of round completion (Invariant I-10),
-    /// shared by both delivery halves — the push
+    /// shared by every delivery path — the push
     /// ([`Multiplexer::poll_pending_rounds`], which types the summary into an
-    /// idle main panel) and the pull ([`Multiplexer::round_status`], which hands
-    /// it to a main worker polling from inside its own turn).
+    /// idle main panel), the pull ([`Multiplexer::round_status`], which hands
+    /// it to a main worker polling from inside its own turn), and the
+    /// hook-reply ([`Multiplexer::take_due_round_summary`], which injects it
+    /// into the main worker's continuing turn through its Stop hook).
     ///
     /// The caller must already have removed the round from `pending_rounds`, so
     /// a round is completed exactly once no matter which half reaches it first.
@@ -697,9 +745,10 @@ impl Multiplexer {
 
     /// Append a `header` line then a `body` block to the session's
     /// `dropped-rounds.log` — the single sink for every round caucus could not
-    /// deliver (main gone, or lost to a restart). Best-effort: a write failure
-    /// is logged, not propagated.
-    fn append_dropped_round(&self, header: &str, body: &str) {
+    /// deliver (main gone, lost to a restart, or a hook reply lost with its
+    /// keystroke fallback failing too). Best-effort: a write failure is
+    /// logged, not propagated.
+    pub(super) fn append_dropped_round(&self, header: &str, body: &str) {
         use std::io::Write;
         let path = self.session.root_dir.join("dropped-rounds.log");
         let spill = || -> std::io::Result<()> {
@@ -1052,10 +1101,19 @@ impl Multiplexer {
                 .find(|p| p.id == id)
                 .is_some_and(|p| p.state() == PanelState::Idle)
         });
-        let quiet = self
-            .main_compose_since
-            .is_none_or(|t| Instant::now().duration_since(t) >= COMPOSE_GRACE);
-        main_idle && quiet
+        main_idle && self.main_compose_quiet()
+    }
+
+    /// Whether no un-submitted human keystroke is holding the main panel
+    /// (`COMPOSE_GRACE` since the last one). The compose half of
+    /// [`Multiplexer::main_deliverable`], split out because the hook-reply
+    /// path ([`Multiplexer::handle_signal_with_reply`]) must apply the same
+    /// "no automated delivery while the human is composing" rule at a moment
+    /// when the main panel is still coarse `Working` — the idle half of the
+    /// gate cannot hold there, but the human-first rule holds everywhere.
+    pub(super) fn main_compose_quiet(&self) -> bool {
+        self.main_compose_since
+            .is_none_or(|t| Instant::now().duration_since(t) >= COMPOSE_GRACE)
     }
 
     /// Nudge the main worker when it has gone idle while sub-panels still run
@@ -3212,6 +3270,192 @@ mod tests {
             "q1",
             "the oldest notice is the one dropped"
         );
+    }
+
+    /// A hermetic main + settled-sub round: main mid-turn (`Working`), the sub
+    /// finished, the round registered and due. The window the hook-reply path
+    /// exists for.
+    fn due_round_with_working_main(mux: &mut Multiplexer) -> (PanelId, PanelId) {
+        let main = push_cat_panel(mux, "main", PanelState::Working);
+        mux.main_panel_id = Some(main);
+        let sub = push_cat_panel(mux, "reviewer", PanelState::Working);
+        finish_turn(mux, sub, "audit done: 3 findings");
+        mux.register_round(vec![sub], None, Some(3600), None, None);
+        assert_eq!(mux.pending_rounds.len(), 1);
+        (main, sub)
+    }
+
+    /// A `Stop` signal for `panel`, as `handle_signal_with_reply` receives it.
+    fn stop_signal(mux: &Multiplexer, panel: PanelId) -> TurnSignal {
+        TurnSignal::now(
+            mux.session.id,
+            panel,
+            crate::signal::TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        )
+    }
+
+    /// The hook-reply delivery: main's own Stop with a waiting reply slot and
+    /// a due round sends the summary as a `Deliver` directive, consumes the
+    /// round exactly once (the push finds nothing left), and continues the
+    /// main turn — the panel never goes `Idle` and its capture turn reopens.
+    /// The sub's latch is taken *inside* this call (the round was registered
+    /// with nothing latched), so the judgement saw fresh state.
+    #[tokio::test]
+    async fn hook_reply_delivers_a_due_round_into_the_continuing_turn() {
+        use crate::signal::StopDirective;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (main, _sub) = due_round_with_working_main(&mut mux);
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
+
+        let StopDirective::Deliver { reason } = rx.try_recv().expect("directive must be sent");
+        assert!(
+            reason.contains("Round complete"),
+            "the directive carries the round summary: {reason}"
+        );
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "the delivered round is consumed"
+        );
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "a blocked Stop continues the turn: main never goes Idle"
+        );
+
+        // Exactly-once: the keystroke push has nothing left to deliver.
+        mux.poll_pending_rounds();
+        assert!(mux.pending_rounds.is_empty());
+        mux.shutdown();
+    }
+
+    /// The human-first rule is path-independent: with the user mid-compose in
+    /// the main panel, the hook is answered allow (sender dropped), the round
+    /// stays pending for the keystroke push, and the compose hold survives —
+    /// `note_prompt_delivered` would have cleared it, which is why the hook
+    /// path reopens the turn through its own sibling helper.
+    #[tokio::test]
+    async fn hook_reply_allows_while_the_user_composes_and_keeps_the_hold() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (main, _sub) = due_round_with_working_main(&mut mux);
+        mux.main_compose_since = Some(Instant::now());
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "the sender must be dropped (allow), not answered"
+        );
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "the round stays for the keystroke push after the grace"
+        );
+        assert!(
+            mux.main_compose_since.is_some(),
+            "the human's compose hold must survive the allow"
+        );
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "an allowed Stop settles main normally"
+        );
+        mux.shutdown();
+    }
+
+    /// A reply slot whose receiver is already gone (the hook client timed out
+    /// before this tick) must not consume a round: the signal is handled as a
+    /// plain stop and the round remains — the keystroke push then delivers it
+    /// to the now-idle main.
+    #[tokio::test]
+    async fn hook_reply_with_a_dead_receiver_leaves_the_round_for_the_push() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (main, _sub) = due_round_with_working_main(&mut mux);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
+
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "a dead hook must not consume the round"
+        );
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+        );
+
+        // The ordinary push completes the delivery.
+        mux.poll_pending_rounds();
+        assert!(mux.pending_rounds.is_empty(), "the push delivered it");
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the injected summary opened a main turn"
+        );
+        mux.shutdown();
+    }
+
+    /// A reply slot on a **sub** panel's signal is answered allow and touches
+    /// no round: only the main panel's own Stop may carry a round back.
+    #[tokio::test]
+    async fn hook_reply_on_a_sub_panel_signal_is_allowed_and_consumes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (_main, _sub) = due_round_with_working_main(&mut mux);
+        let other = push_cat_panel(&mut mux, "qa", PanelState::Working);
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        mux.handle_signal_with_reply(stop_signal(&mux, other), Some(tx));
+
+        assert!(rx.try_recv().is_err(), "a sub panel's hook is always allow");
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "no round is consumed by a sub panel's signal"
+        );
+        mux.shutdown();
+    }
+
+    /// `take_due_round_summary` judges dueness fresh and takes at most one
+    /// round: an unfinished round is left pending and yields `None`; once due
+    /// it is completed, removed, and a second call finds nothing.
+    #[tokio::test]
+    async fn take_due_round_summary_takes_exactly_the_due_round() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        mux.note_prompt_delivered(sub);
+        mux.register_round(vec![sub], None, Some(3600), None, None);
+
+        assert_eq!(
+            mux.take_due_round_summary(),
+            None,
+            "an unfinished round is not taken"
+        );
+        assert_eq!(mux.pending_rounds.len(), 1, "and it stays pending");
+
+        finish_turn(&mut mux, sub, "done");
+        let summary = mux
+            .take_due_round_summary()
+            .expect("a settled round is due");
+        assert!(summary.contains("Round complete"), "got: {summary}");
+        assert!(mux.pending_rounds.is_empty());
+        assert_eq!(
+            mux.take_due_round_summary(),
+            None,
+            "a taken round cannot be taken twice"
+        );
+        mux.shutdown();
     }
 
     /// A pending round is itself a wake path, so a main idle with a `Working`

@@ -232,12 +232,69 @@ impl Multiplexer {
     /// — the single owner of that transition (Invariant I-2) — which also
     /// recomputes `derived_state` and stores the signal's `last_message`.
     pub fn handle_signal(&mut self, signal: TurnSignal) {
+        self.handle_signal_with_reply(signal, None);
+    }
+
+    /// [`Multiplexer::handle_signal`] with the signal's reply slot — the
+    /// hook-reply round delivery (`docs/design.md` §7.6).
+    ///
+    /// When the **main** panel's own Stop fires while a round is due, the
+    /// summary is sent back through `reply` instead of waiting for main to go
+    /// idle and typing it in: the hook prints Claude's block JSON and the main
+    /// worker receives the round *inside the same turn* — closing the window
+    /// where a round that completed mid-turn sat until the next idle gap.
+    ///
+    /// The delivery preconditions, checked in order, are: the reply slot
+    /// exists and its receiver is still waiting (a hook that already timed out
+    /// must not consume a round — the round stays for the keystroke push); the
+    /// panel is the main panel; no human keystroke is holding the compose
+    /// gate (the "no automated delivery while the human is composing" rule is
+    /// path-independent — held here too, and the sender drop answers allow);
+    /// and a round is actually due ([`Multiplexer::take_due_round_summary`]).
+    /// Every precondition that fails simply drops the sender — allow — and
+    /// the signal is handled exactly as before.
+    ///
+    /// A delivered reply means the turn *continues*: the panel skips the
+    /// `Idle` transition and its capture turn is reopened
+    /// ([`Multiplexer::reopen_turn_after_hook_delivery`]). If the receiver
+    /// disappears between the check and the send (the client timed out at
+    /// that instant), the round has already been completed and removed — the
+    /// summary falls back to the keystroke path immediately, and failing
+    /// that, to `dropped-rounds.log` (the full report is already on disk).
+    pub fn handle_signal_with_reply(
+        &mut self,
+        signal: TurnSignal,
+        reply: Option<tokio::sync::oneshot::Sender<crate::signal::StopDirective>>,
+    ) {
+        use crate::signal::StopDirective;
+
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == signal.panel_id) else {
+            // An unknown panel's reply sender (if any) drops here — allow.
             return;
         };
         panel.end_turn();
-        // A turn signal means the agent is idle, waiting for the next prompt.
-        if panel.state() == PanelState::Working {
+
+        // Hook-reply delivery, decided before the Idle transition.
+        let mut delivered_by_hook = false;
+        let mut keystroke_fallback: Option<String> = None;
+        if let Some(sender) = reply
+            && Some(signal.panel_id) == self.main_panel_id
+            && !sender.is_closed()
+            && self.main_compose_quiet()
+            && let Some(summary) = self.take_due_round_summary()
+        {
+            match sender.send(StopDirective::Deliver { reason: summary }) {
+                Ok(()) => delivered_by_hook = true,
+                Err(StopDirective::Deliver { reason }) => keystroke_fallback = Some(reason),
+            }
+        }
+
+        // A turn signal means the agent is idle, waiting for the next prompt —
+        // unless the hook delivery just continued the turn.
+        if !delivered_by_hook
+            && let Some(panel) = self.panels.iter_mut().find(|p| p.id == signal.panel_id)
+            && panel.state() == PanelState::Working
+        {
             let _ = lifecycle::transition(panel, PanelState::Idle);
         }
 
@@ -259,6 +316,51 @@ impl Multiplexer {
         }
         self.record_commit_provenance(signal.panel_id);
         self.record_commit_supersessions(signal.panel_id);
+
+        if delivered_by_hook {
+            self.reopen_turn_after_hook_delivery(signal.panel_id);
+        }
+        if let Some(summary) = keystroke_fallback {
+            // The receiver vanished after the liveness check: the round is
+            // already completed and out of the queue, so this summary is its
+            // only copy in flight. The panel just flipped Idle above, which is
+            // exactly the state the keystroke push delivers into.
+            warn!(
+                panel = %signal.panel_id,
+                "hook reply receiver gone after round completion; delivering by keystroke"
+            );
+            if let Err(err) =
+                crate::mcp::McpToolSurface::send_keys(self, signal.panel_id, &summary, true)
+            {
+                warn!(error = %err, "keystroke fallback failed; spilling round to dropped-rounds.log");
+                self.append_dropped_round(
+                    "----- dropped round (hook reply lost and keystroke fallback failed) -----",
+                    &summary,
+                );
+            }
+        }
+    }
+
+    /// Reopen the main panel's capture turn after a round summary was
+    /// delivered through its Stop hook reply: the blocked Stop continues the
+    /// same turn, so the panel must read as mid-turn again — `begin_turn()`
+    /// for the capture, `Working` kept (or restored), and the injected prompt
+    /// recorded on the timeline.
+    ///
+    /// Deliberately a sibling of [`Multiplexer::note_prompt_delivered`], not a
+    /// call to it: that path clears `main_compose_since`, because a *submitted
+    /// line* consumed the human's composition. Nothing was submitted here — a
+    /// hook reply travels the socket, not the input line — so a compose hold
+    /// the human owns must survive the delivery.
+    fn reopen_turn_after_hook_delivery(&mut self, panel_id: PanelId) {
+        let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
+            return;
+        };
+        panel.begin_turn();
+        if matches!(panel.state(), PanelState::Spawning | PanelState::Idle) {
+            let _ = lifecycle::transition(panel, PanelState::Working);
+        }
+        self.record_lane_event(panel_id, LaneEventKind::PromptDelivered);
     }
 
     /// Ingest a mid-turn note: cap its body once (`AgentNote::truncated`, so
