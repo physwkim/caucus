@@ -1264,6 +1264,20 @@ impl Multiplexer {
         }
     }
 
+    /// Drain every queued question notice, rendered for delivery — the
+    /// hook-reply counterpart of [`Multiplexer::poll_question_notices`]
+    /// (`docs/design.md` §7.6). The push path delivers one notice per tick
+    /// because each push opens its own main turn; the hook reply is one
+    /// continuing turn, so it batches the whole queue — a notice held back
+    /// here would wait an entire further main turn, which is exactly the
+    /// latency this path exists to remove. Caller (the hook-delivery block in
+    /// `handle_signal_with_reply`) guarantees the texts are delivered or fall
+    /// back to a keystroke, mirroring the round summary.
+    pub(super) fn take_question_notice_texts(&mut self) -> Vec<String> {
+        let notices = std::mem::take(&mut self.pending_question_notices);
+        notices.iter().map(|n| self.question_notice(n)).collect()
+    }
+
     /// Render one question notice for injection into the main panel.
     ///
     /// The guidance clause reports the questioning panel's state **as of
@@ -3414,7 +3428,8 @@ mod tests {
     async fn hook_reply_allows_while_the_user_composes_and_keeps_the_hold() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        let (main, _sub) = due_round_with_working_main(&mut mux);
+        let (main, sub) = due_round_with_working_main(&mut mux);
+        mux.enqueue_question_notice(sub, "reviewer".into(), "held?".into());
         mux.main_compose_since = Some(Instant::now());
 
         let (tx, mut rx) = tokio::sync::oneshot::channel();
@@ -3428,6 +3443,11 @@ mod tests {
             mux.pending_rounds.len(),
             1,
             "the round stays for the keystroke push after the grace"
+        );
+        assert_eq!(
+            mux.pending_question_notices.len(),
+            1,
+            "the notice queue also survives the compose hold"
         );
         assert!(
             mux.main_compose_since.is_some(),
@@ -3449,7 +3469,8 @@ mod tests {
     async fn hook_reply_with_a_dead_receiver_leaves_the_round_for_the_push() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        let (main, _sub) = due_round_with_working_main(&mut mux);
+        let (main, sub) = due_round_with_working_main(&mut mux);
+        mux.enqueue_question_notice(sub, "reviewer".into(), "kept?".into());
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         drop(rx);
@@ -3459,6 +3480,11 @@ mod tests {
             mux.pending_rounds.len(),
             1,
             "a dead hook must not consume the round"
+        );
+        assert_eq!(
+            mux.pending_question_notices.len(),
+            1,
+            "a dead hook must not consume the notice queue either"
         );
         assert_eq!(
             mux.panels.iter().find(|p| p.id == main).unwrap().state(),
@@ -3482,8 +3508,9 @@ mod tests {
     async fn hook_reply_on_a_sub_panel_signal_is_allowed_and_consumes_nothing() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        let (_main, _sub) = due_round_with_working_main(&mut mux);
+        let (_main, sub) = due_round_with_working_main(&mut mux);
         let other = push_cat_panel(&mut mux, "qa", PanelState::Working);
+        mux.enqueue_question_notice(sub, "reviewer".into(), "kept?".into());
 
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         mux.handle_signal_with_reply(stop_signal(&mux, other), Some(tx));
@@ -3494,6 +3521,84 @@ mod tests {
             1,
             "no round is consumed by a sub panel's signal"
         );
+        assert_eq!(
+            mux.pending_question_notices.len(),
+            1,
+            "no notice is consumed by a sub panel's signal"
+        );
+        mux.shutdown();
+    }
+
+    /// Queued question notices ride the hook reply even with no due round:
+    /// the whole queue is batched into the continuing turn — held back, a
+    /// notice would wait an entire further main turn for the idle push, which
+    /// is the latency the hook path exists to remove.
+    #[tokio::test]
+    async fn hook_reply_delivers_queued_notices_without_a_round() {
+        use crate::signal::StopDirective;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Working);
+        mux.main_panel_id = Some(main);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        mux.enqueue_question_notice(sub, "reviewer".into(), "which schema?".into());
+        mux.enqueue_question_notice(sub, "reviewer".into(), "and which port?".into());
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
+
+        let StopDirective::Deliver { reason } = rx.try_recv().expect("directive must be sent");
+        assert!(reason.contains("which schema?"), "first notice: {reason}");
+        assert!(
+            reason.contains("and which port?"),
+            "the queue is batched: {reason}"
+        );
+        assert!(
+            mux.pending_question_notices.is_empty(),
+            "delivered notices are consumed"
+        );
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "a blocked Stop continues the turn: main never goes Idle"
+        );
+        mux.shutdown();
+    }
+
+    /// With both pending, one reply carries the round first (the primary
+    /// deliverable) and the notice queue after it — and both are consumed, so
+    /// neither push path delivers a second copy.
+    #[tokio::test]
+    async fn hook_reply_combines_a_due_round_and_the_notice_queue() {
+        use crate::signal::StopDirective;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (main, sub) = due_round_with_working_main(&mut mux);
+        mux.enqueue_question_notice(sub, "reviewer".into(), "which schema?".into());
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
+
+        let StopDirective::Deliver { reason } = rx.try_recv().expect("directive must be sent");
+        let round_at = reason.find("Round complete").expect("round in reason");
+        let notice_at = reason.find("which schema?").expect("notice in reason");
+        assert!(
+            round_at < notice_at,
+            "the round leads, notices follow: {reason}"
+        );
+        assert!(mux.pending_rounds.is_empty(), "the round is consumed");
+        assert!(
+            mux.pending_question_notices.is_empty(),
+            "the notices are consumed"
+        );
+
+        // Exactly-once on both: neither push has anything left.
+        mux.poll_pending_rounds();
+        mux.poll_question_notices();
+        assert!(mux.pending_rounds.is_empty());
+        assert!(mux.pending_question_notices.is_empty());
         mux.shutdown();
     }
 

@@ -615,6 +615,10 @@ caucus signal note --kind progress "sweep half done: 40/80 files"
   열린다", 소멸/`Exited`면 "패널이 종료됐다 — 질문이 그 이유를 설명할 수 있다".
   notice 자체는 억제하지 않는다: 질문이 이미 해소됐는지(main이 `last_note`를
   보고 선답했는지)는 caucus가 모르는 지식이다.
+- notice는 hook-reply(§7.6)에도 실린다: main의 턴 경계에서 round 요약 뒤에
+  큐 전체가 batch로 배달된다 — idle-push tick을 기다리는 main 턴 하나만큼의
+  지연이 사라진다. idle-push 경로는 main이 reply 슬롯 없이 idle이 된 경우를
+  위해 그대로 남는다.
 
 모든 sub-agent system prompt에는 note contract
 (`role::prompt::SUBAGENT_NOTE_CONTRACT`)가 부착된다 — question contract
@@ -629,8 +633,8 @@ caucus signal note --kind progress "sweep half done: 40/80 files"
 
 **해결**: main의 턴 경계에서 원자적으로 전달한다. Claude Stop hook이 stdout에
 `{"decision":"block","reason":"<텍스트>"}`를 내면 Claude는 **같은 턴 안에서**
-reason을 피드백으로 받아 계속한다(공식 문서 검증). due인 round의 요약을 그
-reason으로 실어 보낸다. 키스트로크 push는 강등되지 않는다 — main이 먼저 idle이
+reason을 피드백으로 받아 계속한다(공식 문서 검증). due인 round의 요약과 대기
+중인 question notice들을 그 reason으로 실어 보낸다. 키스트로크 push는 강등되지 않는다 — main이 먼저 idle이
 된 흔한 경우는 여전히 push가 전달하며, hook-reply는 "round가 main 턴 도중
 완료"된 경우를 턴 경계에서 닫는 보완이다.
 
@@ -661,9 +665,13 @@ compose 중, 런타임 종료)가 코드 0줄로 allow에 정합한다. allow를
 2. 신호의 패널이 main 패널이다.
 3. compose hold가 없다 (`main_compose_quiet` — "사람이 작성 중이면 자동 전달
    없음" 규칙은 경로 불문이다; hold면 allow, round는 grace 해소 후 push가 전달).
-4. due인 round가 있다 (`take_due_round_summary` — `round_status` pull을 큐
-   전체로 일반화한 것: latch 갱신(I-9) → push와 동일한 due 판정
-   (`fallback_due || all_settled`) → 제거 후 `complete_round`(I-10) → 영속화).
+4. 배달할 것이 있다: due인 round (`take_due_round_summary` — `round_status`
+   pull을 큐 전체로 일반화한 것: latch 갱신(I-9) → push와 동일한 due 판정
+   (`fallback_due || all_settled`) → 제거 후 `complete_round`(I-10) → 영속화)
+   **또는** 대기 중인 question notice (`take_question_notice_texts` — §7.5 큐
+   전체를 batch; push는 push마다 main 턴을 하나 여니까 tick당 1건이지만, reply는
+   하나의 이어지는 턴이라 나눠 보내면 notice가 main 턴 하나를 통째로 더
+   기다린다). reason은 round 요약이 앞(primary deliverable), notice들이 뒤.
 
 전달되면 main 턴은 계속되므로 Idle 전이를 생략하고 캡처 턴을 다시 연다
 (`reopen_turn_after_hook_delivery` — `note_prompt_delivered`의 형제:
@@ -688,9 +696,10 @@ Idle로 전이한 main — push가 착지하는 바로 그 상태), 그것도 �
 `dropped-rounds.log`에 남는다. 전체 리포트는 어느 경우든 이미 디스크에 있다
 (`rounds/<id>.md`).
 
-**종결 논증**: block 1회 = due round 1개 소비이므로 연속 block은 due round 수만큼만
-가능하다 — 종결은 구조적이고 `stop_hook_active` 파싱이 필요 없다. Claude의 연속
-block 8회 하드 캡은 추가 안전망으로만 존재한다.
+**종결 논증**: block 1회 = due round 1개 + question notice 큐 전체 소비이므로,
+연속 block은 그 사이 새로 도착한 deliverable이 있어야만 가능하다 — 종결은
+구조적이고 `stop_hook_active` 파싱이 필요 없다. Claude의 연속 block 8회 하드
+캡은 추가 안전망으로만 존재한다.
 
 ### 7.7 OSC in-band 알림 캡처 — 훅 없는 도구의 신호
 

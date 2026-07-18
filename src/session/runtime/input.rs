@@ -274,18 +274,31 @@ impl Multiplexer {
         };
         panel.end_turn();
 
-        // Hook-reply delivery, decided before the Idle transition.
+        // Hook-reply delivery, decided before the Idle transition. The reason
+        // carries every deliverable waiting for main's attention: the first
+        // due round (the primary deliverable, so it leads), then the whole
+        // question-notice queue — the reply is one continuing turn, so a
+        // notice held back would wait an entire further main turn for the
+        // push path, which is the latency this delivery exists to remove.
+        // Both takes are gated behind the checks, so nothing is consumed on a
+        // path that cannot deliver; with nothing pending the sender drops —
+        // allow.
         let mut delivered_by_hook = false;
         let mut keystroke_fallback: Option<String> = None;
         if let Some(sender) = reply
             && Some(signal.panel_id) == self.main_panel_id
             && !sender.is_closed()
             && self.main_compose_quiet()
-            && let Some(summary) = self.take_due_round_summary()
         {
-            match sender.send(StopDirective::Deliver { reason: summary }) {
-                Ok(()) => delivered_by_hook = true,
-                Err(StopDirective::Deliver { reason }) => keystroke_fallback = Some(reason),
+            let mut parts: Vec<String> = Vec::new();
+            parts.extend(self.take_due_round_summary());
+            parts.extend(self.take_question_notice_texts());
+            if !parts.is_empty() {
+                let reason = parts.join("\n\n");
+                match sender.send(StopDirective::Deliver { reason }) {
+                    Ok(()) => delivered_by_hook = true,
+                    Err(StopDirective::Deliver { reason }) => keystroke_fallback = Some(reason),
+                }
             }
         }
 
@@ -321,31 +334,34 @@ impl Multiplexer {
             self.reopen_turn_after_hook_delivery(signal.panel_id);
         }
         if let Some(summary) = keystroke_fallback {
-            // The receiver vanished after the liveness check: the round is
-            // already completed and out of the queue, so this summary is its
-            // only copy in flight. The panel just flipped Idle above, which is
-            // exactly the state the keystroke push delivers into.
+            // The receiver vanished after the liveness check: the round (if
+            // one was taken) is already completed and the notices are out of
+            // their queue, so this text is their only copy in flight. The
+            // panel just flipped Idle above, which is exactly the state the
+            // keystroke push delivers into.
             warn!(
                 panel = %signal.panel_id,
-                "hook reply receiver gone after round completion; delivering by keystroke"
+                "hook reply receiver gone after payload was taken; delivering by keystroke"
             );
             if let Err(err) =
                 crate::mcp::McpToolSurface::send_keys(self, signal.panel_id, &summary, true)
             {
-                warn!(error = %err, "keystroke fallback failed; spilling round to dropped-rounds.log");
+                warn!(error = %err, "keystroke fallback failed; spilling to dropped-rounds.log");
                 self.append_dropped_round(
-                    "----- dropped round (hook reply lost and keystroke fallback failed) -----",
+                    "----- dropped turn-boundary delivery (hook reply lost and keystroke \
+                     fallback failed) -----",
                     &summary,
                 );
             }
         }
     }
 
-    /// Reopen the main panel's capture turn after a round summary was
-    /// delivered through its Stop hook reply: the blocked Stop continues the
-    /// same turn, so the panel must read as mid-turn again — `begin_turn()`
-    /// for the capture, `Working` kept (or restored), and the injected prompt
-    /// recorded on the timeline.
+    /// Reopen the main panel's capture turn after a turn-boundary payload (a
+    /// round summary and/or queued question notices) was delivered through
+    /// its Stop hook reply: the blocked Stop continues the same turn, so the
+    /// panel must read as mid-turn again — `begin_turn()` for the capture,
+    /// `Working` kept (or restored), and the injected prompt recorded on the
+    /// timeline.
     ///
     /// Deliberately a sibling of [`Multiplexer::note_prompt_delivered`], not a
     /// call to it: that path clears `main_compose_since`, because a *submitted
