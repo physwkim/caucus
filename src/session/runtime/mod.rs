@@ -10,7 +10,7 @@
 //! * manifests are written only through `agent::manifest::write`;
 //! * worktree removal is enqueued only through `worktree::cleanup`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -39,7 +39,7 @@ mod spawn;
 mod spawn_async;
 
 use self::mcp::PendingSubmit;
-use self::rounds::PendingRound;
+use self::rounds::{PendingRound, QuestionNotice};
 pub(crate) use self::scroll::ScrollState;
 
 /// The live multiplexer: one [`Session`] plus every panel running in it.
@@ -134,6 +134,14 @@ pub struct Multiplexer {
     /// this tracks prompts caucus answered *for* it under its pre-authorized
     /// [`crate::mcp::protocol::SelectionPolicy`].
     auto_answered: HashMap<PanelId, u64>,
+    /// `question` notes posted by panel agents (`caucus signal note --kind
+    /// question`), waiting to be announced to the main worker. FIFO, drained
+    /// one per tick by [`Multiplexer::poll_question_notices`] under the same
+    /// `main_deliverable` gate as every other caucus→main push. Capped at
+    /// [`rounds::QUESTION_NOTICE_CAP`] (oldest dropped, with a warning) so a
+    /// runaway agent cannot grow it unbounded. Ephemeral, like
+    /// `pending_rounds`: a notice does not survive a caucus restart.
+    pending_question_notices: VecDeque<QuestionNotice>,
     /// Instant of the last stranded-main nudge, or `None` while not stranded.
     /// caucus's only caucus→main pushes require a registered round; if the
     /// main worker ends its turn without one while sub-panels still run, no
@@ -328,6 +336,7 @@ impl Multiplexer {
                 main_panel_id: None,
                 main_compose_since: None,
                 notified_blockers: HashMap::new(),
+                pending_question_notices: VecDeque::new(),
                 auto_answered: HashMap::new(),
                 main_stranded_last_nudge: None,
                 layout_mode: LayoutMode::default(),

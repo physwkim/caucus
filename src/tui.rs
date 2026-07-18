@@ -755,9 +755,18 @@ async fn event_loop(
             warn!(error = %e, "clipboard OSC 52 write failed");
         }
 
-        // 2. Turn signals — drain whatever the socket server has queued.
-        while let Ok(signal) = signal_server.signals().try_recv() {
-            mux.handle_signal(signal);
+        // 2. Signal events — drain whatever the socket server has queued: turn
+        //    signals settle panels (a main-panel signal's reply slot may carry
+        //    a due round back through the waiting Stop hook), mid-turn notes
+        //    are recorded without any state transition. A note's reply slot is
+        //    always `None`; dropping a turn signal's slot answers allow.
+        while let Ok((event, reply)) = signal_server.signals().try_recv() {
+            match event {
+                crate::signal::SignalEvent::Turn(signal) => {
+                    mux.handle_signal_with_reply(signal, reply)
+                }
+                crate::signal::SignalEvent::Note(note) => mux.handle_note(note),
+            }
         }
 
         // 3. Control jobs — execute the main worker's queued MCP tool calls against
@@ -786,6 +795,12 @@ async fn event_loop(
         //     runs before round delivery so the dropped-round notice lands first.
         mux.poll_resume_notice();
 
+        // 4d. In-band notifications — drain the OSC 9/99/777 texts the pump
+        //     just parsed into each grid and record them on the panel's
+        //     manifest timeline (`NotificationSeen`). Capture only — no state
+        //     transition, no push — so it competes with nothing below.
+        mux.poll_notifications();
+
         // 5. Blocked panels — if a panel in a pending round has stopped on an
         //    interactive chooser or a raw `[y/n]` prompt (no Stop hook fires, so
         //    its round never settles), announce it to the main worker so it can
@@ -798,6 +813,12 @@ async fn event_loop(
         //    (or its fallback deadline passed), assemble their results and
         //    inject them into the main worker's panel (the caucus→main push).
         mux.poll_pending_rounds();
+
+        // 6b. Question notices — a panel agent posted a `question` note
+        //     (`caucus signal note`); announce it to the main worker. After
+        //     round delivery: a finished round is the primary deliverable, and
+        //     all pushes share the one-push-per-tick gate.
+        mux.poll_question_notices();
 
         // 7. Stranded-main guard — if the main worker went idle with no round
         //    registered while sub-panels still run, nothing above can ever

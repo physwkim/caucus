@@ -219,6 +219,9 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
     // An agent that backgrounds a long command and ends its turn — or waits on
     // one across turns — therefore reports done while still working, and caucus
     // captures a half-finished result (§4, §8.5).
+    // The note contract (`role::prompt::SUBAGENT_NOTE_CONTRACT`) is the
+    // mid-turn complement: `caucus signal note` posts progress / artifact /
+    // question lines over the signal socket without ending the turn (§7).
     // A sub-agent with a worktree also carries the worktree contract: its cwd
     // is the worktree, but the same repo is checked out at the session root
     // too, and nothing else in its context says which checkout is its own — so
@@ -233,6 +236,7 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
         }
         parts.push(crate::role::prompt::SUBAGENT_QUESTION_CONTRACT.to_string());
         parts.push(crate::role::prompt::SUBAGENT_TURN_CONTRACT.to_string());
+        parts.push(crate::role::prompt::SUBAGENT_NOTE_CONTRACT.to_string());
         if let Some(worktree) = &request.worktree_path {
             parts.push(crate::role::prompt::subagent_worktree_contract(worktree));
         }
@@ -287,6 +291,14 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
     env.insert("CAUCUS_PANEL_ID".to_string(), panel_id.to_string());
     if let Some(sock) = &request.sock_path {
         env.insert("CAUCUS_SOCK".to_string(), sock.display().to_string());
+        // Hook-reply capability (`docs/design.md` §7.6): only the claude
+        // **main** panel's Stop hook is offered a reply — sub panels and the
+        // codex backend keep byte-identical wire lines. The env var, not the
+        // hook script, is the negotiation: an older caucus never sets it, and
+        // a hook running without it never asks.
+        if request.is_main() && matches!(cli, AgentCli::Claude) {
+            env.insert("CAUCUS_HOOK_REPLY".to_string(), "1".to_string());
+        }
     }
     // A guaranteed-shared path for inter-panel handoff artifacts, reachable
     // even from an isolated worktree cwd. Empty means "unset" (test/default).
@@ -490,7 +502,9 @@ pub(crate) fn spawn(request: &SpawnRequest) -> Result<SpawnOutcome, SpawnError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::role::prompt::{SUBAGENT_QUESTION_CONTRACT, SUBAGENT_TURN_CONTRACT};
+    use crate::role::prompt::{
+        SUBAGENT_NOTE_CONTRACT, SUBAGENT_QUESTION_CONTRACT, SUBAGENT_TURN_CONTRACT,
+    };
 
     fn role() -> RoleSpec {
         RoleSpec {
@@ -592,10 +606,13 @@ mod tests {
 
     /// The contracts every sub-agent carries, in the order `build_command`
     /// appends them: ask in plain text and end the turn
-    /// ([`SUBAGENT_QUESTION_CONTRACT`]), and do not end that turn with work
-    /// still running ([`SUBAGENT_TURN_CONTRACT`]).
+    /// ([`SUBAGENT_QUESTION_CONTRACT`]), do not end that turn with work
+    /// still running ([`SUBAGENT_TURN_CONTRACT`]), and how to post mid-turn
+    /// notes ([`SUBAGENT_NOTE_CONTRACT`]).
     fn subagent_contracts() -> String {
-        format!("{SUBAGENT_QUESTION_CONTRACT}\n\n{SUBAGENT_TURN_CONTRACT}")
+        format!(
+            "{SUBAGENT_QUESTION_CONTRACT}\n\n{SUBAGENT_TURN_CONTRACT}\n\n{SUBAGENT_NOTE_CONTRACT}"
+        )
     }
 
     /// A sub-agent's resolved role prompt is injected with the caucus contracts
@@ -1163,6 +1180,79 @@ mod tests {
         assert_eq!(
             cmd.env.get("CAUCUS_SESSION_DIR").map(String::as_str),
             Some("/repo/.caucus/sessions/S1")
+        );
+    }
+
+    /// `CAUCUS_HOOK_REPLY=1` reaches exactly one spawn shape: the claude
+    /// **main** panel with a signal socket. A claude sub panel, a codex main
+    /// panel, and a main panel without a socket all spawn without it — their
+    /// hooks post today's fire-and-forget wire line, byte for byte.
+    #[test]
+    fn hook_reply_env_is_injected_for_the_claude_main_panel_only() {
+        let sock = PathBuf::from("/tmp/caucus.sock");
+        let main_mcp = || {
+            Some(CaucusMcp {
+                caucus_bin: PathBuf::from("caucus"),
+                control_sock: PathBuf::from("/tmp/caucus-control.sock"),
+            })
+        };
+
+        let claude_main = SpawnRequest {
+            role: role(),
+            agent_name: "main".into(),
+            sock_path: Some(sock.clone()),
+            caucus_mcp: main_mcp(),
+            ..SpawnRequest::default()
+        };
+        assert_eq!(
+            build_command(&claude_main, PanelId::new())
+                .env
+                .get("CAUCUS_HOOK_REPLY")
+                .map(String::as_str),
+            Some("1")
+        );
+
+        let claude_sub = SpawnRequest {
+            role: role(),
+            agent_name: "reviewer-r1".into(),
+            sock_path: Some(sock.clone()),
+            ..SpawnRequest::default()
+        };
+        assert!(
+            !build_command(&claude_sub, PanelId::new())
+                .env
+                .contains_key("CAUCUS_HOOK_REPLY"),
+            "a sub panel never asks for a reply"
+        );
+
+        let mut codex_role = role();
+        codex_role.agent_cli = AgentCli::Codex;
+        codex_role.model = None;
+        let codex_main = SpawnRequest {
+            role: codex_role,
+            agent_name: "main".into(),
+            sock_path: Some(sock),
+            caucus_mcp: main_mcp(),
+            ..SpawnRequest::default()
+        };
+        assert!(
+            !build_command(&codex_main, PanelId::new())
+                .env
+                .contains_key("CAUCUS_HOOK_REPLY"),
+            "codex has no Stop hook to reply to"
+        );
+
+        let sockless_main = SpawnRequest {
+            role: role(),
+            agent_name: "main".into(),
+            caucus_mcp: main_mcp(),
+            ..SpawnRequest::default()
+        };
+        assert!(
+            !build_command(&sockless_main, PanelId::new())
+                .env
+                .contains_key("CAUCUS_HOOK_REPLY"),
+            "no signal socket, nothing to reply on"
         );
     }
 

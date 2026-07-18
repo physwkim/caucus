@@ -159,6 +159,13 @@ impl McpToolSurface for Multiplexer {
                         .map(|path| path.display().to_string()),
                     branch: self.worktree_branches.get(&p.id).cloned(),
                     model: manifest.and_then(|m| m.model.clone()),
+                    transcript_path: manifest
+                        .and_then(|m| m.transcript_path())
+                        .map(|path| path.display().to_string()),
+                    last_note: manifest.and_then(|m| m.last_note()).map(str::to_string),
+                    last_notification: manifest
+                        .and_then(|m| m.last_notification())
+                        .map(str::to_string),
                 }
             })
             .collect()
@@ -647,18 +654,27 @@ mod tests {
             return;
         };
 
-        // A plain (non-worktree) panel: no path, no branch.
+        // A plain (non-worktree) panel: no path, no branch, no transcript or
+        // note yet.
         let plain = McpToolSurface::list_panels(&mux);
         assert_eq!(plain[0].worktree_path, None);
         assert_eq!(plain[0].branch, None);
+        assert_eq!(plain[0].transcript_path, None);
+        assert_eq!(plain[0].last_note, None);
+        assert_eq!(plain[0].last_notification, None);
 
         // Simulate the worktree-backed spawn bookkeeping: the manifest carries
         // the live worktree path and the model override; the branch lives in
-        // the side map (it outlives the path across shutdown/resume).
+        // the side map (it outlives the path across shutdown/resume). The
+        // transcript path arrives later, on the first turn signal; the note
+        // arrives whenever the agent posts one mid-turn.
         let wt = tmp.path().join("wt");
         let mf = mux.manifests.get_mut(&panel).unwrap();
         mf.worktree_path = Some(wt.clone());
         mf.model = Some("opus".to_string());
+        mf.transcript_path = Some("/logs/conv.jsonl".into());
+        mf.last_note = Some("[progress] sweep half done".to_string());
+        mf.last_notification = Some("build finished".to_string());
         mux.worktree_branches
             .insert(panel, "caucus/reviewer-1".to_string());
 
@@ -666,6 +682,12 @@ mod tests {
         assert_eq!(s[0].worktree_path, Some(wt.display().to_string()));
         assert_eq!(s[0].branch.as_deref(), Some("caucus/reviewer-1"));
         assert_eq!(s[0].model.as_deref(), Some("opus"));
+        assert_eq!(s[0].transcript_path.as_deref(), Some("/logs/conv.jsonl"));
+        assert_eq!(
+            s[0].last_note.as_deref(),
+            Some("[progress] sweep half done")
+        );
+        assert_eq!(s[0].last_notification.as_deref(), Some("build finished"));
 
         mux.shutdown();
     }

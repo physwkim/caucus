@@ -87,6 +87,22 @@ pub struct PanelSummary {
     /// Model override the panel runs under (`spawn_role(model=...)`), if one
     /// was set; `None` when the panel uses the backend's default model.
     pub model: Option<String>,
+    /// Path of the agent's conversation transcript (JSONL), once a turn
+    /// signal has carried one (`docs/design.md` §7.4). The main worker reads
+    /// the file directly for the full conversation — richer than any screen
+    /// capture. `None` before the first turn signal and for backends whose
+    /// payloads carry no such path (codex).
+    pub transcript_path: Option<String>,
+    /// The panel's most recent mid-turn note (`caucus signal note`), rendered
+    /// `[kind] body` — how a still-`working` panel reports progress, names an
+    /// artifact, or asks a question without ending its turn. `None` until the
+    /// panel posts one; the full history is on the manifest's lane events.
+    pub last_note: Option<String>,
+    /// The most recent desktop-notification text the panel's process emitted
+    /// in-band (OSC 9 / 99 / 777, `docs/design.md` §7.7) — an attention
+    /// signal from tools with no hook channel. `None` until one is seen; the
+    /// full history is on the manifest's lane events.
+    pub last_notification: Option<String>,
 }
 
 /// Errors surfaced by MCP tool calls.

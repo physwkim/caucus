@@ -124,6 +124,13 @@ pub struct Grid {
     title: Option<String>,
     /// Last hyperlink URI set via OSC 8 (stored, not rendered here).
     hyperlink: Option<String>,
+    /// Desktop-notification texts the panel's process emitted in-band via
+    /// OSC 9 / OSC 99 (kitty) / OSC 777 (`notify`), oldest first. Unlike
+    /// `title`/`hyperlink` this is an *event queue*, not screen state: entries
+    /// wait here until the runtime drains them ([`Grid::take_notifications`]),
+    /// and a terminal reset does not erase them — the notifications happened.
+    /// Bounded at [`Self::MAX_PENDING_NOTIFICATIONS`], dropping the oldest.
+    notifications: std::collections::VecDeque<String>,
     /// Saved cursor state for `ESC 7` / `ESC 8` (DECSC/DECRC) and the
     /// `CSI s` / `CSI u` SCO variant. `None` until the first save.
     saved_cursor: Option<SavedCursor>,
@@ -191,6 +198,12 @@ impl Grid {
     pub const MAX_COLS: usize = 2000;
     pub const MAX_ROWS: usize = 1000;
 
+    /// Maximum queued notifications retained between runtime drains. The
+    /// runtime drains every tick, so the cap only matters when a process
+    /// floods notifications faster than one tick — then the *oldest* are
+    /// dropped: the most recent attention requests are the live ones.
+    pub const MAX_PENDING_NOTIFICATIONS: usize = 16;
+
     /// Build a blank grid sized `cols x rows` with the default scrollback depth
     /// ([`Self::DEFAULT_SCROLLBACK`]).
     pub fn new(cols: usize, rows: usize) -> Self {
@@ -217,6 +230,7 @@ impl Grid {
             wrap_pending: false,
             title: None,
             hyperlink: None,
+            notifications: std::collections::VecDeque::new(),
             saved_cursor: None,
             alt_saved: None,
             bracketed_paste: false,
@@ -281,6 +295,26 @@ impl Grid {
     /// Most recent hyperlink URI (OSC 8), if set.
     pub fn hyperlink(&self) -> Option<&str> {
         self.hyperlink.as_deref()
+    }
+
+    /// Drain the queued desktop-notification texts (OSC 9 / 99 / 777), oldest
+    /// first. A queue drain, not a screen mutation — the cell grid is still
+    /// only ever written by PTY bytes through `advance`.
+    pub fn take_notifications(&mut self) -> Vec<String> {
+        self.notifications.drain(..).collect()
+    }
+
+    /// Queue one notification text, dropping the oldest beyond
+    /// [`Self::MAX_PENDING_NOTIFICATIONS`]. Empty texts are discarded — an
+    /// OSC 9 with no payload requests nothing a reader could act on.
+    fn push_notification(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if self.notifications.len() == Self::MAX_PENDING_NOTIFICATIONS {
+            self.notifications.pop_front();
+        }
+        self.notifications.push_back(text);
     }
 
     /// Collect a viewport row's characters into a `String` (test/diagnostic
@@ -1142,7 +1176,8 @@ fn xterm_to_field(n: u8) -> u8 {
 ///   switches to a cleared alt buffer, exit restores it. Cursor save/restore
 ///   via `CSI s` / `CSI u` is implemented.
 /// - `osc_dispatch` — window title (OSC 0/2) and hyperlinks (OSC 8) stored on
-///   the grid.
+///   the grid; desktop notifications (OSC 9 / 99 / 777) queued for the
+///   runtime to drain ([`Grid::take_notifications`]).
 ///
 /// **Documented partials** (intentionally simplified for caucus's read-only
 /// scraping use; design.md §0 #3 scopes the grid to ~2-4k LOC):
@@ -1354,6 +1389,32 @@ impl Perform for Grid {
                 // closes the link.
                 let uri = osc_join(params, 2);
                 self.hyperlink = if uri.is_empty() { None } else { Some(uri) };
+            }
+            // Desktop notifications — the in-band "I want attention" signals
+            // (`docs/design.md` §7.7). Captured into the notification queue;
+            // what to do with them is the runtime's decision, not the grid's.
+            b"9" => {
+                // iTerm2/ConEmu style: `OSC 9 ; text ST`. The text may itself
+                // contain ';' — rejoin, as for the title.
+                self.push_notification(osc_join(params, 1));
+            }
+            b"99" => {
+                // kitty style: `OSC 99 ; metadata ; payload ST`. The metadata
+                // (`key=value` pairs, ':'-separated) is not interpreted — the
+                // payload text is the signal. It may contain ';': rejoin.
+                self.push_notification(osc_join(params, 2));
+            }
+            b"777" if matches!(params.get(1).copied(), Some(b"notify")) => {
+                // urxvt/VTE style: `OSC 777 ; notify ; title ; body ST`. Only
+                // the `notify` subcommand is a notification. The title cannot
+                // contain ';' (it is a delimited field); the body can — rejoin.
+                let title = String::from_utf8_lossy(params.get(2).copied().unwrap_or(b""));
+                let body = osc_join(params, 3);
+                self.push_notification(match (title.is_empty(), body.is_empty()) {
+                    (false, false) => format!("{title}: {body}"),
+                    (false, true) => title.into_owned(),
+                    _ => body,
+                });
             }
             _ => {
                 // OSC 4 (palette), 52 (clipboard), 10/11 (default colours):
@@ -2035,6 +2096,101 @@ mod tests {
         assert_eq!(g.title(), None);
         assert_eq!(g.cell(0, 0).unwrap().fg, 0);
         assert!(!g.bracketed_paste(), "RIS clears bracketed-paste mode");
+    }
+
+    #[test]
+    fn osc_9_queues_a_notification() {
+        let mut g = Grid::new(10, 3);
+        g.advance(b"\x1b]9;deploy done\x07");
+        assert_eq!(g.take_notifications(), vec!["deploy done".to_string()]);
+        assert!(g.take_notifications().is_empty(), "take drains the queue");
+    }
+
+    #[test]
+    fn osc_9_keeps_an_embedded_semicolon() {
+        // vte splits the OSC string on ';' — the text must be rejoined, like
+        // the title, or it truncates at its first ';'.
+        let mut g = Grid::new(10, 3);
+        g.advance(b"\x1b]9;tests: 3 passed; 1 failed\x07");
+        assert_eq!(
+            g.take_notifications(),
+            vec!["tests: 3 passed; 1 failed".to_string()]
+        );
+    }
+
+    #[test]
+    fn osc_9_with_no_text_queues_nothing() {
+        let mut g = Grid::new(10, 3);
+        g.advance(b"\x1b]9\x07\x1b]9;\x07");
+        assert!(g.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn osc_99_queues_the_payload_without_the_metadata() {
+        // kitty: `OSC 99 ; metadata ; payload ST` — the metadata k=v pairs are
+        // not part of the text a reader should see.
+        let mut g = Grid::new(10, 3);
+        g.advance(b"\x1b]99;i=1:d=0;build finished\x07");
+        assert_eq!(g.take_notifications(), vec!["build finished".to_string()]);
+    }
+
+    #[test]
+    fn osc_777_notify_joins_title_and_body() {
+        let mut g = Grid::new(10, 3);
+        g.advance(b"\x1b]777;notify;claude;waiting for input\x07");
+        assert_eq!(
+            g.take_notifications(),
+            vec!["claude: waiting for input".to_string()]
+        );
+    }
+
+    #[test]
+    fn osc_777_notify_keeps_an_embedded_semicolon_in_the_body() {
+        let mut g = Grid::new(10, 3);
+        g.advance(b"\x1b]777;notify;t;a;b\x07");
+        assert_eq!(g.take_notifications(), vec!["t: a;b".to_string()]);
+    }
+
+    #[test]
+    fn osc_777_notify_with_only_a_title_queues_the_title() {
+        let mut g = Grid::new(10, 3);
+        g.advance(b"\x1b]777;notify;ding\x07");
+        assert_eq!(g.take_notifications(), vec!["ding".to_string()]);
+    }
+
+    #[test]
+    fn osc_777_non_notify_subcommand_is_ignored() {
+        let mut g = Grid::new(10, 3);
+        g.advance(b"\x1b]777;other;t;b\x07");
+        assert!(g.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn notification_queue_drops_the_oldest_beyond_the_cap() {
+        let mut g = Grid::new(10, 3);
+        for i in 0..Grid::MAX_PENDING_NOTIFICATIONS + 1 {
+            g.advance(format!("\x1b]9;n{i}\x07").as_bytes());
+        }
+        let drained = g.take_notifications();
+        assert_eq!(drained.len(), Grid::MAX_PENDING_NOTIFICATIONS);
+        assert_eq!(
+            drained.first().map(String::as_str),
+            Some("n1"),
+            "n0 dropped"
+        );
+        assert_eq!(
+            drained.last().map(String::as_str),
+            Some(format!("n{}", Grid::MAX_PENDING_NOTIFICATIONS).as_str())
+        );
+    }
+
+    #[test]
+    fn ris_keeps_queued_notifications() {
+        // The queue records events that happened, not screen state — a
+        // terminal reset must not erase an undrained attention request.
+        let mut g = Grid::new(10, 3);
+        g.advance(b"\x1b]9;ping\x07\x1bc");
+        assert_eq!(g.take_notifications(), vec!["ping".to_string()]);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::agent::manifest;
 use crate::agent::provenance::{self, LaneCommitProvenance, SupersededBy};
 use crate::input::CaucusCommand;
 use crate::panel::lifecycle::{self, PanelState};
-use crate::signal::TurnSignal;
+use crate::signal::{AgentNote, NoteKind, TurnSignal};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -232,12 +232,82 @@ impl Multiplexer {
     /// — the single owner of that transition (Invariant I-2) — which also
     /// recomputes `derived_state` and stores the signal's `last_message`.
     pub fn handle_signal(&mut self, signal: TurnSignal) {
+        self.handle_signal_with_reply(signal, None);
+    }
+
+    /// [`Multiplexer::handle_signal`] with the signal's reply slot — the
+    /// hook-reply round delivery (`docs/design.md` §7.6).
+    ///
+    /// When the **main** panel's own Stop fires while a round is due, the
+    /// summary is sent back through `reply` instead of waiting for main to go
+    /// idle and typing it in: the hook prints Claude's block JSON and the main
+    /// worker receives the round *inside the same turn* — closing the window
+    /// where a round that completed mid-turn sat until the next idle gap.
+    ///
+    /// The delivery preconditions, checked in order, are: the reply slot
+    /// exists and its receiver is still waiting (a hook that already timed out
+    /// must not consume a round — the round stays for the keystroke push); the
+    /// panel is the main panel; no human keystroke is holding the compose
+    /// gate (the "no automated delivery while the human is composing" rule is
+    /// path-independent — held here too, and the sender drop answers allow);
+    /// and a round is actually due ([`Multiplexer::take_due_round_summary`]).
+    /// Every precondition that fails simply drops the sender — allow — and
+    /// the signal is handled exactly as before.
+    ///
+    /// A delivered reply means the turn *continues*: the panel skips the
+    /// `Idle` transition and its capture turn is reopened
+    /// ([`Multiplexer::reopen_turn_after_hook_delivery`]). If the receiver
+    /// disappears between the check and the send (the client timed out at
+    /// that instant), the round has already been completed and removed — the
+    /// summary falls back to the keystroke path immediately, and failing
+    /// that, to `dropped-rounds.log` (the full report is already on disk).
+    pub fn handle_signal_with_reply(
+        &mut self,
+        signal: TurnSignal,
+        reply: Option<tokio::sync::oneshot::Sender<crate::signal::StopDirective>>,
+    ) {
+        use crate::signal::StopDirective;
+
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == signal.panel_id) else {
+            // An unknown panel's reply sender (if any) drops here — allow.
             return;
         };
         panel.end_turn();
-        // A turn signal means the agent is idle, waiting for the next prompt.
-        if panel.state() == PanelState::Working {
+
+        // Hook-reply delivery, decided before the Idle transition. The reason
+        // carries every deliverable waiting for main's attention: the first
+        // due round (the primary deliverable, so it leads), then the whole
+        // question-notice queue — the reply is one continuing turn, so a
+        // notice held back would wait an entire further main turn for the
+        // push path, which is the latency this delivery exists to remove.
+        // Both takes are gated behind the checks, so nothing is consumed on a
+        // path that cannot deliver; with nothing pending the sender drops —
+        // allow.
+        let mut delivered_by_hook = false;
+        let mut keystroke_fallback: Option<String> = None;
+        if let Some(sender) = reply
+            && Some(signal.panel_id) == self.main_panel_id
+            && !sender.is_closed()
+            && self.main_compose_quiet()
+        {
+            let mut parts: Vec<String> = Vec::new();
+            parts.extend(self.take_due_round_summary());
+            parts.extend(self.take_question_notice_texts());
+            if !parts.is_empty() {
+                let reason = parts.join("\n\n");
+                match sender.send(StopDirective::Deliver { reason }) {
+                    Ok(()) => delivered_by_hook = true,
+                    Err(StopDirective::Deliver { reason }) => keystroke_fallback = Some(reason),
+                }
+            }
+        }
+
+        // A turn signal means the agent is idle, waiting for the next prompt —
+        // unless the hook delivery just continued the turn.
+        if !delivered_by_hook
+            && let Some(panel) = self.panels.iter_mut().find(|p| p.id == signal.panel_id)
+            && panel.state() == PanelState::Working
+        {
             let _ = lifecycle::transition(panel, PanelState::Idle);
         }
 
@@ -259,6 +329,109 @@ impl Multiplexer {
         }
         self.record_commit_provenance(signal.panel_id);
         self.record_commit_supersessions(signal.panel_id);
+
+        if delivered_by_hook {
+            self.reopen_turn_after_hook_delivery(signal.panel_id);
+        }
+        if let Some(summary) = keystroke_fallback {
+            // The receiver vanished after the liveness check: the round (if
+            // one was taken) is already completed and the notices are out of
+            // their queue, so this text is their only copy in flight. The
+            // panel just flipped Idle above, which is exactly the state the
+            // keystroke push delivers into.
+            warn!(
+                panel = %signal.panel_id,
+                "hook reply receiver gone after payload was taken; delivering by keystroke"
+            );
+            if let Err(err) =
+                crate::mcp::McpToolSurface::send_keys(self, signal.panel_id, &summary, true)
+            {
+                warn!(error = %err, "keystroke fallback failed; spilling to dropped-rounds.log");
+                self.append_dropped_round(
+                    "----- dropped turn-boundary delivery (hook reply lost and keystroke \
+                     fallback failed) -----",
+                    &summary,
+                );
+            }
+        }
+    }
+
+    /// Reopen the main panel's capture turn after a turn-boundary payload (a
+    /// round summary and/or queued question notices) was delivered through
+    /// its Stop hook reply: the blocked Stop continues the same turn, so the
+    /// panel must read as mid-turn again — `begin_turn()` for the capture,
+    /// `Working` kept (or restored), and the injected prompt recorded on the
+    /// timeline.
+    ///
+    /// Deliberately a sibling of [`Multiplexer::note_prompt_delivered`], not a
+    /// call to it: that path clears `main_compose_since`, because a *submitted
+    /// line* consumed the human's composition. Nothing was submitted here — a
+    /// hook reply travels the socket, not the input line — so a compose hold
+    /// the human owns must survive the delivery.
+    fn reopen_turn_after_hook_delivery(&mut self, panel_id: PanelId) {
+        let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
+            return;
+        };
+        panel.begin_turn();
+        if matches!(panel.state(), PanelState::Spawning | PanelState::Idle) {
+            let _ = lifecycle::transition(panel, PanelState::Working);
+        }
+        self.record_lane_event(panel_id, LaneEventKind::PromptDelivered);
+    }
+
+    /// Ingest a mid-turn note: cap its body once (`AgentNote::truncated`, so
+    /// the manifest record and any notice see the same text) and record it on
+    /// the panel's manifest via `agent::manifest::record_note` (Invariant
+    /// I-2). Deliberately NO panel state transition — a note arrives mid-turn;
+    /// the turn is talking, not ending, so `Working` survives it. A
+    /// `question` note is additionally queued for the main worker
+    /// ([`Multiplexer::poll_question_notices`]).
+    pub fn handle_note(&mut self, note: AgentNote) {
+        // A note for a panel caucus does not know (already killed, or a stray
+        // client) has nowhere to be recorded and no one to be forwarded for.
+        let Some(panel) = self.panels.iter().find(|p| p.id == note.panel_id) else {
+            return;
+        };
+        let role = panel.role.clone();
+        let note = note.truncated();
+        if let Some(manifest) = self.manifests.get_mut(&note.panel_id)
+            && let Err(err) = manifest::record_note(manifest, &self.session.root_dir, &note)
+        {
+            warn!(panel = %note.panel_id, error = %err, "manifest note write failed");
+        }
+        if note.kind == NoteKind::Question {
+            self.enqueue_question_notice(note.panel_id, role, note.body);
+        }
+    }
+
+    /// Drain every panel's queued in-band desktop notifications (OSC 9 / 99 /
+    /// 777 — `term::Grid`) onto its manifest timeline as `NotificationSeen`
+    /// events (`docs/design.md` §7.7). Runs once per event-loop tick, after
+    /// the PTY pump that fills the queues.
+    ///
+    /// Capture only: no panel state transition and no settle semantics.
+    /// Whether a notification may ever hint settlement (D-2) is decided
+    /// elsewhere and would have to route through the turn-completion owner
+    /// (`handle_signal` → `record_turn_completed`) — never through here.
+    pub(crate) fn poll_notifications(&mut self) {
+        let drained: Vec<(PanelId, Vec<String>)> = self
+            .panels
+            .iter_mut()
+            .map(|p| (p.id, p.take_notifications()))
+            .filter(|(_, texts)| !texts.is_empty())
+            .collect();
+        for (panel_id, texts) in drained {
+            let Some(manifest) = self.manifests.get_mut(&panel_id) else {
+                continue;
+            };
+            for body in texts {
+                if let Err(err) =
+                    manifest::record_notification(manifest, &self.session.root_dir, &body)
+                {
+                    warn!(panel = %panel_id, error = %err, "manifest notification write failed");
+                }
+            }
+        }
     }
 
     /// Record a `CommitCreated` event when the turn that just ended named a
@@ -484,6 +657,167 @@ mod tests {
             on_disk.lane_events()
         );
         mux.shutdown();
+    }
+
+    /// A mid-turn note records on the panel's manifest and does NOT end the
+    /// turn: the panel stays `Working` (contrast `handle_signal`, which flips
+    /// it `Idle`). A non-`question` note queues nothing for the main worker.
+    #[tokio::test]
+    async fn handle_note_records_without_ending_the_turn() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        let agent_id = mf.agent_id;
+        mux.manifests.insert(id, mf);
+
+        mux.handle_note(AgentNote::now(
+            mux.session.id,
+            id,
+            NoteKind::Progress,
+            "halfway through the sweep".into(),
+        ));
+
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == id).unwrap().state(),
+            PanelState::Working,
+            "a note must not end the turn"
+        );
+        assert!(
+            mux.pending_question_notices.is_empty(),
+            "a progress note queues nothing for main"
+        );
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(
+            on_disk.last_note(),
+            Some("[progress] halfway through the sweep")
+        );
+        mux.shutdown();
+    }
+
+    /// An OSC 9 the panel emitted lands on its manifest timeline as a
+    /// `NotificationSeen` event, with no state transition — and a second poll
+    /// records nothing new, because the drain consumed the queue.
+    #[tokio::test]
+    async fn poll_notifications_records_a_notification_seen_event() {
+        use crate::agent::lane_event::LaneEventKind;
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        let agent_id = mf.agent_id;
+        mux.manifests.insert(id, mf);
+
+        // Feed the escape the way the pump would: bytes through the grid.
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == id)
+            .unwrap()
+            .grid
+            .advance(b"\x1b]9;deploy done\x07");
+        mux.poll_notifications();
+
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == id).unwrap().state(),
+            PanelState::Working,
+            "a notification must not end the turn"
+        );
+        let seen = |m: &AgentManifest| {
+            m.lane_events()
+                .iter()
+                .filter(|e| matches!(&e.kind, LaneEventKind::NotificationSeen { body } if body == "deploy done"))
+                .count()
+        };
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(on_disk.last_notification(), Some("deploy done"));
+        assert_eq!(seen(&on_disk), 1);
+
+        mux.poll_notifications();
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(
+            seen(&on_disk),
+            1,
+            "a drained notification is not re-recorded"
+        );
+        mux.shutdown();
+    }
+
+    /// A notification from a panel with no manifest (spawn raced, or a bare
+    /// shell panel) has nowhere to be recorded — the poll drains the queue
+    /// and drops the texts instead of panicking or leaking them to a later
+    /// manifest.
+    #[tokio::test]
+    async fn poll_notifications_without_a_manifest_drops_the_texts() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+
+        let panel = mux.panels.iter_mut().find(|p| p.id == id).unwrap();
+        panel.grid.advance(b"\x1b]9;ping\x07");
+        mux.poll_notifications();
+
+        let panel = mux.panels.iter_mut().find(|p| p.id == id).unwrap();
+        assert!(
+            panel.take_notifications().is_empty(),
+            "the poll drains the queue even with no manifest to record on"
+        );
+        mux.shutdown();
+    }
+
+    /// A `question` note is additionally queued for the main worker; delivery
+    /// itself is `poll_question_notices`' job (tested in `rounds`).
+    #[tokio::test]
+    async fn handle_note_queues_a_question_for_the_main_worker() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+
+        mux.handle_note(AgentNote::now(
+            mux.session.id,
+            id,
+            NoteKind::Question,
+            "which API version should I target?".into(),
+        ));
+
+        assert_eq!(mux.pending_question_notices.len(), 1);
+        mux.shutdown();
+    }
+
+    /// A note for a panel caucus does not know (already killed, or a stray
+    /// client) is dropped whole: nothing to record on, no one to forward for.
+    #[tokio::test]
+    async fn handle_note_for_an_unknown_panel_is_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        mux.handle_note(AgentNote::now(
+            mux.session.id,
+            PanelId::new(),
+            NoteKind::Question,
+            "does anyone hear me?".into(),
+        ));
+
+        assert!(mux.pending_question_notices.is_empty());
     }
 
     /// A turn signal whose final message names a commit this agent left on its

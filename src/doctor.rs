@@ -1,7 +1,8 @@
 //! `caucus doctor` — environment + configuration health check
 //! (`docs/design.md` §10).
 //!
-//! Checks: the running caucus version + `caucus` on `PATH`, `git`, that the cwd
+//! Checks: the running caucus version + `caucus` on `PATH` (and that the two
+//! builds agree — the hook chain runs the PATH binary), `git`, that the cwd
 //! is a git repository, the agent CLIs (`claude` / `codex`), the Stop hook
 //! chain (present in settings, its command runnable on this machine, and a
 //! live end-to-end signal delivery), and every role's `allowed_tools` for the
@@ -55,8 +56,9 @@ impl Report {
 
 /// Run all environment + configuration checks for the project rooted at `repo`.
 ///
-/// Reports the running caucus version (and that `caucus` is on `PATH` for the
-/// turn-signal hook), probes `git` and the agent CLIs (`claude` / `codex`) on
+/// Reports the running caucus version (that `caucus` is on `PATH` for the
+/// turn-signal hook, and that the PATH build's version matches the running
+/// one), probes `git` and the agent CLIs (`claude` / `codex`) on
 /// `PATH`, confirms `repo` is a git repository, verifies the Claude `Stop` hook
 /// is installed in `~/.claude/settings.json`, and audits every role's
 /// `allowed_tools` for the forbidden `Task` tool (Invariant I-7).
@@ -163,22 +165,80 @@ fn binary_check(bin: &str, missing_severity: Severity, why: &str) -> Check {
 /// itself works. The version is surfaced so `caucus doctor` output pins the
 /// exact build for bug reports and upgrade confirmation.
 fn caucus_check() -> Check {
-    let version = env!("CARGO_PKG_VERSION");
-    match which("caucus") {
-        Some(p) => Check {
-            name: "caucus".into(),
-            severity: Severity::Ok,
-            detail: format!("v{version} (on PATH at {})", p.display()),
+    let on_path = which("caucus");
+    let path_version = on_path.as_deref().and_then(path_binary_version);
+    caucus_check_from(
+        env!("CARGO_PKG_VERSION"),
+        on_path.as_deref(),
+        path_version.as_deref(),
+    )
+}
+
+/// The pure body of [`caucus_check`]: running version vs what `PATH` resolves.
+/// A version mismatch is the one *silent* degradation in the signal chain —
+/// the stale PATH binary still posts signals (the live selftest passes), but
+/// it speaks an older wire, so newer capabilities (e.g. the `wants_reply`
+/// hook-reply of §7.6) quietly degrade to fire-and-forget.
+fn caucus_check_from(running: &str, on_path: Option<&Path>, path_version: Option<&str>) -> Check {
+    let name = "caucus".to_string();
+    match on_path {
+        Some(p) => match path_version {
+            Some(found) if found != running => Check {
+                name,
+                severity: Severity::Warn,
+                detail: format!(
+                    "v{running} running, but `caucus` on PATH ({}) is v{found} — the \
+                     turn-signal hook execs the PATH binary, so signals go through \
+                     the other build and newer wire features degrade silently; \
+                     reinstall caucus so PATH matches",
+                    p.display()
+                ),
+            },
+            // Same version, or a binary whose version cannot be read (a
+            // wrapper script, say) — no mismatch provable. Whether it works
+            // at all is the live selftest's verdict, not this check's.
+            _ => Check {
+                name,
+                severity: Severity::Ok,
+                detail: format!("v{running} (on PATH at {})", p.display()),
+            },
         },
         None => Check {
-            name: "caucus".into(),
+            name,
             severity: Severity::Warn,
             detail: format!(
-                "v{version} running, but `caucus` is not on PATH — the turn-signal \
+                "v{running} running, but `caucus` is not on PATH — the turn-signal \
                  hook (`exec caucus signal post`) cannot run; install caucus on PATH"
             ),
         },
     }
+}
+
+/// The version of the caucus binary at `path`, via `<path> --version` (clap
+/// prints `caucus <semver>`). `None` when it cannot be run or prints nothing
+/// version-shaped — then [`caucus_check_from`] stays quiet and the live
+/// selftest is the arbiter of chain health.
+fn path_binary_version(path: &Path) -> Option<String> {
+    let out = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_version_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The version token out of `--version` output: the last whitespace token of
+/// the first line (`caucus 0.9.1` → `0.9.1`), required to start with a digit
+/// so arbitrary wrapper-script chatter does not read as a mismatch.
+fn parse_version_output(text: &str) -> Option<String> {
+    text.lines()
+        .next()?
+        .split_whitespace()
+        .last()
+        .filter(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+        .map(str::to_string)
 }
 
 /// Check that `repo` is inside a git work tree. caucus's per-panel isolation
@@ -414,7 +474,18 @@ fn run_selftest(hook_command: &str, sock: &Path) -> Result<(), String> {
             Ok((mut conn, _)) => {
                 let _ = conn.set_read_timeout(Some(SELFTEST_DEADLINE));
                 let mut buf = [0u8; 1];
-                break conn.read(&mut buf).map(|n| n > 0).unwrap_or(false);
+                // Retry on EINTR rather than reporting a false "hook did not
+                // post": a signal interrupting this probe read is not evidence
+                // the hook stayed silent. Same handling as the production reply
+                // read in `signal::post`.
+                let got = loop {
+                    match conn.read(&mut buf) {
+                        Ok(n) => break n > 0,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break false,
+                    }
+                };
+                break got;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 let now = std::time::Instant::now();
@@ -543,6 +614,69 @@ mod tests {
             "version not surfaced: {}",
             check.detail
         );
+    }
+
+    #[test]
+    fn caucus_check_warns_when_the_path_binary_version_differs() {
+        let check = caucus_check_from("0.9.1", Some(Path::new("/usr/bin/caucus")), Some("0.8.0"));
+        assert_eq!(check.severity, Severity::Warn, "{}", check.detail);
+        for needle in ["0.9.1", "0.8.0", "/usr/bin/caucus"] {
+            assert!(check.detail.contains(needle), "detail: {}", check.detail);
+        }
+    }
+
+    #[test]
+    fn caucus_check_is_ok_when_the_path_binary_version_matches() {
+        let check = caucus_check_from("0.9.1", Some(Path::new("/usr/bin/caucus")), Some("0.9.1"));
+        assert_eq!(check.severity, Severity::Ok, "{}", check.detail);
+    }
+
+    #[test]
+    fn caucus_check_is_ok_when_the_path_binary_version_is_unreadable() {
+        // A wrapper script with no readable version: no mismatch provable, so
+        // no warning — the live selftest decides whether the chain works.
+        let check = caucus_check_from("0.9.1", Some(Path::new("/usr/bin/caucus")), None);
+        assert_eq!(check.severity, Severity::Ok, "{}", check.detail);
+    }
+
+    #[test]
+    fn caucus_check_warns_when_not_on_path() {
+        let check = caucus_check_from("0.9.1", None, None);
+        assert_eq!(check.severity, Severity::Warn, "{}", check.detail);
+        assert!(check.detail.contains("not on PATH"), "{}", check.detail);
+    }
+
+    #[test]
+    fn parse_version_output_takes_the_first_line_version_token() {
+        assert_eq!(
+            parse_version_output("caucus 0.9.1\n").as_deref(),
+            Some("0.9.1")
+        );
+        assert_eq!(parse_version_output("0.9.1").as_deref(), Some("0.9.1"));
+        assert_eq!(parse_version_output("not a version"), None);
+        assert_eq!(parse_version_output(""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_binary_version_reads_a_binary_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("caucus");
+        std::fs::write(&bin, "#!/bin/sh\necho 'caucus 99.0.0'\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(path_binary_version(&bin).as_deref(), Some("99.0.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_binary_version_is_none_for_a_failing_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("caucus");
+        std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(path_binary_version(&bin), None);
     }
 
     #[test]

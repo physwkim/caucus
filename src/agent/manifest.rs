@@ -74,6 +74,22 @@ pub struct AgentManifest {
     /// turn signal carries one (or for non-claude backends).
     #[serde(default)]
     pub(crate) claude_session_id: Option<String>,
+    /// Path of the agent's conversation transcript (JSONL), lifted from its
+    /// turn signals (`TurnSignal::transcript_path`). Lets the main worker read
+    /// the whole conversation from disk instead of scraping the terminal.
+    /// Kept once learned: a later signal that omits it does not clear it.
+    #[serde(default)]
+    pub(crate) transcript_path: Option<PathBuf>,
+    /// The agent's most recent mid-turn note (`caucus signal note`), rendered
+    /// as `[kind] body`. The full history is in the lane events; this scalar
+    /// is the display convenience `list_panels` surfaces, like `last_message`.
+    #[serde(default)]
+    pub(crate) last_note: Option<String>,
+    /// The most recent desktop-notification text the panel's process emitted
+    /// in-band (OSC 9 / 99 / 777, `docs/design.md` §7.7). Same shape as
+    /// `last_note`: full history in the lane events, scalar for `list_panels`.
+    #[serde(default)]
+    pub(crate) last_notification: Option<String>,
 }
 
 impl AgentManifest {
@@ -107,6 +123,9 @@ impl AgentManifest {
             error: None,
             last_message: None,
             claude_session_id: None,
+            transcript_path: None,
+            last_note: None,
+            last_notification: None,
         }
     }
 
@@ -120,6 +139,25 @@ impl AgentManifest {
     /// carried one — what `claude --resume` needs to continue the session.
     pub fn claude_session_id(&self) -> Option<&str> {
         self.claude_session_id.as_deref()
+    }
+
+    /// Path of the agent's conversation transcript (JSONL), if a turn signal
+    /// has carried one — surfaced by `list_panels` so the main worker can read
+    /// the conversation directly.
+    pub fn transcript_path(&self) -> Option<&Path> {
+        self.transcript_path.as_deref()
+    }
+
+    /// The agent's most recent mid-turn note as `[kind] body`, if it has
+    /// posted one (`caucus signal note`) — surfaced by `list_panels`.
+    pub fn last_note(&self) -> Option<&str> {
+        self.last_note.as_deref()
+    }
+
+    /// The most recent in-band desktop notification (OSC 9 / 99 / 777) the
+    /// panel's process emitted, if any — surfaced by `list_panels`.
+    pub fn last_notification(&self) -> Option<&str> {
+        self.last_notification.as_deref()
     }
 
     /// Read-only view of the lane-event timeline.
@@ -242,6 +280,13 @@ pub(crate) fn record_turn_completed(
         manifest.claude_session_id = Some(sid.to_string());
     }
 
+    // Same keep-if-absent rule as the conversation id: the transcript path is
+    // stable for the agent's lifetime, so a signal without one (codex, a
+    // malformed payload) must not erase what an earlier signal taught us.
+    if let Some(path) = &signal.transcript_path {
+        manifest.transcript_path = Some(path.clone());
+    }
+
     // A non-Stop turn signal carries a failure. One match produces both the
     // blocker `derived_state` reads and the timeline event that records it, so
     // the two cannot drift: a manifest showing a blocker always has the event
@@ -274,6 +319,52 @@ pub(crate) fn record_turn_completed(
         manifest.current_blocker.as_ref(),
     );
     to_disk(manifest, session_root)
+}
+
+/// Record a mid-turn [`crate::signal::AgentNote`] on the manifest: append a
+/// `NoteRecorded` lane event and store the rendered note as `last_note`.
+///
+/// Deliberately NO state transition and no `derived_state` recompute — a note
+/// arrives mid-turn; the turn is talking, not ending, so `Working` must
+/// survive it. The caller (`Multiplexer::handle_note`) has already capped the
+/// body (`AgentNote::truncated`).
+pub(crate) fn record_note(
+    manifest: &mut AgentManifest,
+    session_root: &Path,
+    note: &crate::signal::AgentNote,
+) -> Result<(), ManifestError> {
+    manifest.last_note = Some(format!("[{}] {}", note.kind.as_str(), note.body));
+    write(
+        manifest,
+        session_root,
+        Some(LaneEvent::now(LaneEventKind::NoteRecorded {
+            note_kind: note.kind,
+            body: note.body.clone(),
+        })),
+    )
+}
+
+/// Record an in-band desktop notification (OSC 9 / 99 / 777) the panel's
+/// process emitted (`docs/design.md` §7.7): append a `NotificationSeen` lane
+/// event and store the text as `last_notification`.
+///
+/// Like [`record_note`], deliberately NO state transition and no
+/// `derived_state` recompute — capture only. Whether a notification may ever
+/// hint turn settlement is D-2's decision, and would have to route through
+/// [`record_turn_completed`], the turn-completion owner — never through here.
+pub(crate) fn record_notification(
+    manifest: &mut AgentManifest,
+    session_root: &Path,
+    body: &str,
+) -> Result<(), ManifestError> {
+    manifest.last_notification = Some(body.to_string());
+    write(
+        manifest,
+        session_root,
+        Some(LaneEvent::now(LaneEventKind::NotificationSeen {
+            body: body.to_string(),
+        })),
+    )
 }
 
 /// Mark an agent's process as exited (`docs/design.md` §8.3).
@@ -336,6 +427,9 @@ fn render_md(m: &AgentManifest) -> String {
     if let Some(wt) = &m.worktree_path {
         let _ = writeln!(s, "- worktree: {}", wt.display());
     }
+    if let Some(t) = &m.transcript_path {
+        let _ = writeln!(s, "- transcript: {}", t.display());
+    }
     let _ = writeln!(s, "- created_at: {}", m.created_at);
     if let Some(t) = m.exited_at {
         let _ = writeln!(s, "- exited_at: {t}");
@@ -370,6 +464,12 @@ fn event_label(kind: &LaneEventKind) -> String {
             }
             SupersededBy::Unknown => format!("commit_superseded ({commit} -> unknown)"),
         },
+        LaneEventKind::NoteRecorded { note_kind, body } => {
+            format!("note ({}: {})", note_kind.as_str(), body)
+        }
+        LaneEventKind::NotificationSeen { body } => {
+            format!("notification ({body})")
+        }
         LaneEventKind::WorktreeCreated { path } => {
             format!("worktree_created ({})", path.display())
         }
@@ -498,6 +598,152 @@ mod tests {
         );
         record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
         assert_eq!(manifest.claude_session_id(), Some("kept-id"));
+    }
+
+    /// A turn signal whose payload carries `transcript_path` lands the path on
+    /// the manifest — the whole lift chain, since `TurnSignal::now` extracts
+    /// it from the payload.
+    #[test]
+    fn record_turn_completed_extracts_transcript_path() {
+        use crate::signal::{TurnKind, TurnSignal};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            None,
+        );
+        assert_eq!(manifest.transcript_path(), None);
+
+        let signal = TurnSignal::now(
+            manifest.session_id,
+            manifest.panel_id,
+            TurnKind::Stop,
+            Some("done".into()),
+            serde_json::json!({ "transcript_path": "/logs/conv.jsonl" }),
+        );
+        record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
+        assert_eq!(
+            manifest.transcript_path(),
+            Some(Path::new("/logs/conv.jsonl"))
+        );
+
+        // Persisted: a fresh read sees the same path.
+        let back = read(tmp.path(), manifest.agent_id).unwrap();
+        assert_eq!(back.transcript_path(), Some(Path::new("/logs/conv.jsonl")));
+    }
+
+    /// A mid-turn note lands `last_note` plus a persisted `NoteRecorded` lane
+    /// event — and changes no state: the note arrives mid-turn, the turn is
+    /// talking rather than ending, so `status` and `derived_state` must
+    /// survive it untouched.
+    #[test]
+    fn record_note_records_without_a_state_transition() {
+        use crate::signal::{AgentNote, NoteKind};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            None,
+        );
+        let status_before = manifest.status;
+        let derived_before = manifest.derived_state;
+
+        let note = AgentNote::now(
+            manifest.session_id,
+            manifest.panel_id,
+            NoteKind::Question,
+            "which schema version?".into(),
+        );
+        record_note(&mut manifest, tmp.path(), &note).unwrap();
+
+        assert_eq!(
+            manifest.last_note(),
+            Some("[question] which schema version?")
+        );
+        assert_eq!(manifest.status, status_before);
+        assert_eq!(manifest.derived_state, derived_before);
+
+        // Persisted: a fresh read sees the note and its lane event.
+        let back = read(tmp.path(), manifest.agent_id).unwrap();
+        assert_eq!(back.last_note(), Some("[question] which schema version?"));
+        assert!(
+            back.lane_events().iter().any(|e| matches!(
+                &e.kind,
+                LaneEventKind::NoteRecorded { note_kind: NoteKind::Question, body }
+                    if body == "which schema version?"
+            )),
+            "the note is on the persisted timeline: {:?}",
+            back.lane_events()
+        );
+    }
+
+    /// An in-band notification lands `last_notification` plus a persisted
+    /// `NotificationSeen` lane event, with no state transition.
+    #[test]
+    fn record_notification_records_without_a_state_transition() {
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            None,
+        );
+        let status_before = manifest.status;
+        let derived_before = manifest.derived_state;
+
+        record_notification(&mut manifest, tmp.path(), "build finished").unwrap();
+
+        assert_eq!(manifest.last_notification(), Some("build finished"));
+        assert_eq!(manifest.status, status_before);
+        assert_eq!(manifest.derived_state, derived_before);
+
+        let back = read(tmp.path(), manifest.agent_id).unwrap();
+        assert_eq!(back.last_notification(), Some("build finished"));
+        assert!(
+            back.lane_events().iter().any(|e| matches!(
+                &e.kind,
+                LaneEventKind::NotificationSeen { body } if body == "build finished"
+            )),
+            "the notification is on the persisted timeline: {:?}",
+            back.lane_events()
+        );
+    }
+
+    /// A turn signal without a transcript path (codex, malformed payload)
+    /// leaves a previously learned path untouched.
+    #[test]
+    fn record_turn_completed_without_transcript_path_keeps_prior() {
+        use crate::signal::{TurnKind, TurnSignal};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            None,
+        );
+        manifest.transcript_path = Some("/logs/kept.jsonl".into());
+        let signal = TurnSignal::now(
+            manifest.session_id,
+            manifest.panel_id,
+            TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        );
+        record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
+        assert_eq!(
+            manifest.transcript_path(),
+            Some(Path::new("/logs/kept.jsonl"))
+        );
     }
 
     #[test]
@@ -669,6 +915,10 @@ mod tests {
                     worktree: None,
                 },
             },
+            LaneEventKind::NoteRecorded {
+                note_kind: crate::signal::NoteKind::Question,
+                body: "which port should the mock bind?".into(),
+            },
             LaneEventKind::WorktreeCreated {
                 path: PathBuf::from("/tmp/wt/backend-1"),
             },
@@ -699,6 +949,7 @@ mod tests {
             "blocked (PermissionPrompt: Allow? [y/n])",
             "failed (Transport: pipe)",
             "commit_created (abc1234)",
+            "note (question: which port should the mock bind?)",
             "worktree_created (/tmp/wt/backend-1)",
             "worktree_removed (/tmp/wt/backend-1)",
         ] {
