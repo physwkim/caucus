@@ -601,6 +601,10 @@ pub(crate) mod tests {
     /// here the replacement sits 100 commits behind the tip and is still named.
     #[test]
     fn a_replacement_is_named_however_far_behind_the_tip_it_sits() {
+        // This test makes ~200 git calls (a 100-commit branch); hold the heavy
+        // test lock so it does not run alongside a `git worktree add` and spike
+        // fork/exec pressure on a small CI runner (`crate::test_serial`).
+        let _serial = crate::test_serial::exclusive();
         let (dir, sha) = repo_with_commit();
         let branch = branch_of(dir.path());
         amend_reword(dir.path(), "reworded");

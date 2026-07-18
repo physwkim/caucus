@@ -155,6 +155,11 @@ fn short_session(id: SessionId) -> String {
 /// event loop calls this directly on its own thread — no async bridging, so
 /// no nested-runtime hazard.
 pub(crate) fn create(req: &WorktreeRequest) -> Result<WorktreeHandle, WorktreeError> {
+    // Tests: yield this `git worktree add` to the subprocess-heavy provenance
+    // depth test so their git spawns do not pile up on a small CI runner
+    // (`crate::test_serial`). Compiled out of production builds.
+    #[cfg(test)]
+    let _serial = crate::test_serial::shared();
     let path = req.default_path();
     if path.exists() {
         return Err(WorktreeError::AlreadyExists(path));
@@ -200,6 +205,10 @@ pub(crate) fn attach(
     path: &Path,
     branch: &str,
 ) -> Result<WorktreeHandle, WorktreeError> {
+    // Tests: same serialization as [`create`] — this is the resume path's
+    // `git worktree add`. Compiled out of production builds.
+    #[cfg(test)]
+    let _serial = crate::test_serial::shared();
     if path.exists() {
         return Err(WorktreeError::AlreadyExists(path.to_path_buf()));
     }

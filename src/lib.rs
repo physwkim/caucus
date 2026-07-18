@@ -24,5 +24,9 @@ pub mod term;
 pub mod tui;
 pub mod worktree;
 
+/// Coordinates subprocess-heavy tests so they do not flake under CI load.
+#[cfg(test)]
+mod test_serial;
+
 /// Compile-time package version, exposed for `caucus --version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
