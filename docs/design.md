@@ -713,10 +713,13 @@ title/hyperlink와 달리 이 큐는 **화면 상태가 아니라 이벤트 기�
 worker는 화면을 긁지 않고도 "이 패널이 방금 주의를 요청했다"를 본다.
 
 **경계 — 캡처는 settle이 아니다**: `NotificationSeen`은 상태 전이를 일으키지
-않는다. 훅 없는 패널에 한해 이것을 settle 힌트로 쓸지는 D-2의 결정이며, 쓴다면
-반드시 기존 turn-completion 단일 owner(`handle_signal` →
-`record_turn_completed`)를 경유해야 한다 — 제2의 settle 경로는 만들지 않는다.
-훅이 커버하는 claude/codex 패널은 D-2 대상이 아니다: 기록·관찰 전용.
+않는다. 훅 없는 패널에 한해 이것을 settle 힌트로 쓸지가 D-2였고, **구현하지
+않기로 결정**했다(2026-07): caucus가 스폰하는 모든 프로덕션 패널은 claude(Stop
+hook) 또는 codex(notify)라 대상 집합이 비어 있고, 아무도 밟지 않는 settle 경로는
+방출자 없는 lane event와 같은 부류의 죽은 분기다. 훅 없는 백엔드가 추가되면
+그때 결정하되, 제약은 지금 확정된 그대로다: settle로 쓴다면 반드시 기존
+turn-completion 단일 owner(`handle_signal` → `record_turn_completed`)를
+경유해야 하며 제2의 settle 경로는 만들지 않는다.
 
 ---
 
