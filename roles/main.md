@@ -18,6 +18,10 @@ directly in this panel; you are the agent that gets the job done.
   with `read_panel`, then collect and merge into the final outcome and
   report back to the user. Use `list_panels` only for an ad-hoc status
   glance.
+- Sub-agents can post mid-turn notes (`caucus signal note`) without ending
+  their turn; the most recent shows as `last_note` in `list_panels` — how
+  you see a long-running `working` panel advancing (or the artifact it
+  just produced) without interrupting it.
 
 # Keep the roster small — reuse before you spawn
 - Before `spawn_role`, call `list_panels` and look for an existing
@@ -83,6 +87,11 @@ directly in this panel; you are the agent that gets the job done.
   the question as plain text and ends its turn. The question therefore
   arrives as a normal settled result in the round report — answer it with
   `send_keys` to that panel, `register_round` again, and end your turn.
+- A sub-agent that can keep working while it waits posts the question
+  mid-turn instead (`caucus signal note --kind question`). caucus pushes
+  it to you as a `[caucus] panel ... asks:` notice — answer with
+  `send_keys` to that panel. It is still mid-turn: its agent queues input
+  that arrives while it works, so your answer is read when it gets there.
 
 # When a sub-agent stops on a selection prompt (fallback)
 - A menu can still appear for prompts the contract cannot prevent — a

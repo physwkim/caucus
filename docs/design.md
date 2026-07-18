@@ -568,6 +568,53 @@ exec caucus signal post \
 재사용한다. hook을 노출하지 않는 백엔드는 caucus가 grid 관찰(agent 프롬프트 복귀
 패턴 매치)로 fallback한다 — §8.3. 휴리스틱이라 hook 경로보다 신뢰도가 낮다.
 
+### 7.5 Mid-turn note (`caucus signal note`)
+
+턴 종료 신호는 턴이 끝나야만 나온다 — 긴 턴은 그동안 침묵한다. sub-agent는
+같은 신호 소켓으로 **턴을 끝내지 않고** 한 줄 노트를 보낼 수 있다:
+
+```sh
+caucus signal note --kind progress "sweep half done: 40/80 files"
+```
+
+`--sock`/`--session`/`--panel`은 spawn 시 주입된 `CAUCUS_*` env에서
+기본값을 얻으므로 패널 안에서는 본문만 넘기면 된다. wire 스키마
+(`AgentNote`):
+
+```json
+{
+  "session_id": "01HXX...",
+  "panel_id": "01HXY...",
+  "ts": "2026-07-18T09:00:00Z",
+  "kind": "progress",
+  "body": "sweep half done: 40/80 files"
+}
+```
+
+`kind`: `progress | artifact | question`. 소켓의 한 라인은 untagged
+`SignalEvent`로 파싱된다 — turn signal과 note는 shape로 구분되며 충돌할 수
+없다(`kind` 어휘가 서로소이고, `raw_hook_payload` vs `body`로 각자 상대에게
+없는 필드를 요구한다). 따라서 기존 hook 라인은 변경 없이 그대로 파싱된다.
+
+수신(`Multiplexer::handle_note`)은:
+
+- body를 2 KiB로 1회 cap(문자 경계, truncation 마커) — 노트는 타임라인의 한
+  줄이지 payload 채널이 아니다. 산출물은 파일로 쓰고 경로를 노트한다.
+- manifest에 `NoteRecorded` lane event를 기록하고(I-2), 최신 노트를
+  `[kind] body` 스칼라(`last_note`)로 저장한다 — `list_panels`가 노출.
+- **상태 전이는 없다**: 노트는 턴 중에 오므로 패널은 `Working`에 머문다.
+- `question` 노트는 추가로 main worker에게 notice로 주입된다: bounded 큐
+  (cap 32, drop-oldest)에 쌓이고, round 배달과 동일한 deliverability gate
+  (main `Idle` + compose hold 없음, `main_deliverable`)에서 tick당 하나씩
+  `send_keys`로 들어간다. main이 사라지면(패널 없음/`Exited`) 큐를 버린다 —
+  round 배달과 같은 규칙. 답은 main이 해당 패널에 `send_keys`로 보낸다;
+  패널 agent는 작업 중 도착한 입력을 큐잉했다가 읽는다.
+
+모든 sub-agent system prompt에는 note contract
+(`role::prompt::SUBAGENT_NOTE_CONTRACT`)가 부착된다 — question contract
+(막힌 질문은 턴을 끝내 round로 올린다)와의 역할 구분 포함: `question`
+노트는 답을 기다리며 **계속 일할 수 있는** 질문에만 쓴다.
+
 ---
 
 ## 8. Manifest & LaneEvent
@@ -615,6 +662,9 @@ enum LaneEventKind {
     CommitSuperseded { commit: String, by: SupersededBy },
                        // Multiplexer::record_commit_supersessions — 브랜치가 더는
                        // 갖고 있지 않은, 앞서 기록된 커밋
+    NoteRecorded { note_kind: NoteKind, body: String },
+                       // manifest::record_note — mid-turn `caucus signal note`
+                       // (§7.5). 상태 전이 없음: 턴은 계속된다
     WorktreeCreated { path: PathBuf },       // Multiplexer::spawn_panel_inner
     WorktreeRemoved { path: PathBuf },       // worktree::cleanup::record_removals
 }
@@ -968,6 +1018,10 @@ caucus gc [--older-than 7d] [--prune]
 
 caucus signal post --sock <s> --session <id> --panel <id> --kind stop
                                     # turn-signal hook이 호출 (사람은 안 침, 내부용)
+caucus signal note [--kind progress|artifact|question] <body>
+                                    # sub-agent가 턴 중에 호출 (§7.5). sock/session/
+                                    # panel은 CAUCUS_* env에서 기본값
+
 caucus mcp-serve --control-sock <p> # main worker용 stdio MCP 서버
                                     # (main worker의 Claude Code가 spawn, 내부용)
 ```

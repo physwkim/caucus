@@ -93,6 +93,11 @@ pub struct PanelSummary {
     /// capture. `None` before the first turn signal and for backends whose
     /// payloads carry no such path (codex).
     pub transcript_path: Option<String>,
+    /// The panel's most recent mid-turn note (`caucus signal note`), rendered
+    /// `[kind] body` — how a still-`working` panel reports progress, names an
+    /// artifact, or asks a question without ending its turn. `None` until the
+    /// panel posts one; the full history is on the manifest's lane events.
+    pub last_note: Option<String>,
 }
 
 /// Errors surfaced by MCP tool calls.

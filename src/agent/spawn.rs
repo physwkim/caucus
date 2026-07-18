@@ -219,6 +219,9 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
     // An agent that backgrounds a long command and ends its turn — or waits on
     // one across turns — therefore reports done while still working, and caucus
     // captures a half-finished result (§4, §8.5).
+    // The note contract (`role::prompt::SUBAGENT_NOTE_CONTRACT`) is the
+    // mid-turn complement: `caucus signal note` posts progress / artifact /
+    // question lines over the signal socket without ending the turn (§7).
     // A sub-agent with a worktree also carries the worktree contract: its cwd
     // is the worktree, but the same repo is checked out at the session root
     // too, and nothing else in its context says which checkout is its own — so
@@ -233,6 +236,7 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
         }
         parts.push(crate::role::prompt::SUBAGENT_QUESTION_CONTRACT.to_string());
         parts.push(crate::role::prompt::SUBAGENT_TURN_CONTRACT.to_string());
+        parts.push(crate::role::prompt::SUBAGENT_NOTE_CONTRACT.to_string());
         if let Some(worktree) = &request.worktree_path {
             parts.push(crate::role::prompt::subagent_worktree_contract(worktree));
         }
@@ -490,7 +494,9 @@ pub(crate) fn spawn(request: &SpawnRequest) -> Result<SpawnOutcome, SpawnError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::role::prompt::{SUBAGENT_QUESTION_CONTRACT, SUBAGENT_TURN_CONTRACT};
+    use crate::role::prompt::{
+        SUBAGENT_NOTE_CONTRACT, SUBAGENT_QUESTION_CONTRACT, SUBAGENT_TURN_CONTRACT,
+    };
 
     fn role() -> RoleSpec {
         RoleSpec {
@@ -592,10 +598,13 @@ mod tests {
 
     /// The contracts every sub-agent carries, in the order `build_command`
     /// appends them: ask in plain text and end the turn
-    /// ([`SUBAGENT_QUESTION_CONTRACT`]), and do not end that turn with work
-    /// still running ([`SUBAGENT_TURN_CONTRACT`]).
+    /// ([`SUBAGENT_QUESTION_CONTRACT`]), do not end that turn with work
+    /// still running ([`SUBAGENT_TURN_CONTRACT`]), and how to post mid-turn
+    /// notes ([`SUBAGENT_NOTE_CONTRACT`]).
     fn subagent_contracts() -> String {
-        format!("{SUBAGENT_QUESTION_CONTRACT}\n\n{SUBAGENT_TURN_CONTRACT}")
+        format!(
+            "{SUBAGENT_QUESTION_CONTRACT}\n\n{SUBAGENT_TURN_CONTRACT}\n\n{SUBAGENT_NOTE_CONTRACT}"
+        )
     }
 
     /// A sub-agent's resolved role prompt is injected with the caucus contracts

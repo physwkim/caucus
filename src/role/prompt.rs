@@ -68,6 +68,40 @@ finished, say — is read by nobody.
 silently: say so in plain text, with what you did and what remains, and end \
 the turn. The main worker decides what happens next.";
 
+/// The note contract appended to every **sub-agent** system prompt
+/// (`crate::agent::spawn::build_command`, `docs/design.md` §7): how to talk to
+/// caucus *mid-turn*, without ending the turn.
+///
+/// The turn contract makes the end of the turn the completion signal — which
+/// leaves a long turn silent until it ends. `caucus signal note` is the
+/// backchannel for exactly that window: a progress heartbeat, an artifact
+/// reference, or a question the main worker can answer while the panel keeps
+/// working. The `CAUCUS_*` env vars injected at spawn (§7.1) default the
+/// CLI's socket/session/panel arguments, so the command works as-is from the
+/// panel's shell.
+pub const SUBAGENT_NOTE_CONTRACT: &str = "\
+# caucus: mid-turn notes
+
+The end of your turn is your completion signal — but during a long turn you \
+can talk to caucus without ending it, by running:
+
+    caucus signal note --kind progress \"one line on where the work stands\"
+    caucus signal note --kind artifact \"path/to/thing-you-produced\"
+    caucus signal note --kind question \"a question the main worker can answer\"
+
+The socket, session, and panel are read from environment variables already \
+set in this panel — pass only the text. A note is one line on your timeline, \
+not a payload channel: bodies are capped at 2 KiB, so name an artifact by \
+path instead of pasting its content.
+
+- `progress`: post at natural checkpoints of a long task, so the \
+orchestrator sees the panel advancing rather than wedged.
+- `artifact`: name a file the moment it is useful to others.
+- `question`: forwarded to the main worker as a notice. Use it only for a \
+question you can keep working past — the answer arrives as a message typed \
+into this panel. When you are blocked on the answer, use the question \
+contract instead: write the question as plain text and end your turn.";
+
 /// The worktree contract appended to a **sub-agent that owns a git worktree**
 /// (`crate::agent::spawn::build_command`, `docs/design.md` §5).
 ///
