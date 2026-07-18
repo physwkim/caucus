@@ -474,7 +474,18 @@ fn run_selftest(hook_command: &str, sock: &Path) -> Result<(), String> {
             Ok((mut conn, _)) => {
                 let _ = conn.set_read_timeout(Some(SELFTEST_DEADLINE));
                 let mut buf = [0u8; 1];
-                break conn.read(&mut buf).map(|n| n > 0).unwrap_or(false);
+                // Retry on EINTR rather than reporting a false "hook did not
+                // post": a signal interrupting this probe read is not evidence
+                // the hook stayed silent. Same handling as the production reply
+                // read in `signal::post`.
+                let got = loop {
+                    match conn.read(&mut buf) {
+                        Ok(n) => break n > 0,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break false,
+                    }
+                };
+                break got;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 let now = std::time::Instant::now();

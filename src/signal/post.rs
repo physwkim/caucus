@@ -181,7 +181,15 @@ fn read_deliver_reason(stream: UnixStream) -> Option<String> {
             // EOF: judge whatever arrived (a reply without a trailing newline).
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            // Timeout or transport error.
+            // A signal interrupted the blocking read before the timeout fired —
+            // retry, do not fail open. Treating EINTR as a timeout lets any
+            // signal (a reaped subprocess's SIGCHLD, SIGWINCH, a profiler tick)
+            // collapse the reply wait to a few milliseconds and drop a deliver
+            // the server was still about to send, defeating the timeout ladder
+            // (§7.6). This matches the EINTR handling the blocking reads in
+            // `tui` and `pty` already use.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A real read timeout (SO_RCVTIMEO) or transport error: fail open.
             Err(_) => return None,
         }
     }
@@ -458,9 +466,19 @@ mod tests {
         let (writer, reader) = UnixStream::pair().unwrap();
         let started = std::time::Instant::now();
         assert_eq!(read_deliver_reason(reader), None);
+        // The read must *wait out* the timeout rather than failing open early —
+        // a wedged server has to cost the full budget, not a few milliseconds.
+        // `read_deliver_reason` retries on EINTR, so a signal landing mid-read
+        // (which is why this once flaked at ~119 ms under CI's subprocess load)
+        // no longer short-circuits it; the wait ends only on the real
+        // `SO_RCVTIMEO` expiry. The small margin covers just kernel timer
+        // granularity on that final expiry, while still proving a multi-second
+        // wait — a regression that mis-handled EINTR would return in ~100 ms and
+        // trip this assertion.
+        let waited = started.elapsed();
         assert!(
-            started.elapsed() >= HOOK_REPLY_READ_TIMEOUT,
-            "the read must wait out the full timeout before failing open"
+            waited >= HOOK_REPLY_READ_TIMEOUT - Duration::from_millis(50),
+            "the read must wait out the timeout before failing open, waited {waited:?}"
         );
         drop(writer);
     }
