@@ -615,6 +615,77 @@ caucus signal note --kind progress "sweep half done: 40/80 files"
 (막힌 질문은 턴을 끝내 round로 올린다)와의 역할 구분 포함: `question`
 노트는 답을 기다리며 **계속 일할 수 있는** 질문에만 쓴다.
 
+### 7.6 Hook-reply push — round 결과를 main Stop hook 응답으로
+
+**문제**: caucus→main round push(§4)는 키스트로크 주입이라 main이 idle일 때만
+착지한다. round가 main의 **턴 도중** 완료되면 main이 턴을 끝내고 idle이 될
+때까지 기다린다 — compose race·livelock 인접 사례가 살던 창이다.
+
+**해결**: main의 턴 경계에서 원자적으로 전달한다. Claude Stop hook이 stdout에
+`{"decision":"block","reason":"<텍스트>"}`를 내면 Claude는 **같은 턴 안에서**
+reason을 피드백으로 받아 계속한다(공식 문서 검증). due인 round의 요약을 그
+reason으로 실어 보낸다. 키스트로크 push는 강등되지 않는다 — main이 먼저 idle이
+된 흔한 경우는 여전히 push가 전달하며, hook-reply는 "round가 main 턴 도중
+완료"된 경우를 턴 경계에서 닫는 보완이다.
+
+**능력 협상 = env, 스크립트 불변**: `~/.claude/hooks/caucus-turn-signal` 본문은
+바뀌지 않는다. caucus가 **claude main 패널에만** `CAUCUS_HOOK_REPLY=1`을
+주입하고(`agent::spawn::build_command`), 그 env 아래의 `caucus signal post`만
+`wants_reply: true`를 와이어에 실어 보낸다. `wants_reply`는 false면 직렬화되지
+않으므로 sub 패널·codex·구버전 바이너리의 와이어 라인은 바이트 동일하다. 구/신
+어떤 조합도 오늘의 fire-and-forget으로 자연 강등된다.
+
+**와이어**: 요청은 §7.4의 turn signal + `"wants_reply":true`. 응답은 같은
+연결에 1줄 JSON — `{"action":"allow"}` 또는
+`{"action":"deliver","reason":"<round 요약>"}`. 서버(`signal::server`)가 응답
+라인의 유일한 writer다(I-6의 따름 규칙).
+
+**런타임 채널**: 서버는 `wants_reply` turn signal을
+`(SignalEvent, Some(oneshot::Sender<StopDirective>))`로 전달한다.
+`StopDirective`에는 `Deliver{reason}` 변형 하나뿐이다 — **sender drop이 곧
+allow**라서, 전달하지 않는 모든 경로(메인 패널 아님, due round 없음, 사람이
+compose 중, 런타임 종료)가 코드 0줄로 allow에 정합한다. allow를 "보내는 것을
+잊을" 수 있는 경로가 구조적으로 없다.
+
+**전달 판정** (`Multiplexer::handle_signal_with_reply`, 순서대로):
+
+1. reply slot이 있고 수신자가 살아 있다 (`!sender.is_closed()` — 이미 타임아웃한
+   hook이 round를 소비하면 그 round는 어디에도 전달되지 않는다; 닫혔으면 평범한
+   stop으로 처리하고 round는 키스트로크 push로 남는다).
+2. 신호의 패널이 main 패널이다.
+3. compose hold가 없다 (`main_compose_quiet` — "사람이 작성 중이면 자동 전달
+   없음" 규칙은 경로 불문이다; hold면 allow, round는 grace 해소 후 push가 전달).
+4. due인 round가 있다 (`take_due_round_summary` — `round_status` pull을 큐
+   전체로 일반화한 것: latch 갱신(I-9) → push와 동일한 due 판정
+   (`fallback_due || all_settled`) → 제거 후 `complete_round`(I-10) → 영속화).
+
+전달되면 main 턴은 계속되므로 Idle 전이를 생략하고 캡처 턴을 다시 연다
+(`reopen_turn_after_hook_delivery` — `note_prompt_delivered`의 형제:
+`begin_turn` + `Working` 유지 + `PromptDelivered` 기록. `main_compose_since`는
+**지우지 않는다** — 제출된 입력 라인이 없었으므로).
+
+**타임아웃 사다리**: 런타임 정상 응답 1 이벤트루프 틱(4–20ms) ≪ 서버 oneshot
+대기 1500ms (`server::HOOK_REPLY_WAIT`) < 클라이언트 read 2500ms
+(`post::HOOK_REPLY_READ_TIMEOUT`) ≪ Claude hook 타임아웃(기본 600s). 서버가
+먼저 명시적 allow를 보내는 것이 정상 fail-open 경로이고, 클라이언트 타임아웃은
+caucus가 진짜 죽었을 때만 발화한다.
+
+**클라이언트 fail-open 매트릭스** (`post::read_deliver_reason`): deliver 응답이
+잘 파싱된 경우에만 block JSON을 출력한다. 그 외 전부 — allow, read 타임아웃,
+EOF, 크기 초과, 파싱 실패, 미지의 action — 아무것도 출력하지 않고 exit 0: 턴은
+오늘과 동일하게 끝난다. hook이 main의 턴을 실패시키거나 붙잡아 둘 수 있는
+경로는 없다.
+
+**수신자 소실 경합**: liveness 확인과 send 사이에 클라이언트가 타임아웃하면
+round는 이미 완료·제거된 상태다. 이때 요약은 즉시 키스트로크로 전달되고(방금
+Idle로 전이한 main — push가 착지하는 바로 그 상태), 그것도 실패하면
+`dropped-rounds.log`에 남는다. 전체 리포트는 어느 경우든 이미 디스크에 있다
+(`rounds/<id>.md`).
+
+**종결 논증**: block 1회 = due round 1개 소비이므로 연속 block은 due round 수만큼만
+가능하다 — 종결은 구조적이고 `stop_hook_active` 파싱이 필요 없다. Claude의 연속
+block 8회 하드 캡은 추가 안전망으로만 존재한다.
+
 ---
 
 ## 8. Manifest & LaneEvent
@@ -816,6 +887,8 @@ manifest만 보는 순수 함수 — turn signal 수신 시 재계산한다. gri
    `.caucus/sessions/<id>/panels/<panel_id>.log`(메모리 링 + 디스크 spill). 라운드가
    settle하면 caucus가 이 캡처에서 각 패널 결과를 모아 main 패널에 push하고(§4),
    main worker는 더 필요한 디테일을 `read_panel`로 자기 페이스로 읽는다 — 경주 없음.
+   hook-reply 배달(§7.6)은 main의 캡처 턴을 턴 경계에서 다시 열어(`begin_turn`)
+   이어지는 출력이 같은 턴 로그 규율 아래 계속 잡히게 한다.
 3. **`read_panel` 모드.** MCP `read_panel` 툴은 `mode`를 받는다:
    - `screen` — 현재 보이는 grid
    - `scrollback` — 스크롤백 버퍼 전체
@@ -1149,12 +1222,17 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 - **Enforcement**: `pty` / `panel` 내부 타입은 `pub(crate)`, 생성자 비공개.
 - **Tests**: 동적 spawn/kill 후 레이아웃 reflow 일관성, PTY fd 누수 없음.
 
-### Invariant I-6: Turn signal은 signal::server만 ingest
+### Invariant I-6: Turn signal은 signal::server만 ingest — 그리고 응답도 server만 write
 - **Owner**: `signal::server::ingest()`
 - **MUST**: 소켓에서 온 turn signal은 이 함수만 파싱하고 manifest에 반영.
-- **MUST NOT**: 다른 모듈이 turn-signal 소켓을 직접 read.
-- **Enforcement**: 소켓 listener는 `signal::server` 내부에만 존재.
-- **Tests**: 동시 turn signal 수신 시 순서·manifest 반영 보장.
+  `wants_reply` 연결(§7.6)의 응답 라인도 server만 쓴다 — 런타임은 oneshot
+  `StopDirective`로 의도만 전달하고, 와이어 직렬화·타임아웃 fail-open
+  (`HOOK_REPLY_WAIT`)은 server가 한 곳에서 처리한다.
+- **MUST NOT**: 다른 모듈이 turn-signal 소켓을 직접 read/write.
+- **Enforcement**: 소켓 listener는 `signal::server` 내부에만 존재. 런타임에는
+  소켓 핸들이 아예 넘어가지 않는다 — `SignalEnvelope`의 oneshot sender뿐.
+- **Tests**: 동시 turn signal 수신 시 순서·manifest 반영 보장; deliver 지시가
+  응답 라인이 되는지; sender drop·타임아웃이 allow 라인이 되는지.
 
 ### Invariant I-7: 중첩 sub-agent 금지 — 모든 팀원은 패널
 - **Owner**: (없음 — 부재가 invariant, §0 #13)
@@ -1203,22 +1281,29 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
   남는지; latch 후 도착한 `Stop` 훅이 리포트의 `last_message`를 덮지 못하는지; backlog가 남은 채
   fallback이 닫히면 latch는 되고 feed는 안 되는지.
 
-### Invariant I-10: 라운드는 정확히 한 번 배달된다 (push 또는 pull)
+### Invariant I-10: 라운드는 정확히 한 번 배달된다 (push, pull 또는 hook-reply)
 - **Owner**: `Multiplexer::complete_round()` — assemble + spill + summary의 유일한 지점.
   호출 전에 라운드는 이미 `pending_rounds`에서 제거되어 있어야 한다.
-- **MUST**: 두 배달 경로 모두 이 owner를 지난다. **push** =
+- **MUST**: 세 배달 경로 모두 이 owner를 지난다. **push** =
   `poll_pending_rounds()` (메인 패널이 idle일 때 요약을 타이핑해 넣음),
-  **pull** = `round_status()` (완료된 라운드면 조립된 리포트를 호출자에게 그대로 반환).
-- **MUST NOT**: pull이 라운드를 pending에 남겨 두지 않는다 (남기면 push가 두 번째로 배달한다).
+  **pull** = `round_status()` (완료된 라운드면 조립된 리포트를 호출자에게 그대로 반환),
+  **hook-reply** = `take_due_round_summary()` (§7.6 — main의 Stop hook 응답에 요약을
+  실음; push와 같은 due 판정을 쓰고, 같은 제거-후-`complete_round` 규율을 지킨다).
+- **MUST NOT**: pull이 라운드를 pending에 남겨 두지 않는다 (남기면 push가 두 번째로
+  배달한다). hook-reply가 꺼낸 요약을 oneshot send 실패 시 조용히 버리지 않는다 —
+  라운드는 이미 완료됐으므로 키스트로크 fallback, 최후에는 `dropped-rounds.log`로
+  반드시 어딘가에 착지시킨다.
 - **왜**: push는 메인 패널이 idle일 때만 착지한다 — 즉 메인 워커가 **턴을 끝낸 뒤에만**. 턴 안에서
   기다리며 폴링하는 메인 워커는 내내 `Working`이므로 push는 영원히 못 온다: 메인은 라운드를 기다리고
   라운드는 메인이 기다림을 멈추기를 기다린다. `fallback_deadline`은 이 라이브락을 못 끊는다 — 그것은
   라운드를 *due*로 만들 뿐 *deliverable*로 만들지 않는다. pull이 구조적으로 끊는다.
-- **Enforcement**: 두 경로 다 라운드를 `pending_rounds`에서 꺼낸 뒤에만 `complete_round`를 부른다.
-  둘 다 같은 이벤트 루프 스레드에서 실행되므로 (control drain → poll) 겹칠 수 없다.
+- **Enforcement**: 세 경로 다 라운드를 `pending_rounds`에서 꺼낸 뒤에만 `complete_round`를 부른다.
+  셋 다 같은 이벤트 루프 스레드에서 실행되므로 (signal drain → control drain → poll) 겹칠 수 없다.
 - **Tests**: 메인이 `Working`인 채로 `round_status`가 리포트를 반환하고 라운드를 완료시키는지;
   그 뒤 `poll_pending_rounds`가 아무것도 배달하지 않고 같은 id의 두 번째 `round_status`가 에러인지;
-  아직 안 끝난 라운드는 pull 되지 않고 상태 텍스트만 반환하며 pending으로 남는지.
+  아직 안 끝난 라운드는 pull 되지 않고 상태 텍스트만 반환하며 pending으로 남는지;
+  hook-reply 배달 후 push가 같은 라운드를 다시 배달하지 않는지, 수신자가 죽은 hook은
+  아무것도 소비하지 않고 push 경로에 라운드를 남기는지.
 
 
 ---
