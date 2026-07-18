@@ -395,14 +395,26 @@ mod tests {
         assert_eq!(sig.last_message.as_deref(), Some("reviewer pass complete"));
     }
 
-    /// Write `reply` to one end of a socket pair, close it, and run
+    /// Write `reply` to one end of a socket pair, signal end-of-input, and run
     /// [`read_deliver_reason`] on the other end.
+    ///
+    /// The write side is half-closed with `shutdown(Write)` — a graceful EOF —
+    /// rather than a full `drop(writer)`. A `drop` here races the reader on
+    /// macOS AF_UNIX, which can discard buffered bytes the reader has not yet
+    /// consumed when the sender fully closes, so the reader sees EOF with no
+    /// data and a deliver reply reads as `None`. `shutdown(Write)` sends the
+    /// EOF while the fd stays open, so the reader reliably observes the
+    /// buffered reply then EOF on every platform. Production never hits the
+    /// race: the server keeps the connection open after replying
+    /// (`signal::server`), so it never close-races the client.
     fn deliver_reason_for(reply: &[u8]) -> Option<String> {
         use std::io::Write as _;
         let (mut writer, reader) = UnixStream::pair().unwrap();
         writer.write_all(reply).unwrap();
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        let out = read_deliver_reason(reader);
         drop(writer);
-        read_deliver_reason(reader)
+        out
     }
 
     /// The client fail-open matrix (`docs/design.md` §7.6): only a well-formed
