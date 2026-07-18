@@ -186,6 +186,9 @@ mod tests {
         let sig = ingest(&line).unwrap();
         assert_eq!(sig.kind, TurnKind::Stop);
         assert_eq!(sig.last_message.as_deref(), Some("done"));
+        // The line predates `transcript_path` (an old `caucus` binary posted
+        // it): the field defaults to None rather than failing the parse.
+        assert_eq!(sig.transcript_path, None);
     }
 
     /// Dropping the server removes its socket file, so it does not accumulate

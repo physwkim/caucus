@@ -87,6 +87,12 @@ pub struct PanelSummary {
     /// Model override the panel runs under (`spawn_role(model=...)`), if one
     /// was set; `None` when the panel uses the backend's default model.
     pub model: Option<String>,
+    /// Path of the agent's conversation transcript (JSONL), once a turn
+    /// signal has carried one (`docs/design.md` §7.4). The main worker reads
+    /// the file directly for the full conversation — richer than any screen
+    /// capture. `None` before the first turn signal and for backends whose
+    /// payloads carry no such path (codex).
+    pub transcript_path: Option<String>,
 }
 
 /// Errors surfaced by MCP tool calls.

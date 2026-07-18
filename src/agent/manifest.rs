@@ -74,6 +74,12 @@ pub struct AgentManifest {
     /// turn signal carries one (or for non-claude backends).
     #[serde(default)]
     pub(crate) claude_session_id: Option<String>,
+    /// Path of the agent's conversation transcript (JSONL), lifted from its
+    /// turn signals (`TurnSignal::transcript_path`). Lets the main worker read
+    /// the whole conversation from disk instead of scraping the terminal.
+    /// Kept once learned: a later signal that omits it does not clear it.
+    #[serde(default)]
+    pub(crate) transcript_path: Option<PathBuf>,
 }
 
 impl AgentManifest {
@@ -107,6 +113,7 @@ impl AgentManifest {
             error: None,
             last_message: None,
             claude_session_id: None,
+            transcript_path: None,
         }
     }
 
@@ -120,6 +127,13 @@ impl AgentManifest {
     /// carried one — what `claude --resume` needs to continue the session.
     pub fn claude_session_id(&self) -> Option<&str> {
         self.claude_session_id.as_deref()
+    }
+
+    /// Path of the agent's conversation transcript (JSONL), if a turn signal
+    /// has carried one — surfaced by `list_panels` so the main worker can read
+    /// the conversation directly.
+    pub fn transcript_path(&self) -> Option<&Path> {
+        self.transcript_path.as_deref()
     }
 
     /// Read-only view of the lane-event timeline.
@@ -242,6 +256,13 @@ pub(crate) fn record_turn_completed(
         manifest.claude_session_id = Some(sid.to_string());
     }
 
+    // Same keep-if-absent rule as the conversation id: the transcript path is
+    // stable for the agent's lifetime, so a signal without one (codex, a
+    // malformed payload) must not erase what an earlier signal taught us.
+    if let Some(path) = &signal.transcript_path {
+        manifest.transcript_path = Some(path.clone());
+    }
+
     // A non-Stop turn signal carries a failure. One match produces both the
     // blocker `derived_state` reads and the timeline event that records it, so
     // the two cannot drift: a manifest showing a blocker always has the event
@@ -335,6 +356,9 @@ fn render_md(m: &AgentManifest) -> String {
     }
     if let Some(wt) = &m.worktree_path {
         let _ = writeln!(s, "- worktree: {}", wt.display());
+    }
+    if let Some(t) = &m.transcript_path {
+        let _ = writeln!(s, "- transcript: {}", t.display());
     }
     let _ = writeln!(s, "- created_at: {}", m.created_at);
     if let Some(t) = m.exited_at {
@@ -498,6 +522,70 @@ mod tests {
         );
         record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
         assert_eq!(manifest.claude_session_id(), Some("kept-id"));
+    }
+
+    /// A turn signal whose payload carries `transcript_path` lands the path on
+    /// the manifest — the whole lift chain, since `TurnSignal::now` extracts
+    /// it from the payload.
+    #[test]
+    fn record_turn_completed_extracts_transcript_path() {
+        use crate::signal::{TurnKind, TurnSignal};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            None,
+        );
+        assert_eq!(manifest.transcript_path(), None);
+
+        let signal = TurnSignal::now(
+            manifest.session_id,
+            manifest.panel_id,
+            TurnKind::Stop,
+            Some("done".into()),
+            serde_json::json!({ "transcript_path": "/logs/conv.jsonl" }),
+        );
+        record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
+        assert_eq!(
+            manifest.transcript_path(),
+            Some(Path::new("/logs/conv.jsonl"))
+        );
+
+        // Persisted: a fresh read sees the same path.
+        let back = read(tmp.path(), manifest.agent_id).unwrap();
+        assert_eq!(back.transcript_path(), Some(Path::new("/logs/conv.jsonl")));
+    }
+
+    /// A turn signal without a transcript path (codex, malformed payload)
+    /// leaves a previously learned path untouched.
+    #[test]
+    fn record_turn_completed_without_transcript_path_keeps_prior() {
+        use crate::signal::{TurnKind, TurnSignal};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            None,
+        );
+        manifest.transcript_path = Some("/logs/kept.jsonl".into());
+        let signal = TurnSignal::now(
+            manifest.session_id,
+            manifest.panel_id,
+            TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        );
+        record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
+        assert_eq!(
+            manifest.transcript_path(),
+            Some(Path::new("/logs/kept.jsonl"))
+        );
     }
 
     #[test]
