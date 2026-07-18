@@ -7,6 +7,101 @@ versions.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-07-18
+
+caucus knew when a sub-agent's turn ended and almost nothing in between, and a
+round that finished while the main worker was mid-turn had no way to reach it
+until the worker next went idle. The main worker read the terminal to learn what
+a panel had done; a sub-agent with a question or a progress note had to end its
+turn to say so; a round completing inside the main worker's turn queued behind
+its idle. This release fills the middle of the channel: a structured turn-signal
+payload, a mid-turn backchannel, delivery at the turn boundary, and capture of
+the in-band notifications tools already emit.
+
+### Added
+
+- **`transcript_path` on the turn signal, surfaced by `list_panels`.** Claude's
+  `Stop` hook payload names the conversation transcript on disk; caucus now lifts
+  it onto the manifest and reports it, so the main worker reads a sub-agent's whole
+  conversation from the JSONL file instead of scraping the panel. Kept once learned
+  — a later signal that omits it does not clear it — and `None` for backends whose
+  payload carries no such path (codex).
+
+- **`caucus signal note` — a sub-agent mid-turn backchannel.** A sub-agent can post
+  a `progress`, `artifact`, or `question` note *without ending its turn*: it lands
+  on the panel's lane timeline (`NoteRecorded`) and as `last_note` in `list_panels`,
+  with no state transition — the panel stays `working`. A `question` note (one the
+  agent can keep working past) is additionally announced to the main worker, one per
+  tick, under the same deliverability gate as a round push; a note body is capped at
+  2 KiB once at ingest. The contract is stated at the single sub-agent spawn path
+  (`SUBAGENT_NOTE_CONTRACT`), distinguishing a work-on question-note from a blocking
+  question that must end the turn and rise as a round.
+
+- **Hook-reply push — a round is delivered through the main worker's `Stop` hook.**
+  A caucus→main round push types the report into the main panel, so it could only
+  land while the panel was idle; a round that completed *during* the main worker's
+  turn waited for the turn to end. Claude's `Stop` hook can continue the same turn
+  when its reply is `{"decision":"block","reason":...}`, so caucus now delivers a
+  due round's summary — and the whole queued question-notice list — as that reason,
+  at the turn boundary. Capability is negotiated by env (`CAUCUS_HOOK_REPLY=1`,
+  injected into the claude main panel only), so sub panels, codex, and older
+  binaries send a byte-identical wire and degrade naturally to the keystroke push,
+  which remains for a main worker that goes idle without a reply slot. A 1500 ms
+  server / 2500 ms client timeout ladder fails open to the ordinary turn end; a
+  reply that cannot be delivered consumes nothing.
+
+- **In-band desktop notifications (OSC 9 / 99 / 777) are captured.** The middle
+  layer of the signal hierarchy — hook > OSC in-band > screen — was empty: a panel
+  with no turn-completion hook (a bare shell, an arbitrary TUI tool) had no signal
+  but the screen. The grid now parses the three notification escapes into a bounded
+  per-panel queue (16, drop-oldest), and the runtime drains them each tick onto the
+  lane timeline as `NotificationSeen`, surfaced as `last_notification`. Capture only
+  — no state transition, no settle semantics.
+
+- **`caucus doctor` warns when the `caucus` on `PATH` is a different version.** The
+  turn-signal hook execs the `PATH` binary, so the whole signal chain runs whatever
+  build `PATH` resolves — not the running one. A stale `PATH` binary is the one
+  *silent* degradation: it still posts signals (the live selftest passes) but speaks
+  an older wire, so newer capabilities degrade quietly to fire-and-forget. doctor
+  reads `<path> --version` and warns on a mismatch, naming both builds.
+
+### Fixed
+
+- **A question notice reports the questioning panel's state as of delivery.** A
+  notice can wait behind a round push for a whole main turn, and the panel can
+  settle or exit in that window. The notice asserted the enqueue-time state
+  unconditionally — "the panel is still mid-turn, its agent queues input" — so a
+  main worker following it literally would open a spurious new turn on an idle panel
+  with `send_keys`, or answer into a dead one. The guidance clause now renders from
+  the panel's live state at delivery: `working` keeps the queue-input claim, `idle`
+  says the turn has ended (check the result first; an answer starts a new turn),
+  gone/exited advertises no answer path. The notice itself is never suppressed —
+  whether the question is already resolved is knowledge caucus does not have.
+
+### Changed
+
+- **ratatui 0.29 → 0.30.2, ulid 1 → 3, unicode-width `=0.2.0` → `=0.2.2`.** ratatui's
+  facade now resolves to the split `ratatui-core` / `ratatui-crossterm` /
+  `ratatui-widgets` crates; caucus's usage compiles unchanged. `ulid::Ulid::new()`
+  was renamed `generate()` (one call site, the id-newtype macro). The exact `=` pin
+  on unicode-width is kept — grid cell widths must not drift under an uncontrolled
+  bump — and moved to the current release.
+
+### Breaking (library API)
+
+The CLI, MCP tool surface, and keybindings are unchanged — nothing here affects
+using caucus as a binary. As a library, this is a breaking release: cargo reads
+`0.10.0` as incompatible with `^0.9`, so a consumer pinning `caucus = "0.9"` stays
+put until they opt in.
+
+- `LaneEventKind` gains `NoteRecorded` and `NotificationSeen` variants — an
+  exhaustive `match` on it must add arms.
+- `PanelSummary` gains `last_note` and `last_notification` fields — a struct literal
+  must set them.
+- The turn-signal wire types changed: `SignalEvent` is now a tagged enum carrying
+  either a `TurnSignal` or an `AgentNote`, `TurnSignal` grew a `transcript_path` and
+  a `wants_reply` field, and `StopDirective` / `SignalReply` are new.
+
 ## [0.9.1] — 2026-07-14
 
 The per-agent lane-event timeline named eight kinds of event and emitted two.
