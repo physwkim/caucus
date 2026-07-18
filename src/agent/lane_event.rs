@@ -94,6 +94,12 @@ pub enum LaneEventKind {
     /// artifact reference, or a question. Produced by `manifest::record_note`.
     /// Deliberately transition-free: the panel stays `Working`.
     NoteRecorded { note_kind: NoteKind, body: String },
+    /// A desktop-notification escape (OSC 9 / 99 / 777) the panel's process
+    /// emitted — an in-band attention signal from tools with no hook channel
+    /// (`docs/design.md` §7.7). Produced by `manifest::record_notification`.
+    /// Capture only: no state transition and no settle semantics — if it ever
+    /// hints settle (D-2), that must route through the turn-completion owner.
+    NotificationSeen { body: String },
     /// A worktree was created for this agent. Produced at the manifest's first
     /// write in `Multiplexer::spawn_panel_inner`.
     WorktreeCreated { path: PathBuf },
@@ -190,6 +196,9 @@ mod tests {
                     (input, "LaneEventKind::CommitSuperseded {")
                 }
                 LaneEventKind::NoteRecorded { .. } => (manifest, "LaneEventKind::NoteRecorded {"),
+                LaneEventKind::NotificationSeen { .. } => {
+                    (manifest, "LaneEventKind::NotificationSeen {")
+                }
                 LaneEventKind::WorktreeCreated { .. } => {
                     (spawn, "LaneEventKind::WorktreeCreated {")
                 }
@@ -223,6 +232,9 @@ mod tests {
             LaneEventKind::NoteRecorded {
                 note_kind: NoteKind::Progress,
                 body: "half done".into(),
+            },
+            LaneEventKind::NotificationSeen {
+                body: "build finished".into(),
             },
             LaneEventKind::WorktreeCreated { path: path.clone() },
             LaneEventKind::WorktreeRemoved { path },

@@ -388,6 +388,36 @@ impl Multiplexer {
         }
     }
 
+    /// Drain every panel's queued in-band desktop notifications (OSC 9 / 99 /
+    /// 777 — `term::Grid`) onto its manifest timeline as `NotificationSeen`
+    /// events (`docs/design.md` §7.7). Runs once per event-loop tick, after
+    /// the PTY pump that fills the queues.
+    ///
+    /// Capture only: no panel state transition and no settle semantics.
+    /// Whether a notification may ever hint settlement (D-2) is decided
+    /// elsewhere and would have to route through the turn-completion owner
+    /// (`handle_signal` → `record_turn_completed`) — never through here.
+    pub(crate) fn poll_notifications(&mut self) {
+        let drained: Vec<(PanelId, Vec<String>)> = self
+            .panels
+            .iter_mut()
+            .map(|p| (p.id, p.take_notifications()))
+            .filter(|(_, texts)| !texts.is_empty())
+            .collect();
+        for (panel_id, texts) in drained {
+            let Some(manifest) = self.manifests.get_mut(&panel_id) else {
+                continue;
+            };
+            for body in texts {
+                if let Err(err) =
+                    manifest::record_notification(manifest, &self.session.root_dir, &body)
+                {
+                    warn!(panel = %panel_id, error = %err, "manifest notification write failed");
+                }
+            }
+        }
+    }
+
     /// Record a `CommitCreated` event when the turn that just ended named a
     /// commit this agent left on its own branch (`docs/design.md` §5).
     ///
@@ -655,6 +685,85 @@ mod tests {
         assert_eq!(
             on_disk.last_note(),
             Some("[progress] halfway through the sweep")
+        );
+        mux.shutdown();
+    }
+
+    /// An OSC 9 the panel emitted lands on its manifest timeline as a
+    /// `NotificationSeen` event, with no state transition — and a second poll
+    /// records nothing new, because the drain consumed the queue.
+    #[tokio::test]
+    async fn poll_notifications_records_a_notification_seen_event() {
+        use crate::agent::lane_event::LaneEventKind;
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        let agent_id = mf.agent_id;
+        mux.manifests.insert(id, mf);
+
+        // Feed the escape the way the pump would: bytes through the grid.
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == id)
+            .unwrap()
+            .grid
+            .advance(b"\x1b]9;deploy done\x07");
+        mux.poll_notifications();
+
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == id).unwrap().state(),
+            PanelState::Working,
+            "a notification must not end the turn"
+        );
+        let seen = |m: &AgentManifest| {
+            m.lane_events()
+                .iter()
+                .filter(|e| matches!(&e.kind, LaneEventKind::NotificationSeen { body } if body == "deploy done"))
+                .count()
+        };
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(on_disk.last_notification(), Some("deploy done"));
+        assert_eq!(seen(&on_disk), 1);
+
+        mux.poll_notifications();
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(
+            seen(&on_disk),
+            1,
+            "a drained notification is not re-recorded"
+        );
+        mux.shutdown();
+    }
+
+    /// A notification from a panel with no manifest (spawn raced, or a bare
+    /// shell panel) has nowhere to be recorded — the poll drains the queue
+    /// and drops the texts instead of panicking or leaking them to a later
+    /// manifest.
+    #[tokio::test]
+    async fn poll_notifications_without_a_manifest_drops_the_texts() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+
+        let panel = mux.panels.iter_mut().find(|p| p.id == id).unwrap();
+        panel.grid.advance(b"\x1b]9;ping\x07");
+        mux.poll_notifications();
+
+        let panel = mux.panels.iter_mut().find(|p| p.id == id).unwrap();
+        assert!(
+            panel.take_notifications().is_empty(),
+            "the poll drains the queue even with no manifest to record on"
         );
         mux.shutdown();
     }

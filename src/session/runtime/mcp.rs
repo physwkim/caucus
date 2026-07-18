@@ -163,6 +163,9 @@ impl McpToolSurface for Multiplexer {
                         .and_then(|m| m.transcript_path())
                         .map(|path| path.display().to_string()),
                     last_note: manifest.and_then(|m| m.last_note()).map(str::to_string),
+                    last_notification: manifest
+                        .and_then(|m| m.last_notification())
+                        .map(str::to_string),
                 }
             })
             .collect()
@@ -658,6 +661,7 @@ mod tests {
         assert_eq!(plain[0].branch, None);
         assert_eq!(plain[0].transcript_path, None);
         assert_eq!(plain[0].last_note, None);
+        assert_eq!(plain[0].last_notification, None);
 
         // Simulate the worktree-backed spawn bookkeeping: the manifest carries
         // the live worktree path and the model override; the branch lives in
@@ -670,6 +674,7 @@ mod tests {
         mf.model = Some("opus".to_string());
         mf.transcript_path = Some("/logs/conv.jsonl".into());
         mf.last_note = Some("[progress] sweep half done".to_string());
+        mf.last_notification = Some("build finished".to_string());
         mux.worktree_branches
             .insert(panel, "caucus/reviewer-1".to_string());
 
@@ -682,6 +687,7 @@ mod tests {
             s[0].last_note.as_deref(),
             Some("[progress] sweep half done")
         );
+        assert_eq!(s[0].last_notification.as_deref(), Some("build finished"));
 
         mux.shutdown();
     }

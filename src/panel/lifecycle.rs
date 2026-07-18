@@ -108,6 +108,13 @@ impl Panel {
         &self.capture
     }
 
+    /// Drain the desktop notifications (OSC 9 / 99 / 777) the grid queued
+    /// from this panel's output. A queue drain, not a screen mutation — the
+    /// cell grid itself is still only ever written by PTY bytes via `pump`.
+    pub(crate) fn take_notifications(&mut self) -> Vec<String> {
+        self.grid.take_notifications()
+    }
+
     /// Drain whatever the PTY has produced since the last call into the grid
     /// and the turn capture.
     ///

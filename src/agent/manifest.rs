@@ -85,6 +85,11 @@ pub struct AgentManifest {
     /// is the display convenience `list_panels` surfaces, like `last_message`.
     #[serde(default)]
     pub(crate) last_note: Option<String>,
+    /// The most recent desktop-notification text the panel's process emitted
+    /// in-band (OSC 9 / 99 / 777, `docs/design.md` §7.7). Same shape as
+    /// `last_note`: full history in the lane events, scalar for `list_panels`.
+    #[serde(default)]
+    pub(crate) last_notification: Option<String>,
 }
 
 impl AgentManifest {
@@ -120,6 +125,7 @@ impl AgentManifest {
             claude_session_id: None,
             transcript_path: None,
             last_note: None,
+            last_notification: None,
         }
     }
 
@@ -146,6 +152,12 @@ impl AgentManifest {
     /// posted one (`caucus signal note`) — surfaced by `list_panels`.
     pub fn last_note(&self) -> Option<&str> {
         self.last_note.as_deref()
+    }
+
+    /// The most recent in-band desktop notification (OSC 9 / 99 / 777) the
+    /// panel's process emitted, if any — surfaced by `list_panels`.
+    pub fn last_notification(&self) -> Option<&str> {
+        self.last_notification.as_deref()
     }
 
     /// Read-only view of the lane-event timeline.
@@ -332,6 +344,29 @@ pub(crate) fn record_note(
     )
 }
 
+/// Record an in-band desktop notification (OSC 9 / 99 / 777) the panel's
+/// process emitted (`docs/design.md` §7.7): append a `NotificationSeen` lane
+/// event and store the text as `last_notification`.
+///
+/// Like [`record_note`], deliberately NO state transition and no
+/// `derived_state` recompute — capture only. Whether a notification may ever
+/// hint turn settlement is D-2's decision, and would have to route through
+/// [`record_turn_completed`], the turn-completion owner — never through here.
+pub(crate) fn record_notification(
+    manifest: &mut AgentManifest,
+    session_root: &Path,
+    body: &str,
+) -> Result<(), ManifestError> {
+    manifest.last_notification = Some(body.to_string());
+    write(
+        manifest,
+        session_root,
+        Some(LaneEvent::now(LaneEventKind::NotificationSeen {
+            body: body.to_string(),
+        })),
+    )
+}
+
 /// Mark an agent's process as exited (`docs/design.md` §8.3).
 ///
 /// Single owner of the terminal `Exited` transition: flips `status` to
@@ -431,6 +466,9 @@ fn event_label(kind: &LaneEventKind) -> String {
         },
         LaneEventKind::NoteRecorded { note_kind, body } => {
             format!("note ({}: {})", note_kind.as_str(), body)
+        }
+        LaneEventKind::NotificationSeen { body } => {
+            format!("notification ({body})")
         }
         LaneEventKind::WorktreeCreated { path } => {
             format!("worktree_created ({})", path.display())
@@ -641,6 +679,40 @@ mod tests {
                     if body == "which schema version?"
             )),
             "the note is on the persisted timeline: {:?}",
+            back.lane_events()
+        );
+    }
+
+    /// An in-band notification lands `last_notification` plus a persisted
+    /// `NotificationSeen` lane event, with no state transition.
+    #[test]
+    fn record_notification_records_without_a_state_transition() {
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "backend",
+            "backend-1",
+            AgentCli::Claude,
+            None,
+        );
+        let status_before = manifest.status;
+        let derived_before = manifest.derived_state;
+
+        record_notification(&mut manifest, tmp.path(), "build finished").unwrap();
+
+        assert_eq!(manifest.last_notification(), Some("build finished"));
+        assert_eq!(manifest.status, status_before);
+        assert_eq!(manifest.derived_state, derived_before);
+
+        let back = read(tmp.path(), manifest.agent_id).unwrap();
+        assert_eq!(back.last_notification(), Some("build finished"));
+        assert!(
+            back.lane_events().iter().any(|e| matches!(
+                &e.kind,
+                LaneEventKind::NotificationSeen { body } if body == "build finished"
+            )),
+            "the notification is on the persisted timeline: {:?}",
             back.lane_events()
         );
     }

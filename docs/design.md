@@ -686,6 +686,38 @@ Idle로 전이한 main — push가 착지하는 바로 그 상태), 그것도 �
 가능하다 — 종결은 구조적이고 `stop_hook_active` 파싱이 필요 없다. Claude의 연속
 block 8회 하드 캡은 추가 안전망으로만 존재한다.
 
+### 7.7 OSC in-band 알림 캡처 — 훅 없는 도구의 신호
+
+**문제**: caucus의 완료 신호는 백엔드의 turn-completion hook 하나다(§7). 훅이
+설치되지 않은 세션, 훅/notify 개념이 없는 백엔드(bare shell, 임의 TUI 도구)는
+화면 regex 말고는 아무 신호도 못 낸다. cmux의 계층(훅 > OSC in-band > 화면)에서
+가운데 층이 비어 있었다.
+
+**해결 (D-1, 캡처 전용 — 정책 없음)**: 터미널 데스크톱 알림 이스케이프 3종을
+grid가 파싱해 큐에 담는다:
+
+- **OSC 9** — `9;텍스트` (iTerm2/ConEmu)
+- **OSC 99** — `99;메타데이터;본문` (kitty; `k=v` 메타데이터는 해석하지 않고 본문만)
+- **OSC 777** — `777;notify;제목;본문` (urxvt/VTE; `notify` 서브커맨드만,
+  `제목: 본문`으로 합쳐 저장)
+
+`;`를 포함할 수 있는 필드는 title/hyperlink와 같은 규칙으로 rejoin한다
+(`osc_join`). 큐는 패널당 16개 bounded, drop-oldest — 런타임이 매 틱 드레인하므로
+캡은 한 틱 안에 폭주하는 프로세스에만 닿고, 그때 살아남는 것은 최신 요청들이다.
+title/hyperlink와 달리 이 큐는 **화면 상태가 아니라 이벤트 기록**이다: 터미널
+리셋(RIS)이 지우지 않는다 — 알림은 이미 일어난 일이다.
+
+런타임은 매 틱, 큐를 채우는 PTY pump 뒤에 드레인해 패널 manifest 타임라인에
+`NotificationSeen` lane event로 기록하고(`manifest::record_notification`, I-2)
+최신 텍스트를 `last_notification`으로 유지한다 — `list_panels`가 노출하므로 main
+worker는 화면을 긁지 않고도 "이 패널이 방금 주의를 요청했다"를 본다.
+
+**경계 — 캡처는 settle이 아니다**: `NotificationSeen`은 상태 전이를 일으키지
+않는다. 훅 없는 패널에 한해 이것을 settle 힌트로 쓸지는 D-2의 결정이며, 쓴다면
+반드시 기존 turn-completion 단일 owner(`handle_signal` →
+`record_turn_completed`)를 경유해야 한다 — 제2의 settle 경로는 만들지 않는다.
+훅이 커버하는 claude/codex 패널은 D-2 대상이 아니다: 기록·관찰 전용.
+
 ---
 
 ## 8. Manifest & LaneEvent
@@ -736,6 +768,10 @@ enum LaneEventKind {
     NoteRecorded { note_kind: NoteKind, body: String },
                        // manifest::record_note — mid-turn `caucus signal note`
                        // (§7.5). 상태 전이 없음: 턴은 계속된다
+    NotificationSeen { body: String },
+                       // manifest::record_notification — 패널 프로세스가 in-band로
+                       // 방출한 OSC 9/99/777 데스크톱 알림 (§7.7). 캡처 전용:
+                       // 상태 전이 없음, settle 의미론 없음
     WorktreeCreated { path: PathBuf },       // Multiplexer::spawn_panel_inner
     WorktreeRemoved { path: PathBuf },       // worktree::cleanup::record_removals
 }
@@ -932,7 +968,7 @@ caucus/
     │   ├── registry.rs      (이름 → RoleSpec 조회)
     │   └── spec.rs          (RoleSpec: allowlist, prompt_template, permission_mode, agent_cli, model)
     ├── pty/                 (portable-pty 래퍼: 패널별 PTY spawn/read/write/resize/kill)
-    ├── term/                (vte 기반 grid: `Perform` 구현, 셀 매트릭스, 스크롤백)
+    ├── term/                (vte 기반 grid: `Perform` 구현, 셀 매트릭스, 스크롤백, OSC 알림 큐)
     ├── render/              (ratatui: 패널 레이아웃, reflow, 드로잉, focus 표시)
     ├── input/               (키 라우팅: `Ctrl-A` 프리픽스 키맵, focus·임의 키 → PTY, §9.2)
     ├── panel/

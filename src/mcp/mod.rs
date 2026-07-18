@@ -98,6 +98,11 @@ pub struct PanelSummary {
     /// artifact, or asks a question without ending its turn. `None` until the
     /// panel posts one; the full history is on the manifest's lane events.
     pub last_note: Option<String>,
+    /// The most recent desktop-notification text the panel's process emitted
+    /// in-band (OSC 9 / 99 / 777, `docs/design.md` §7.7) — an attention
+    /// signal from tools with no hook channel. `None` until one is seen; the
+    /// full history is on the manifest's lane events.
+    pub last_notification: Option<String>,
 }
 
 /// Errors surfaced by MCP tool calls.

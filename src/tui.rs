@@ -795,6 +795,12 @@ async fn event_loop(
         //     runs before round delivery so the dropped-round notice lands first.
         mux.poll_resume_notice();
 
+        // 4d. In-band notifications — drain the OSC 9/99/777 texts the pump
+        //     just parsed into each grid and record them on the panel's
+        //     manifest timeline (`NotificationSeen`). Capture only — no state
+        //     transition, no push — so it competes with nothing below.
+        mux.poll_notifications();
+
         // 5. Blocked panels — if a panel in a pending round has stopped on an
         //    interactive chooser or a raw `[y/n]` prompt (no Stop hook fires, so
         //    its round never settles), announce it to the main worker so it can
