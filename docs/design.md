@@ -551,11 +551,18 @@ exec caucus signal post \
   "ts": "2026-05-16T14:23:01Z",
   "kind": "stop",
   "last_message": "Completed reviewer pass. 3 findings.",
+  "transcript_path": "/home/user/.claude/projects/.../conv.jsonl",
   "raw_hook_payload": { "...": "..." }
 }
 ```
 
 `kind`: `stop | tool_blocked | error`.
+
+`transcript_path`는 hook payload의 동명 필드에서 `TurnSignal::now`가 승격한
+값 — agent의 대화 전체가 담긴 JSONL 경로다. main worker는 `list_panels`로
+이 경로를 얻어 터미널 스크래핑 없이 대화를 직접 읽는다. payload에 경로가
+없으면(codex notify JSON에는 대응 필드가 없다) `null`이고, 구버전 `caucus`
+바이너리가 보낸 라인에는 필드 자체가 없다(serde default로 `None`).
 
 **Codex 백엔드**: 동등한 turn-completion hook이 있으면 같은 스크립트를
 재사용한다. hook을 노출하지 않는 백엔드는 caucus가 grid 관찰(agent 프롬프트 복귀
