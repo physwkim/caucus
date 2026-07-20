@@ -25,11 +25,11 @@ impl Multiplexer {
     ///
     /// When [`Multiplexer::zoom`] names a still-live panel the layout is a
     /// single full-area slot for that panel; otherwise the slots come from
-    /// [`Multiplexer::layout_tree`] (empty before the first spawn). This keeps
-    /// any manual `Ctrl-A Ctrl-arrow` split ratios across a terminal resize —
-    /// only [`Multiplexer::rebuild_layout_tree`] resets them to the preset.
-    /// Hidden (un-tiled) panels keep their last PTY size — they are resized
-    /// again the moment they reappear in a slot.
+    /// [`Multiplexer::layout_tree`] (empty before the first spawn) re-projected
+    /// onto the current area, so a plain terminal resize repaints the same
+    /// arrangement without a structural rebuild. Hidden (un-tiled) panels keep
+    /// their last PTY size — they are resized again the moment they reappear in
+    /// a slot.
     pub(crate) fn reflow(&mut self) {
         let zoomed = self
             .zoom
@@ -56,34 +56,13 @@ impl Multiplexer {
     }
 
     /// Rebuild the layout tree from the current panels and [`LayoutMode`]
-    /// preset, then reflow. Called on every *structural* change — spawn, kill,
-    /// move, mode switch — so the tree always matches the live panel set. This
-    /// resets any manual split ratios to the preset's even split, matching
-    /// tmux `select-layout`: a custom resize lasts only until the arrangement
-    /// itself changes. A plain terminal resize keeps the ratios (it calls
-    /// [`Multiplexer::reflow`], not this).
+    /// preset, then reflow. Called on every *structural* change — spawn, kill —
+    /// so the tree always matches the live panel set. A plain terminal resize
+    /// re-projects the existing tree instead (it calls [`Multiplexer::reflow`],
+    /// not this).
     pub(crate) fn rebuild_layout_tree(&mut self) {
         let ids: Vec<PanelId> = self.panels.iter().map(|p| p.id).collect();
         self.layout_tree = LayoutTree::from_preset(&ids, self.layout_mode);
-        self.reflow();
-    }
-
-    /// Resize the focused panel one step in screen direction `dir` (`Ctrl-A`
-    /// then `Ctrl-arrow`): grow it toward `dir` (Right/Down) or shrink it
-    /// (Left/Up) by nudging the nearest matching-axis split in the layout tree.
-    /// A no-op with no focused panel, no live tree, or while zoomed (a single
-    /// full-screen pane has no divider to move).
-    pub(crate) fn resize_focused(&mut self, dir: Direction) {
-        if self.zoom.is_some() {
-            return;
-        }
-        let Some(focused) = self.focus.focused() else {
-            return;
-        };
-        let Some(tree) = self.layout_tree.as_mut() else {
-            return;
-        };
-        tree.resize(focused, dir);
         self.reflow();
     }
 
@@ -100,26 +79,6 @@ impl Multiplexer {
             Some(focused)
         };
         self.reflow();
-    }
-
-    /// Move the focused panel one step (`delta` = -1 earlier, +1 later) in the
-    /// panel order — which is also the tile order and the focus-cycle order.
-    /// A no-op when there is no focused panel or it is already at the end.
-    pub(crate) fn move_panel(&mut self, delta: isize) {
-        let Some(focused) = self.focus.focused() else {
-            return;
-        };
-        let Some(idx) = self.panels.iter().position(|p| p.id == focused) else {
-            return;
-        };
-        let target = idx as isize + delta;
-        if target < 0 || target as usize >= self.panels.len() {
-            return;
-        }
-        self.panels.swap(idx, target as usize);
-        self.rebuild_layout_tree();
-        // `order_index` in the record changed.
-        self.persist_record();
     }
 
     /// Move focus to the panel geometrically nearest the focused one in screen
@@ -194,21 +153,28 @@ mod tests {
         assert!(mux.focused().is_none());
     }
 
-    /// `CycleLayout` advances the arrangement mode through the full cycle and
-    /// wraps back to `Tiled`.
+    /// A fresh session seeds its fixed arrangement from `[settings] layout`
+    /// (the sole selector now that runtime cycling is gone).
     #[tokio::test]
-    async fn cycle_layout_advances_the_mode() {
+    async fn layout_mode_is_seeded_from_config_settings() {
         let tmp = TempDir::new().unwrap();
-        let mut mux = mux(&tmp);
-        assert_eq!(mux.layout_mode(), LayoutMode::Tiled);
-        mux.apply_command(CaucusCommand::CycleLayout);
-        assert_eq!(mux.layout_mode(), LayoutMode::EvenHorizontal);
-        mux.apply_command(CaucusCommand::CycleLayout);
-        assert_eq!(mux.layout_mode(), LayoutMode::EvenVertical);
-        mux.apply_command(CaucusCommand::CycleLayout);
+        // Default config resolves `layout` to `Tiled`.
+        let mut config = crate::config::Config::load(tmp.path()).unwrap();
+        assert_eq!(mux(&tmp).layout_mode(), LayoutMode::Tiled);
+
+        // A non-`Tiled` setting flows through `Multiplexer::new` into the live
+        // arrangement mode.
+        config.settings.layout = LayoutMode::MainVertical;
+        let session = crate::session::state::Session::new("test", tmp.path().to_path_buf());
+        let (mux, _signal, _control) = Multiplexer::new(
+            session,
+            config,
+            area(),
+            'a',
+            crate::session::LaunchMode::Fresh,
+        )
+        .unwrap();
         assert_eq!(mux.layout_mode(), LayoutMode::MainVertical);
-        mux.apply_command(CaucusCommand::CycleLayout);
-        assert_eq!(mux.layout_mode(), LayoutMode::Tiled);
     }
 
     /// `ToggleZoom` with no focused panel is a no-op (no panic).
@@ -253,109 +219,6 @@ mod tests {
         assert!(mux.zoomed().is_none());
 
         mux.shutdown();
-    }
-
-    /// `MovePanelEarlier`/`MovePanelLater` swap adjacent entries in the panel
-    /// order; moving past either end is a no-op.
-    #[tokio::test]
-    async fn move_panel_swaps_order() {
-        let tmp = TempDir::new().unwrap();
-        let mut mux = mux(&tmp);
-
-        let Ok(a) = mux.spawn_panel("reviewer", None, None, None) else {
-            eprintln!("skipping: no agent CLI on PATH");
-            return;
-        };
-        let Ok(b) = mux.spawn_panel("reviewer", None, None, None) else {
-            eprintln!("skipping: no agent CLI on PATH");
-            return;
-        };
-        let order = |m: &Multiplexer| m.panels().iter().map(|p| p.id).collect::<Vec<_>>();
-        assert_eq!(order(&mux), vec![a, b]);
-
-        // Focus `a` (index 0) and move it later — order becomes [b, a].
-        mux.focus.set_focus(Some(a));
-        mux.apply_command(CaucusCommand::MovePanelLater);
-        assert_eq!(order(&mux), vec![b, a]);
-
-        // `a` is now last — moving later again is a no-op.
-        mux.apply_command(CaucusCommand::MovePanelLater);
-        assert_eq!(order(&mux), vec![b, a]);
-
-        // Move `a` back earlier — order returns to [a, b].
-        mux.apply_command(CaucusCommand::MovePanelEarlier);
-        assert_eq!(order(&mux), vec![a, b]);
-
-        // `a` is first — moving earlier again is a no-op.
-        mux.apply_command(CaucusCommand::MovePanelEarlier);
-        assert_eq!(order(&mux), vec![a, b]);
-
-        mux.shutdown();
-    }
-
-    /// `Ctrl-A Ctrl-arrow` grows the focused pane by perturbing the layout
-    /// tree, and the perturbed ratio survives a plain reflow (terminal
-    /// SIGWINCH) — only a structural rebuild resets it.
-    #[tokio::test]
-    async fn resize_focused_grows_the_focused_pane_and_survives_reflow() {
-        let tmp = TempDir::new().unwrap();
-        let mut mux = mux(&tmp);
-        let a = PanelId::new();
-        let b = PanelId::new();
-        mux.layout_tree = LayoutTree::from_preset(&[a, b], LayoutMode::EvenHorizontal);
-        mux.focus.set_focus(Some(a));
-        mux.reflow();
-        let before = mux.layout().rect_of(a).unwrap().width;
-
-        mux.resize_focused(Direction::Right);
-        let grown = mux.layout().rect_of(a).unwrap().width;
-        assert!(
-            grown > before,
-            "Ctrl-arrow resize must grow the focused pane: {before} -> {grown}"
-        );
-
-        // A plain reflow re-projects the same tree, so the manual ratio holds.
-        mux.reflow();
-        assert_eq!(
-            mux.layout().rect_of(a).unwrap().width,
-            grown,
-            "the manual split ratio must survive a terminal resize"
-        );
-    }
-
-    /// `resize_focused` is a no-op without a focused panel and while zoomed (a
-    /// full-screen pane has no divider to move).
-    #[tokio::test]
-    async fn resize_focused_is_a_noop_while_unfocused_or_zoomed() {
-        let tmp = TempDir::new().unwrap();
-        let mut mux = mux(&tmp);
-        let a = PanelId::new();
-        let b = PanelId::new();
-        mux.layout_tree = LayoutTree::from_preset(&[a, b], LayoutMode::EvenHorizontal);
-
-        // No focus: the resize does nothing.
-        mux.focus.set_focus(None);
-        mux.reflow();
-        let even = mux.layout().rect_of(a).unwrap().width;
-        mux.resize_focused(Direction::Right);
-        assert_eq!(
-            mux.layout().rect_of(a).unwrap().width,
-            even,
-            "no focused panel => no resize"
-        );
-
-        // Zoomed: the guard returns before touching the tree, so unzooming
-        // still shows the untouched even split.
-        mux.focus.set_focus(Some(a));
-        mux.zoom = Some(a);
-        mux.resize_focused(Direction::Right);
-        mux.zoom = None;
-        mux.reflow();
-        assert_eq!(
-            mux.layout().rect_of(a).unwrap().width,
-            even,
-            "zoom guards the resize — the tree ratio is untouched"
-        );
     }
 
     /// Killing the zoomed panel clears the zoom so the layout never points at

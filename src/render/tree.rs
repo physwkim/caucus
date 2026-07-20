@@ -1,28 +1,19 @@
-//! Binary space-partition layout tree — the live, resizable model behind the
-//! panel tiling (`docs/design.md` §0 #10).
+//! Binary space-partition layout tree — the live model behind the panel tiling
+//! (`docs/design.md` §0 #10).
 //!
-//! [`Layout::reflow`](super::Layout::reflow) recomputes a *preset* arrangement
-//! from scratch on every call and keeps no per-split state, so it cannot
-//! express a manually-resized pane. The tree fills that gap: it is built from a
-//! preset (so every [`LayoutMode`] still has a starting arrangement) but then
-//! holds a `ratio` at each split that `Ctrl-A Ctrl-arrow` perturbs, tmux-style.
+//! The multiplexer projects this tree onto the screen area (`Multiplexer::reflow`)
+//! to place every panel. It is built from a [`LayoutMode`] preset via
+//! [`LayoutTree::from_preset`] — an even split `ratio` at each node — and
+//! rebuilt on every structural change (spawn / kill) so it always matches the
+//! live panel set, mirroring [`Layout::reflow`](super::Layout::reflow)'s preset
+//! arrangement while keeping the projection state in one place.
 //!
-//! The tree is ephemeral. `caucus resume` rebuilds it from the persisted
+//! The tree is ephemeral. `caucus resume` reconstructs it from the persisted
 //! `layout_mode` + panel order via [`LayoutTree::from_preset`], so the record
-//! schema is unchanged and a manual resize lasts only until the next structural
-//! change (spawn / kill / move / mode switch), which rebuilds the preset — the
-//! same as tmux `select-layout` resetting custom splits.
+//! schema is unchanged.
 
-use super::{Direction, LayoutMode, Rect};
+use super::{LayoutMode, Rect};
 use crate::session::id::PanelId;
-
-/// Smallest / largest a split `ratio` may be nudged to. A pane can shrink to a
-/// tenth of its parent split but never collapse to nothing.
-const MIN_RATIO: f32 = 0.1;
-const MAX_RATIO: f32 = 0.9;
-
-/// One `Ctrl-A Ctrl-arrow` step, as a fraction of the split extent.
-const RESIZE_STEP: f32 = 0.05;
 
 /// The axis a [`LayoutTree::Split`] divides its area along.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -42,7 +33,8 @@ pub enum LayoutTree {
     Split {
         /// The axis this node divides its area along.
         axis: Axis,
-        /// Fraction `[MIN_RATIO, MAX_RATIO]` of the split extent given to `first`.
+        /// Fraction of the split extent given to `first` — the preset's even
+        /// split (`1/n` for a chain head, `0.5` for `MainVertical`).
         ratio: f32,
         /// The leading child (top for `Vertical`, left for `Horizontal`).
         first: Box<LayoutTree>,
@@ -94,56 +86,6 @@ impl LayoutTree {
                 second.collect(b, out);
             }
         }
-    }
-
-    /// Resize the pane `leaf` one `RESIZE_STEP` in screen direction `dir`:
-    /// grow it toward `dir` (`Right`/`Down`) or shrink it (`Left`/`Up`) by
-    /// nudging the nearest ancestor split whose axis matches the motion.
-    /// Returns whether `leaf` was found (false ⇒ no-op).
-    pub fn resize(&mut self, leaf: PanelId, dir: Direction) -> bool {
-        let (axis, grow) = match dir {
-            Direction::Right => (Axis::Horizontal, true),
-            Direction::Left => (Axis::Horizontal, false),
-            Direction::Down => (Axis::Vertical, true),
-            Direction::Up => (Axis::Vertical, false),
-        };
-        self.adjust(leaf, axis, grow).0
-    }
-
-    /// Recurse toward `leaf`. Returns `(found, adjusted)`: `found` once the leaf
-    /// is located, `adjusted` once a matching-axis split on the path has had its
-    /// ratio nudged. The *nearest* matching-axis ancestor is adjusted — the
-    /// first one met while unwinding — so the resize moves the divider closest
-    /// to the focused pane.
-    fn adjust(&mut self, leaf: PanelId, axis: Axis, grow: bool) -> (bool, bool) {
-        let Self::Split {
-            axis: a,
-            ratio,
-            first,
-            second,
-        } = self
-        else {
-            return (matches!(self, Self::Leaf(id) if *id == leaf), false);
-        };
-        let (in_first, adjusted) = first.adjust(leaf, axis, grow);
-        if in_first {
-            if !adjusted && *a == axis {
-                // leaf lives in `first`: growing it means `first` gets more.
-                *ratio = nudge(*ratio, grow);
-                return (true, true);
-            }
-            return (true, adjusted);
-        }
-        let (in_second, adjusted) = second.adjust(leaf, axis, grow);
-        if in_second {
-            if !adjusted && *a == axis {
-                // leaf lives in `second`: growing it means `first` gets less.
-                *ratio = nudge(*ratio, !grow);
-                return (true, true);
-            }
-            return (true, adjusted);
-        }
-        (false, false)
     }
 }
 
@@ -225,17 +167,6 @@ fn split_rect(area: Rect, axis: Axis, ratio: f32) -> (Rect, Rect) {
             )
         }
     }
-}
-
-/// Nudge `ratio` one [`RESIZE_STEP`] up (`grow`) or down, clamped to the
-/// visible band `[MIN_RATIO, MAX_RATIO]`.
-fn nudge(ratio: f32, grow: bool) -> f32 {
-    let next = if grow {
-        ratio + RESIZE_STEP
-    } else {
-        ratio - RESIZE_STEP
-    };
-    next.clamp(MIN_RATIO, MAX_RATIO)
 }
 
 #[cfg(test)]
@@ -332,100 +263,5 @@ mod tests {
             assert_eq!(tree.rects(area()).len(), n);
             assert_partitions_area(&tree);
         }
-    }
-
-    #[test]
-    fn resize_grows_and_shrinks_the_focused_pane() {
-        let ids = ids(2);
-        let mut tree = LayoutTree::from_preset(&ids, LayoutMode::EvenHorizontal).unwrap();
-        let width_of = |t: &LayoutTree, id: PanelId| {
-            t.rects(area())
-                .iter()
-                .find(|(i, _)| *i == id)
-                .unwrap()
-                .1
-                .width
-        };
-        let even = width_of(&tree, ids[0]);
-        assert_eq!(even, 40, "even split starts at half width");
-
-        // Pressing Right grows the left pane toward the divider.
-        assert!(tree.resize(ids[0], Direction::Right));
-        assert!(
-            width_of(&tree, ids[0]) > even,
-            "Right must grow the left pane"
-        );
-        // The partition still holds after the nudge.
-        assert_partitions_area(&tree);
-
-        // Pressing Left shrinks it back below even.
-        tree = LayoutTree::from_preset(&ids, LayoutMode::EvenHorizontal).unwrap();
-        assert!(tree.resize(ids[0], Direction::Left));
-        assert!(
-            width_of(&tree, ids[0]) < even,
-            "Left must shrink the left pane"
-        );
-    }
-
-    #[test]
-    fn resize_of_the_trailing_pane_grows_it_toward_its_edge() {
-        let ids = ids(2);
-        let mut tree = LayoutTree::from_preset(&ids, LayoutMode::EvenHorizontal).unwrap();
-        let width_of = |t: &LayoutTree, id: PanelId| {
-            t.rects(area())
-                .iter()
-                .find(|(i, _)| *i == id)
-                .unwrap()
-                .1
-                .width
-        };
-        let even = width_of(&tree, ids[1]);
-
-        // The right pane grows when pressing Right (toward its own edge).
-        assert!(tree.resize(ids[1], Direction::Right));
-        assert!(
-            width_of(&tree, ids[1]) > even,
-            "Right must grow the right pane"
-        );
-    }
-
-    #[test]
-    fn resize_clamps_the_ratio_to_the_visible_band() {
-        let ids = ids(2);
-        let mut tree = LayoutTree::from_preset(&ids, LayoutMode::EvenHorizontal).unwrap();
-        // Grow far past the clamp — many more steps than the band allows.
-        for _ in 0..50 {
-            tree.resize(ids[0], Direction::Right);
-        }
-        let w = tree
-            .rects(area())
-            .iter()
-            .find(|(i, _)| *i == ids[0])
-            .unwrap()
-            .1
-            .width;
-        // MAX_RATIO 0.9 of 80 = 72; the pane must clamp there, never fill.
-        assert_eq!(w, 72, "ratio clamps at MAX_RATIO");
-        assert_partitions_area(&tree);
-    }
-
-    #[test]
-    fn resize_against_the_grain_is_a_noop() {
-        // EvenHorizontal has only horizontal splits; a vertical (Up/Down) resize
-        // finds no matching-axis ancestor and changes nothing.
-        let ids = ids(2);
-        let mut tree = LayoutTree::from_preset(&ids, LayoutMode::EvenHorizontal).unwrap();
-        let before = tree.rects(area());
-        assert!(tree.resize(ids[0], Direction::Up), "leaf is found");
-        assert_eq!(before, tree.rects(area()), "wrong-axis resize is a no-op");
-    }
-
-    #[test]
-    fn resize_of_an_unknown_leaf_returns_false() {
-        let ids = ids(2);
-        let mut tree = LayoutTree::from_preset(&ids, LayoutMode::EvenHorizontal).unwrap();
-        let before = tree.rects(area());
-        assert!(!tree.resize(PanelId::new(), Direction::Right));
-        assert_eq!(before, tree.rects(area()));
     }
 }

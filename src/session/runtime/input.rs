@@ -127,19 +127,10 @@ impl Multiplexer {
             CaucusCommand::FocusNext => self.cycle_focus(1),
             CaucusCommand::FocusPrev => self.cycle_focus(-1),
             CaucusCommand::FocusDir(dir) => self.focus_dir(dir),
-            CaucusCommand::ResizeDir(dir) => self.resize_focused(dir),
             CaucusCommand::ToggleZoom => self.toggle_zoom(),
-            CaucusCommand::MovePanelEarlier => self.move_panel(-1),
-            CaucusCommand::MovePanelLater => self.move_panel(1),
             CaucusCommand::CloseFocused => self.arm_close_confirm(),
             CaucusCommand::ConfirmClose => self.confirm_close(),
             CaucusCommand::CancelClose => self.cancel_close(),
-            CaucusCommand::CycleLayout => {
-                self.layout_mode = self.layout_mode.next();
-                self.rebuild_layout_tree();
-                // The record carries `layout_mode` and the panel order.
-                self.persist_record();
-            }
             CaucusCommand::ToggleTranscript => {
                 self.show_transcript = !self.show_transcript;
                 self.focus.set_transcript_open(self.show_transcript);

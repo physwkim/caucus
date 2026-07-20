@@ -118,7 +118,6 @@ impl Multiplexer {
 
 #[cfg(test)]
 mod tests {
-    use crate::input::CaucusCommand;
     use crate::mcp::protocol::{ControlRequest, ControlResponse};
     use crate::panel::lifecycle::{Panel, PanelState};
     use crate::pty::{Pty, PtyCommand};
@@ -162,19 +161,6 @@ mod tests {
         assert_eq!(record.id, id);
         assert_eq!(record.layout_mode, LayoutMode::Tiled);
         assert!(record.panels.is_empty(), "no panels were spawned");
-    }
-
-    /// A layout-mode change persists the new mode into `session.json`.
-    #[tokio::test]
-    async fn cycle_layout_persists_the_record() {
-        use crate::session::record::SessionRecord;
-        let tmp = TempDir::new().unwrap();
-        let mut mux = mux(&tmp);
-        let root = mux.session.root_dir.clone();
-
-        mux.apply_command(CaucusCommand::CycleLayout);
-        let record = SessionRecord::read(&root).expect("session.json written");
-        assert_eq!(record.layout_mode, LayoutMode::EvenHorizontal);
     }
 
     /// The main worker identity is persisted independently from panel order:
