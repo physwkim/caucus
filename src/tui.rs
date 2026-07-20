@@ -35,6 +35,7 @@ use ratatui::widgets::Paragraph;
 use tracing::warn;
 
 use crate::config::Config;
+use crate::panel::PanelState;
 use crate::render::{self, Rect};
 use crate::role::spec::AgentCli;
 use crate::session::record::{PanelRecord, SessionRecord};
@@ -954,7 +955,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mux: &Multiplexer) ->
     Ok(())
 }
 
-/// One-line status bar: panel count, focus, layout mode, and the keymap hint.
+/// One-line status bar: panel count, focus, working-panel count, and the keymap hint.
 fn status_line(mux: &Multiplexer) -> String {
     let focused = mux
         .focused()
@@ -990,12 +991,17 @@ fn status_line(mux: &Multiplexer) -> String {
             .to_string();
     }
     let key = mux.prefix().to_ascii_uppercase();
+    let working = mux
+        .panels()
+        .iter()
+        .filter(|p| p.state() == PanelState::Working)
+        .count();
     format!(
-        " caucus · {} panel(s) · focus: {} · layout: {} · \
-         Ctrl-{key} then n/p/arrows focus, Ctrl-arrows resize, z zoom, </> move, x close, Space layout, t transcript, [ scroll, q quit{}{}{}",
+        " caucus · {} panel(s) · focus: {} · working: {} · \
+         Ctrl-{key} then n/p/arrows focus, z zoom, x close, t transcript, [ scroll, q quit{}{}{}",
         mux.panels().len(),
         focused,
-        mux.layout_mode().label(),
+        working,
         zoom,
         transcript,
         prefix
