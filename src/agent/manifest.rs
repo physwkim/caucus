@@ -321,6 +321,40 @@ pub(crate) fn record_turn_completed(
     to_disk(manifest, session_root)
 }
 
+/// Record a delivered prompt on the manifest — the turn-phase transition *into*
+/// `Working` (`docs/design.md` §8.3). Single owner of the `PromptDelivered`
+/// transition (Invariant I-2): appends the event, clears any blocker the new
+/// prompt supersedes, recomputes `derived_state`, and persists — the mirror of
+/// [`record_turn_completed`], which pins `Idle` once the turn's Stop hook fires.
+///
+/// A freshly delivered prompt has no turn signal yet, so `derive_agent_state`
+/// yields `Working`. Without this recompute, `derived_state` — the value
+/// `list_panels` reports to the main worker — would stay whatever the last turn
+/// signal left it: the reason a resumed sub-panel, whose reloaded conversation
+/// already fired its Stop hook (→ `Idle`), was reported `idle` no matter how
+/// many prompts it was given. `PromptDelivered` was the sole turn-phase event
+/// that appended through the generic [`write`] without recomputing state.
+pub(crate) fn record_prompt_delivered(
+    manifest: &mut AgentManifest,
+    session_root: &Path,
+) -> Result<(), ManifestError> {
+    manifest
+        .lane_events
+        .push(LaneEvent::now(LaneEventKind::PromptDelivered));
+    // A new prompt supersedes a stale blocker: `select_option` answering an
+    // open menu resumes the turn, so the panel is `Working`, not blocked. (A
+    // still-open live prompt is re-detected and overlaid by `list_panels`, so
+    // clearing here cannot hide a menu that is genuinely still on screen.)
+    manifest.current_blocker = None;
+    manifest.derived_state = super::derive_state::derive_agent_state(
+        manifest.status.as_str(),
+        None, // no turn signal since this prompt — the turn is open again
+        manifest.error.as_deref(),
+        manifest.current_blocker.as_ref(),
+    );
+    to_disk(manifest, session_root)
+}
+
 /// Record a mid-turn [`crate::signal::AgentNote`] on the manifest: append a
 /// `NoteRecorded` lane event and store the rendered note as `last_note`.
 ///
@@ -540,6 +574,85 @@ mod tests {
         // Persisted: a fresh read sees the same derived state.
         let back = read(tmp.path(), manifest.agent_id).unwrap();
         assert_eq!(back.derived_state(), DerivedState::Idle);
+    }
+
+    /// A delivered prompt reopens the turn: `derived_state` returns to `Working`
+    /// even after a prior turn signal pinned it `Idle`, and the recompute is
+    /// persisted. Regression — a resumed sub-panel whose reloaded conversation
+    /// had already fired its Stop hook was reported `idle` to the main worker
+    /// after every command, because `PromptDelivered` never recomputed state.
+    #[test]
+    fn record_prompt_delivered_reopens_the_turn_to_working() {
+        use crate::signal::{TurnKind, TurnSignal};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        // A completed turn pins Idle (the resume Stop-hook scenario).
+        let signal = TurnSignal::now(
+            manifest.session_id,
+            manifest.panel_id,
+            TurnKind::Stop,
+            Some("prior turn".into()),
+            serde_json::Value::Null,
+        );
+        record_turn_completed(&mut manifest, tmp.path(), &signal).unwrap();
+        assert_eq!(manifest.derived_state(), DerivedState::Idle);
+
+        // Delivering a prompt reopens the turn.
+        record_prompt_delivered(&mut manifest, tmp.path()).unwrap();
+        assert_eq!(manifest.derived_state(), DerivedState::Working);
+        assert!(
+            manifest
+                .lane_events()
+                .iter()
+                .any(|e| matches!(e.kind, LaneEventKind::PromptDelivered))
+        );
+        // Persisted: a fresh read agrees, so `list_panels` reads `working` too.
+        let back = read(tmp.path(), manifest.agent_id).unwrap();
+        assert_eq!(back.derived_state(), DerivedState::Working);
+    }
+
+    /// A delivered prompt clears a stale blocker — `select_option` answering an
+    /// open menu resumes the turn to `Working`, not the blocked state the prior
+    /// signal recorded.
+    #[test]
+    fn record_prompt_delivered_clears_a_stale_blocker() {
+        use crate::agent::lane_event::{LaneEventBlocker, LaneFailureClass};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        // Stand the manifest up in a blocked state, as a `tool_blocked` signal
+        // would have left it.
+        manifest.current_blocker = Some(LaneEventBlocker::new(
+            LaneFailureClass::PermissionPrompt,
+            "y/n prompt",
+        ));
+        manifest.derived_state = crate::agent::derive_state::derive_agent_state(
+            manifest.status.as_str(),
+            None,
+            None,
+            manifest.current_blocker.as_ref(),
+        );
+        assert_ne!(manifest.derived_state(), DerivedState::Working);
+
+        record_prompt_delivered(&mut manifest, tmp.path()).unwrap();
+        assert!(
+            manifest.current_blocker.is_none(),
+            "the new prompt supersedes the blocker"
+        );
+        assert_eq!(manifest.derived_state(), DerivedState::Working);
     }
 
     /// A turn signal whose raw hook payload carries `session_id` lands that

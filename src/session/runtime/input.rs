@@ -367,7 +367,7 @@ impl Multiplexer {
         if matches!(panel.state(), PanelState::Spawning | PanelState::Idle) {
             let _ = lifecycle::transition(panel, PanelState::Working);
         }
-        self.record_lane_event(panel_id, LaneEventKind::PromptDelivered);
+        self.record_prompt_delivered(panel_id);
     }
 
     /// Ingest a mid-turn note: cap its body once (`AgentNote::truncated`, so
@@ -555,8 +555,10 @@ impl Multiplexer {
         }
         // This is the only `Idle -> Working` path, so it is where a delivered
         // prompt becomes a fact — the timeline's `PromptDelivered` is written
-        // here or nowhere.
-        self.record_lane_event(panel_id, LaneEventKind::PromptDelivered);
+        // here or nowhere, and it also reopens the manifest's `derived_state`
+        // to `Working` (what `list_panels` reports) in lockstep with the live
+        // `PanelState` transition above.
+        self.record_prompt_delivered(panel_id);
     }
 
     /// Single owner of lane-event appends for a live panel (Invariant I-2).
@@ -584,6 +586,22 @@ impl Multiplexer {
             manifest::write(manifest, &self.session.root_dir, Some(LaneEvent::now(kind)))
         {
             warn!(panel = %panel_id, error = %err, "lane event write failed");
+        }
+    }
+
+    /// Owner of the `PromptDelivered` turn-phase transition on the manifest —
+    /// the sibling of [`Multiplexer::record_lane_event`] for the one lane event
+    /// that also advances `derived_state`. Routes through
+    /// [`manifest::record_prompt_delivered`] so the manifest state `list_panels`
+    /// reports flips to `working` in lockstep with the live [`PanelState`],
+    /// instead of appending through the generic `write` that never recomputes.
+    /// Best-effort, like `record_lane_event`.
+    fn record_prompt_delivered(&mut self, panel_id: PanelId) {
+        let Some(manifest) = self.manifests.get_mut(&panel_id) else {
+            return;
+        };
+        if let Err(err) = manifest::record_prompt_delivered(manifest, &self.session.root_dir) {
+            warn!(panel = %panel_id, error = %err, "prompt-delivered manifest write failed");
         }
     }
 }
@@ -647,6 +665,63 @@ mod tests {
             "a delivered prompt is on the persisted timeline: {:?}",
             on_disk.lane_events()
         );
+        mux.shutdown();
+    }
+
+    /// After a completed turn pins the manifest `Idle` (the resume Stop-hook
+    /// scenario), delivering a new prompt reopens `derived_state` to `Working`,
+    /// so `list_panels` reports the commanded panel as `working` rather than
+    /// leaving it stuck at `idle`. Regression for the resumed-worker-idle bug.
+    #[tokio::test]
+    async fn note_prompt_delivered_reopens_derived_state_after_a_completed_turn() {
+        use crate::agent::derive_state::DerivedState;
+        use crate::agent::manifest::{self, AgentManifest};
+        use crate::role::spec::AgentCli;
+        use crate::signal::{TurnKind, TurnSignal};
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Idle);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        let agent_id = mf.agent_id;
+        mux.manifests.insert(id, mf);
+
+        // A prior turn completes → the manifest's derived_state is pinned Idle,
+        // exactly as a resumed agent's reloaded Stop hook leaves it.
+        let signal = TurnSignal::now(
+            mux.session.id,
+            id,
+            TurnKind::Stop,
+            Some("prior".into()),
+            serde_json::Value::Null,
+        );
+        manifest::record_turn_completed(
+            mux.manifests.get_mut(&id).unwrap(),
+            &mux.session.root_dir,
+            &signal,
+        )
+        .unwrap();
+        assert_eq!(
+            mux.manifests.get(&id).unwrap().derived_state(),
+            DerivedState::Idle
+        );
+
+        // A new command reopens the turn — the value `list_panels` reports.
+        mux.note_prompt_delivered(id);
+        assert_eq!(
+            mux.manifests.get(&id).unwrap().derived_state(),
+            DerivedState::Working,
+            "a commanded panel must report working, not idle, to list_panels"
+        );
+        let on_disk = manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(on_disk.derived_state(), DerivedState::Working);
         mux.shutdown();
     }
 
