@@ -393,6 +393,9 @@ mouse                   = true   # 마우스 캡처: on이면 스크롤 휠 = Pa
 prefix                  = "a"    # 예약 prefix 키(Ctrl-<letter>). --prefix/CAUCUS_PREFIX가
                                  # 우선하고, 미설정이면 기본 Ctrl-A — 단 바깥 tmux의
                                  # prefix가 Ctrl-A면 Ctrl-B로 자동 회피(input::effective_prefix)
+layout                  = "tiled" # 패널 배치 모드(§9.2). tiled(기본)/even-horizontal/
+                                 # even-vertical/main-vertical. fresh 세션에만 적용되고
+                                 # resume 세션은 저장된 모드를 복원한다
 ```
 
 `[settings]` 안의 오탈자 키는 무시되지 않고 거부된다(로드 에러).
@@ -1050,9 +1053,6 @@ caucus는 단 하나의 **프리픽스 키** `Ctrl-A`를 자기 명령용으로 
 | `Ctrl-A` 다음 `p` / `←` | 이전 패널로 focus |
 | `Ctrl-A` 다음 `q` | caucus 종료 |
 | `Ctrl-A` 다음 `z` | focus 패널 zoom 토글 |
-| `Ctrl-A` 다음 `<` | focus 패널을 순서상 한 칸 앞으로 |
-| `Ctrl-A` 다음 `>` | focus 패널을 순서상 한 칸 뒤로 |
-| `Ctrl-A` 다음 `Space` | 레이아웃 배치 모드 순환 |
 | `Ctrl-A` 다음 `t` | transcript 오버레이 토글 |
 | `Esc` (오버레이 열림) | transcript 오버레이 닫기 |
 | `Ctrl-A` 다음 `[` | focus 패널 스크롤백 페이저 열기 |
@@ -1071,10 +1071,11 @@ caucus는 단 하나의 **프리픽스 키** `Ctrl-A`를 자기 명령용으로 
 프리픽스는 소비된다 — `Ctrl-A` 다음 키는 명령을 선택하고 forward되지 않으며,
 예외인 `Ctrl-A Ctrl-A`만 리터럴 `Ctrl-A`(0x01) 한 바이트를 패널로 보낸다.
 
-**레이아웃 모드.** `render::LayoutMode`는 4종 — `Tiled` → `EvenHorizontal` →
-`EvenVertical` → `MainVertical` → (순환). `Ctrl-A Space`가 다음 모드로 cycle하고
-caucus는 패널을 해당 배치로 reflow한다. 패널 동적 spawn/kill 시에도 현재 모드로
-reflow된다(§0 #10).
+**레이아웃 모드.** `render::LayoutMode`는 4종 — `Tiled`(기본) · `EvenHorizontal` ·
+`EvenVertical` · `MainVertical`. 세션마다 하나로 고정된다: fresh 세션은
+`[settings] layout`으로 고르고(§6), resume 세션은 레코드에 저장된 모드를 복원한다
+(런타임 재배열은 없다). caucus는 패널 동적 spawn/kill 시 현재 모드로 reflow한다
+(§0 #10).
 
 **transcript 오버레이.** `Ctrl-A t`는 읽기 전용 팀 관찰 뷰를 토글한다 —
 패널 위에 그려지는 bordered 박스로, 패널당 한 행(role · derived_state · 완료

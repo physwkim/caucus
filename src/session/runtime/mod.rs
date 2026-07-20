@@ -62,12 +62,11 @@ pub struct Multiplexer {
     /// recomputed on every spawn/kill/resize/move.
     layout: Layout,
     /// The live binary space-partition behind the tiling. Rebuilt from the
-    /// `layout_mode` preset + panel order on every structural change
-    /// ([`Multiplexer::rebuild_layout_tree`]); `Ctrl-A Ctrl-arrow`
-    /// ([`Multiplexer::resize_focused`]) perturbs its split ratios in place so
-    /// a manual resize survives terminal resizes but resets on the next
-    /// spawn/kill/move/mode switch (tmux `select-layout` semantics). `None`
-    /// until the first panel is spawned.
+    /// `layout_mode` preset + panel order on every structural change — spawn,
+    /// kill ([`Multiplexer::rebuild_layout_tree`]) — and projected onto the
+    /// screen area by [`Multiplexer::reflow`], which also re-projects the same
+    /// tree on a plain terminal resize. `None` until the first panel is
+    /// spawned.
     layout_tree: Option<LayoutTree>,
     /// Input focus + reserved-prefix state.
     focus: FocusRouter,
@@ -151,7 +150,9 @@ pub struct Multiplexer {
     /// every tick. Cleared the moment main is no longer stranded, so a fresh
     /// stranding re-arms immediately.
     main_stranded_last_nudge: Option<Instant>,
-    /// Panel arrangement mode for [`Layout::reflow`] — cycled by `Ctrl-A Space`.
+    /// Panel arrangement mode for [`Layout::reflow`]. Fixed for a session:
+    /// selected by `[settings] layout` on a fresh start, or restored from the
+    /// persisted record on `caucus resume` ([`Multiplexer::set_layout_mode`]).
     layout_mode: LayoutMode,
     /// When `Some` and the id is still live, the layout shows only that panel
     /// full-screen (`Ctrl-A z`). Hidden panels keep running — `pump_all`
@@ -313,6 +314,12 @@ impl Multiplexer {
 
         let (cleanup, _consumer) = CleanupQueue::spawn();
 
+        // The fixed arrangement a fresh session tiles into. Runtime cycling was
+        // removed, so `[settings] layout` is the sole selector; a resumed
+        // session overrides this with its persisted mode (`caucus resume` calls
+        // `set_layout_mode`). Read before the struct literal moves `config`.
+        let layout_mode = config.settings.layout;
+
         Ok((
             Self {
                 session,
@@ -339,7 +346,7 @@ impl Multiplexer {
                 pending_question_notices: VecDeque::new(),
                 auto_answered: HashMap::new(),
                 main_stranded_last_nudge: None,
-                layout_mode: LayoutMode::default(),
+                layout_mode,
                 zoom: None,
                 show_transcript: false,
                 scroll: None,

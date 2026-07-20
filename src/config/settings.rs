@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::render::LayoutMode;
+
 /// Default round safety-net deadline (seconds). A round is force-delivered when
 /// every panel settles or this deadline passes (`docs/design.md` §4).
 pub(crate) const ROUND_FALLBACK_DEFAULT_SECS: u64 = 600;
@@ -54,6 +56,12 @@ pub struct Settings {
     /// resolution chain (`--prefix`/`CAUCUS_PREFIX` > this > default `Ctrl-A`
     /// with tmux auto-dodge — see [`crate::input::effective_prefix`]).
     pub prefix: Option<char>,
+    /// The fixed panel arrangement a fresh session tiles into
+    /// ([`crate::render::LayoutMode`]). Runtime rearrangement was removed, so
+    /// this is the sole way to select a non-`Tiled` arrangement; a resumed
+    /// session restores its persisted mode instead of this default. Default
+    /// `Tiled`.
+    pub layout: LayoutMode,
 }
 
 impl Default for Settings {
@@ -68,6 +76,7 @@ impl Default for Settings {
             capture_open_turn_bytes: crate::term::OutputCapture::DEFAULT_OPEN_TURN_BYTES,
             mouse: true,
             prefix: None,
+            layout: LayoutMode::Tiled,
         }
     }
 }
@@ -109,6 +118,7 @@ struct SettingsOverrides {
     capture_open_turn_bytes: Option<usize>,
     mouse: Option<bool>,
     prefix: Option<PrefixOverride>,
+    layout: Option<LayoutMode>,
 }
 
 /// The `prefix` settings value, validated at parse time through the same
@@ -160,6 +170,7 @@ impl SettingsOverrides {
                 .or(self.capture_open_turn_bytes),
             mouse: other.mouse.or(self.mouse),
             prefix: other.prefix.or(self.prefix),
+            layout: other.layout.or(self.layout),
         }
     }
 
@@ -192,6 +203,7 @@ impl SettingsOverrides {
             // default-with-tmux-dodge is applied by `input::effective_prefix`,
             // not here, so an unset key is distinguishable from a chosen one.
             prefix: self.prefix.map(|p| p.0),
+            layout: self.layout.unwrap_or(d.layout),
         }
     }
 }
@@ -285,6 +297,35 @@ mod tests {
             !load(None, tmp.path()).unwrap().mouse,
             "mouse = false keeps the terminal's native selection"
         );
+    }
+
+    #[test]
+    fn layout_defaults_tiled_and_selects_a_fixed_mode() {
+        // Default is `Tiled` — the historical auto-tile.
+        assert_eq!(Settings::default().layout, LayoutMode::Tiled);
+        let tmp = TempDir::new().unwrap();
+        // A kebab-case mode name selects a fixed arrangement (runtime cycling
+        // was removed, so this is the only way to reach a non-`Tiled` layout).
+        std::fs::write(
+            tmp.path().join("settings.toml"),
+            "[settings]\nlayout = \"main-vertical\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load(None, tmp.path()).unwrap().layout,
+            LayoutMode::MainVertical
+        );
+
+        // An unknown mode name is a load error, not a silent fall-through.
+        std::fs::write(
+            tmp.path().join("settings.toml"),
+            "[settings]\nlayout = \"diagonal\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            load(None, tmp.path()),
+            Err(SettingsError::Toml { .. })
+        ));
     }
 
     #[test]

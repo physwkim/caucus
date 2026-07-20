@@ -28,13 +28,9 @@
 //! | `Ctrl-A` then `n`         | focus the next panel (cycle order)      |
 //! | `Ctrl-A` then `p`         | focus the previous panel (cycle order)  |
 //! | `Ctrl-A` then `↑↓←→`      | focus the panel in that direction       |
-//! | `Ctrl-A` then `Ctrl-↑↓←→` | resize the focused panel (tmux-style)   |
 //! | `Ctrl-A` then `q`         | quit caucus                             |
 //! | `Ctrl-A` then `z`         | toggle zoom on the focused panel        |
-//! | `Ctrl-A` then `<`         | move the focused panel one step earlier |
-//! | `Ctrl-A` then `>`         | move the focused panel one step later   |
 //! | `Ctrl-A` then `x`         | close the focused panel (y/n confirm)   |
-//! | `Ctrl-A` then `Space`     | cycle the layout arrangement mode       |
 //! | `Ctrl-A` then `t`         | toggle the transcript overlay           |
 //! | `Esc` (overlay open)      | hide the transcript overlay             |
 //! | `Ctrl-A` then `[`         | open the scrollback pager (focused panel)|
@@ -181,18 +177,10 @@ pub enum CaucusCommand {
     /// Move focus to the panel geometrically in the given screen direction
     /// (`Ctrl-A` + arrow) — tmux-style directional navigation.
     FocusDir(Direction),
-    /// Resize the focused panel one step in the given screen direction
-    /// (`Ctrl-A` + `Ctrl`-arrow): grow it toward `Right`/`Down`, shrink it on
-    /// `Left`/`Up` — tmux-style pane resize.
-    ResizeDir(Direction),
     /// Quit caucus.
     Quit,
     /// Toggle full-screen zoom on the focused panel.
     ToggleZoom,
-    /// Move the focused panel one step earlier in the panel order.
-    MovePanelEarlier,
-    /// Move the focused panel one step later in the panel order.
-    MovePanelLater,
     /// Close the focused panel (`Ctrl-A x`) — arms a y/n confirm prompt. The
     /// main worker panel is protected and cannot be closed.
     CloseFocused,
@@ -200,8 +188,6 @@ pub enum CaucusCommand {
     ConfirmClose,
     /// Cancel the pending panel close (`n`/`Esc`/`Ctrl-C` while it is open).
     CancelClose,
-    /// Cycle the arrangement mode (`Tiled` → `EvenHorizontal` → ...).
-    CycleLayout,
     /// Toggle the read-only transcript overlay.
     ToggleTranscript,
     /// Hide the transcript overlay (the `Esc` path while it is open).
@@ -452,26 +438,17 @@ impl FocusRouter {
                 None => InputAction::Ignore,
             };
         }
-        // Arrows are directional (tmux-style). A bare arrow moves focus to the
-        // panel in that screen direction; holding `Ctrl` resizes the focused
-        // panel toward it instead. n/p remain the linear focus cycle.
+        // Arrows are directional (tmux-style): a bare arrow moves focus to the
+        // panel in that screen direction. n/p remain the linear focus cycle.
         if let Some(dir) = arrow_direction(key.code) {
-            let cmd = if key.modifiers.contains(KeyModifiers::CONTROL) {
-                CaucusCommand::ResizeDir(dir)
-            } else {
-                CaucusCommand::FocusDir(dir)
-            };
-            return InputAction::Caucus(cmd);
+            return InputAction::Caucus(CaucusCommand::FocusDir(dir));
         }
         match key.code {
             KeyCode::Char('n') => InputAction::Caucus(CaucusCommand::FocusNext),
             KeyCode::Char('p') => InputAction::Caucus(CaucusCommand::FocusPrev),
             KeyCode::Char('q') => InputAction::Caucus(CaucusCommand::Quit),
             KeyCode::Char('z') => InputAction::Caucus(CaucusCommand::ToggleZoom),
-            KeyCode::Char('<') => InputAction::Caucus(CaucusCommand::MovePanelEarlier),
-            KeyCode::Char('>') => InputAction::Caucus(CaucusCommand::MovePanelLater),
             KeyCode::Char('x') => InputAction::Caucus(CaucusCommand::CloseFocused),
-            KeyCode::Char(' ') => InputAction::Caucus(CaucusCommand::CycleLayout),
             KeyCode::Char('t') => InputAction::Caucus(CaucusCommand::ToggleTranscript),
             KeyCode::Char('[') => InputAction::Caucus(CaucusCommand::EnterScroll),
             // Any other key after the prefix: prefix consumed, nothing done.
@@ -924,28 +901,6 @@ mod tests {
     }
 
     #[test]
-    fn prefix_then_ctrl_arrows_are_directional_resize() {
-        let mut router = FocusRouter::new();
-        router.set_focus(Some(PanelId::new()));
-        let cases = [
-            (KeyCode::Up, Direction::Up),
-            (KeyCode::Down, Direction::Down),
-            (KeyCode::Left, Direction::Left),
-            (KeyCode::Right, Direction::Right),
-        ];
-        for (code, dir) in cases {
-            router.route(ctrl('a'));
-            let arrow = KeyEvent::new(code, KeyModifiers::CONTROL);
-            match router.route(arrow) {
-                InputAction::Caucus(CaucusCommand::ResizeDir(d)) => {
-                    assert_eq!(d, dir, "Ctrl-{code:?} should resize {dir:?}")
-                }
-                other => panic!("expected ResizeDir({dir:?}) for Ctrl-{code:?}, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
     fn prefix_then_q_is_quit() {
         let mut router = FocusRouter::new();
         router.set_focus(Some(PanelId::new()));
@@ -964,33 +919,6 @@ mod tests {
         assert!(matches!(
             router.route(key(KeyCode::Char('z'))),
             InputAction::Caucus(CaucusCommand::ToggleZoom)
-        ));
-    }
-
-    #[test]
-    fn prefix_then_lt_gt_move_the_panel() {
-        let mut router = FocusRouter::new();
-        router.set_focus(Some(PanelId::new()));
-        router.route(ctrl('a'));
-        assert!(matches!(
-            router.route(key(KeyCode::Char('<'))),
-            InputAction::Caucus(CaucusCommand::MovePanelEarlier)
-        ));
-        router.route(ctrl('a'));
-        assert!(matches!(
-            router.route(key(KeyCode::Char('>'))),
-            InputAction::Caucus(CaucusCommand::MovePanelLater)
-        ));
-    }
-
-    #[test]
-    fn prefix_then_space_is_cycle_layout() {
-        let mut router = FocusRouter::new();
-        router.set_focus(Some(PanelId::new()));
-        router.route(ctrl('a'));
-        assert!(matches!(
-            router.route(key(KeyCode::Char(' '))),
-            InputAction::Caucus(CaucusCommand::CycleLayout)
         ));
     }
 

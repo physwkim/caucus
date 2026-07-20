@@ -69,7 +69,8 @@ impl From<Rect> for TuiRect {
 /// How [`Layout::reflow`] arranges the panels into the screen area.
 ///
 /// `Tiled` is the historical roughly-square auto-tile; the rest mirror the
-/// tmux layout names. The arrangement is cycled at runtime via `Ctrl-A Space`.
+/// tmux layout names. Fixed per session: selected by `[settings] layout` on a
+/// fresh start and restored from the record on resume.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LayoutMode {
@@ -82,28 +83,6 @@ pub enum LayoutMode {
     EvenVertical,
     /// Panel 0 fills the left half; the rest stack in the right half.
     MainVertical,
-}
-
-impl LayoutMode {
-    /// The next arrangement in the `Ctrl-A Space` cycle.
-    pub fn next(self) -> Self {
-        match self {
-            LayoutMode::Tiled => LayoutMode::EvenHorizontal,
-            LayoutMode::EvenHorizontal => LayoutMode::EvenVertical,
-            LayoutMode::EvenVertical => LayoutMode::MainVertical,
-            LayoutMode::MainVertical => LayoutMode::Tiled,
-        }
-    }
-
-    /// A short human-readable label for the status bar.
-    pub fn label(self) -> &'static str {
-        match self {
-            LayoutMode::Tiled => "tiled",
-            LayoutMode::EvenHorizontal => "even-horizontal",
-            LayoutMode::EvenVertical => "even-vertical",
-            LayoutMode::MainVertical => "main-vertical",
-        }
-    }
 }
 
 /// A computed layout: the screen rectangle assigned to each panel.
