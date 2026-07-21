@@ -7,6 +7,80 @@ versions.
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-07-21
+
+0.10.0 opened the middle of the main↔sub-agent channel; this release makes it
+hold under a real session. A resumed sub-panel reported itself idle after every
+command it was given, a steady stream of due rounds could wedge the main worker
+in a compact→continue loop, and mouse-selecting panel text had quietly stopped
+copying. It also retires the runtime layout-rearrangement commands in favour of
+a single `[settings] layout` key.
+
+### Added
+
+- **`[settings] layout` selects the pane arrangement.** The four arrangements
+  are now chosen once, by a config key read by `Multiplexer::new` when a fresh
+  session starts, instead of being rearranged live. `caucus resume` still
+  restores the persisted mode; directional focus (arrows), zoom (`z`), and
+  linear focus nav (`n` / `p`) are unchanged.
+
+### Changed
+
+- **The status bar shows the working-panel count.** The `· layout: <mode> ·`
+  indicator is replaced by `· working: <n>`, counting panels in
+  `PanelState::Working`; the layout-mode label and its keymap hints no longer
+  appear on the status line.
+
+### Removed
+
+- **Runtime layout rearrangement.** The `Ctrl-A` pane resize (`Ctrl`-arrows),
+  move (`<` / `>`), and cycle-layout (`Space`) commands are gone, along with the
+  layout-tree resize machinery (`LayoutTree::{resize,adjust}`, nudge, ratio-band
+  constants) and `LayoutMode::{next,label}`. Arrangement is now a
+  start-of-session setting (see Added).
+
+### Fixed
+
+- **A resumed sub-panel no longer reports `idle` after every command.** A
+  reloaded conversation ends on a completed turn, so the backend's `Stop` hook
+  fires on resume and pins `derived_state = Idle` — and `PromptDelivered` was the
+  one turn-phase lane event that appended without recomputing `derived_state`, so
+  the manifest value `list_panels` reports stayed `idle` while the live panel
+  flipped to `working`. `manifest::record_prompt_delivered` is now the third
+  `derived_state` owner (mirroring `record_turn_completed`): both `Idle ->
+  Working` paths route through it, so the reported state flips in lockstep with
+  the live one.
+
+- **A stream of due rounds no longer wedges the main worker mid-compaction.** The
+  main's `Stop` hook is answered with a due round to continue the turn in place;
+  with rounds always due this fired at every boundary, so the main never returned
+  to idle and sat in a continue→compact→continue loop where Claude Code could not
+  compact at a clean boundary and the user could not type. caucus now holds an
+  alternation invariant — it never hook-continues the main on two consecutive
+  boundaries: after a hook-continued boundary the next `Stop` passes through to a
+  real idle boundary (where compaction and user input happen) and the still-due
+  round rides the idle-gated keystroke push. Only main boundaries move the flag; a
+  sub panel's `Stop` leaves it untouched.
+
+- **Mouse drag-select and copy work out of the box.** Mouse capture defaulted on,
+  which routes the wheel to `PageUp` / `PageDown` but suppresses the terminal's
+  native drag-to-select, so copying panel text with the mouse silently stopped
+  working. The shipped default is now off; `mouse = true` opts back into
+  wheel-driven scrollback, and the pager still scrolls with `PageUp` / `PageDown`
+  either way.
+
+### Breaking (library API)
+
+Retiring the runtime rearrangement commands also removed the public methods
+behind them, so as a library this is a breaking release even though the version
+is a patch: cargo reads `0.10.1` as compatible with `^0.10`, so a consumer
+pinning `caucus = "0.10"` picks it up on `cargo update`. Pin `=0.10.0` to stay on
+the old surface.
+
+- `render::LayoutMode::{next, label}` and `render::LayoutTree::resize` are gone.
+  A caller must drop the call — the arrangement is now chosen once via
+  `[settings] layout`, not mutated at runtime.
+
 ## [0.10.0] — 2026-07-18
 
 caucus knew when a sub-agent's turn ended and almost nothing in between, and a
