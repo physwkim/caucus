@@ -71,6 +71,13 @@ pub enum LaneEventKind {
     /// A turn signal was received for this panel, whatever kind it carried: the
     /// turn ended. Produced by `manifest::record_turn_completed`.
     TurnCompleted,
+    /// A local slash command (`/compact`, `/clear`) finished in the panel.
+    /// Such a command runs no agent turn, so no Stop hook ever fires for it —
+    /// its completion arrives as a lifecycle signal (`PreCompact` /
+    /// `SessionStart` hooks, `docs/design.md` §7) and settles the panel the
+    /// way a turn signal would. Produced by
+    /// `manifest::record_local_command_completed`.
+    LocalCommandCompleted { command: String },
     /// The turn ended blocked (recoverable) — see `blocker`. Produced by
     /// `manifest::record_turn_completed` from a `tool_blocked` signal.
     Blocked { blocker: LaneEventBlocker },
@@ -194,6 +201,9 @@ mod tests {
                 LaneEventKind::TurnCompleted => {
                     (manifest, "LaneEvent::now(LaneEventKind::TurnCompleted)")
                 }
+                LaneEventKind::LocalCommandCompleted { .. } => {
+                    (manifest, "LaneEventKind::LocalCommandCompleted {")
+                }
                 LaneEventKind::Blocked { .. } => (manifest, "LaneEventKind::Blocked { blocker"),
                 LaneEventKind::Failed { .. } => (manifest, "LaneEventKind::Failed { blocker"),
                 LaneEventKind::CommitCreated { .. } => (input, "LaneEventKind::CommitCreated {"),
@@ -219,6 +229,9 @@ mod tests {
             LaneEventKind::Started,
             LaneEventKind::PromptDelivered,
             LaneEventKind::TurnCompleted,
+            LaneEventKind::LocalCommandCompleted {
+                command: "/compact".into(),
+            },
             LaneEventKind::Blocked {
                 blocker: blocker.clone(),
             },

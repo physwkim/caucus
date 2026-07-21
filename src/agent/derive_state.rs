@@ -12,7 +12,6 @@
 use serde::{Deserialize, Serialize};
 
 use super::lane_event::{LaneEventBlocker, LaneFailureClass};
-use crate::signal::TurnSignal;
 
 /// Coarse state surface for the main worker (`docs/design.md` §8.3).
 ///
@@ -67,12 +66,15 @@ impl DerivedState {
 /// Pure function deriving the coarse state (`docs/design.md` §8.4).
 ///
 /// `status` is the raw agent status string from the manifest
-/// (`live` / `exited` / `failed`). A recorded blocker dominates; otherwise a
-/// received turn signal means `Idle`, and `live` with no signal means
+/// (`live` / `exited` / `failed`). A recorded blocker dominates; otherwise
+/// `turn_settled` decides: `true` means the open phase reached a completion
+/// boundary — a received turn signal, or a local slash command (`/compact`,
+/// `/clear`) whose finish arrived as a lifecycle signal — so the agent is
+/// `Idle`; `false` means the phase is still open, so a live agent is
 /// `Working`.
 pub fn derive_agent_state(
     status: &str,
-    last_turn_signal: Option<&TurnSignal>,
+    turn_settled: bool,
     error: Option<&str>,
     blocker: Option<&LaneEventBlocker>,
 ) -> DerivedState {
@@ -81,8 +83,8 @@ pub fn derive_agent_state(
     //   2. A live `error` string puts the agent in a transport-interrupted
     //      state (the process is alive but its turn ended badly).
     //   3. A recorded `blocker` maps onto its blocked/degraded variant.
-    //   4. Otherwise: a received turn signal means `Idle`, a live agent with
-    //      no signal yet means `Working`.
+    //   4. Otherwise: a settled phase means `Idle`, a live agent with an
+    //      open phase means `Working`.
 
     // `exited` is terminal regardless of any pending blocker.
     if status == "exited" {
@@ -99,7 +101,7 @@ pub fn derive_agent_state(
 
     match status {
         "failed" => DerivedState::InterruptedTransport,
-        _ if last_turn_signal.is_some() => DerivedState::Idle,
+        _ if turn_settled => DerivedState::Idle,
         _ => DerivedState::Working,
     }
 }
@@ -150,9 +152,9 @@ mod tests {
     }
 
     #[test]
-    fn live_with_no_signal_is_working() {
+    fn live_with_open_phase_is_working() {
         assert_eq!(
-            derive_agent_state("live", None, None, None),
+            derive_agent_state("live", false, None, None),
             DerivedState::Working
         );
     }
@@ -160,22 +162,15 @@ mod tests {
     #[test]
     fn exited_status_is_exited() {
         assert_eq!(
-            derive_agent_state("exited", None, None, None),
+            derive_agent_state("exited", false, None, None),
             DerivedState::Exited
         );
     }
 
     #[test]
-    fn turn_signal_with_no_blocker_is_idle() {
-        let sig = TurnSignal::now(
-            crate::session::id::SessionId::new(),
-            crate::session::id::PanelId::new(),
-            crate::signal::TurnKind::Stop,
-            Some("done".into()),
-            serde_json::Value::Null,
-        );
+    fn settled_phase_with_no_blocker_is_idle() {
         assert_eq!(
-            derive_agent_state("live", Some(&sig), None, None),
+            derive_agent_state("live", true, None, None),
             DerivedState::Idle
         );
     }
@@ -183,7 +178,7 @@ mod tests {
     #[test]
     fn error_string_is_interrupted_transport() {
         assert_eq!(
-            derive_agent_state("live", None, Some("pipe broke"), None),
+            derive_agent_state("live", false, Some("pipe broke"), None),
             DerivedState::InterruptedTransport
         );
     }
@@ -201,7 +196,7 @@ mod tests {
         for (class, expected) in cases {
             let blk = LaneEventBlocker::new(class, "detail");
             assert_eq!(
-                derive_agent_state("live", None, None, Some(&blk)),
+                derive_agent_state("live", false, None, Some(&blk)),
                 expected,
                 "failure class {class:?} must map to {expected:?}"
             );
@@ -214,24 +209,17 @@ mod tests {
     #[test]
     fn failed_status_is_interrupted_transport() {
         assert_eq!(
-            derive_agent_state("failed", None, None, None),
+            derive_agent_state("failed", false, None, None),
             DerivedState::InterruptedTransport
         );
     }
 
-    /// `failed` is weighed before a turn signal: a stale `Stop` signal must not
-    /// surface a failed agent as `Idle`.
+    /// `failed` is weighed before a settled phase: a stale `Stop` signal must
+    /// not surface a failed agent as `Idle`.
     #[test]
-    fn failed_status_beats_a_turn_signal() {
-        let sig = TurnSignal::now(
-            crate::session::id::SessionId::new(),
-            crate::session::id::PanelId::new(),
-            crate::signal::TurnKind::Stop,
-            Some("done".into()),
-            serde_json::Value::Null,
-        );
+    fn failed_status_beats_a_settled_phase() {
         assert_eq!(
-            derive_agent_state("failed", Some(&sig), None, None),
+            derive_agent_state("failed", true, None, None),
             DerivedState::InterruptedTransport
         );
     }
@@ -240,25 +228,18 @@ mod tests {
     fn exited_dominates_error_and_blocker() {
         let blk = LaneEventBlocker::new(LaneFailureClass::PermissionPrompt, "y/n");
         assert_eq!(
-            derive_agent_state("exited", None, Some("err"), Some(&blk)),
+            derive_agent_state("exited", false, Some("err"), Some(&blk)),
             DerivedState::Exited
         );
     }
 
-    /// A blocker outranks a received turn signal: an agent whose turn ended on
+    /// A blocker outranks a settled phase: an agent whose turn ended on
     /// `tool_blocked` is blocked, not `Idle`.
     #[test]
-    fn blocker_outranks_a_turn_signal() {
-        let sig = TurnSignal::now(
-            crate::session::id::SessionId::new(),
-            crate::session::id::PanelId::new(),
-            crate::signal::TurnKind::ToolBlocked,
-            None,
-            serde_json::Value::Null,
-        );
+    fn blocker_outranks_a_settled_phase() {
         let blk = LaneEventBlocker::new(LaneFailureClass::PermissionPrompt, "y/n");
         assert_eq!(
-            derive_agent_state("live", Some(&sig), None, Some(&blk)),
+            derive_agent_state("live", true, None, Some(&blk)),
             DerivedState::BlockedPermissionPrompt
         );
     }

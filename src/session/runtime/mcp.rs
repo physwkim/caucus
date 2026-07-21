@@ -22,7 +22,17 @@ impl McpToolSurface for Multiplexer {
         // even when the submit is deferred: caucus has decided to submit, and
         // the deferral is only the mechanical separation the agent needs to
         // accept the Enter.
-        if enter {
+        //
+        // A *local* slash command (`/compact`, `/clear`) is not a prompt: it
+        // runs entirely inside the agent client, starts no agent turn, and so
+        // fires no Stop hook — the only other `Working -> Idle` producer.
+        // Opening `Working` for it wedges the panel there on machines whose
+        // lifecycle hooks (`PreCompact`/`SessionStart`) are not installed;
+        // with the hooks installed [`Multiplexer::handle_lifecycle`] would
+        // close it, but this classification keeps the panel truthful either
+        // way. Direct typing cannot be classified (keystrokes arrive
+        // byte-by-byte) — that path is covered by the lifecycle hooks alone.
+        if enter && !is_local_slash_command(text) {
             self.note_prompt_delivered(panel);
         }
         Ok(())
@@ -250,6 +260,18 @@ fn submit_delay_for(paste_len: usize) -> Duration {
     let scaled =
         SUBMIT_DELAY_BASE + SUBMIT_DELAY_PER_KIB * (paste_len / 1024).min(u32::MAX as usize) as u32;
     scaled.min(SUBMIT_DELAY_MAX)
+}
+
+/// Whether a submitted line invokes a *local* Claude Code slash command
+/// (`/compact`, `/clear`) — a client builtin that runs no agent turn and fires
+/// no Stop hook. First-token match on a word boundary: `/compact focus on X`
+/// is still `/compact` (it takes instructions), while `/compactify` is an
+/// ordinary prompt.
+fn is_local_slash_command(text: &str) -> bool {
+    matches!(
+        text.split_whitespace().next(),
+        Some("/compact") | Some("/clear")
+    )
 }
 
 /// A submitting Enter held back from a bracketed paste, waiting to be delivered
@@ -689,6 +711,76 @@ mod tests {
         );
         assert_eq!(s[0].last_notification.as_deref(), Some("build finished"));
 
+        mux.shutdown();
+    }
+
+    /// First-token, word-boundary classification of local slash commands: the
+    /// command with arguments still matches; a prompt that merely *starts
+    /// with* the letters (`/compactify`) or mentions the command mid-line does
+    /// not.
+    #[test]
+    fn is_local_slash_command_matches_first_token_only() {
+        assert!(is_local_slash_command("/compact"));
+        assert!(is_local_slash_command("/clear"));
+        assert!(is_local_slash_command("/compact focus on the parser"));
+        assert!(is_local_slash_command("  /compact"));
+        assert!(!is_local_slash_command("/compactify the structs"));
+        assert!(!is_local_slash_command("/clearance check"));
+        assert!(!is_local_slash_command("please run /compact"));
+        assert!(!is_local_slash_command("summarize the findings"));
+        assert!(!is_local_slash_command(""));
+    }
+
+    /// Insert a hermetic `/bin/cat` panel so `send_keys` tests do not depend
+    /// on a real agent CLI being installed.
+    fn push_cat_panel(
+        mux: &mut Multiplexer,
+        state: crate::panel::lifecycle::PanelState,
+    ) -> PanelId {
+        use crate::pty::{Pty, PtyCommand};
+        use crate::session::id::AgentId;
+        use crate::term::{Grid, OutputCapture};
+        let id = PanelId::new();
+        let inner = area().inner();
+        let pty = Pty::spawn(&PtyCommand::new("/bin/cat"), inner.width, inner.height).unwrap();
+        mux.panels.push(crate::panel::lifecycle::Panel {
+            id,
+            role: "reviewer".to_string(),
+            agent_id: AgentId::new(),
+            state,
+            worktree_path: None,
+            pty,
+            grid: Grid::new(inner.width as usize, inner.height as usize),
+            capture: OutputCapture::new(),
+        });
+        mux.rebuild_layout_tree();
+        id
+    }
+
+    /// The defense line for machines without the lifecycle hooks: submitting a
+    /// local slash command via `send_keys` must NOT open a turn (no Stop hook
+    /// will ever close it), while an ordinary prompt still flips the panel
+    /// `Working`.
+    #[tokio::test]
+    async fn send_keys_local_slash_command_does_not_open_a_turn() {
+        use crate::panel::lifecycle::PanelState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let panel = push_cat_panel(&mut mux, PanelState::Idle);
+
+        McpToolSurface::send_keys(&mut mux, panel, "/compact", true).unwrap();
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == panel).unwrap().state(),
+            PanelState::Idle,
+            "a local slash command runs no agent turn — Working would wedge"
+        );
+
+        McpToolSurface::send_keys(&mut mux, panel, "review the diff", true).unwrap();
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == panel).unwrap().state(),
+            PanelState::Working,
+            "an ordinary prompt still opens the turn"
+        );
         mux.shutdown();
     }
 

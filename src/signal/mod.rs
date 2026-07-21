@@ -159,15 +159,77 @@ impl AgentNote {
     }
 }
 
+/// How a compaction was triggered, lifted from the `PreCompact` hook payload's
+/// `trigger` field. `manual` is the user (or the main worker via `send_keys`)
+/// running `/compact` from the input prompt; `auto` is Claude Code compacting
+/// mid-turn because the context window filled. The distinction is what lets
+/// caucus close a `/compact` command phase without ever mistaking an
+/// auto-compact — which happens *inside* a real turn — for one.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactTrigger {
+    Manual,
+    Auto,
+}
+
+/// What kind of lifecycle event a [`LifecycleSignal`] carries. Serialised
+/// internally tagged on `kind` (`pre_compact` / `session_start`) so the wire
+/// vocabulary stays disjoint from turn signals and notes.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LifecycleKind {
+    /// Claude Code is about to compact the conversation (`PreCompact` hook).
+    PreCompact { trigger: CompactTrigger },
+    /// A session (re)started (`SessionStart` hook). `source` is Claude Code's
+    /// own vocabulary — `startup` / `resume` / `clear` / `compact` — kept as a
+    /// string so a source this binary does not know is ignored, not a parse
+    /// failure that drops the line.
+    SessionStart { source: String },
+}
+
+/// One session-lifecycle signal, posted by the `PreCompact` / `SessionStart`
+/// hooks to the caucus socket (`docs/design.md` §7). Not a turn boundary by
+/// itself: the runtime (`Multiplexer::handle_lifecycle`) decides whether it
+/// closes a local-command phase (`/compact`, `/clear`) — the completions the
+/// Stop hook can never report, because a local builtin runs no agent turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleSignal {
+    pub session_id: SessionId,
+    pub panel_id: PanelId,
+    pub ts: DateTime<Utc>,
+    #[serde(flatten)]
+    pub kind: LifecycleKind,
+    /// The raw Claude hook payload, retained verbatim for diagnostics.
+    pub raw_hook_payload: serde_json::Value,
+}
+
+impl LifecycleSignal {
+    /// Construct a signal stamped with `Utc::now()`.
+    pub fn now(
+        session_id: SessionId,
+        panel_id: PanelId,
+        kind: LifecycleKind,
+        raw_hook_payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            session_id,
+            panel_id,
+            ts: Utc::now(),
+            kind,
+            raw_hook_payload,
+        }
+    }
+}
+
 /// One parsed line off the signal socket: the historical turn signal, a
-/// mid-turn note, or an unbound turn signal from a hook that lost its
-/// `CAUCUS_*` env. Untagged so each client's wire line stays exactly what it
-/// already posts — discrimination is by shape, which cannot collide: the two
-/// `kind` vocabularies are disjoint (`stop|tool_blocked|error` vs
-/// `progress|artifact|question`), each of the historical shapes requires a
-/// field the others lack (`panel_id`+`raw_hook_payload` vs `body`), and an
-/// unbound line is the only one carrying the `unbound` marker while lacking
-/// `panel_id`.
+/// mid-turn note, a session-lifecycle signal, or an unbound turn signal from a
+/// hook that lost its `CAUCUS_*` env. Untagged so each client's wire line stays
+/// exactly what it already posts — discrimination is by shape, which cannot
+/// collide: the three `kind` vocabularies are disjoint
+/// (`stop|tool_blocked|error` vs `progress|artifact|question` vs
+/// `pre_compact|session_start`), a note lacks `raw_hook_payload` while the
+/// others lack `body`, and an unbound line is the only one carrying the
+/// `unbound` marker while lacking `panel_id`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum SignalEvent {
@@ -178,6 +240,8 @@ pub enum SignalEvent {
     /// A turn ended, but the posting hook does not know which panel it
     /// belongs to ([`UnboundSignal`]).
     Unbound(UnboundSignal),
+    /// A session-lifecycle event ([`LifecycleSignal`]).
+    Lifecycle(LifecycleSignal),
 }
 
 /// A turn-completion signal posted **without** panel identity

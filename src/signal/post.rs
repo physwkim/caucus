@@ -22,7 +22,10 @@ use anyhow::{Context, Result};
 
 use crate::session::id::{PanelId, SessionId};
 
-use super::{AgentNote, NoteKind, SignalReply, TurnKind, TurnSignal, UnboundSignal};
+use super::{
+    AgentNote, CompactTrigger, LifecycleKind, LifecycleSignal, NoteKind, SignalReply, TurnKind,
+    TurnSignal, UnboundSignal,
+};
 
 /// How long the client waits for the server's one reply line — the client
 /// half of the reply-timeout ladder (`docs/design.md` §7.6): above the
@@ -167,6 +170,66 @@ fn discover_socks(dir: &Path) -> Vec<std::path::PathBuf> {
         .collect();
     socks.sort();
     socks
+}
+
+/// Which lifecycle hook invoked `caucus signal post` — the CLI-level selector
+/// for [`run_lifecycle`]. The hook payload's own discriminating field
+/// (`trigger` for `PreCompact`, `source` for `SessionStart`) is read from
+/// stdin, so this only names the hook, never its data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifecycleHook {
+    PreCompact,
+    SessionStart,
+}
+
+/// Run `caucus signal post --kind pre-compact|session-start` — post one
+/// [`LifecycleSignal`] from a Claude Code `PreCompact` / `SessionStart` hook.
+///
+/// Reads the hook payload from stdin like [`run`] and lifts the discriminating
+/// field out of it: `trigger` (`manual` / `auto`) for `PreCompact`, `source`
+/// (`startup` / `resume` / `clear` / `compact`) for `SessionStart`. A payload
+/// whose field is absent or (for `trigger`) unknown posts nothing — it does not
+/// even open the socket: with no readable discriminant the runtime could take
+/// no decision from the line, and a hook process must never fail the panel it
+/// runs in. Never prints to stdout: `SessionStart` hook stdout is injected
+/// into the agent's context by Claude Code, so any output here would leak into
+/// the panel's conversation.
+pub(crate) fn run_lifecycle(
+    sock_path: &Path,
+    session_id: SessionId,
+    panel_id: PanelId,
+    hook: LifecycleHook,
+) -> Result<()> {
+    let mut payload_text = String::new();
+    std::io::stdin()
+        .read_to_string(&mut payload_text)
+        .context("read Claude hook payload from stdin")?;
+    let raw: serde_json::Value =
+        serde_json::from_str(payload_text.trim()).unwrap_or(serde_json::Value::Null);
+
+    let field = |key: &str| {
+        raw.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let kind = match hook {
+        LifecycleHook::PreCompact => match field("trigger").as_deref() {
+            Some("manual") => LifecycleKind::PreCompact {
+                trigger: CompactTrigger::Manual,
+            },
+            Some("auto") => LifecycleKind::PreCompact {
+                trigger: CompactTrigger::Auto,
+            },
+            // Unknown or absent trigger: no decision can be taken from it.
+            _ => return Ok(()),
+        },
+        LifecycleHook::SessionStart => match field("source") {
+            Some(source) => LifecycleKind::SessionStart { source },
+            None => return Ok(()),
+        },
+    };
+    let signal = LifecycleSignal::now(session_id, panel_id, kind, raw);
+    send_line(sock_path, &signal)
 }
 
 /// Run `caucus signal note` — post one mid-turn [`AgentNote`].

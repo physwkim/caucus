@@ -322,8 +322,8 @@ fn stop_hook_checks() -> Vec<Check> {
             }];
         }
     };
-    let commands = match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(v) => crate::hook::caucus_stop_hook_commands(&v),
+    let settings_value = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => v,
         Err(err) => {
             return vec![Check {
                 name,
@@ -332,6 +332,7 @@ fn stop_hook_checks() -> Vec<Check> {
             }];
         }
     };
+    let commands = crate::hook::caucus_hook_commands(&settings_value, "Stop");
     let Some(command) = commands.first() else {
         return vec![Check {
             name,
@@ -366,7 +367,41 @@ fn stop_hook_checks() -> Vec<Check> {
             detail: format!("Stop hook present and `{program}` is runnable"),
         },
         signal_selftest(command),
+        lifecycle_hooks_check(&settings_value),
     ]
+}
+
+/// Presence check for the lifecycle hook events (`PreCompact`, `SessionStart`).
+/// These close the `working` state for local slash commands (`/compact`,
+/// `/clear`), which run no agent turn and therefore fire no `Stop` hook; a
+/// panel given one on a machine without them wedges in `working` until its
+/// next real prompt.
+fn lifecycle_hooks_check(settings: &serde_json::Value) -> Check {
+    let name = "claude-lifecycle-hooks".to_string();
+    let missing: Vec<&str> = crate::hook::HOOK_EVENTS
+        .iter()
+        .filter(|(event, _)| *event != "Stop")
+        .filter(|(event, _)| crate::hook::caucus_hook_commands(settings, event).is_empty())
+        .map(|(event, _)| *event)
+        .collect();
+    if missing.is_empty() {
+        Check {
+            name,
+            severity: Severity::Ok,
+            detail: "PreCompact + SessionStart hooks present".into(),
+        }
+    } else {
+        Check {
+            name,
+            severity: Severity::Warn,
+            detail: format!(
+                "no `{}` hook in ~/.claude/settings.json — run `caucus init \
+                 --install-hook`; until then a panel given `/compact` or \
+                 `/clear` stays `working` until its next real prompt",
+                missing.join("` / `")
+            ),
+        }
+    }
 }
 
 /// The program a hook command starts with — its first whitespace token.

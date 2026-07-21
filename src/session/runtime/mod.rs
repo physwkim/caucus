@@ -10,7 +10,7 @@
 //! * manifests are written only through `agent::manifest::write`;
 //! * worktree removal is enqueued only through `worktree::cleanup`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -129,6 +129,18 @@ pub struct Multiplexer {
     /// every main Stop to whether *this* boundary was hook-continued, so an
     /// allowed boundary clears it and the next continuation is free again.
     main_last_boundary_hook_continued: bool,
+    /// Panels with a *manual* `/compact` in flight: a `PreCompact
+    /// (trigger=manual)` lifecycle signal arrived and the matching
+    /// `SessionStart (source=compact)` has not. A manual `/compact` is a local
+    /// Claude Code builtin — it runs no agent turn, so no Stop hook ever fires
+    /// and nothing else ever closes the `Working` the submit opened; the
+    /// `SessionStart(compact)` that follows is that close
+    /// ([`Multiplexer::handle_lifecycle`]). The latch exists because *auto*
+    /// compaction emits the same `SessionStart(compact)` mid-turn — closing on
+    /// it unlatched would flip a genuinely-working panel to `Idle` and settle
+    /// its round early. Cleared by the close itself, by any real turn signal
+    /// (the turn boundary supersedes it), and by a new prompt delivery.
+    manual_compact_inflight: HashSet<PanelId>,
     /// Blocking prompts already announced to the main worker, keyed by the
     /// panel showing one — value is the prompt's content signature
     /// ([`rounds::BlockedPrompt::signature`]). Dedups the proactive
@@ -367,6 +379,7 @@ impl Multiplexer {
                 main_panel_id: None,
                 main_compose_since: None,
                 main_last_boundary_hook_continued: false,
+                manual_compact_inflight: HashSet::new(),
                 notified_blockers: HashMap::new(),
                 pending_question_notices: VecDeque::new(),
                 auto_answered: HashMap::new(),

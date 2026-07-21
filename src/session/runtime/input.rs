@@ -4,7 +4,9 @@ use crate::agent::manifest;
 use crate::agent::provenance::{self, LaneCommitProvenance, SupersededBy};
 use crate::input::CaucusCommand;
 use crate::panel::lifecycle::{self, PanelState};
-use crate::signal::{AgentNote, NoteKind, TurnSignal};
+use crate::signal::{
+    AgentNote, CompactTrigger, LifecycleKind, LifecycleSignal, NoteKind, TurnSignal,
+};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -270,6 +272,12 @@ impl Multiplexer {
         };
         panel.end_turn();
 
+        // A real turn boundary supersedes any manual-compact latch: the Stop
+        // proves the panel ran (and finished) an agent turn since the
+        // `PreCompact`, so a later `SessionStart(compact)` from *auto*
+        // compaction must not be mistaken for the manual close.
+        self.manual_compact_inflight.remove(&signal.panel_id);
+
         // Hook-reply delivery, decided before the Idle transition. The reason
         // carries every deliverable waiting for main's attention: the first
         // due round (the primary deliverable, so it leads), then the whole
@@ -385,6 +393,78 @@ impl Multiplexer {
             let _ = lifecycle::transition(panel, PanelState::Working);
         }
         self.record_prompt_delivered(panel_id);
+    }
+
+    /// Ingest a lifecycle hook signal (`PreCompact` / `SessionStart`) — the
+    /// close for a *local* slash command (`/compact`, `/clear`), which runs no
+    /// agent turn and therefore never fires the Stop hook that is otherwise
+    /// the only `Working -> Idle` producer. Without this, a panel handed
+    /// `/compact` wedges in `working` forever and its round never settles.
+    ///
+    /// The latch (`manual_compact_inflight`) distinguishes the two producers
+    /// of `SessionStart(source=compact)`:
+    /// * a **manual** `/compact` announces itself first via
+    ///   `PreCompact(trigger=manual)` — latch, then close on the matching
+    ///   `SessionStart(compact)`;
+    /// * **auto** compaction fires `PreCompact(trigger=auto)` +
+    ///   `SessionStart(compact)` *mid-turn* — no latch, so the `SessionStart`
+    ///   is ignored and the genuinely-working panel keeps its `Working` (its
+    ///   real Stop closes the turn later).
+    ///
+    /// `SessionStart(source=clear)` closes unlatched: `/clear` has no
+    /// `PreCompact`, and its `SessionStart` has no mid-turn producer to
+    /// confuse it with. Every other source (`startup`, `resume`) is an agent
+    /// (re)launch, not a local-command completion — ignored.
+    pub fn handle_lifecycle(&mut self, sig: LifecycleSignal) {
+        match sig.kind {
+            LifecycleKind::PreCompact {
+                trigger: CompactTrigger::Manual,
+            } => {
+                // Latch only a live panel — a stray signal for a killed panel
+                // must not leave a latch that outlives its owner.
+                if self.panels.iter().any(|p| p.id == sig.panel_id) {
+                    self.manual_compact_inflight.insert(sig.panel_id);
+                }
+            }
+            LifecycleKind::PreCompact {
+                trigger: CompactTrigger::Auto,
+            } => {}
+            LifecycleKind::SessionStart { ref source } => match source.as_str() {
+                "compact" => {
+                    if self.manual_compact_inflight.remove(&sig.panel_id) {
+                        self.close_local_command(sig.panel_id, "/compact");
+                    }
+                }
+                "clear" => {
+                    self.manual_compact_inflight.remove(&sig.panel_id);
+                    self.close_local_command(sig.panel_id, "/clear");
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Close the turn phase a local slash command occupied: end the capture
+    /// turn, flip a `Working` panel back to `Idle` (via `lifecycle::transition`,
+    /// Invariant I-5), and record `LocalCommandCompleted` on the manifest so
+    /// `derived_state` follows in lockstep (Invariant I-2) and a pending round
+    /// on the panel can settle. A panel that was not `Working` (the submit
+    /// path already classified the command and never opened a turn) keeps its
+    /// state — the manifest still records the completion fact.
+    fn close_local_command(&mut self, panel_id: PanelId, command: &str) {
+        let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
+            return;
+        };
+        panel.end_turn();
+        if panel.state() == PanelState::Working {
+            let _ = lifecycle::transition(panel, PanelState::Idle);
+        }
+        if let Some(manifest) = self.manifests.get_mut(&panel_id)
+            && let Err(err) =
+                manifest::record_local_command_completed(manifest, &self.session.root_dir, command)
+        {
+            warn!(panel = %panel_id, error = %err, "local-command manifest write failed");
+        }
     }
 
     /// Ingest a mid-turn note: cap its body once (`AgentNote::truncated`, so
@@ -560,6 +640,11 @@ impl Multiplexer {
         if Some(panel_id) == self.main_panel_id {
             self.main_compose_since = None;
         }
+        // A new prompt supersedes any manual-compact latch: the `Working` it
+        // opens belongs to the new turn, and only that turn's own boundary may
+        // close it — a stale latch must not let a later `SessionStart(compact)`
+        // (from auto compaction during the new turn) flip it to `Idle` early.
+        self.manual_compact_inflight.remove(&panel_id);
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
             return;
         };
@@ -785,6 +870,288 @@ mod tests {
             on_disk.last_note(),
             Some("[progress] halfway through the sweep")
         );
+        mux.shutdown();
+    }
+
+    /// A cat panel with a manifest, flipped `Working` by a delivered prompt —
+    /// exactly the state a panel handed `/compact` wedges in, since a local
+    /// command runs no agent turn and no Stop hook ever closes it.
+    fn working_panel_with_manifest(
+        mux: &mut Multiplexer,
+    ) -> (PanelId, crate::session::id::AgentId) {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+        let id = push_cat_panel(mux, PanelState::Idle);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        let agent_id = mf.agent_id;
+        mux.manifests.insert(id, mf);
+        mux.note_prompt_delivered(id);
+        (id, agent_id)
+    }
+
+    fn panel_state(mux: &Multiplexer, id: PanelId) -> PanelState {
+        mux.panels.iter().find(|p| p.id == id).unwrap().state()
+    }
+
+    fn lifecycle(mux: &mut Multiplexer, id: PanelId, kind: LifecycleKind) {
+        let session = mux.session.id;
+        mux.handle_lifecycle(LifecycleSignal::now(
+            session,
+            id,
+            kind,
+            serde_json::Value::Null,
+        ));
+    }
+
+    /// The wedge this whole change closes: a manual `/compact` — `PreCompact
+    /// (trigger=manual)` then `SessionStart(source=compact)`, with NO Stop
+    /// hook in between — flips the panel `Working -> Idle`, recomputes the
+    /// manifest's `derived_state` in lockstep, and records the completion on
+    /// the timeline. The PreCompact alone closes nothing (compaction is still
+    /// running).
+    #[tokio::test]
+    async fn lifecycle_manual_compact_closes_the_working_wedge() {
+        use crate::agent::derive_state::DerivedState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+        assert_eq!(panel_state(&mux, id), PanelState::Working);
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::PreCompact {
+                trigger: CompactTrigger::Manual,
+            },
+        );
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "PreCompact only latches — compaction has not finished yet"
+        );
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::SessionStart {
+                source: "compact".into(),
+            },
+        );
+        assert_eq!(panel_state(&mux, id), PanelState::Idle);
+        assert!(
+            mux.manual_compact_inflight.is_empty(),
+            "the close consumes the latch"
+        );
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(
+            on_disk.derived_state(),
+            DerivedState::Idle,
+            "list_panels must report idle so a pending round can settle"
+        );
+        assert!(
+            on_disk.lane_events().iter().any(|e| matches!(
+                &e.kind,
+                LaneEventKind::LocalCommandCompleted { command } if command == "/compact"
+            )),
+            "the completion is on the persisted timeline: {:?}",
+            on_disk.lane_events()
+        );
+        mux.shutdown();
+    }
+
+    /// *Auto* compaction happens mid-turn: `PreCompact(trigger=auto)` +
+    /// `SessionStart(source=compact)` with no manual latch. The panel is
+    /// genuinely working — the SessionStart must NOT flip it `Idle` (its real
+    /// Stop closes the turn later).
+    #[tokio::test]
+    async fn lifecycle_auto_compact_session_start_leaves_working() {
+        use crate::agent::derive_state::DerivedState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::PreCompact {
+                trigger: CompactTrigger::Auto,
+            },
+        );
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::SessionStart {
+                source: "compact".into(),
+            },
+        );
+
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "an unlatched SessionStart(compact) is auto-compaction mid-turn"
+        );
+        assert_eq!(
+            mux.manifests.get(&id).unwrap().derived_state(),
+            DerivedState::Working
+        );
+        mux.shutdown();
+    }
+
+    /// `/clear` fires no `PreCompact`, and its `SessionStart(source=clear)`
+    /// has no mid-turn producer to confuse it with — it closes unlatched.
+    #[tokio::test]
+    async fn lifecycle_session_start_clear_closes_unlatched() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::SessionStart {
+                source: "clear".into(),
+            },
+        );
+
+        assert_eq!(panel_state(&mux, id), PanelState::Idle);
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert!(
+            on_disk.lane_events().iter().any(|e| matches!(
+                &e.kind,
+                LaneEventKind::LocalCommandCompleted { command } if command == "/clear"
+            )),
+            "{:?}",
+            on_disk.lane_events()
+        );
+        mux.shutdown();
+    }
+
+    /// A `SessionStart` from an agent (re)launch — `startup`, `resume`, or a
+    /// source this binary does not know — is not a local-command completion
+    /// and must not touch a working panel.
+    #[tokio::test]
+    async fn lifecycle_session_start_startup_and_resume_are_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+
+        for source in ["startup", "resume", "some-future-source"] {
+            lifecycle(
+                &mut mux,
+                id,
+                LifecycleKind::SessionStart {
+                    source: source.into(),
+                },
+            );
+            assert_eq!(
+                panel_state(&mux, id),
+                PanelState::Working,
+                "SessionStart({source}) must not close the turn"
+            );
+        }
+        mux.shutdown();
+    }
+
+    /// A real turn boundary (Stop signal) supersedes a stale manual-compact
+    /// latch: a later `SessionStart(compact)` — auto-compaction during the
+    /// panel's *next* turn — must not close that turn early.
+    #[tokio::test]
+    async fn lifecycle_latch_is_cleared_by_a_real_turn_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::PreCompact {
+                trigger: CompactTrigger::Manual,
+            },
+        );
+        assert!(mux.manual_compact_inflight.contains(&id));
+
+        let session = mux.session.id;
+        mux.handle_signal(TurnSignal::now(
+            session,
+            id,
+            crate::signal::TurnKind::Stop,
+            Some("done".into()),
+            serde_json::Value::Null,
+        ));
+        assert!(
+            mux.manual_compact_inflight.is_empty(),
+            "a Stop signal is a real boundary — the latch is stale"
+        );
+
+        // The panel's next turn: an auto-compact SessionStart mid-turn must
+        // leave it Working, which only holds because the latch is gone.
+        mux.note_prompt_delivered(id);
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::SessionStart {
+                source: "compact".into(),
+            },
+        );
+        assert_eq!(panel_state(&mux, id), PanelState::Working);
+        mux.shutdown();
+    }
+
+    /// A new prompt delivery supersedes a stale manual-compact latch: the
+    /// `Working` it opens belongs to the new turn, so a later
+    /// `SessionStart(compact)` must not flip it early.
+    #[tokio::test]
+    async fn lifecycle_latch_is_cleared_by_a_new_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::PreCompact {
+                trigger: CompactTrigger::Manual,
+            },
+        );
+        mux.note_prompt_delivered(id);
+        assert!(
+            mux.manual_compact_inflight.is_empty(),
+            "a delivered prompt supersedes the latch"
+        );
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::SessionStart {
+                source: "compact".into(),
+            },
+        );
+        assert_eq!(panel_state(&mux, id), PanelState::Working);
+        mux.shutdown();
+    }
+
+    /// A `PreCompact(manual)` for a panel caucus does not know (already
+    /// killed, or a stray client) must not leave a latch behind.
+    #[tokio::test]
+    async fn lifecycle_unknown_panel_never_latches() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let stray = PanelId::new();
+        lifecycle(
+            &mut mux,
+            stray,
+            LifecycleKind::PreCompact {
+                trigger: CompactTrigger::Manual,
+            },
+        );
+        assert!(mux.manual_compact_inflight.is_empty());
         mux.shutdown();
     }
 

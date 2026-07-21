@@ -272,6 +272,72 @@ mod tests {
         );
     }
 
+    /// Lifecycle lines — exactly what `caucus signal post --kind pre-compact /
+    /// session-start` serialises — ingest as `Lifecycle`, and a round-trip
+    /// through the serializer parses back to the same kind. The untagged
+    /// discrimination cannot confuse them with turn signals or notes:
+    /// `pre_compact` / `session_start` are outside both other vocabularies.
+    #[test]
+    fn ingest_parses_lifecycle_signal_lines() {
+        use crate::signal::{CompactTrigger, LifecycleKind, LifecycleSignal};
+        let session_id = SessionId::new();
+        let panel_id = PanelId::new();
+
+        let line = serde_json::json!({
+            "session_id": session_id,
+            "panel_id": panel_id,
+            "ts": "2026-07-21T05:00:00Z",
+            "kind": "pre_compact",
+            "trigger": "manual",
+            "raw_hook_payload": { "trigger": "manual" }
+        })
+        .to_string();
+        let SignalEvent::Lifecycle(sig) = ingest(&line).unwrap() else {
+            panic!("a pre_compact line must ingest as Lifecycle");
+        };
+        assert_eq!(
+            sig.kind,
+            LifecycleKind::PreCompact {
+                trigger: CompactTrigger::Manual
+            }
+        );
+
+        let line = serde_json::json!({
+            "session_id": session_id,
+            "panel_id": panel_id,
+            "ts": "2026-07-21T05:00:01Z",
+            "kind": "session_start",
+            "source": "compact",
+            "raw_hook_payload": {}
+        })
+        .to_string();
+        let SignalEvent::Lifecycle(sig) = ingest(&line).unwrap() else {
+            panic!("a session_start line must ingest as Lifecycle");
+        };
+        assert_eq!(
+            sig.kind,
+            LifecycleKind::SessionStart {
+                source: "compact".into()
+            }
+        );
+
+        // Round-trip: what `LifecycleSignal` serialises is what ingest parses.
+        let posted = LifecycleSignal::now(
+            session_id,
+            panel_id,
+            LifecycleKind::SessionStart {
+                source: "clear".into(),
+            },
+            serde_json::Value::Null,
+        );
+        let line = serde_json::to_string(&posted).unwrap();
+        let SignalEvent::Lifecycle(back) = ingest(&line).unwrap() else {
+            panic!("a serialised LifecycleSignal must ingest as Lifecycle");
+        };
+        assert_eq!(back.kind, posted.kind);
+        assert_eq!(back.panel_id, panel_id);
+    }
+
     /// Dropping the server removes its socket file, so it does not accumulate
     /// in the temp dir across runs.
     #[tokio::test]
