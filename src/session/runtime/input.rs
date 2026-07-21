@@ -241,9 +241,14 @@ impl Multiplexer {
     /// panel is the main panel; no human keystroke is holding the compose
     /// gate (the "no automated delivery while the human is composing" rule is
     /// path-independent — held here too, and the sender drop answers allow);
-    /// and a round is actually due ([`Multiplexer::take_due_round_summary`]).
-    /// Every precondition that fails simply drops the sender — allow — and
-    /// the signal is handled exactly as before.
+    /// the *previous* boundary was not itself hook-continued
+    /// (`main_last_boundary_hook_continued`, the alternation gate — caucus
+    /// never continues the main on two consecutive boundaries, so it always
+    /// reaches a real idle boundary where Claude Code can compact and the user
+    /// can type); and a round is actually due
+    /// ([`Multiplexer::take_due_round_summary`]). Every precondition that fails
+    /// simply drops the sender — allow — and the signal is handled exactly as
+    /// before; the still-due round then rides the keystroke push.
     ///
     /// A delivered reply means the turn *continues*: the panel skips the
     /// `Idle` transition and its capture turn is reopened
@@ -280,6 +285,7 @@ impl Multiplexer {
             && Some(signal.panel_id) == self.main_panel_id
             && !sender.is_closed()
             && self.main_compose_quiet()
+            && !self.main_last_boundary_hook_continued
         {
             let mut parts: Vec<String> = Vec::new();
             parts.extend(self.take_due_round_summary());
@@ -291,6 +297,17 @@ impl Multiplexer {
                     Err(StopDirective::Deliver { reason }) => keystroke_fallback = Some(reason),
                 }
             }
+        }
+
+        // Alternation gate: remember whether *this* main boundary was
+        // hook-continued so the next one is not (a due round then rides the
+        // keystroke push, which waits for the main to be `Idle`). Only main
+        // boundaries move the flag — a sub panel's Stop leaves it untouched.
+        // An allowed boundary (`delivered_by_hook == false`) clears it, so the
+        // main is never continued twice in a row and always reaches a real
+        // idle boundary within one turn.
+        if Some(signal.panel_id) == self.main_panel_id {
+            self.main_last_boundary_hook_continued = delivered_by_hook;
         }
 
         // A turn signal means the agent is idle, waiting for the next prompt —

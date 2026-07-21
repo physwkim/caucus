@@ -114,6 +114,20 @@ pub struct Multiplexer {
     /// `COMPOSE_GRACE` after this instant so the injection never lands in the
     /// middle of a line the user is composing.
     main_compose_since: Option<Instant>,
+    /// True when caucus continued the main worker's *previous* turn boundary by
+    /// answering its Stop hook with a due round (`Deliver`) instead of letting
+    /// the turn stop. The alternation gate of
+    /// [`Multiplexer::handle_signal_with_reply`]: caucus must not hook-continue
+    /// the main on two consecutive boundaries, so after one continuation the
+    /// next Stop is *allowed* — the main reaches a real `Idle` boundary, where
+    /// Claude Code can compact and the user can type, and any still-due round
+    /// rides the `main_deliverable`-gated keystroke push
+    /// ([`Multiplexer::poll_pending_rounds`]) instead. Without the bound a
+    /// stream of due rounds answers `Deliver` every turn and the main never
+    /// returns to idle — it wedges in a continue→compact→continue loop. Set on
+    /// every main Stop to whether *this* boundary was hook-continued, so an
+    /// allowed boundary clears it and the next continuation is free again.
+    main_last_boundary_hook_continued: bool,
     /// Blocking prompts already announced to the main worker, keyed by the
     /// panel showing one — value is the prompt's content signature
     /// ([`rounds::BlockedPrompt::signature`]). Dedups the proactive
@@ -342,6 +356,7 @@ impl Multiplexer {
                 pending_close: None,
                 main_panel_id: None,
                 main_compose_since: None,
+                main_last_boundary_hook_continued: false,
                 notified_blockers: HashMap::new(),
                 pending_question_notices: VecDeque::new(),
                 auto_answered: HashMap::new(),
