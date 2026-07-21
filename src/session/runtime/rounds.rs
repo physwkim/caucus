@@ -3529,6 +3529,80 @@ mod tests {
         mux.shutdown();
     }
 
+    /// A hook-continued boundary arms the alternation gate: the first delivery
+    /// works exactly as before and records that this boundary continued the
+    /// turn, so the next one may not.
+    #[tokio::test]
+    async fn a_hook_continued_boundary_arms_the_alternation_gate() {
+        use crate::signal::StopDirective;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (main, _sub) = due_round_with_working_main(&mut mux);
+        assert!(
+            !mux.main_last_boundary_hook_continued,
+            "a fresh boundary is free to continue"
+        );
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
+
+        let StopDirective::Deliver { .. } = rx.try_recv().expect("directive must be sent");
+        assert!(
+            mux.main_last_boundary_hook_continued,
+            "a hook-continued boundary arms the gate against a second in a row"
+        );
+        mux.shutdown();
+    }
+
+    /// Alternation gate: caucus must not hook-continue the main on two
+    /// consecutive boundaries. With the previous boundary already
+    /// hook-continued, a due round is answered *allow* (sender dropped) — the
+    /// main settles to a real `Idle` boundary where Claude Code can compact and
+    /// the user can type — the round stays for the keystroke push, and the gate
+    /// clears so the next boundary is free again. This is the bound that stops a
+    /// stream of due rounds from wedging the main in a continue→compact→continue
+    /// loop (the resumed/heavy-session symptom).
+    #[tokio::test]
+    async fn hook_reply_does_not_continue_the_main_twice_in_a_row() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (main, _sub) = due_round_with_working_main(&mut mux);
+        // The previous boundary was hook-continued.
+        mux.main_last_boundary_hook_continued = true;
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a second consecutive boundary must be allowed, not delivered"
+        );
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "the round stays pending for the keystroke push"
+        );
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "an allowed Stop settles main to a real idle boundary"
+        );
+        assert!(
+            !mux.main_last_boundary_hook_continued,
+            "the allowed boundary clears the gate so the next may continue"
+        );
+
+        // The still-due round now rides the keystroke push into the idle main.
+        mux.poll_pending_rounds();
+        assert!(mux.pending_rounds.is_empty(), "the push delivered it");
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the injected summary opened a main turn once it was idle"
+        );
+        mux.shutdown();
+    }
+
     /// Queued question notices ride the hook reply even with no due round:
     /// the whole queue is batched into the continuing turn — held back, a
     /// notice would wait an entire further main turn for the idle push, which

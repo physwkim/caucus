@@ -63,7 +63,10 @@ pub enum LaneEventKind {
     Started,
     /// A prompt was delivered to the panel — by the main worker's `send_keys`,
     /// or by the user typing into it. Produced by
-    /// `Multiplexer::note_prompt_delivered`, the only `Idle -> Working` path.
+    /// `manifest::record_prompt_delivered`, the sole writer of this event and
+    /// the turn-phase transition back into `Working` (the mirror of
+    /// `record_turn_completed`); the runtime's `Idle -> Working` paths route
+    /// through it.
     PromptDelivered,
     /// A turn signal was received for this panel, whatever kind it carried: the
     /// turn ended. Produced by `manifest::record_turn_completed`.
@@ -185,7 +188,9 @@ mod tests {
         let producer = |kind: &LaneEventKind| -> (&str, &str) {
             match kind {
                 LaneEventKind::Started => (manifest, "LaneEvent::started(now)"),
-                LaneEventKind::PromptDelivered => (input, "LaneEventKind::PromptDelivered"),
+                LaneEventKind::PromptDelivered => {
+                    (manifest, "LaneEvent::now(LaneEventKind::PromptDelivered)")
+                }
                 LaneEventKind::TurnCompleted => {
                     (manifest, "LaneEvent::now(LaneEventKind::TurnCompleted)")
                 }

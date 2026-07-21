@@ -49,7 +49,9 @@ pub struct Settings {
     /// Whether caucus captures the mouse (`docs/design.md` §1). On, a scroll
     /// wheel notch reaches caucus as a `PageUp`/`PageDown` keypress; off, the
     /// terminal keeps its native mouse behaviour (drag-to-select / copy).
-    /// Default on — set `mouse = false` to keep native selection.
+    /// Default off — native selection/copy works out of the box; set
+    /// `mouse = true` to capture the wheel for scrollback (the pager still
+    /// scrolls with `PageUp`/`PageDown` regardless).
     pub mouse: bool,
     /// The reserved prefix letter (`prefix = "b"` → `Ctrl-B`), or `None` when
     /// unset. Sits between the CLI and the compiled default in the prefix
@@ -74,7 +76,7 @@ impl Default for Settings {
             round_fallback_secs: ROUND_FALLBACK_DEFAULT_SECS,
             capture_turn_limit: crate::term::OutputCapture::DEFAULT_TURN_LIMIT,
             capture_open_turn_bytes: crate::term::OutputCapture::DEFAULT_OPEN_TURN_BYTES,
-            mouse: true,
+            mouse: false,
             prefix: None,
             layout: LayoutMode::Tiled,
         }
@@ -284,18 +286,18 @@ mod tests {
     }
 
     #[test]
-    fn mouse_defaults_on_and_can_be_disabled() {
-        // Default is on — caucus captures the mouse for scrollback.
-        assert!(Settings::default().mouse);
+    fn mouse_defaults_off_and_can_be_enabled() {
+        // Default is off — the terminal keeps native drag-to-select/copy.
+        assert!(!Settings::default().mouse);
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("settings.toml"),
-            "[settings]\nmouse = false\n",
+            "[settings]\nmouse = true\n",
         )
         .unwrap();
         assert!(
-            !load(None, tmp.path()).unwrap().mouse,
-            "mouse = false keeps the terminal's native selection"
+            load(None, tmp.path()).unwrap().mouse,
+            "mouse = true captures the mouse for wheel scrollback"
         );
     }
 
