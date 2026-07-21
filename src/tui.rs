@@ -285,10 +285,10 @@ impl TerminalGuard {
     /// rather than streaming it key-by-key (which would submit at every embedded
     /// newline — see [`Multiplexer::handle_paste`]).
     ///
-    /// When `mouse` is set (the `[settings] mouse` default), also capture the
-    /// mouse so the scroll wheel reaches caucus as `PageUp`/`PageDown`
+    /// When `mouse` is set (`[settings] mouse = true`; off by default), also
+    /// capture the mouse so the scroll wheel reaches caucus as `PageUp`/`PageDown`
     /// ([`Multiplexer::handle_mouse`]). Capture suppresses the terminal's native
-    /// drag-to-select, so it is left off when the setting is disabled.
+    /// drag-to-select, so the default leaves it off to keep native copy working.
     fn enter(mouse: bool) -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
         crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
