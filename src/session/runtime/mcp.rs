@@ -27,7 +27,7 @@ impl McpToolSurface for Multiplexer {
         // runs entirely inside the agent client, starts no agent turn, and so
         // fires no Stop hook — the only other `Working -> Idle` producer.
         // Opening `Working` for it wedges the panel there on machines whose
-        // lifecycle hooks (`PreCompact`/`SessionStart`) are not installed;
+        // lifecycle hooks (`PostCompact`/`SessionStart`) are not installed;
         // with the hooks installed [`Multiplexer::handle_lifecycle`] would
         // close it, but this classification keeps the panel truthful either
         // way. Direct typing cannot be classified (keystrokes arrive

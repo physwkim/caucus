@@ -515,8 +515,11 @@ caucus가 tmux 안에서 돌든 밖에서 돌든 구성상 동일하고, 패널 
 ### 7.2 작성 주체
 **Claude `Stop` hook**. caucus는 이 hook을 `caucus init --install-hook`으로
 설치한다 — Claude `~/.claude/settings.json`에 merge하고 `.bak` 백업을 남긴다.
-같은 설치가 `PreCompact` / `SessionStart` hook도 함께 wire한다 — 스크립트는
-하나이고, 이벤트별 인자만 다르다 (§7.8).
+같은 설치가 `PostCompact` / `SessionStart` hook도 함께 wire한다 — 스크립트는
+하나이고, 이벤트별 인자만 다르다 (§7.9). 설치는 `HOOK_EVENTS`가 나열한
+이벤트만 남기고, settings.json에 있는 **다른 모든** 이벤트의 caucus hook은
+제거한다 — caucus가 은퇴시킨 이벤트(예: 미출시 빌드가 설치한 `PreCompact`)가
+이제는 받지 않는 인자로 스크립트를 계속 호출하는 것을 막는다.
 
 ### 7.3 hook 스크립트
 `caucus init --install-hook`이 만드는 `~/.claude/hooks/caucus-turn-signal`:
@@ -537,8 +540,8 @@ hook을 실행하게 되어 어떤 패널도 신호를 보내지 못하고 어�
 ```sh
 #!/bin/sh
 # CAUCUS_* env는 caucus가 패널 spawn 시 주입. Claude hook payload는 stdin JSON.
-# $1은 hook 이벤트 인자: Stop 항목은 인자 없이(기본 stop), PreCompact/
-# SessionStart 항목은 pre-compact / session-start를 넘긴다 (§7.9).
+# $1은 hook 이벤트 인자: Stop 항목은 인자 없이(기본 stop), PostCompact/
+# SessionStart 항목은 post-compact / session-start를 넘긴다 (§7.9).
 # 아래 discovery 분기가 위치 파라미터를 소켓 glob으로 덮어쓰므로 먼저 캡처한다.
 kind="${1:-stop}"
 if [ -n "$CAUCUS_SOCK" ]; then
@@ -819,7 +822,7 @@ resume`이 fork 이전 대화를 되살린다. env 상속을 끊는 **모든** �
 버리고, 클라이언트는 그 소켓의 read timeout(2.5s)을 기다린 뒤 fail-open한다 —
 fallback 경로에서만 나는 지연이라 수용한다.
 
-### 7.9 Lifecycle 신호 (PreCompact / SessionStart) — local slash command의 settle
+### 7.9 Lifecycle 신호 (PostCompact / SessionStart) — local slash command의 settle
 
 **문제**: `/compact`·`/clear`는 Claude Code **로컬 빌트인**이다 — agent 턴을
 돌리지 않으므로 Stop hook이 절대 발화하지 않는다. 그런데 submit 경로
@@ -829,23 +832,34 @@ fallback 경로에서만 나는 지연이라 수용한다.
 
 **해결, 두 겹**:
 
-1. **Hook 기반 close(구조적 fix)** — 같은 스크립트(§7.3)를 `PreCompact`
-   (인자 `pre-compact`) / `SessionStart`(인자 `session-start`)에도 설치한다.
+1. **Hook 기반 close(구조적 fix)** — 같은 스크립트(§7.3)를 `PostCompact`
+   (인자 `post-compact`) / `SessionStart`(인자 `session-start`)에도 설치한다.
    `caucus signal post`가 payload의 `trigger`/`source`를 stdin에서 승격해
-   lifecycle 신호(`kind: pre_compact | session_start`)를 소켓에 쓴다.
+   lifecycle 신호(`kind: post_compact | session_start`)를 소켓에 쓴다.
    런타임(`Multiplexer::handle_lifecycle`)의 규칙:
-   - `PreCompact(trigger=manual)` → 해당 패널에 "수동 compact 진행 중" 래치.
-   - `SessionStart(source=compact)` → **래치가 있을 때만** `Working → Idle`로
-     닫는다. auto-compact는 같은 `SessionStart(compact)`를 **턴 중간에**
-     방출하므로, 래치 없이 닫으면 진짜 작업 중인 패널을 조기 settle시킨다.
-   - `SessionStart(source=clear)` → 항상 닫는다 (`/clear`에는 mid-turn
-     producer가 없다).
-   - `startup`/`resume`/미지의 source → 무시.
-   - 래치는 close 자신, 실제 turn signal, 새 프롬프트 전달이 지운다;
-     패널 kill 시 함께 정리된다.
+   - `PostCompact(trigger=manual)` → `/compact` 명령 phase를 닫는다
+     (`Working → Idle`). 수동 `/compact` 뒤에는 agent 턴이 없으므로 이
+     완료가 곧 phase의 close다.
+   - `PostCompact(trigger=auto)` → **무시**. auto compaction은 Claude Code의
+     query loop **안에서**, 아직 돌고 있는 턴의 중간에 일어나며 아무것도
+     끝내지 않는다. 여기서 닫으면 진짜 작업 중인 패널을 `Idle`로 떨어뜨려
+     round를 조기 settle시킨다 — 패널의 진짜 Stop이 나중에 턴을 닫는다.
+   - `SessionStart(source=clear)` → 닫는다 (`/clear`는 compaction이 없으므로
+     `PostCompact`가 없다).
+   - 그 외 모든 `SessionStart` source(`startup`/`resume`/`compact`/미지) →
+     무시. `compact`는 compaction이 함께 방출하지만 그 사건의 owner는
+     `PostCompact` 하나다.
    닫힘은 `manifest::record_local_command_completed`(I-2 owner)를 경유해
    `LocalCommandCompleted` lane event를 남기고 `derived_state`를 `Idle`로
    재계산한다 — turn signal이 한 번도 없어도 settle된다.
+
+   `trigger`를 payload에서 **읽는다**는 점이 이 설계의 핵심이다. 이전 설계는
+   `PreCompact(manual)` 래치를 걸고 뒤따르는 `SessionStart(compact)`가
+   래치되어 있을 때만 닫는 방식으로 manual/auto를 *재구성*했다. 그 래치는
+   "수동 compact 진행 중"과 "직전 턴의 잔여물"이라는 두 의미를 한 셀이
+   지니게 만들었고, 실제 turn signal·새 프롬프트·패널 kill마다 별도의 무효화
+   경로를 요구했다. `PostCompact`는 `trigger`를 그대로 실어주므로 래치와 그
+   무효화 경로 전체가 사라진다.
 
 2. **send_keys 분류(방어선)** — `send_keys(enter=true)`의 제출 텍스트 첫
    토큰이 `/compact`·`/clear`면 `note_prompt_delivered`를 건너뛴다(턴을 열지
@@ -858,10 +872,15 @@ Stop hook이 유일한 `Working → Idle` producer라는 §8.3의 전제는 이�
 owner(`handle_lifecycle` → `record_local_command_completed`)를 경유하며,
 제2의 자유 settle 경로가 아니다.
 
-**알려진 한계**: lifecycle 신호는 §7.8의 unbound 경로를 타지 못한다 —
-`UnboundSignal`이 `TurnKind`만 싣고, lifecycle 소비자가 아직 거기에 연결되어
-있지 않다. env가 끊긴 패널에서 `/compact`·`/clear`를 하면 이 절의 close는
-발화하지 않고 2번 방어선(send_keys 분류)만 남는다.
+**알려진 한계**:
+
+- lifecycle 신호는 §7.8의 unbound 경로를 타지 못한다 — `UnboundSignal`이
+  `TurnKind`만 싣고, lifecycle 소비자가 아직 거기에 연결되어 있지 않다. env가
+  끊긴 패널에서 `/compact`·`/clear`를 하면 이 절의 close는 발화하지 않고
+  2번 방어선(send_keys 분류)만 남는다.
+- `PostCompact` hook을 방출하지 않는 구버전 Claude Code에서는 1번 층이 통째로
+  발화하지 않는다. `caucus doctor`가 hook 설치 여부는 보지만 Claude Code 버전은
+  검증하지 않는다.
 
 ---
 

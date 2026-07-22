@@ -22,12 +22,19 @@ pub(crate) const GLOBAL_HOOK_FILENAME: &str = "caucus-turn-signal";
 /// posting a `stop` turn signal, keeping its settings command byte-identical
 /// to prior installs — while the lifecycle events name themselves, and
 /// `caucus signal post` lifts the payload's own `trigger` / `source` field
-/// from stdin. `PreCompact` + `SessionStart` exist because a local slash
+/// from stdin. `PostCompact` + `SessionStart` exist because a local slash
 /// command (`/compact`, `/clear`) runs no agent turn: no Stop hook ever fires
 /// for it, so without them a panel given one wedges in `working` forever.
+///
+/// This list is the whole truth about which caucus hooks belong in
+/// `settings.json`: `init` prunes caucus-owned hooks under *every* event the
+/// file carries, so an event dropped from here (e.g. the `PreCompact` entry an
+/// unreleased build installed) is uninstalled on the next
+/// `caucus init --install-hook` rather than left behind invoking the script
+/// with an argument this binary no longer accepts.
 pub(crate) const HOOK_EVENTS: &[(&str, Option<&str>)] = &[
     ("Stop", None),
-    ("PreCompact", Some("pre-compact")),
+    ("PostCompact", Some("post-compact")),
     ("SessionStart", Some("session-start")),
 ];
 
@@ -149,8 +156,8 @@ mod tests {
         });
         assert!(!current_hook_present(&stale, "Stop", TURN_SIGNAL));
         // Presence is per-event: a command wired under Stop says nothing about
-        // PreCompact — each installed event is checked under its own key.
-        assert!(!current_hook_present(&with, "PreCompact", TURN_SIGNAL));
+        // PostCompact — each installed event is checked under its own key.
+        assert!(!current_hook_present(&with, "PostCompact", TURN_SIGNAL));
     }
 
     #[test]
@@ -179,7 +186,7 @@ mod tests {
             by_event,
             vec![
                 ("Stop", GLOBAL_HOOK_SCRIPT.to_string()),
-                ("PreCompact", format!("{GLOBAL_HOOK_SCRIPT} pre-compact")),
+                ("PostCompact", format!("{GLOBAL_HOOK_SCRIPT} post-compact")),
                 (
                     "SessionStart",
                     format!("{GLOBAL_HOOK_SCRIPT} session-start")

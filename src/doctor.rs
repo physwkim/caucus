@@ -371,7 +371,7 @@ fn stop_hook_checks() -> Vec<Check> {
     ]
 }
 
-/// Presence check for the lifecycle hook events (`PreCompact`, `SessionStart`).
+/// Presence check for the lifecycle hook events (`PostCompact`, `SessionStart`).
 /// These close the `working` state for local slash commands (`/compact`,
 /// `/clear`), which run no agent turn and therefore fire no `Stop` hook; a
 /// panel given one on a machine without them wedges in `working` until its
@@ -388,7 +388,7 @@ fn lifecycle_hooks_check(settings: &serde_json::Value) -> Check {
         Check {
             name,
             severity: Severity::Ok,
-            detail: "PreCompact + SessionStart hooks present".into(),
+            detail: "PostCompact + SessionStart hooks present".into(),
         }
     } else {
         Check {

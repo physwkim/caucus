@@ -272,11 +272,11 @@ mod tests {
         );
     }
 
-    /// Lifecycle lines — exactly what `caucus signal post --kind pre-compact /
+    /// Lifecycle lines — exactly what `caucus signal post --kind post-compact /
     /// session-start` serialises — ingest as `Lifecycle`, and a round-trip
     /// through the serializer parses back to the same kind. The untagged
     /// discrimination cannot confuse them with turn signals or notes:
-    /// `pre_compact` / `session_start` are outside both other vocabularies.
+    /// `post_compact` / `session_start` are outside both other vocabularies.
     #[test]
     fn ingest_parses_lifecycle_signal_lines() {
         use crate::signal::{CompactTrigger, LifecycleKind, LifecycleSignal};
@@ -287,17 +287,17 @@ mod tests {
             "session_id": session_id,
             "panel_id": panel_id,
             "ts": "2026-07-21T05:00:00Z",
-            "kind": "pre_compact",
+            "kind": "post_compact",
             "trigger": "manual",
             "raw_hook_payload": { "trigger": "manual" }
         })
         .to_string();
         let SignalEvent::Lifecycle(sig) = ingest(&line).unwrap() else {
-            panic!("a pre_compact line must ingest as Lifecycle");
+            panic!("a post_compact line must ingest as Lifecycle");
         };
         assert_eq!(
             sig.kind,
-            LifecycleKind::PreCompact {
+            LifecycleKind::PostCompact {
                 trigger: CompactTrigger::Manual
             }
         );

@@ -43,7 +43,7 @@ const TURN_SIGNAL_SCRIPT: &str = "#!/bin/sh\n\
 #\n\
 # One script serves every caucus hook event: settings.json invokes it bare for\n\
 # Stop (the default below) and with an argument for the lifecycle events\n\
-# (`pre-compact` / `session-start`), which report a local /compact or /clear\n\
+# (`post-compact` / `session-start`), which report a local /compact or /clear\n\
 # finishing — completions the Stop hook never fires for. Capture it now: the\n\
 # discovery branch below reuses the positional parameters for socket globbing.\n\
 kind=\"${1:-stop}\"\n\
@@ -374,14 +374,18 @@ fn install_claude_hook(claude_dir: &Path) -> Result<(PathBuf, HookInstall)> {
         None
     };
 
-    // Per event: drop any stale caucus hook (a caucus hook command that is not
-    // the current one), then wire the current one when absent — so a prior
-    // `sentinel-stop` is replaced, not left alongside a dead duplicate, and an
-    // install that already carries some of the events only adds the missing
-    // ones.
-    let mut migrated = false;
+    // Drop every stale caucus hook the file carries, then wire the current
+    // ones where absent — so a prior `sentinel-stop` is replaced rather than
+    // left alongside a dead duplicate, and an install that already carries
+    // some of the events only adds the missing ones.
+    //
+    // The prune sweeps *every* event in the file, not just the ones
+    // `HOOK_EVENTS` still lists: an event caucus has retired (the `PreCompact`
+    // entry an unreleased build installed) would otherwise never be visited,
+    // and would keep invoking the script with an argument this binary no
+    // longer accepts.
+    let migrated = prune_stale_caucus_hooks(&mut settings, &commands) > 0;
     for (event, cmd) in &commands {
-        migrated |= prune_stale_caucus_hooks(&mut settings, event, cmd) > 0;
         if !current_hook_present(&settings, event, cmd) {
             merge_hook(&mut settings, event, cmd)?;
         }
@@ -402,41 +406,50 @@ fn install_claude_hook(claude_dir: &Path) -> Result<(PathBuf, HookInstall)> {
     ))
 }
 
-/// Remove every *stale* caucus hook — a caucus hook command that is not the
-/// current `hook_command` — from `settings.hooks.<event>`, preserving all
-/// other hooks. Matcher groups left with no hooks are dropped. Returns how
-/// many stale caucus hook commands were removed.
-fn prune_stale_caucus_hooks(
-    settings: &mut serde_json::Value,
-    event: &str,
-    hook_command: &str,
-) -> usize {
-    let Some(groups) = settings
-        .get_mut("hooks")
-        .and_then(|h| h.get_mut(event))
-        .and_then(|s| s.as_array_mut())
-    else {
+/// Remove every *stale* caucus hook from `settings.hooks` — any caucus hook
+/// command that is not the current command for the event it sits under —
+/// preserving all other hooks. Matcher groups left with no hooks are dropped.
+/// Returns how many stale caucus hook commands were removed.
+///
+/// `current` is the full set of `(event, command)` pairs caucus installs
+/// ([`crate::hook::HOOK_EVENTS`]). Every event key in the file is swept, not
+/// just the ones `current` names: an event caucus once installed and has since
+/// retired holds a caucus hook with *no* current command, so every caucus hook
+/// under it is stale and comes out. That is what makes `HOOK_EVENTS` the whole
+/// truth about which caucus hooks the settings file may carry.
+fn prune_stale_caucus_hooks(settings: &mut serde_json::Value, current: &[(&str, String)]) -> usize {
+    let Some(events) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
         return 0;
     };
     let mut removed = 0;
-    for group in groups.iter_mut() {
-        if let Some(hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-            let before = hooks.len();
-            hooks.retain(|hook| match hook.get("command").and_then(|c| c.as_str()) {
-                Some(cmd) => !(is_caucus_hook_command(cmd) && cmd != hook_command),
-                None => true,
-            });
-            removed += before - hooks.len();
+    for (event, value) in events.iter_mut() {
+        // `None` for a retired event: no command under it is the current one.
+        let keep = current
+            .iter()
+            .find(|(name, _)| name == event)
+            .map(|(_, cmd)| cmd.as_str());
+        let Some(groups) = value.as_array_mut() else {
+            continue;
+        };
+        for group in groups.iter_mut() {
+            if let Some(hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                let before = hooks.len();
+                hooks.retain(|hook| match hook.get("command").and_then(|c| c.as_str()) {
+                    Some(cmd) => !(is_caucus_hook_command(cmd) && Some(cmd) != keep),
+                    None => true,
+                });
+                removed += before - hooks.len();
+            }
         }
+        // Drop matcher groups whose hooks array is now empty; leave groups
+        // without a `hooks` array untouched.
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_none_or(|a| !a.is_empty())
+        });
     }
-    // Drop matcher groups whose hooks array is now empty; leave groups without
-    // a `hooks` array untouched.
-    groups.retain(|group| {
-        group
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .is_none_or(|a| !a.is_empty())
-    });
     removed
 }
 
@@ -707,7 +720,7 @@ mod tests {
     }
 
     /// The upgrade path: a settings.json holding only the `Stop` hook — what a
-    /// pre-lifecycle caucus installed — gains the missing `PreCompact` +
+    /// pre-lifecycle caucus installed — gains the missing `PostCompact` +
     /// `SessionStart` entries on reinstall (reported `Merged`, since not every
     /// event was present), and the existing Stop entry is neither duplicated
     /// nor rewritten (its command is byte-identical across versions).
@@ -927,6 +940,7 @@ mod tests {
 
     const TURN_SIGNAL: &str = "/abs/repo/.caucus/bin/turn-signal";
     const SENTINEL_STOP: &str = "/abs/repo/.caucus/bin/sentinel-stop";
+    const THIRD_PARTY: &str = "/Users/me/codes/claude-config/hooks/no-deferral-guard.py";
 
     #[test]
     fn merge_hook_into_empty_settings() {
@@ -1012,7 +1026,7 @@ mod tests {
             }
         });
 
-        let removed = prune_stale_caucus_hooks(&mut settings, "Stop", TURN_SIGNAL);
+        let removed = prune_stale_caucus_hooks(&mut settings, &[("Stop", TURN_SIGNAL.to_string())]);
         assert_eq!(removed, 1, "the stale sentinel-stop hook is pruned");
 
         let hooks = settings["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
@@ -1037,7 +1051,7 @@ mod tests {
                 "Stop": [{ "hooks": [{ "type": "command", "command": TURN_SIGNAL }] }]
             }
         });
-        let removed = prune_stale_caucus_hooks(&mut settings, "Stop", TURN_SIGNAL);
+        let removed = prune_stale_caucus_hooks(&mut settings, &[("Stop", TURN_SIGNAL.to_string())]);
         assert_eq!(removed, 0);
         assert!(current_hook_present(&settings, "Stop", TURN_SIGNAL));
     }
@@ -1051,10 +1065,47 @@ mod tests {
                 "Stop": [{ "matcher": "", "hooks": [{ "command": SENTINEL_STOP }] }]
             }
         });
-        let removed = prune_stale_caucus_hooks(&mut settings, "Stop", TURN_SIGNAL);
+        let removed = prune_stale_caucus_hooks(&mut settings, &[("Stop", TURN_SIGNAL.to_string())]);
         assert_eq!(removed, 1);
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
         assert!(stop.is_empty(), "the emptied group is dropped: {stop:?}");
+    }
+
+    /// A caucus hook under an event caucus has **retired** is stale by
+    /// definition — no command under that event is current — so the sweep
+    /// uninstalls it. This is the boundary the per-event prune could not
+    /// reach: it only ever visited the events still listed, leaving a retired
+    /// one to keep invoking the script with an argument the binary no longer
+    /// accepts. Third-party hooks under the same retired event survive.
+    #[test]
+    fn prune_stale_caucus_hooks_uninstalls_a_retired_event() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [{ "hooks": [{ "command": TURN_SIGNAL }] }],
+                "PreCompact": [{ "hooks": [
+                    { "command": format!("{TURN_SIGNAL} pre-compact") },
+                    { "command": THIRD_PARTY }
+                ] }]
+            }
+        });
+
+        // `current` names Stop only — PreCompact has been retired.
+        let removed = prune_stale_caucus_hooks(&mut settings, &[("Stop", TURN_SIGNAL.to_string())]);
+
+        assert_eq!(removed, 1, "the retired event's caucus hook is removed");
+        assert!(
+            current_hook_present(&settings, "Stop", TURN_SIGNAL),
+            "the current Stop hook is untouched"
+        );
+        let pre = settings["hooks"]["PreCompact"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        let commands: Vec<&str> = pre.iter().filter_map(|h| h["command"].as_str()).collect();
+        assert_eq!(
+            commands,
+            vec![THIRD_PARTY],
+            "third-party hook under the retired event survives"
+        );
     }
 
     /// Run [`TURN_SIGNAL_SCRIPT`] for real against a stub `caucus` on PATH and

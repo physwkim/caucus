@@ -174,19 +174,19 @@ fn discover_socks(dir: &Path) -> Vec<std::path::PathBuf> {
 
 /// Which lifecycle hook invoked `caucus signal post` — the CLI-level selector
 /// for [`run_lifecycle`]. The hook payload's own discriminating field
-/// (`trigger` for `PreCompact`, `source` for `SessionStart`) is read from
+/// (`trigger` for `PostCompact`, `source` for `SessionStart`) is read from
 /// stdin, so this only names the hook, never its data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleHook {
-    PreCompact,
+    PostCompact,
     SessionStart,
 }
 
-/// Run `caucus signal post --kind pre-compact|session-start` — post one
-/// [`LifecycleSignal`] from a Claude Code `PreCompact` / `SessionStart` hook.
+/// Run `caucus signal post --kind post-compact|session-start` — post one
+/// [`LifecycleSignal`] from a Claude Code `PostCompact` / `SessionStart` hook.
 ///
 /// Reads the hook payload from stdin like [`run`] and lifts the discriminating
-/// field out of it: `trigger` (`manual` / `auto`) for `PreCompact`, `source`
+/// field out of it: `trigger` (`manual` / `auto`) for `PostCompact`, `source`
 /// (`startup` / `resume` / `clear` / `compact`) for `SessionStart`. A payload
 /// whose field is absent or (for `trigger`) unknown posts nothing — it does not
 /// even open the socket: with no readable discriminant the runtime could take
@@ -213,11 +213,11 @@ pub(crate) fn run_lifecycle(
             .map(str::to_string)
     };
     let kind = match hook {
-        LifecycleHook::PreCompact => match field("trigger").as_deref() {
-            Some("manual") => LifecycleKind::PreCompact {
+        LifecycleHook::PostCompact => match field("trigger").as_deref() {
+            Some("manual") => LifecycleKind::PostCompact {
                 trigger: CompactTrigger::Manual,
             },
-            Some("auto") => LifecycleKind::PreCompact {
+            Some("auto") => LifecycleKind::PostCompact {
                 trigger: CompactTrigger::Auto,
             },
             // Unknown or absent trigger: no decision can be taken from it.

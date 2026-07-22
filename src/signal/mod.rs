@@ -159,12 +159,15 @@ impl AgentNote {
     }
 }
 
-/// How a compaction was triggered, lifted from the `PreCompact` hook payload's
-/// `trigger` field. `manual` is the user (or the main worker via `send_keys`)
-/// running `/compact` from the input prompt; `auto` is Claude Code compacting
-/// mid-turn because the context window filled. The distinction is what lets
-/// caucus close a `/compact` command phase without ever mistaking an
-/// auto-compact — which happens *inside* a real turn — for one.
+/// How a compaction was triggered, lifted from the `PostCompact` hook
+/// payload's `trigger` field. `manual` is the user (or the main worker via
+/// `send_keys`) running `/compact` from the input prompt; `auto` is Claude Code
+/// compacting because the context window filled — which happens *inside* the
+/// agent's query loop, between turns of a running turn, and ends nothing.
+///
+/// This is the whole reason caucus reads `trigger` rather than inferring: only
+/// `manual` closes a command phase. Treating an `auto` compaction as a
+/// completion settles a panel that is still working.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactTrigger {
@@ -173,13 +176,15 @@ pub enum CompactTrigger {
 }
 
 /// What kind of lifecycle event a [`LifecycleSignal`] carries. Serialised
-/// internally tagged on `kind` (`pre_compact` / `session_start`) so the wire
+/// internally tagged on `kind` (`post_compact` / `session_start`) so the wire
 /// vocabulary stays disjoint from turn signals and notes.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LifecycleKind {
-    /// Claude Code is about to compact the conversation (`PreCompact` hook).
-    PreCompact { trigger: CompactTrigger },
+    /// Claude Code finished compacting the conversation (`PostCompact` hook).
+    /// Carries the trigger, so a manual `/compact` completing is distinguished
+    /// from an auto-compaction mid-turn by the payload itself.
+    PostCompact { trigger: CompactTrigger },
     /// A session (re)started (`SessionStart` hook). `source` is Claude Code's
     /// own vocabulary — `startup` / `resume` / `clear` / `compact` — kept as a
     /// string so a source this binary does not know is ignored, not a parse
@@ -187,7 +192,7 @@ pub enum LifecycleKind {
     SessionStart { source: String },
 }
 
-/// One session-lifecycle signal, posted by the `PreCompact` / `SessionStart`
+/// One session-lifecycle signal, posted by the `PostCompact` / `SessionStart`
 /// hooks to the caucus socket (`docs/design.md` §7). Not a turn boundary by
 /// itself: the runtime (`Multiplexer::handle_lifecycle`) decides whether it
 /// closes a local-command phase (`/compact`, `/clear`) — the completions the
@@ -227,7 +232,7 @@ impl LifecycleSignal {
 /// exactly what it already posts — discrimination is by shape, which cannot
 /// collide: the three `kind` vocabularies are disjoint
 /// (`stop|tool_blocked|error` vs `progress|artifact|question` vs
-/// `pre_compact|session_start`), a note lacks `raw_hook_payload` while the
+/// `post_compact|session_start`), a note lacks `raw_hook_payload` while the
 /// others lack `body`, and an unbound line is the only one carrying the
 /// `unbound` marker while lacking `panel_id`.
 #[derive(Debug, Clone, Deserialize)]

@@ -233,14 +233,14 @@ pub enum SignalCommand {
 }
 
 /// CLI spelling of the signal kinds `caucus signal post` accepts: the
-/// [`TurnKind`]s the Stop hook posts, plus the lifecycle hooks (`pre-compact`,
+/// [`TurnKind`]s the Stop hook posts, plus the lifecycle hooks (`post-compact`,
 /// `session-start`) whose payloads carry their own discriminant on stdin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum SignalKindArg {
     Stop,
     ToolBlocked,
     Error,
-    PreCompact,
+    PostCompact,
     SessionStart,
 }
 
@@ -252,7 +252,7 @@ impl SignalKindArg {
             SignalKindArg::Stop => Some(TurnKind::Stop),
             SignalKindArg::ToolBlocked => Some(TurnKind::ToolBlocked),
             SignalKindArg::Error => Some(TurnKind::Error),
-            SignalKindArg::PreCompact | SignalKindArg::SessionStart => None,
+            SignalKindArg::PostCompact | SignalKindArg::SessionStart => None,
         }
     }
 
@@ -260,7 +260,7 @@ impl SignalKindArg {
     fn lifecycle_hook(self) -> Option<crate::signal::post::LifecycleHook> {
         use crate::signal::post::LifecycleHook;
         match self {
-            SignalKindArg::PreCompact => Some(LifecycleHook::PreCompact),
+            SignalKindArg::PostCompact => Some(LifecycleHook::PostCompact),
             SignalKindArg::SessionStart => Some(LifecycleHook::SessionStart),
             SignalKindArg::Stop | SignalKindArg::ToolBlocked | SignalKindArg::Error => None,
         }
@@ -488,7 +488,7 @@ fn run_signal(cmd: SignalCommand) -> Result<ExitCode> {
             let panel_id = PanelId::from_str(&panel)
                 .with_context(|| format!("invalid --panel id '{panel}'"))?;
             if let Some(hook) = kind.lifecycle_hook() {
-                // A lifecycle hook (`PreCompact` / `SessionStart`) posts a
+                // A lifecycle hook (`PostCompact` / `SessionStart`) posts a
                 // fire-and-forget lifecycle signal; its payload's own
                 // `trigger` / `source` field is read from stdin.
                 crate::signal::post::run_lifecycle(&sock, session_id, panel_id, hook)?;
@@ -801,7 +801,7 @@ mod tests {
         );
     }
 
-    /// The lifecycle kinds parse (`--kind pre-compact` / `session-start` are
+    /// The lifecycle kinds parse (`--kind post-compact` / `session-start` are
     /// what the shared hook script passes as its argument), and every kind maps
     /// to exactly one of the two dispatch paths: a turn kind or a lifecycle
     /// hook, never both, never neither — the invariant behind `run_signal`'s
@@ -813,7 +813,7 @@ mod tests {
             (SignalKindArg::Stop, "stop"),
             (SignalKindArg::ToolBlocked, "tool-blocked"),
             (SignalKindArg::Error, "error"),
-            (SignalKindArg::PreCompact, "pre-compact"),
+            (SignalKindArg::PostCompact, "post-compact"),
             (SignalKindArg::SessionStart, "session-start"),
         ] {
             let cli = Cli::try_parse_from([
@@ -840,8 +840,8 @@ mod tests {
             );
         }
         assert_eq!(
-            SignalKindArg::PreCompact.lifecycle_hook(),
-            Some(LifecycleHook::PreCompact)
+            SignalKindArg::PostCompact.lifecycle_hook(),
+            Some(LifecycleHook::PostCompact)
         );
         assert_eq!(
             SignalKindArg::SessionStart.lifecycle_hook(),

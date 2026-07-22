@@ -73,7 +73,7 @@ pub enum LaneEventKind {
     TurnCompleted,
     /// A local slash command (`/compact`, `/clear`) finished in the panel.
     /// Such a command runs no agent turn, so no Stop hook ever fires for it —
-    /// its completion arrives as a lifecycle signal (`PreCompact` /
+    /// its completion arrives as a lifecycle signal (`PostCompact` /
     /// `SessionStart` hooks, `docs/design.md` §7) and settles the panel the
     /// way a turn signal would. Produced by
     /// `manifest::record_local_command_completed`.
