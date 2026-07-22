@@ -7,6 +7,60 @@ versions.
 
 ## [Unreleased]
 
+Two ways a panel's real state and caucus's belief about it could diverge,
+in opposite directions: a local `/compact` left a panel wedged `Working`
+forever, and a `Stop` fired while background work was still in flight
+delivered a still-working worker's "done" to the main panel. Run
+`caucus init --install-hook` to update the deployed hook script and
+settings entries — both fixes need it.
+
+### Fixed
+
+- **A local `/compact` or `/clear` no longer wedges a panel in `Working`.**
+  Both are Claude Code builtins: they run no agent turn, so no `Stop` hook
+  ever fires, and nothing closed the `Working` that submitting them opened —
+  the panel stuck there forever and any round including it never settled.
+  The shared hook script is now installed on `PostCompact` and
+  `SessionStart` too, and `caucus signal post` lifts the payload's own
+  discriminant (`trigger` / `source`) into a lifecycle signal. The runtime
+  closes the command phase through the same manifest owner a turn signal
+  uses (`record_local_command_completed`), so `derived_state` follows in
+  lockstep and no second settle path exists. A `send_keys` classifier is
+  the second layer, covering the MCP path on machines whose hooks are not
+  installed. Design §7.9.
+- **An auto-compaction no longer settles a panel that is still working.**
+  caucus reads `trigger` off the `PostCompact` payload rather than
+  reconstructing it: `manual` closes the `/compact` phase, `auto` — which
+  Claude Code runs *inside* the agent's query loop, mid-turn — is ignored.
+  This replaces a latch that had to be invalidated on every real turn
+  signal, prompt delivery, and panel kill.
+- **A `Stop` waiting on background work no longer reports the turn as
+  done.** Claude Code puts `background_tasks` on the payload precisely to
+  separate "session is done" from "session is paused waiting for background
+  work to wake it", pre-filtered to `running`/`pending` backgrounded work.
+  caucus's round-settle gate is panel state, so such a `Stop` used to latch
+  the panel's contribution and push a still-working worker's summary to
+  main — likelier the longer the worker ran. It is now handled like a
+  mid-turn note: nothing transitions, nothing is recorded, the hook is
+  allowed through, and the real `Stop` lands when the work wakes the
+  session. A payload without the field is unchanged. Design §7.7b.
+- **`caucus init --install-hook` now uninstalls hooks for events caucus has
+  retired.** The prune only visited events caucus currently installs, so a
+  retired event's entry stayed in `settings.json` indefinitely, invoking
+  the script with an argument the binary no longer accepts. It now sweeps
+  every event in the file; third-party hooks are preserved as before.
+
+### Added
+
+- **A lineage-resolved unbound signal is now logged with its evidence.**
+  Rule 2 of §7.8 (match an unknown conversation id through the transcript
+  head) is inference, not proof — conversations forked from one ancestor
+  all carry that ancestor's id — and a claim settles the panel's round
+  unconditionally. Each such claim now logs the claimed panel, the ancestor
+  id matched, the transcript path, and the panel's state at claim time. A
+  claim landing on a `Working` panel is the signature of a mis-attribution;
+  the gate is deliberately left undesigned until one is observed (§7.8).
+
 ## [0.10.2] — 2026-07-22
 
 A panel's turn signals died silently whenever its agent process stopped

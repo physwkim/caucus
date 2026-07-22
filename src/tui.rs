@@ -759,8 +759,10 @@ async fn event_loop(
         // 2. Signal events — drain whatever the socket server has queued: turn
         //    signals settle panels (a main-panel signal's reply slot may carry
         //    a due round back through the waiting Stop hook), mid-turn notes
-        //    are recorded without any state transition. A note's reply slot is
-        //    always `None`; dropping a turn signal's slot answers allow.
+        //    are recorded without any state transition, lifecycle signals
+        //    close local slash commands (`/compact`, `/clear`) that end no
+        //    agent turn. A note's or lifecycle signal's reply slot is always
+        //    `None`; dropping a turn signal's slot answers allow.
         while let Ok((event, reply)) = signal_server.signals().try_recv() {
             match event {
                 crate::signal::SignalEvent::Turn(signal) => {
@@ -768,6 +770,7 @@ async fn event_loop(
                 }
                 crate::signal::SignalEvent::Unbound(sig) => mux.handle_unbound_signal(sig, reply),
                 crate::signal::SignalEvent::Note(note) => mux.handle_note(note),
+                crate::signal::SignalEvent::Lifecycle(sig) => mux.handle_lifecycle(sig),
             }
         }
 

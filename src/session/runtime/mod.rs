@@ -10,7 +10,7 @@
 //! * manifests are written only through `agent::manifest::write`;
 //! * worktree removal is enqueued only through `worktree::cleanup`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -244,7 +244,7 @@ pub struct Multiplexer {
     /// turns would re-read its transcript head. A conversation that was not
     /// ours cannot become ours later — panels caucus spawns are matched by the
     /// exact-id rule before this cache is consulted.
-    unbound_unclaimed: std::collections::HashSet<String>,
+    unbound_unclaimed: HashSet<String>,
 }
 
 /// Whether [`Multiplexer::new`] is opening a brand-new session or reopening a
@@ -382,7 +382,7 @@ impl Multiplexer {
                 last_liveness_probe: None,
                 view_epoch: 0,
                 pending_clipboard: None,
-                unbound_unclaimed: std::collections::HashSet::new(),
+                unbound_unclaimed: HashSet::new(),
             },
             signal_server,
             control_server,

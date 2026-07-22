@@ -16,6 +16,37 @@ use std::path::{Path, PathBuf};
 /// Basename of the machine-wide turn-signal hook script.
 pub(crate) const GLOBAL_HOOK_FILENAME: &str = "caucus-turn-signal";
 
+/// Every Claude Code hook event caucus installs, with the argument the shared
+/// script is invoked with under that event (`hook_event_command`). One script
+/// serves all of them: `Stop` passes no argument — the script defaults to
+/// posting a `stop` turn signal, keeping its settings command byte-identical
+/// to prior installs — while the lifecycle events name themselves, and
+/// `caucus signal post` lifts the payload's own `trigger` / `source` field
+/// from stdin. `PostCompact` + `SessionStart` exist because a local slash
+/// command (`/compact`, `/clear`) runs no agent turn: no Stop hook ever fires
+/// for it, so without them a panel given one wedges in `working` forever.
+///
+/// This list is the whole truth about which caucus hooks belong in
+/// `settings.json`: `init` prunes caucus-owned hooks under *every* event the
+/// file carries, so an event dropped from here (e.g. the `PreCompact` entry an
+/// unreleased build installed) is uninstalled on the next
+/// `caucus init --install-hook` rather than left behind invoking the script
+/// with an argument this binary no longer accepts.
+pub(crate) const HOOK_EVENTS: &[(&str, Option<&str>)] = &[
+    ("Stop", None),
+    ("PostCompact", Some("post-compact")),
+    ("SessionStart", Some("session-start")),
+];
+
+/// The `settings.json` hook command for one installed event: the script path,
+/// plus the event's argument when it has one.
+pub(crate) fn hook_event_command(script: &Path, arg: Option<&str>) -> String {
+    match arg {
+        Some(arg) => format!("{} {arg}", script.display()),
+        None => script.display().to_string(),
+    }
+}
+
 /// Absolute path of the turn-signal hook script, under a `~/.claude` directory.
 ///
 /// The Stop hook is installed **globally** (`~/.claude/settings.json`), so its
@@ -47,38 +78,42 @@ pub(crate) fn is_caucus_hook_command(cmd: &str) -> bool {
         || cmd.contains("caucus sentinel")
 }
 
-/// Whether the *current* caucus hook (`hook_command`, the exact `turn-signal`
-/// path) is already wired into `settings.hooks.Stop`. Exact-match, not a loose
+/// Whether the *current* caucus hook command for `event` (exact string) is
+/// already wired into `settings.hooks.<event>`. Exact-match, not a loose
 /// "mentions caucus" — so a stale caucus hook never masquerades as the current
 /// one (the bug that blocked migration off `sentinel-stop`).
-pub(crate) fn current_hook_present(settings: &serde_json::Value, hook_command: &str) -> bool {
-    stop_strings(settings)
+pub(crate) fn current_hook_present(
+    settings: &serde_json::Value,
+    event: &str,
+    hook_command: &str,
+) -> bool {
+    event_strings(settings, event)
         .into_iter()
         .any(|s| s == hook_command)
 }
 
-/// Every caucus Stop-hook command string in `settings`, in document order —
-/// any command under `hooks.Stop` that [`is_caucus_hook_command`], and not an
+/// Every caucus hook command string under `settings.hooks.<event>`, in
+/// document order — any command that [`is_caucus_hook_command`], and not an
 /// unrelated command that merely mentions "caucus". Empty means no caucus
-/// Stop hook is installed. `caucus doctor` verifies each one actually runs on
-/// *this* machine: a synced `~/.claude/settings.json` can carry another
-/// machine's absolute `turn-signal` path, which passes a presence check while
-/// every turn signal silently dies.
-pub(crate) fn caucus_stop_hook_commands(settings: &serde_json::Value) -> Vec<String> {
-    stop_strings(settings)
+/// hook is installed for that event. `caucus doctor` verifies each one
+/// actually runs on *this* machine: a synced `~/.claude/settings.json` can
+/// carry another machine's absolute `turn-signal` path, which passes a
+/// presence check while every signal silently dies.
+pub(crate) fn caucus_hook_commands(settings: &serde_json::Value, event: &str) -> Vec<String> {
+    event_strings(settings, event)
         .into_iter()
         .filter(|s| is_caucus_hook_command(s))
         .map(str::to_string)
         .collect()
 }
 
-/// Every string under `settings.hooks.Stop`, gathered recursively so command
-/// strings are found regardless of the exact nesting Claude uses (matcher
-/// group → `hooks` → `command`).
-fn stop_strings(settings: &serde_json::Value) -> Vec<&str> {
+/// Every string under `settings.hooks.<event>`, gathered recursively so
+/// command strings are found regardless of the exact nesting Claude uses
+/// (matcher group → `hooks` → `command`).
+fn event_strings<'a>(settings: &'a serde_json::Value, event: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
-    if let Some(stop) = settings.get("hooks").and_then(|h| h.get("Stop")) {
-        collect_strings(stop, &mut out);
+    if let Some(node) = settings.get("hooks").and_then(|h| h.get(event)) {
+        collect_strings(node, &mut out);
     }
     out
 }
@@ -110,27 +145,60 @@ mod tests {
         let with = serde_json::json!({
             "hooks": { "Stop": [{ "hooks": [{ "command": TURN_SIGNAL }] }] }
         });
-        assert!(current_hook_present(&with, TURN_SIGNAL));
+        assert!(current_hook_present(&with, "Stop", TURN_SIGNAL));
         let without = serde_json::json!({ "hooks": { "Stop": [] } });
-        assert!(!current_hook_present(&without, TURN_SIGNAL));
+        assert!(!current_hook_present(&without, "Stop", TURN_SIGNAL));
         // A *stale* caucus hook must NOT count as the current one — this exact
         // confusion (any "caucus" mention satisfies the check) is the bug that
         // blocked migration off sentinel-stop.
         let stale = serde_json::json!({
             "hooks": { "Stop": [{ "hooks": [{ "command": SENTINEL_STOP }] }] }
         });
-        assert!(!current_hook_present(&stale, TURN_SIGNAL));
+        assert!(!current_hook_present(&stale, "Stop", TURN_SIGNAL));
+        // Presence is per-event: a command wired under Stop says nothing about
+        // PostCompact — each installed event is checked under its own key.
+        assert!(!current_hook_present(&with, "PostCompact", TURN_SIGNAL));
     }
 
     #[test]
-    fn caucus_stop_hook_commands_extracts_only_caucus_commands() {
+    fn caucus_hook_commands_extracts_only_caucus_commands() {
         let settings = serde_json::json!({
             "hooks": { "Stop": [
                 { "hooks": [{ "command": THIRD_PARTY }, { "command": TURN_SIGNAL }] },
             ] }
         });
-        assert_eq!(caucus_stop_hook_commands(&settings), vec![TURN_SIGNAL]);
-        assert!(caucus_stop_hook_commands(&serde_json::json!({})).is_empty());
+        assert_eq!(caucus_hook_commands(&settings, "Stop"), vec![TURN_SIGNAL]);
+        assert!(caucus_hook_commands(&serde_json::json!({}), "Stop").is_empty());
+    }
+
+    /// One script serves every installed event: the per-event command is the
+    /// script path plus the event's argument, `Stop`'s stays the bare path
+    /// (byte-identical to prior installs), and each is recognized as a caucus
+    /// hook command.
+    #[test]
+    fn hook_event_command_appends_the_event_argument() {
+        let script = Path::new(GLOBAL_HOOK_SCRIPT);
+        let by_event: Vec<(&str, String)> = HOOK_EVENTS
+            .iter()
+            .map(|(event, arg)| (*event, hook_event_command(script, *arg)))
+            .collect();
+        assert_eq!(
+            by_event,
+            vec![
+                ("Stop", GLOBAL_HOOK_SCRIPT.to_string()),
+                ("PostCompact", format!("{GLOBAL_HOOK_SCRIPT} post-compact")),
+                (
+                    "SessionStart",
+                    format!("{GLOBAL_HOOK_SCRIPT} session-start")
+                ),
+            ]
+        );
+        for (_, cmd) in by_event {
+            assert!(
+                is_caucus_hook_command(&cmd),
+                "{cmd} must be recognized as caucus's own"
+            );
+        }
     }
 
     #[test]
@@ -160,21 +228,22 @@ mod tests {
     }
 
     #[test]
-    fn caucus_stop_hook_commands_matches_exact_family_not_substring() {
+    fn caucus_hook_commands_matches_exact_family_not_substring() {
         // The current hook → found.
         let with = serde_json::json!({
             "hooks": { "Stop": [{ "hooks": [{ "command": TURN_SIGNAL }] }] }
         });
-        assert_eq!(caucus_stop_hook_commands(&with), vec![TURN_SIGNAL]);
+        assert_eq!(caucus_hook_commands(&with, "Stop"), vec![TURN_SIGNAL]);
         // A stale caucus hook still counts (it is caucus's own).
         let stale = serde_json::json!({
             "hooks": { "Stop": [{ "hooks": [{ "command": SENTINEL_STOP }] }] }
         });
-        assert_eq!(caucus_stop_hook_commands(&stale), vec![SENTINEL_STOP]);
+        assert_eq!(caucus_hook_commands(&stale, "Stop"), vec![SENTINEL_STOP]);
         // No hooks at all → not installed.
-        assert!(caucus_stop_hook_commands(&serde_json::json!({})).is_empty());
+        assert!(caucus_hook_commands(&serde_json::json!({}), "Stop").is_empty());
         assert!(
-            caucus_stop_hook_commands(&serde_json::json!({ "hooks": { "Stop": [] } })).is_empty()
+            caucus_hook_commands(&serde_json::json!({ "hooks": { "Stop": [] } }), "Stop")
+                .is_empty()
         );
         // The false-OK this guards: a Stop hook whose only command merely
         // *mentions* "caucus" but is not a caucus hook command must NOT be
@@ -185,7 +254,7 @@ mod tests {
             }] }] }
         });
         assert!(
-            caucus_stop_hook_commands(&unrelated).is_empty(),
+            caucus_hook_commands(&unrelated, "Stop").is_empty(),
             "a non-caucus command that mentions 'caucus' must not count as installed"
         );
     }

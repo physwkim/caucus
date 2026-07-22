@@ -314,7 +314,38 @@ pub(crate) fn record_turn_completed(
 
     manifest.derived_state = super::derive_state::derive_agent_state(
         manifest.status.as_str(),
-        Some(signal),
+        true, // the signal settles the turn
+        manifest.error.as_deref(),
+        manifest.current_blocker.as_ref(),
+    );
+    to_disk(manifest, session_root)
+}
+
+/// Record a local slash command (`/compact`, `/clear`) finishing in the panel
+/// (`docs/design.md` §7, §8.3) — the settle owner for command phases that end
+/// with **no turn signal**: a local builtin runs no agent turn, so no Stop hook
+/// ever fires for it, and its completion arrives as a lifecycle signal instead.
+/// The sibling of [`record_turn_completed`]: appends a `LocalCommandCompleted`
+/// lane event, clears any stale blocker (the panel is at its input prompt), and
+/// recomputes `derived_state` as settled — `Idle`, even when the panel has never
+/// received a turn signal in this generation.
+pub(crate) fn record_local_command_completed(
+    manifest: &mut AgentManifest,
+    session_root: &Path,
+    command: &str,
+) -> Result<(), ManifestError> {
+    manifest
+        .lane_events
+        .push(LaneEvent::now(LaneEventKind::LocalCommandCompleted {
+            command: command.to_string(),
+        }));
+    // The command finished at the input prompt, so no blocker can still be
+    // live. (A prompt genuinely on screen is re-detected and overlaid at read
+    // time by `list_panels`, so clearing here cannot hide one.)
+    manifest.current_blocker = None;
+    manifest.derived_state = super::derive_state::derive_agent_state(
+        manifest.status.as_str(),
+        true, // the lifecycle signal settles the command phase
         manifest.error.as_deref(),
         manifest.current_blocker.as_ref(),
     );
@@ -348,7 +379,7 @@ pub(crate) fn record_prompt_delivered(
     manifest.current_blocker = None;
     manifest.derived_state = super::derive_state::derive_agent_state(
         manifest.status.as_str(),
-        None, // no turn signal since this prompt — the turn is open again
+        false, // no settle since this prompt — the turn is open again
         manifest.error.as_deref(),
         manifest.current_blocker.as_ref(),
     );
@@ -413,7 +444,7 @@ pub(crate) fn record_exited(
     manifest.exited_at = Some(Utc::now());
     manifest.derived_state = super::derive_state::derive_agent_state(
         manifest.status.as_str(),
-        None,
+        false,
         manifest.error.as_deref(),
         manifest.current_blocker.as_ref(),
     );
@@ -483,6 +514,9 @@ fn event_label(kind: &LaneEventKind) -> String {
         LaneEventKind::Started => "started".into(),
         LaneEventKind::PromptDelivered => "prompt_delivered".into(),
         LaneEventKind::TurnCompleted => "turn_completed".into(),
+        LaneEventKind::LocalCommandCompleted { command } => {
+            format!("local_command_completed ({command})")
+        }
         LaneEventKind::Blocked { blocker } => {
             format!("blocked ({:?}: {})", blocker.failure_class, blocker.detail)
         }
@@ -641,7 +675,7 @@ mod tests {
         ));
         manifest.derived_state = crate::agent::derive_state::derive_agent_state(
             manifest.status.as_str(),
-            None,
+            false,
             None,
             manifest.current_blocker.as_ref(),
         );
@@ -653,6 +687,46 @@ mod tests {
             "the new prompt supersedes the blocker"
         );
         assert_eq!(manifest.derived_state(), DerivedState::Working);
+    }
+
+    /// A local slash command settles the command phase to `Idle` even when the
+    /// manifest has **never** seen a turn signal — the boundary that forced
+    /// `derive_agent_state`'s second parameter to a plain `turn_settled` bool:
+    /// there is no `TurnSignal` to point at here, because a local builtin runs
+    /// no agent turn. Blocker cleared, event on the timeline, persisted.
+    #[test]
+    fn record_local_command_completed_settles_without_any_turn_signal() {
+        use crate::agent::lane_event::{LaneEventBlocker, LaneFailureClass};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        // The wedge state: a prompt was delivered (the `/compact` submit),
+        // no turn signal ever followed. Also plant a stale blocker to prove
+        // the completion clears it.
+        record_prompt_delivered(&mut manifest, tmp.path()).unwrap();
+        manifest.current_blocker = Some(LaneEventBlocker::new(
+            LaneFailureClass::PermissionPrompt,
+            "stale",
+        ));
+        assert_eq!(manifest.derived_state(), DerivedState::Working);
+
+        record_local_command_completed(&mut manifest, tmp.path(), "/compact").unwrap();
+
+        assert_eq!(manifest.derived_state(), DerivedState::Idle);
+        assert!(manifest.current_blocker.is_none());
+        assert!(manifest.lane_events().iter().any(|e| matches!(
+            &e.kind,
+            LaneEventKind::LocalCommandCompleted { command } if command == "/compact"
+        )));
+        // Persisted: `list_panels` and a resumed session both read `idle`.
+        let back = read(tmp.path(), manifest.agent_id).unwrap();
+        assert_eq!(back.derived_state(), DerivedState::Idle);
     }
 
     /// A turn signal whose raw hook payload carries `session_id` lands that

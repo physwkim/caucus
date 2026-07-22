@@ -515,6 +515,11 @@ caucus가 tmux 안에서 돌든 밖에서 돌든 구성상 동일하고, 패널 
 ### 7.2 작성 주체
 **Claude `Stop` hook**. caucus는 이 hook을 `caucus init --install-hook`으로
 설치한다 — Claude `~/.claude/settings.json`에 merge하고 `.bak` 백업을 남긴다.
+같은 설치가 `PostCompact` / `SessionStart` hook도 함께 wire한다 — 스크립트는
+하나이고, 이벤트별 인자만 다르다 (§7.9). 설치는 `HOOK_EVENTS`가 나열한
+이벤트만 남기고, settings.json에 있는 **다른 모든** 이벤트의 caucus hook은
+제거한다 — caucus가 은퇴시킨 이벤트(예: 미출시 빌드가 설치한 `PreCompact`)가
+이제는 받지 않는 인자로 스크립트를 계속 호출하는 것을 막는다.
 
 ### 7.3 hook 스크립트
 `caucus init --install-hook`이 만드는 `~/.claude/hooks/caucus-turn-signal`:
@@ -535,16 +540,20 @@ hook을 실행하게 되어 어떤 패널도 신호를 보내지 못하고 어�
 ```sh
 #!/bin/sh
 # CAUCUS_* env는 caucus가 패널 spawn 시 주입. Claude hook payload는 stdin JSON.
+# $1은 hook 이벤트 인자: Stop 항목은 인자 없이(기본 stop), PostCompact/
+# SessionStart 항목은 post-compact / session-start를 넘긴다 (§7.9).
+# 아래 discovery 분기가 위치 파라미터를 소켓 glob으로 덮어쓰므로 먼저 캡처한다.
+kind="${1:-stop}"
 if [ -n "$CAUCUS_SOCK" ]; then
   exec caucus signal post \
     --sock    "$CAUCUS_SOCK" \
     --session "$CAUCUS_SESSION_ID" \
     --panel   "$CAUCUS_PANEL_ID" \
-    --kind    stop
+    --kind    "$kind"
 fi
 set -- "${TMPDIR:-/tmp}"/caucus-*.sock
 [ -e "$1" ] || exit 0
-exec caucus signal post --discover --kind stop
+exec caucus signal post --discover --kind "$kind"
 ```
 
 env가 없는데 caucus 소켓이 하나라도 살아 있으면 `--discover`로 fallback한다
@@ -748,6 +757,31 @@ hook) 또는 codex(notify)라 대상 집합이 비어 있고, 아무도 밟지 �
 turn-completion 단일 owner(`handle_signal` → `record_turn_completed`)를
 경유해야 하며 제2의 settle 경로는 만들지 않는다.
 
+### 7.7b Background work — "끝난 것"과 "깨워지길 기다리는 것"
+
+Stop hook이 발화했다고 해서 에이전트의 작업이 끝난 것은 아니다. Claude Code는
+`Stop` payload에 `background_tasks` 배열을 실어 이것을 명시한다 — 자기 설명으로
+*"lets hooks distinguish 'session is done' from 'session is paused waiting for
+background work to wake it'"*. 배열은 이미 **in-flight만** 담도록 필터링되어
+있다: status가 `running` 또는 `pending`이고 backgrounded인 작업만 들어간다.
+따라서 비어있지 않다 ⟺ 세션은 깨워지길 기다리는 중이다.
+
+caucus의 round settle 게이트는 **패널 상태**다(§9 `poll_round_panels`:
+`Working`/`Spawning`이 아니면 latch). 그러므로 이런 Stop을 그대로 통과시키면
+아직 일하는 worker의 기여가 latch되고 그 "done"이 main에 배달된다. 규칙:
+
+> **MUST NOT**: `background_tasks`가 비어있지 않은 turn signal은 턴 경계가
+> 아니다. `Multiplexer::handle_signal_with_reply`(turn-completion 단일 owner)가
+> 이를 mid-turn note처럼 취급한다 — 상태 전이 없음, 매니페스트 기록 없음, reply
+> sender는 drop(=allow)되어 에이전트는 그대로 진행한다.
+
+백그라운드 작업이 세션을 깨우면 진짜 Stop이 나중에 도착한다. 그 사이 round는
+자신의 `fallback_deadline`이 상한을 준다.
+
+필드가 **없는** 경우(그 필드 이전의 Claude Code, 또는 대응물이 없는 codex
+notify)는 "in-flight 없음"이 아니라 "알 수 없음"이며, 종전과 동일하게 턴을
+닫는다.
+
 ### 7.8 Unbound 신호 — env 없는 hook의 패널 해석
 
 **문제**: §7.1의 패널 신원은 전부 프로세스 env 상속(`CAUCUS_*`)에 실려 있는데,
@@ -806,12 +840,82 @@ resume`이 fork 이전 대화를 되살린다. env 상속을 끊는 **모든** �
   계보를 만들지 않는다 — main worker의 대화는 sub-agent들의 id를 일상적으로
   인용한다.
 
+**미해결 (2026-07)**: lineage 규칙은 *증거*가 아니라 *추론*이다. 같은 조상에서
+갈라진 대화는 모두 그 조상의 id를 head에 지니므로, 살아 있는 패널의 대화가
+아닌 다른 fork의 Stop도 그 패널을 claim할 수 있다. claim은 곧바로
+`handle_signal_with_reply`로 들어가 무조건 턴을 끝내고 round를 settle시키므로,
+그 경우 작업 중인 worker의 done이 main에 조기 배달된다. payload만으로는 두
+경우를 가르는 정보가 없어 지금은 게이트를 걸지 않고 **관측만** 한다:
+`handle_unbound_signal`이 lineage claim마다 claim된 패널, 매치된 조상 id,
+transcript 경로, **claim 시점의 패널 상태**를 `warn`으로 남긴다. 작업 중인
+패널을 claim한 기록이 실제로 관측되면 그때 게이트의 형태가 정해진다.
+
 **알려진 한계**: 해석은 caucus가 그 패널의 conversation id를 한 번이라도
 학습했음을 전제한다(`--resume` spawn 또는 env 경로 신호 ≥1회 —
 `record_turn_completed`가 학습 지점). 첫 신호 전에 env가 끊긴 신생 패널은
 해석 불가로 남는다. 구버전 caucus 서버는 unbound 라인 파싱에 실패해 조용히
 버리고, 클라이언트는 그 소켓의 read timeout(2.5s)을 기다린 뒤 fail-open한다 —
 fallback 경로에서만 나는 지연이라 수용한다.
+
+### 7.9 Lifecycle 신호 (PostCompact / SessionStart) — local slash command의 settle
+
+**문제**: `/compact`·`/clear`는 Claude Code **로컬 빌트인**이다 — agent 턴을
+돌리지 않으므로 Stop hook이 절대 발화하지 않는다. 그런데 submit 경로
+(`send_keys(enter=true)`, 직접 타이핑)는 프롬프트 전달로 간주해 패널을
+`Working`으로 열었고, 닫는 producer가 없어 패널이 영원히 `working`에 wedge —
+그 패널을 낀 round는 settle하지 못했다.
+
+**해결, 두 겹**:
+
+1. **Hook 기반 close(구조적 fix)** — 같은 스크립트(§7.3)를 `PostCompact`
+   (인자 `post-compact`) / `SessionStart`(인자 `session-start`)에도 설치한다.
+   `caucus signal post`가 payload의 `trigger`/`source`를 stdin에서 승격해
+   lifecycle 신호(`kind: post_compact | session_start`)를 소켓에 쓴다.
+   런타임(`Multiplexer::handle_lifecycle`)의 규칙:
+   - `PostCompact(trigger=manual)` → `/compact` 명령 phase를 닫는다
+     (`Working → Idle`). 수동 `/compact` 뒤에는 agent 턴이 없으므로 이
+     완료가 곧 phase의 close다.
+   - `PostCompact(trigger=auto)` → **무시**. auto compaction은 Claude Code의
+     query loop **안에서**, 아직 돌고 있는 턴의 중간에 일어나며 아무것도
+     끝내지 않는다. 여기서 닫으면 진짜 작업 중인 패널을 `Idle`로 떨어뜨려
+     round를 조기 settle시킨다 — 패널의 진짜 Stop이 나중에 턴을 닫는다.
+   - `SessionStart(source=clear)` → 닫는다 (`/clear`는 compaction이 없으므로
+     `PostCompact`가 없다).
+   - 그 외 모든 `SessionStart` source(`startup`/`resume`/`compact`/미지) →
+     무시. `compact`는 compaction이 함께 방출하지만 그 사건의 owner는
+     `PostCompact` 하나다.
+   닫힘은 `manifest::record_local_command_completed`(I-2 owner)를 경유해
+   `LocalCommandCompleted` lane event를 남기고 `derived_state`를 `Idle`로
+   재계산한다 — turn signal이 한 번도 없어도 settle된다.
+
+   `trigger`를 payload에서 **읽는다**는 점이 이 설계의 핵심이다. 이전 설계는
+   `PreCompact(manual)` 래치를 걸고 뒤따르는 `SessionStart(compact)`가
+   래치되어 있을 때만 닫는 방식으로 manual/auto를 *재구성*했다. 그 래치는
+   "수동 compact 진행 중"과 "직전 턴의 잔여물"이라는 두 의미를 한 셀이
+   지니게 만들었고, 실제 turn signal·새 프롬프트·패널 kill마다 별도의 무효화
+   경로를 요구했다. `PostCompact`는 `trigger`를 그대로 실어주므로 래치와 그
+   무효화 경로 전체가 사라진다.
+
+2. **send_keys 분류(방어선)** — `send_keys(enter=true)`의 제출 텍스트 첫
+   토큰이 `/compact`·`/clear`면 `note_prompt_delivered`를 건너뛴다(턴을 열지
+   않는다). lifecycle hook이 설치되지 않은 머신에서도 MCP 경로만은 wedge하지
+   않게 하는 층이다. 직접 타이핑은 바이트 단위로 도착해 분류가 불가능하므로
+   그 경로는 hook 층만이 커버한다.
+
+Stop hook이 유일한 `Working → Idle` producer라는 §8.3의 전제는 이제
+"turn-completion **또는** local-command completion"으로 읽는다 — 후자도 단일
+owner(`handle_lifecycle` → `record_local_command_completed`)를 경유하며,
+제2의 자유 settle 경로가 아니다.
+
+**알려진 한계**:
+
+- lifecycle 신호는 §7.8의 unbound 경로를 타지 못한다 — `UnboundSignal`이
+  `TurnKind`만 싣고, lifecycle 소비자가 아직 거기에 연결되어 있지 않다. env가
+  끊긴 패널에서 `/compact`·`/clear`를 하면 이 절의 close는 발화하지 않고
+  2번 방어선(send_keys 분류)만 남는다.
+- `PostCompact` hook을 방출하지 않는 구버전 Claude Code에서는 1번 층이 통째로
+  발화하지 않는다. `caucus doctor`가 hook 설치 여부는 보지만 Claude Code 버전은
+  검증하지 않는다.
 
 ---
 

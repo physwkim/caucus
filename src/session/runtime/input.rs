@@ -4,9 +4,11 @@ use crate::agent::manifest;
 use crate::agent::provenance::{self, LaneCommitProvenance, SupersededBy};
 use crate::input::CaucusCommand;
 use crate::panel::lifecycle::{self, PanelState};
-use crate::signal::{AgentNote, NoteKind, TurnSignal};
+use crate::signal::{
+    AgentNote, CompactTrigger, LifecycleKind, LifecycleSignal, NoteKind, TurnSignal,
+};
 use std::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// How often [`Multiplexer::pump_all`] probes child-process liveness. PTYs are
 /// drained every tick, but `try_wait` (a `waitpid` syscall) per panel on the
@@ -264,6 +266,26 @@ impl Multiplexer {
     ) {
         use crate::signal::StopDirective;
 
+        // A Stop fired while the session still has backgrounded work in flight
+        // is a *pause*, not a completion — Claude Code says so on the payload
+        // (`TurnSignal::background_tasks_in_flight`), and the round-settle gate
+        // is panel state, so letting this through would latch the panel's
+        // contribution and deliver a still-working agent's "done" to main.
+        // Treat it like a mid-turn note: nothing transitions, nothing is
+        // recorded, the reply sender drops (allow) and the agent proceeds. The
+        // background task wakes the session and its real Stop lands later; the
+        // round's fallback deadline bounds the wait either way.
+        if let Some(in_flight) = signal.background_tasks_in_flight()
+            && in_flight > 0
+        {
+            debug!(
+                panel = %signal.panel_id,
+                in_flight,
+                "turn signal paused on background work; not a turn boundary"
+            );
+            return;
+        }
+
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == signal.panel_id) else {
             // An unknown panel's reply sender (if any) drops here — allow.
             return;
@@ -385,6 +407,66 @@ impl Multiplexer {
             let _ = lifecycle::transition(panel, PanelState::Working);
         }
         self.record_prompt_delivered(panel_id);
+    }
+
+    /// Ingest a lifecycle hook signal (`PostCompact` / `SessionStart`) — the
+    /// close for a *local* slash command (`/compact`, `/clear`), which runs no
+    /// agent turn and therefore never fires the Stop hook that is otherwise
+    /// the only `Working -> Idle` producer. Without this, a panel handed
+    /// `/compact` wedges in `working` forever and its round never settles.
+    ///
+    /// Both compaction triggers report through the same `PostCompact` hook, and
+    /// the payload's own `trigger` field — not caucus's reconstruction of it —
+    /// is what tells them apart:
+    /// * `manual` is the user (or `send_keys`) running `/compact`. There is no
+    ///   agent turn behind it, so its completion is the command phase's close.
+    /// * `auto` is Claude Code compacting because the context filled. That
+    ///   happens *inside* the agent's query loop, between turns of a turn that
+    ///   is still running, and ends nothing — closing on it would settle a
+    ///   panel that is still working. Ignored; the panel's real Stop closes the
+    ///   turn later.
+    ///
+    /// `SessionStart(source=clear)` closes `/clear`, which involves no
+    /// compaction at all. Every other source (`startup`, `resume`, and the
+    /// `compact` a compaction also emits — already handled above) is an agent
+    /// (re)launch, not a local-command completion — ignored.
+    pub fn handle_lifecycle(&mut self, sig: LifecycleSignal) {
+        match sig.kind {
+            LifecycleKind::PostCompact {
+                trigger: CompactTrigger::Manual,
+            } => self.close_local_command(sig.panel_id, "/compact"),
+            LifecycleKind::PostCompact {
+                trigger: CompactTrigger::Auto,
+            } => {}
+            LifecycleKind::SessionStart { ref source } => {
+                if source == "clear" {
+                    self.close_local_command(sig.panel_id, "/clear");
+                }
+            }
+        }
+    }
+
+    /// Close the turn phase a local slash command occupied: end the capture
+    /// turn, flip a `Working` panel back to `Idle` (via `lifecycle::transition`,
+    /// Invariant I-5), and record `LocalCommandCompleted` on the manifest so
+    /// `derived_state` follows in lockstep (Invariant I-2) and a pending round
+    /// on the panel can settle. A panel that was not `Working` (the submit
+    /// path already classified the command and never opened a turn) keeps its
+    /// state — the manifest still records the completion fact.
+    fn close_local_command(&mut self, panel_id: PanelId, command: &str) {
+        let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
+            return;
+        };
+        panel.end_turn();
+        if panel.state() == PanelState::Working {
+            let _ = lifecycle::transition(panel, PanelState::Idle);
+        }
+        if let Some(manifest) = self.manifests.get_mut(&panel_id)
+            && let Err(err) =
+                manifest::record_local_command_completed(manifest, &self.session.root_dir, command)
+        {
+            warn!(panel = %panel_id, error = %err, "local-command manifest write failed");
+        }
     }
 
     /// Ingest a mid-turn note: cap its body once (`AgentNote::truncated`, so
@@ -785,6 +867,289 @@ mod tests {
             on_disk.last_note(),
             Some("[progress] halfway through the sweep")
         );
+        mux.shutdown();
+    }
+
+    /// A cat panel with a manifest, flipped `Working` by a delivered prompt —
+    /// exactly the state a panel handed `/compact` wedges in, since a local
+    /// command runs no agent turn and no Stop hook ever closes it.
+    fn working_panel_with_manifest(
+        mux: &mut Multiplexer,
+    ) -> (PanelId, crate::session::id::AgentId) {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+        let id = push_cat_panel(mux, PanelState::Idle);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        let agent_id = mf.agent_id;
+        mux.manifests.insert(id, mf);
+        mux.note_prompt_delivered(id);
+        (id, agent_id)
+    }
+
+    fn panel_state(mux: &Multiplexer, id: PanelId) -> PanelState {
+        mux.panels.iter().find(|p| p.id == id).unwrap().state()
+    }
+
+    fn lifecycle(mux: &mut Multiplexer, id: PanelId, kind: LifecycleKind) {
+        let session = mux.session.id;
+        mux.handle_lifecycle(LifecycleSignal::now(
+            session,
+            id,
+            kind,
+            serde_json::Value::Null,
+        ));
+    }
+
+    /// One case per boundary of the background-work predicate — the field is
+    /// absent, present-but-empty, or present with entries — because only the
+    /// last one may hold the turn open.
+    ///
+    /// A Stop arriving while the session still has backgrounded work in flight
+    /// is a pause: Claude Code pre-filters `background_tasks` to `running` /
+    /// `pending` **and** backgrounded work, so a non-empty array means the
+    /// agent is waiting to be woken, not finished. Settling there latches the
+    /// panel's contribution into the round and delivers a still-working
+    /// agent's "done" to main.
+    #[tokio::test]
+    async fn a_stop_waiting_on_background_work_is_not_a_turn_boundary() {
+        use crate::agent::derive_state::DerivedState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+        let session = mux.session.id;
+
+        let stop = |payload: serde_json::Value| {
+            TurnSignal::now(
+                session,
+                id,
+                crate::signal::TurnKind::Stop,
+                Some("done".into()),
+                payload,
+            )
+        };
+
+        // In flight: the turn stays open.
+        mux.handle_signal(stop(serde_json::json!({
+            "background_tasks": [
+                { "id": "t1", "type": "shell", "status": "running", "description": "cargo build" }
+            ]
+        })));
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "a paused Stop must not end the turn"
+        );
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(
+            on_disk.derived_state(),
+            DerivedState::Working,
+            "and must not settle the round"
+        );
+        assert!(
+            !on_disk
+                .lane_events()
+                .iter()
+                .any(|e| matches!(&e.kind, LaneEventKind::TurnCompleted)),
+            "no completion may reach the timeline: {:?}",
+            on_disk.lane_events()
+        );
+
+        // Present but empty: the documented "session is done" shape.
+        mux.handle_signal(stop(serde_json::json!({ "background_tasks": [] })));
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Idle,
+            "an empty array is Claude Code saying the session IS done"
+        );
+        mux.shutdown();
+    }
+
+    /// The absent-field boundary, kept separate because it is the compatibility
+    /// case: a Claude Code predating `background_tasks`, or a backend whose
+    /// payload has no counterpart (codex notify). Absence is not evidence of
+    /// in-flight work — the turn ends exactly as it always did.
+    #[tokio::test]
+    async fn a_stop_without_the_background_field_ends_the_turn() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+        let session = mux.session.id;
+
+        mux.handle_signal(TurnSignal::now(
+            session,
+            id,
+            crate::signal::TurnKind::Stop,
+            Some("done".into()),
+            serde_json::json!({ "session_id": "conv-1" }),
+        ));
+
+        assert_eq!(panel_state(&mux, id), PanelState::Idle);
+        mux.shutdown();
+    }
+
+    /// The wedge this whole change closes: a manual `/compact` — no Stop hook
+    /// ever fires for it — flips the panel `Working -> Idle` on its
+    /// `PostCompact(trigger=manual)`, recomputes the manifest's
+    /// `derived_state` in lockstep, and records the completion on the
+    /// timeline so a pending round can settle.
+    #[tokio::test]
+    async fn lifecycle_manual_compact_closes_the_working_wedge() {
+        use crate::agent::derive_state::DerivedState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+        assert_eq!(panel_state(&mux, id), PanelState::Working);
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::PostCompact {
+                trigger: CompactTrigger::Manual,
+            },
+        );
+
+        assert_eq!(panel_state(&mux, id), PanelState::Idle);
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(
+            on_disk.derived_state(),
+            DerivedState::Idle,
+            "list_panels must report idle so a pending round can settle"
+        );
+        assert!(
+            on_disk.lane_events().iter().any(|e| matches!(
+                &e.kind,
+                LaneEventKind::LocalCommandCompleted { command } if command == "/compact"
+            )),
+            "the completion is on the persisted timeline: {:?}",
+            on_disk.lane_events()
+        );
+        mux.shutdown();
+    }
+
+    /// The other side of the `trigger` boundary, and the reason caucus reads it
+    /// off the payload instead of reconstructing it: *auto* compaction runs
+    /// **inside** the agent's query loop, between turns of a turn that is still
+    /// running. Its `PostCompact` ends nothing — closing on it would flip a
+    /// genuinely-working panel `Idle` and settle its round while the agent is
+    /// still working. The panel's real Stop closes the turn later.
+    #[tokio::test]
+    async fn lifecycle_auto_compact_leaves_the_panel_working() {
+        use crate::agent::derive_state::DerivedState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::PostCompact {
+                trigger: CompactTrigger::Auto,
+            },
+        );
+
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "auto compaction is mid-turn — it is not a completion"
+        );
+        assert_eq!(
+            mux.manifests.get(&id).unwrap().derived_state(),
+            DerivedState::Working
+        );
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert!(
+            !on_disk
+                .lane_events()
+                .iter()
+                .any(|e| matches!(&e.kind, LaneEventKind::LocalCommandCompleted { .. })),
+            "no completion may reach the timeline: {:?}",
+            on_disk.lane_events()
+        );
+        mux.shutdown();
+    }
+
+    /// `/clear` runs no compaction at all, so it has no `PostCompact` — its
+    /// `SessionStart(source=clear)` is the close.
+    #[tokio::test]
+    async fn lifecycle_session_start_clear_closes_the_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::SessionStart {
+                source: "clear".into(),
+            },
+        );
+
+        assert_eq!(panel_state(&mux, id), PanelState::Idle);
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert!(
+            on_disk.lane_events().iter().any(|e| matches!(
+                &e.kind,
+                LaneEventKind::LocalCommandCompleted { command } if command == "/clear"
+            )),
+            "{:?}",
+            on_disk.lane_events()
+        );
+        mux.shutdown();
+    }
+
+    /// Every other `SessionStart` source is an agent (re)launch, not a
+    /// local-command completion — including `compact`, which a compaction also
+    /// emits: `PostCompact` owns compaction now, so closing here too would
+    /// double-close and (for auto) settle a working panel early.
+    #[tokio::test]
+    async fn lifecycle_session_start_sources_other_than_clear_are_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+
+        for source in ["startup", "resume", "compact", "some-future-source"] {
+            lifecycle(
+                &mut mux,
+                id,
+                LifecycleKind::SessionStart {
+                    source: source.into(),
+                },
+            );
+            assert_eq!(
+                panel_state(&mux, id),
+                PanelState::Working,
+                "SessionStart({source}) must not close the turn"
+            );
+        }
+        mux.shutdown();
+    }
+
+    /// A lifecycle signal for a panel caucus does not know (already killed, or
+    /// a stray client) has nowhere to be recorded — it must be a quiet no-op,
+    /// not a panic and not a manifest write.
+    #[tokio::test]
+    async fn lifecycle_for_an_unknown_panel_is_a_no_op() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let stray = PanelId::new();
+        for kind in [
+            LifecycleKind::PostCompact {
+                trigger: CompactTrigger::Manual,
+            },
+            LifecycleKind::SessionStart {
+                source: "clear".into(),
+            },
+        ] {
+            lifecycle(&mut mux, stray, kind);
+        }
+        assert!(!mux.manifests.contains_key(&stray));
         mux.shutdown();
     }
 

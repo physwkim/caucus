@@ -13,26 +13,43 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::hook::{current_hook_present, hook_script_path, is_caucus_hook_command};
+use crate::hook::{
+    HOOK_EVENTS, current_hook_present, hook_event_command, hook_script_path, is_caucus_hook_command,
+};
 
-/// The Stop-hook script body (`docs/design.md` §7.3, §7.8). `CAUCUS_*` env
+/// The hook script body (`docs/design.md` §7.3, §7.8, §7.9). `CAUCUS_*` env
 /// vars are injected by caucus when it spawns the panel; the Claude hook
 /// payload arrives on stdin and is forwarded by `caucus signal post`. The body
 /// carries no project-specific state, which is what lets one copy serve every
 /// project.
+///
+/// One script serves every caucus hook event, selected by its single argument
+/// (absent = `stop`). The argument is captured into `kind` on the first line
+/// because the discovery branch below reuses the positional parameters for
+/// socket globbing — reading `$1` after that `set --` would name a socket
+/// path, not the hook event.
 ///
 /// When the env is absent the conversation may still BE a caucus panel whose
 /// process no longer inherits the panel's env (Claude Code's daemon re-hosts
 /// live sessions across restarts as env-less forks). If any caucus session
 /// socket exists, fall back to `--discover`: post the payload unbound to every
 /// live socket and let each server decide ownership from the payload itself.
-/// With no socket present the hook is a harmless no-op, as before.
+/// With no socket present the hook is a harmless no-op, as before. The kind
+/// rides that branch unchanged — the binary, not the script, decides which
+/// kinds the unbound path can carry.
 const TURN_SIGNAL_SCRIPT: &str = "#!/bin/sh\n\
 # caucus turn-signal hook. CAUCUS_* env is injected by caucus at panel spawn;\n\
 # the Claude hook payload is read from stdin by `caucus signal post`.\n\
 #\n\
-# The Stop hook is installed globally (~/.claude/settings.json), so it also\n\
-# fires in ordinary Claude Code sessions that are NOT caucus panels — and in\n\
+# One script serves every caucus hook event: settings.json invokes it bare for\n\
+# Stop (the default below) and with an argument for the lifecycle events\n\
+# (`post-compact` / `session-start`), which report a local /compact or /clear\n\
+# finishing — completions the Stop hook never fires for. Capture it now: the\n\
+# discovery branch below reuses the positional parameters for socket globbing.\n\
+kind=\"${1:-stop}\"\n\
+#\n\
+# The hooks are installed globally (~/.claude/settings.json), so they also\n\
+# fire in ordinary Claude Code sessions that are NOT caucus panels — and in\n\
 # caucus panels whose env was lost to a daemon re-host. With the env present,\n\
 # post directly; otherwise, if any caucus socket is live, post unbound to all\n\
 # of them (each server resolves ownership from the payload); with neither,\n\
@@ -42,11 +59,11 @@ if [ -n \"$CAUCUS_SOCK\" ]; then\n\
     --sock    \"$CAUCUS_SOCK\" \\\n\
     --session \"$CAUCUS_SESSION_ID\" \\\n\
     --panel   \"$CAUCUS_PANEL_ID\" \\\n\
-    --kind    stop\n\
+    --kind    \"$kind\"\n\
 fi\n\
 set -- \"${TMPDIR:-/tmp}\"/caucus-*.sock\n\
 [ -e \"$1\" ] || exit 0\n\
-exec caucus signal post --discover --kind stop\n";
+exec caucus signal post --discover --kind \"$kind\"\n";
 
 /// Result of the `--install-hook` step.
 #[derive(Debug)]
@@ -327,9 +344,18 @@ fn install_claude_hook(claude_dir: &Path) -> Result<(PathBuf, HookInstall)> {
         _ => serde_json::json!({}),
     };
 
-    let hook_command = hook_script.display().to_string();
+    // One command per installed event: the shared script, invoked bare for
+    // `Stop` and with the event's argument for the lifecycle events
+    // (`hook::HOOK_EVENTS`).
+    let commands: Vec<(&str, String)> = HOOK_EVENTS
+        .iter()
+        .map(|(event, arg)| (*event, hook_event_command(&hook_script, *arg)))
+        .collect();
 
-    if current_hook_present(&settings, &hook_command) {
+    if commands
+        .iter()
+        .all(|(event, cmd)| current_hook_present(&settings, event, cmd))
+    {
         return Ok((
             hook_script,
             HookInstall::AlreadyPresent {
@@ -348,11 +374,22 @@ fn install_claude_hook(claude_dir: &Path) -> Result<(PathBuf, HookInstall)> {
         None
     };
 
-    // Drop any stale caucus hook (a caucus hook command that is not the current
-    // one), then wire the current one — so a prior `sentinel-stop` is replaced,
-    // not left alongside a dead duplicate.
-    let migrated = prune_stale_caucus_hooks(&mut settings, &hook_command) > 0;
-    merge_stop_hook(&mut settings, &hook_command)?;
+    // Drop every stale caucus hook the file carries, then wire the current
+    // ones where absent — so a prior `sentinel-stop` is replaced rather than
+    // left alongside a dead duplicate, and an install that already carries
+    // some of the events only adds the missing ones.
+    //
+    // The prune sweeps *every* event in the file, not just the ones
+    // `HOOK_EVENTS` still lists: an event caucus has retired (the `PreCompact`
+    // entry an unreleased build installed) would otherwise never be visited,
+    // and would keep invoking the script with an argument this binary no
+    // longer accepts.
+    let migrated = prune_stale_caucus_hooks(&mut settings, &commands) > 0;
+    for (event, cmd) in &commands {
+        if !current_hook_present(&settings, event, cmd) {
+            merge_hook(&mut settings, event, cmd)?;
+        }
+    }
     let serialized = serde_json::to_string_pretty(&settings)?;
     // Atomic, because Claude Code and `caucus doctor` read this file without
     // taking the lock — a truncate-in-place write is visible to them.
@@ -369,50 +406,64 @@ fn install_claude_hook(claude_dir: &Path) -> Result<(PathBuf, HookInstall)> {
     ))
 }
 
-/// Remove every *stale* caucus Stop hook — a caucus hook command that is not
-/// the current `hook_command` — from `settings.hooks.Stop`, preserving all
-/// other hooks. Matcher groups left with no hooks are dropped. Returns how
-/// many stale caucus hook commands were removed.
-fn prune_stale_caucus_hooks(settings: &mut serde_json::Value, hook_command: &str) -> usize {
-    let Some(stop) = settings
-        .get_mut("hooks")
-        .and_then(|h| h.get_mut("Stop"))
-        .and_then(|s| s.as_array_mut())
-    else {
+/// Remove every *stale* caucus hook from `settings.hooks` — any caucus hook
+/// command that is not the current command for the event it sits under —
+/// preserving all other hooks. Matcher groups left with no hooks are dropped.
+/// Returns how many stale caucus hook commands were removed.
+///
+/// `current` is the full set of `(event, command)` pairs caucus installs
+/// ([`crate::hook::HOOK_EVENTS`]). Every event key in the file is swept, not
+/// just the ones `current` names: an event caucus once installed and has since
+/// retired holds a caucus hook with *no* current command, so every caucus hook
+/// under it is stale and comes out. That is what makes `HOOK_EVENTS` the whole
+/// truth about which caucus hooks the settings file may carry.
+fn prune_stale_caucus_hooks(settings: &mut serde_json::Value, current: &[(&str, String)]) -> usize {
+    let Some(events) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
         return 0;
     };
     let mut removed = 0;
-    for group in stop.iter_mut() {
-        if let Some(hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-            let before = hooks.len();
-            hooks.retain(|hook| match hook.get("command").and_then(|c| c.as_str()) {
-                Some(cmd) => !(is_caucus_hook_command(cmd) && cmd != hook_command),
-                None => true,
-            });
-            removed += before - hooks.len();
+    for (event, value) in events.iter_mut() {
+        // `None` for a retired event: no command under it is the current one.
+        let keep = current
+            .iter()
+            .find(|(name, _)| name == event)
+            .map(|(_, cmd)| cmd.as_str());
+        let Some(groups) = value.as_array_mut() else {
+            continue;
+        };
+        for group in groups.iter_mut() {
+            if let Some(hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                let before = hooks.len();
+                hooks.retain(|hook| match hook.get("command").and_then(|c| c.as_str()) {
+                    Some(cmd) => !(is_caucus_hook_command(cmd) && Some(cmd) != keep),
+                    None => true,
+                });
+                removed += before - hooks.len();
+            }
         }
+        // Drop matcher groups whose hooks array is now empty; leave groups
+        // without a `hooks` array untouched.
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_none_or(|a| !a.is_empty())
+        });
     }
-    // Drop matcher groups whose hooks array is now empty; leave groups without
-    // a `hooks` array untouched.
-    stop.retain(|group| {
-        group
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .is_none_or(|a| !a.is_empty())
-    });
     removed
 }
 
-/// Append the caucus Stop-hook entry into `settings.hooks.Stop`, creating the
-/// intermediate objects/arrays as needed and preserving any existing hooks.
+/// Append the caucus hook entry for one event into `settings.hooks.<event>`,
+/// creating the intermediate objects/arrays as needed and preserving any
+/// existing hooks.
 ///
 /// `~/.claude/settings.json` is user-editable, so its shape cannot be assumed.
 /// A root or `hooks` value that is present but not a JSON object is a
 /// malformed settings file: coercing it would silently discard the user's
 /// entire configuration (root) or every hook (`hooks`), so we error out and
-/// leave the file untouched rather than destroy it. A non-array `Stop` is the
-/// one shape we replace, since it can hold at most one stale event entry.
-fn merge_stop_hook(settings: &mut serde_json::Value, hook_command: &str) -> Result<()> {
+/// leave the file untouched rather than destroy it. A non-array event value is
+/// the one shape we replace, since it can hold at most one stale entry.
+fn merge_hook(settings: &mut serde_json::Value, event: &str, hook_command: &str) -> Result<()> {
     let entry = serde_json::json!({
         "hooks": [
             { "type": "command", "command": hook_command }
@@ -428,14 +479,14 @@ fn merge_stop_hook(settings: &mut serde_json::Value, hook_command: &str) -> Resu
         "~/.claude/settings.json `hooks` is not a JSON object; \
          fix or remove it, then re-run `caucus init --install-hook`",
     )?;
-    let stop = hooks_obj
-        .entry("Stop")
+    let node = hooks_obj
+        .entry(event)
         .or_insert_with(|| serde_json::json!([]));
-    if let Some(arr) = stop.as_array_mut() {
+    if let Some(arr) = node.as_array_mut() {
         arr.push(entry);
     } else {
-        // A non-array `Stop` value is replaced with a fresh array.
-        *stop = serde_json::json!([entry]);
+        // A non-array event value is replaced with a fresh array.
+        *node = serde_json::json!([entry]);
     }
     Ok(())
 }
@@ -609,10 +660,14 @@ mod tests {
             &std::fs::read_to_string(claude.path().join("settings.json")).unwrap(),
         )
         .unwrap();
-        assert!(current_hook_present(
-            &settings,
-            &script.display().to_string()
-        ));
+        // Every event the script serves is wired, each under its own key with
+        // its own argument.
+        for (event, arg) in HOOK_EVENTS {
+            assert!(
+                current_hook_present(&settings, event, &hook_event_command(&script, *arg)),
+                "{event} hook is wired"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -662,6 +717,46 @@ mod tests {
         .unwrap();
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1, "no stacked duplicate hook: {stop:?}");
+    }
+
+    /// The upgrade path: a settings.json holding only the `Stop` hook — what a
+    /// pre-lifecycle caucus installed — gains the missing `PostCompact` +
+    /// `SessionStart` entries on reinstall (reported `Merged`, since not every
+    /// event was present), and the existing Stop entry is neither duplicated
+    /// nor rewritten (its command is byte-identical across versions).
+    #[test]
+    fn install_adds_lifecycle_events_to_a_stop_only_install() {
+        let claude = TempDir::new().unwrap();
+        let script = hook_script_path(claude.path());
+        std::fs::write(
+            claude.path().join("settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": { "Stop": [{ "hooks": [
+                    { "type": "command", "command": script.display().to_string() }
+                ] }] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (script, install) = install_claude_hook(claude.path()).unwrap();
+        assert!(
+            matches!(install, HookInstall::Merged { .. }),
+            "missing lifecycle events mean a merge, not AlreadyPresent"
+        );
+
+        let settings = read_settings(claude.path());
+        for (event, arg) in HOOK_EVENTS {
+            assert!(
+                current_hook_present(&settings, event, &hook_event_command(&script, *arg)),
+                "{event} hook is wired after the upgrade"
+            );
+        }
+        assert_eq!(
+            stop_commands(&settings).len(),
+            1,
+            "the pre-existing Stop entry is kept, not duplicated"
+        );
     }
 
     /// Every caucus Stop-hook command in a settings file, flattened.
@@ -838,18 +933,20 @@ mod tests {
         );
         assert!(current_hook_present(
             &settings,
+            "Stop",
             &script.display().to_string()
         ));
     }
 
     const TURN_SIGNAL: &str = "/abs/repo/.caucus/bin/turn-signal";
     const SENTINEL_STOP: &str = "/abs/repo/.caucus/bin/sentinel-stop";
+    const THIRD_PARTY: &str = "/Users/me/codes/claude-config/hooks/no-deferral-guard.py";
 
     #[test]
-    fn merge_stop_hook_into_empty_settings() {
+    fn merge_hook_into_empty_settings() {
         let mut settings = serde_json::json!({});
-        merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap();
-        assert!(current_hook_present(&settings, TURN_SIGNAL));
+        merge_hook(&mut settings, "Stop", TURN_SIGNAL).unwrap();
+        assert!(current_hook_present(&settings, "Stop", TURN_SIGNAL));
         // The hook command must be absolute, not a relative path.
         let cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
@@ -858,25 +955,25 @@ mod tests {
     }
 
     #[test]
-    fn merge_stop_hook_preserves_existing_hooks() {
+    fn merge_hook_preserves_existing_hooks() {
         let mut settings = serde_json::json!({
             "hooks": {
                 "Stop": [{ "hooks": [{ "type": "command", "command": "/other" }] }]
             }
         });
-        merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap();
+        merge_hook(&mut settings, "Stop", TURN_SIGNAL).unwrap();
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2, "existing hook kept, caucus hook appended");
-        assert!(current_hook_present(&settings, TURN_SIGNAL));
+        assert!(current_hook_present(&settings, "Stop", TURN_SIGNAL));
     }
 
     #[test]
-    fn merge_stop_hook_errors_on_non_object_root() {
+    fn merge_hook_errors_on_non_object_root() {
         // A hand-edited settings.json whose root is an array or scalar must
         // surface a clear error, not panic — and must not be overwritten.
         for mut settings in [serde_json::json!([1, 2, 3]), serde_json::json!("oops")] {
             let before = settings.clone();
-            let err = merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap_err();
+            let err = merge_hook(&mut settings, "Stop", TURN_SIGNAL).unwrap_err();
             assert!(
                 err.to_string().contains("root is not a JSON object"),
                 "unexpected error: {err}"
@@ -886,14 +983,14 @@ mod tests {
     }
 
     #[test]
-    fn merge_stop_hook_errors_on_non_object_hooks() {
+    fn merge_hook_errors_on_non_object_hooks() {
         // `"hooks": []` is the plausible hand-edit that previously panicked:
         // `or_insert_with` returns the existing array, `.as_object_mut()` is
         // None. It must now error and preserve the user's existing hooks value.
         for hooks in [serde_json::json!([]), serde_json::json!("x")] {
             let mut settings = serde_json::json!({ "hooks": hooks });
             let before = settings.clone();
-            let err = merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap_err();
+            let err = merge_hook(&mut settings, "Stop", TURN_SIGNAL).unwrap_err();
             assert!(
                 err.to_string().contains("`hooks` is not a JSON object"),
                 "unexpected error: {err}"
@@ -903,13 +1000,13 @@ mod tests {
     }
 
     #[test]
-    fn merge_stop_hook_replaces_a_non_array_stop() {
+    fn merge_hook_replaces_a_non_array_stop() {
         // A non-array `Stop` is the one shape we coerce (it can hold at most
         // one stale entry): replaced with a fresh array carrying the hook.
         let mut settings = serde_json::json!({ "hooks": { "Stop": "garbage" } });
-        merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap();
+        merge_hook(&mut settings, "Stop", TURN_SIGNAL).unwrap();
         assert!(settings["hooks"]["Stop"].is_array());
-        assert!(current_hook_present(&settings, TURN_SIGNAL));
+        assert!(current_hook_present(&settings, "Stop", TURN_SIGNAL));
     }
 
     #[test]
@@ -929,7 +1026,7 @@ mod tests {
             }
         });
 
-        let removed = prune_stale_caucus_hooks(&mut settings, TURN_SIGNAL);
+        let removed = prune_stale_caucus_hooks(&mut settings, &[("Stop", TURN_SIGNAL.to_string())]);
         assert_eq!(removed, 1, "the stale sentinel-stop hook is pruned");
 
         let hooks = settings["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
@@ -942,8 +1039,8 @@ mod tests {
 
         // After the prune, merging the current hook yields a clean single
         // caucus hook — no stacked duplicate.
-        merge_stop_hook(&mut settings, TURN_SIGNAL).unwrap();
-        assert!(current_hook_present(&settings, TURN_SIGNAL));
+        merge_hook(&mut settings, "Stop", TURN_SIGNAL).unwrap();
+        assert!(current_hook_present(&settings, "Stop", TURN_SIGNAL));
     }
 
     #[test]
@@ -954,9 +1051,9 @@ mod tests {
                 "Stop": [{ "hooks": [{ "type": "command", "command": TURN_SIGNAL }] }]
             }
         });
-        let removed = prune_stale_caucus_hooks(&mut settings, TURN_SIGNAL);
+        let removed = prune_stale_caucus_hooks(&mut settings, &[("Stop", TURN_SIGNAL.to_string())]);
         assert_eq!(removed, 0);
-        assert!(current_hook_present(&settings, TURN_SIGNAL));
+        assert!(current_hook_present(&settings, "Stop", TURN_SIGNAL));
     }
 
     #[test]
@@ -968,9 +1065,155 @@ mod tests {
                 "Stop": [{ "matcher": "", "hooks": [{ "command": SENTINEL_STOP }] }]
             }
         });
-        let removed = prune_stale_caucus_hooks(&mut settings, TURN_SIGNAL);
+        let removed = prune_stale_caucus_hooks(&mut settings, &[("Stop", TURN_SIGNAL.to_string())]);
         assert_eq!(removed, 1);
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
         assert!(stop.is_empty(), "the emptied group is dropped: {stop:?}");
+    }
+
+    /// A caucus hook under an event caucus has **retired** is stale by
+    /// definition — no command under that event is current — so the sweep
+    /// uninstalls it. This is the boundary the per-event prune could not
+    /// reach: it only ever visited the events still listed, leaving a retired
+    /// one to keep invoking the script with an argument the binary no longer
+    /// accepts. Third-party hooks under the same retired event survive.
+    #[test]
+    fn prune_stale_caucus_hooks_uninstalls_a_retired_event() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [{ "hooks": [{ "command": TURN_SIGNAL }] }],
+                "PreCompact": [{ "hooks": [
+                    { "command": format!("{TURN_SIGNAL} pre-compact") },
+                    { "command": THIRD_PARTY }
+                ] }]
+            }
+        });
+
+        // `current` names Stop only — PreCompact has been retired.
+        let removed = prune_stale_caucus_hooks(&mut settings, &[("Stop", TURN_SIGNAL.to_string())]);
+
+        assert_eq!(removed, 1, "the retired event's caucus hook is removed");
+        assert!(
+            current_hook_present(&settings, "Stop", TURN_SIGNAL),
+            "the current Stop hook is untouched"
+        );
+        let pre = settings["hooks"]["PreCompact"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        let commands: Vec<&str> = pre.iter().filter_map(|h| h["command"].as_str()).collect();
+        assert_eq!(
+            commands,
+            vec![THIRD_PARTY],
+            "third-party hook under the retired event survives"
+        );
+    }
+
+    /// Run [`TURN_SIGNAL_SCRIPT`] for real against a stub `caucus` on PATH and
+    /// return the argv it was invoked with (empty when it was never invoked).
+    ///
+    /// `sock_present` controls whether a socket file exists under the script's
+    /// `TMPDIR` glob; `env_sock` sets (or clears) `CAUCUS_SOCK`. Those two are
+    /// the script's only branch inputs besides its argument.
+    fn run_hook_script(arg: Option<&str>, env_sock: bool, sock_present: bool) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let script = tmp.path().join("hook.sh");
+        std::fs::write(&script, TURN_SIGNAL_SCRIPT).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Stub `caucus`: records its argv, one argument per line.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let argv_out = tmp.path().join("argv.txt");
+        let stub = bin.join("caucus");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                argv_out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The socket dir the script globs (`$TMPDIR/caucus-*.sock`).
+        let sock_dir = tmp.path().join("sockdir");
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        if sock_present {
+            std::fs::write(sock_dir.join("caucus-abc.sock"), "").unwrap();
+        }
+
+        let mut cmd = std::process::Command::new(&script);
+        if let Some(arg) = arg {
+            cmd.arg(arg);
+        }
+        cmd.env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("TMPDIR", &sock_dir)
+        .env("CAUCUS_SESSION_ID", "S")
+        .env("CAUCUS_PANEL_ID", "P");
+        if env_sock {
+            cmd.env("CAUCUS_SOCK", tmp.path().join("c.sock"));
+        } else {
+            cmd.env_remove("CAUCUS_SOCK");
+        }
+        let status = cmd.status().unwrap();
+        assert!(status.success(), "hook script must never fail its panel");
+
+        std::fs::read_to_string(&argv_out)
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// The value that followed `--kind` in an argv, if any.
+    fn kind_of(argv: &[String]) -> Option<&str> {
+        let i = argv.iter().position(|a| a == "--kind")?;
+        argv.get(i + 1).map(String::as_str)
+    }
+
+    /// One case per branch input of the hook script — the script has three
+    /// (argument, `CAUCUS_SOCK`, socket-file present) and every combination
+    /// must carry the *hook event* through to `--kind`.
+    ///
+    /// The discovery branch is the one that can silently lose it: it reuses the
+    /// positional parameters (`set -- "$TMPDIR"/caucus-*.sock`) to glob for a
+    /// socket, so a `--kind "${1:-stop}"` read *after* that line would name a
+    /// socket path instead of the hook event. The script captures the argument
+    /// into `kind` before the glob; these cases pin that.
+    #[test]
+    fn hook_script_carries_the_event_kind_down_every_branch() {
+        // Env path: identity flags plus the event.
+        let argv = run_hook_script(Some("session-start"), true, false);
+        assert_eq!(kind_of(&argv), Some("session-start"), "env path: {argv:?}");
+        assert!(!argv.iter().any(|a| a == "--discover"), "{argv:?}");
+
+        // Env path, bare invocation (the Stop entry) defaults to `stop`.
+        let argv = run_hook_script(None, true, false);
+        assert_eq!(kind_of(&argv), Some("stop"), "env path, no arg: {argv:?}");
+
+        // Discovery path: no env, a live socket — the event must survive the
+        // positional-parameter glob.
+        let argv = run_hook_script(Some("session-start"), false, true);
+        assert!(argv.iter().any(|a| a == "--discover"), "{argv:?}");
+        assert_eq!(
+            kind_of(&argv),
+            Some("session-start"),
+            "discovery path must not lose the event to the socket glob: {argv:?}"
+        );
+
+        // Discovery path, bare invocation.
+        let argv = run_hook_script(None, false, true);
+        assert_eq!(kind_of(&argv), Some("stop"), "discovery, no arg: {argv:?}");
+
+        // Neither env nor socket: a quiet no-op, `caucus` is never invoked.
+        let argv = run_hook_script(Some("session-start"), false, false);
+        assert!(argv.is_empty(), "no caucus on this machine: {argv:?}");
     }
 }

@@ -48,6 +48,20 @@ use crate::signal::{StopDirective, TurnSignal, UnboundSignal};
 /// correctness.
 const TRANSCRIPT_HEAD_CAP: usize = 4 * 1024 * 1024;
 
+/// Which resolution rule claimed an unbound signal for a panel
+/// (`resolve_unbound_panel`).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum UnboundMatch {
+    /// Rule 1 — the payload's conversation id is one caucus already holds.
+    /// Proof of identity: the same conversation, only its env was lost.
+    Exact,
+    /// Rule 2 — the id is unknown, but the transcript head names exactly one
+    /// panel's known conversation id. This is *inference*, not proof: it reads
+    /// a fork as its parent's conversation continued, and every conversation
+    /// forked from the same ancestor carries that ancestor's id in its head.
+    Lineage,
+}
+
 impl Multiplexer {
     /// Ingest an [`UnboundSignal`]: resolve which panel (if any) it belongs to
     /// and hand the bound signal to the ordinary turn-completion owner. A
@@ -63,9 +77,12 @@ impl Multiplexer {
         sig: UnboundSignal,
         reply: Option<tokio::sync::oneshot::Sender<StopDirective>>,
     ) {
-        let Some(panel_id) = self.resolve_unbound_panel(&sig) else {
+        let Some((panel_id, matched_by)) = self.resolve_unbound_panel(&sig) else {
             return;
         };
+        if matched_by == UnboundMatch::Lineage {
+            self.log_lineage_claim(panel_id, &sig);
+        }
         let wants_reply = Some(panel_id) == self.main_panel_id;
         let bound = TurnSignal {
             session_id: self.session.id,
@@ -83,7 +100,40 @@ impl Multiplexer {
     /// Resolve an unbound signal to this session's panel, or `None` when the
     /// conversation is not (provably) ours. See the module docs for the rule
     /// order; this is the only place an unbound signal acquires a panel id.
-    fn resolve_unbound_panel(&mut self, sig: &UnboundSignal) -> Option<PanelId> {
+    /// Record that a lineage claim — the *inferred* rule — bound a signal to a
+    /// panel, with the state that decides whether the inference was safe.
+    ///
+    /// A lineage claim routes straight into `handle_signal_with_reply`, which
+    /// ends the panel's turn and settles its round unconditionally. When the
+    /// claimed panel was **working**, the claim just reported a turn ending on
+    /// a panel caucus believed was mid-turn: either the fork really is that
+    /// panel's conversation moved (correct), or a *different* conversation
+    /// forked from the same ancestor just settled a live panel's round early.
+    /// Nothing in the payload separates those two, so the claim is logged with
+    /// the evidence rather than gated on a guess — see the open question in
+    /// `docs/design.md` §7.8.
+    fn log_lineage_claim(&self, panel_id: PanelId, sig: &UnboundSignal) {
+        let state = self
+            .panels
+            .iter()
+            .find(|p| p.id == panel_id)
+            .map(|p| p.state());
+        let known_id = self
+            .manifests
+            .get(&panel_id)
+            .and_then(|m| m.claude_session_id().map(str::to_string));
+        warn!(
+            panel = %panel_id,
+            claude_session_id = ?sig.claude_session_id,
+            matched_panel_conversation = ?known_id,
+            transcript = ?sig.transcript_path,
+            panel_state = ?state,
+            kind = ?sig.kind,
+            "unbound signal claimed by lineage inference, not exact id"
+        );
+    }
+
+    fn resolve_unbound_panel(&mut self, sig: &UnboundSignal) -> Option<(PanelId, UnboundMatch)> {
         // Without a conversation id there is nothing to match on — and
         // nothing to key a cache entry by.
         let sid = sig.claude_session_id.as_deref()?;
@@ -92,7 +142,7 @@ impl Multiplexer {
         // *becomes* known (spawned or healed after a cache entry landed) can
         // never be shadowed by it.
         if let Some(id) = self.panel_by_claude_session_id(sid) {
-            return Some(id);
+            return Some((id, UnboundMatch::Exact));
         }
 
         if self.unbound_unclaimed.contains(sid) {
@@ -122,7 +172,7 @@ impl Multiplexer {
             .map(|(&id, _)| id)
             .collect();
         match matches.as_slice() {
-            [id] => Some(*id),
+            [id] => Some((*id, UnboundMatch::Lineage)),
             [] => {
                 // Only a complete read proves the head names no panel of
                 // ours; a capped read may simply not have reached the copied
@@ -336,6 +386,38 @@ mod tests {
             mux.manifests[&id].claude_session_id(),
             Some("conv-fork"),
             "the manifest heals to the fork's conversation id"
+        );
+        mux.shutdown();
+    }
+
+    /// The two claiming rules must stay distinguishable, because only one of
+    /// them is *proof*: an exact id is the same conversation, a lineage match
+    /// is an inference from a shared ancestor. The distinction is what
+    /// `handle_unbound_signal` logs on, so a claim that settles a live panel
+    /// can be traced back to which rule made it.
+    #[tokio::test]
+    async fn unbound_reports_which_rule_claimed_the_panel() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = panel_with_known_id(&mut mux, "conv-parent");
+        let cwd = mux.session.repo_path.clone();
+
+        assert_eq!(
+            mux.resolve_unbound_panel(&unbound_stop("conv-parent", None, &cwd)),
+            Some((id, UnboundMatch::Exact)),
+            "a known conversation id is proof, not inference"
+        );
+
+        let transcript = tmp.path().join("fork.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"session_id\":\"conv-parent\",\"message\":{}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            mux.resolve_unbound_panel(&unbound_stop("conv-fork", Some(&transcript), &cwd)),
+            Some((id, UnboundMatch::Lineage)),
+            "an unknown id matched through the transcript head is inference"
         );
         mux.shutdown();
     }

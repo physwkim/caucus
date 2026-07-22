@@ -232,20 +232,37 @@ pub enum SignalCommand {
     },
 }
 
-/// CLI spelling of [`TurnKind`].
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+/// CLI spelling of the signal kinds `caucus signal post` accepts: the
+/// [`TurnKind`]s the Stop hook posts, plus the lifecycle hooks (`post-compact`,
+/// `session-start`) whose payloads carry their own discriminant on stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum SignalKindArg {
     Stop,
     ToolBlocked,
     Error,
+    PostCompact,
+    SessionStart,
 }
 
-impl From<SignalKindArg> for TurnKind {
-    fn from(arg: SignalKindArg) -> Self {
-        match arg {
-            SignalKindArg::Stop => TurnKind::Stop,
-            SignalKindArg::ToolBlocked => TurnKind::ToolBlocked,
-            SignalKindArg::Error => TurnKind::Error,
+impl SignalKindArg {
+    /// The turn kind this argument names, or `None` for a lifecycle kind —
+    /// which `run_signal` routes to `post::run_lifecycle` instead.
+    fn turn_kind(self) -> Option<TurnKind> {
+        match self {
+            SignalKindArg::Stop => Some(TurnKind::Stop),
+            SignalKindArg::ToolBlocked => Some(TurnKind::ToolBlocked),
+            SignalKindArg::Error => Some(TurnKind::Error),
+            SignalKindArg::PostCompact | SignalKindArg::SessionStart => None,
+        }
+    }
+
+    /// The lifecycle hook this argument names, or `None` for a turn kind.
+    fn lifecycle_hook(self) -> Option<crate::signal::post::LifecycleHook> {
+        use crate::signal::post::LifecycleHook;
+        match self {
+            SignalKindArg::PostCompact => Some(LifecycleHook::PostCompact),
+            SignalKindArg::SessionStart => Some(LifecycleHook::SessionStart),
+            SignalKindArg::Stop | SignalKindArg::ToolBlocked | SignalKindArg::Error => None,
         }
     }
 }
@@ -446,7 +463,18 @@ fn run_signal(cmd: SignalCommand) -> Result<ExitCode> {
                 // No env, no identity: broadcast the payload as an unbound
                 // signal; each live caucus server resolves ownership itself
                 // (`docs/design.md` §7.8).
-                crate::signal::post::run_discover(kind.into())?;
+                //
+                // Only a *turn* kind can ride the unbound path: `UnboundSignal`
+                // carries a `TurnKind`, and panel resolution reads the
+                // conversation's transcript lineage — which a lifecycle hook's
+                // payload names just as well, but which no lifecycle consumer
+                // is wired to yet (design §7.9, known bound). A lifecycle kind
+                // here posts nothing rather than failing: a hook process must
+                // never fail the panel it runs in.
+                let Some(kind) = kind.turn_kind() else {
+                    return Ok(ExitCode::SUCCESS);
+                };
+                crate::signal::post::run_discover(kind)?;
                 return Ok(ExitCode::SUCCESS);
             }
             // clap enforces the three flags whenever --discover is absent.
@@ -459,13 +487,21 @@ fn run_signal(cmd: SignalCommand) -> Result<ExitCode> {
                 .with_context(|| format!("invalid --session id '{session}'"))?;
             let panel_id = PanelId::from_str(&panel)
                 .with_context(|| format!("invalid --panel id '{panel}'"))?;
+            if let Some(hook) = kind.lifecycle_hook() {
+                // A lifecycle hook (`PostCompact` / `SessionStart`) posts a
+                // fire-and-forget lifecycle signal; its payload's own
+                // `trigger` / `source` field is read from stdin.
+                crate::signal::post::run_lifecycle(&sock, session_id, panel_id, hook)?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            let kind = kind.turn_kind().expect("non-lifecycle kind is a turn kind");
             // Reply capability is negotiated by env, never by flag
             // (`docs/design.md` §7.6): the hook script body stays fixed, and a
             // caucus that can answer injects `CAUCUS_HOOK_REPLY=1` into the
             // claude main panel alone — any other combination of binary ages
             // degrades to today's fire-and-forget post.
             let wants_reply = std::env::var("CAUCUS_HOOK_REPLY").as_deref() == Ok("1");
-            crate::signal::post::run(&sock, session_id, panel_id, kind.into(), wants_reply)?;
+            crate::signal::post::run(&sock, session_id, panel_id, kind, wants_reply)?;
             Ok(ExitCode::SUCCESS)
         }
         SignalCommand::Note {
@@ -762,6 +798,54 @@ mod tests {
         assert!(
             Cli::try_parse_from(["caucus", "signal", "post", "--kind", "stop"]).is_err(),
             "without --discover the identity flags are required"
+        );
+    }
+
+    /// The lifecycle kinds parse (`--kind post-compact` / `session-start` are
+    /// what the shared hook script passes as its argument), and every kind maps
+    /// to exactly one of the two dispatch paths: a turn kind or a lifecycle
+    /// hook, never both, never neither — the invariant behind `run_signal`'s
+    /// `expect` on the non-lifecycle branch.
+    #[test]
+    fn signal_post_kind_maps_to_exactly_one_dispatch_path() {
+        use crate::signal::post::LifecycleHook;
+        for (arg, spec) in [
+            (SignalKindArg::Stop, "stop"),
+            (SignalKindArg::ToolBlocked, "tool-blocked"),
+            (SignalKindArg::Error, "error"),
+            (SignalKindArg::PostCompact, "post-compact"),
+            (SignalKindArg::SessionStart, "session-start"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "caucus",
+                "signal",
+                "post",
+                "--sock",
+                "/s",
+                "--session",
+                "S",
+                "--panel",
+                "P",
+                "--kind",
+                spec,
+            ])
+            .unwrap();
+            let Some(Command::Signal(SignalCommand::Post { kind, .. })) = cli.command else {
+                panic!("--kind {spec} must parse as signal post");
+            };
+            assert_eq!(kind, arg, "--kind {spec}");
+            assert!(
+                kind.turn_kind().is_some() != kind.lifecycle_hook().is_some(),
+                "--kind {spec} must map to exactly one dispatch path"
+            );
+        }
+        assert_eq!(
+            SignalKindArg::PostCompact.lifecycle_hook(),
+            Some(LifecycleHook::PostCompact)
+        );
+        assert_eq!(
+            SignalKindArg::SessionStart.lifecycle_hook(),
+            Some(LifecycleHook::SessionStart)
         );
     }
 
