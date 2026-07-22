@@ -815,6 +815,16 @@ resume`이 fork 이전 대화를 되살린다. env 상속을 끊는 **모든** �
   계보를 만들지 않는다 — main worker의 대화는 sub-agent들의 id를 일상적으로
   인용한다.
 
+**미해결 (2026-07)**: lineage 규칙은 *증거*가 아니라 *추론*이다. 같은 조상에서
+갈라진 대화는 모두 그 조상의 id를 head에 지니므로, 살아 있는 패널의 대화가
+아닌 다른 fork의 Stop도 그 패널을 claim할 수 있다. claim은 곧바로
+`handle_signal_with_reply`로 들어가 무조건 턴을 끝내고 round를 settle시키므로,
+그 경우 작업 중인 worker의 done이 main에 조기 배달된다. payload만으로는 두
+경우를 가르는 정보가 없어 지금은 게이트를 걸지 않고 **관측만** 한다:
+`handle_unbound_signal`이 lineage claim마다 claim된 패널, 매치된 조상 id,
+transcript 경로, **claim 시점의 패널 상태**를 `warn`으로 남긴다. 작업 중인
+패널을 claim한 기록이 실제로 관측되면 그때 게이트의 형태가 정해진다.
+
 **알려진 한계**: 해석은 caucus가 그 패널의 conversation id를 한 번이라도
 학습했음을 전제한다(`--resume` spawn 또는 env 경로 신호 ≥1회 —
 `record_turn_completed`가 학습 지점). 첫 신호 전에 env가 끊긴 신생 패널은
