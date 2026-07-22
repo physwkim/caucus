@@ -5,7 +5,7 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
-## [Unreleased]
+## [0.10.3] — 2026-07-23
 
 Two ways a panel's real state and caucus's belief about it could diverge,
 in opposite directions: a local `/compact` left a panel wedged `Working`
