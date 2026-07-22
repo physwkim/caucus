@@ -37,6 +37,7 @@ mod rounds;
 mod scroll;
 mod spawn;
 mod spawn_async;
+mod unbound;
 
 use self::mcp::PendingSubmit;
 use self::rounds::{PendingRound, QuestionNotice};
@@ -235,6 +236,15 @@ pub struct Multiplexer {
     /// [`Multiplexer::take_pending_clipboard`] and writes it. `None` when no
     /// copy is pending.
     pending_clipboard: Option<String>,
+    /// Claude conversation ids whose unbound signals this session has already
+    /// judged not-ours after a *complete* lineage read
+    /// ([`Multiplexer::resolve_unbound_panel`]). Every ordinary Claude Code
+    /// session on the machine broadcasts unbound signals when its env is
+    /// missing and a caucus socket exists, so without this cache each of its
+    /// turns would re-read its transcript head. A conversation that was not
+    /// ours cannot become ours later — panels caucus spawns are matched by the
+    /// exact-id rule before this cache is consulted.
+    unbound_unclaimed: std::collections::HashSet<String>,
 }
 
 /// Whether [`Multiplexer::new`] is opening a brand-new session or reopening a
@@ -372,6 +382,7 @@ impl Multiplexer {
                 last_liveness_probe: None,
                 view_epoch: 0,
                 pending_clipboard: None,
+                unbound_unclaimed: std::collections::HashSet::new(),
             },
             signal_server,
             control_server,

@@ -15,23 +15,38 @@ use anyhow::{Context, Result};
 
 use crate::hook::{current_hook_present, hook_script_path, is_caucus_hook_command};
 
-/// The Stop-hook script body (`docs/design.md` §7.3). `CAUCUS_*` env vars are
-/// injected by caucus when it spawns the panel; the Claude hook payload
-/// arrives on stdin and is forwarded by `caucus signal post`. The body carries
-/// no project-specific state, which is what lets one copy serve every project.
+/// The Stop-hook script body (`docs/design.md` §7.3, §7.8). `CAUCUS_*` env
+/// vars are injected by caucus when it spawns the panel; the Claude hook
+/// payload arrives on stdin and is forwarded by `caucus signal post`. The body
+/// carries no project-specific state, which is what lets one copy serve every
+/// project.
+///
+/// When the env is absent the conversation may still BE a caucus panel whose
+/// process no longer inherits the panel's env (Claude Code's daemon re-hosts
+/// live sessions across restarts as env-less forks). If any caucus session
+/// socket exists, fall back to `--discover`: post the payload unbound to every
+/// live socket and let each server decide ownership from the payload itself.
+/// With no socket present the hook is a harmless no-op, as before.
 const TURN_SIGNAL_SCRIPT: &str = "#!/bin/sh\n\
 # caucus turn-signal hook. CAUCUS_* env is injected by caucus at panel spawn;\n\
 # the Claude hook payload is read from stdin by `caucus signal post`.\n\
 #\n\
 # The Stop hook is installed globally (~/.claude/settings.json), so it also\n\
-# fires in ordinary Claude Code sessions that are NOT caucus panels. There the\n\
-# CAUCUS_* env is unset — exit quietly so the hook is a harmless no-op.\n\
-[ -n \"$CAUCUS_SOCK\" ] || exit 0\n\
-exec caucus signal post \\\n\
-  --sock    \"$CAUCUS_SOCK\" \\\n\
-  --session \"$CAUCUS_SESSION_ID\" \\\n\
-  --panel   \"$CAUCUS_PANEL_ID\" \\\n\
-  --kind    stop\n";
+# fires in ordinary Claude Code sessions that are NOT caucus panels — and in\n\
+# caucus panels whose env was lost to a daemon re-host. With the env present,\n\
+# post directly; otherwise, if any caucus socket is live, post unbound to all\n\
+# of them (each server resolves ownership from the payload); with neither,\n\
+# exit quietly so the hook is a harmless no-op.\n\
+if [ -n \"$CAUCUS_SOCK\" ]; then\n\
+  exec caucus signal post \\\n\
+    --sock    \"$CAUCUS_SOCK\" \\\n\
+    --session \"$CAUCUS_SESSION_ID\" \\\n\
+    --panel   \"$CAUCUS_PANEL_ID\" \\\n\
+    --kind    stop\n\
+fi\n\
+set -- \"${TMPDIR:-/tmp}\"/caucus-*.sock\n\
+[ -e \"$1\" ] || exit 0\n\
+exec caucus signal post --discover --kind stop\n";
 
 /// Result of the `--install-hook` step.
 #[derive(Debug)]

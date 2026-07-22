@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 
 use crate::session::id::{PanelId, SessionId};
 
-use super::{AgentNote, NoteKind, SignalReply, TurnKind, TurnSignal};
+use super::{AgentNote, NoteKind, SignalReply, TurnKind, TurnSignal, UnboundSignal};
 
 /// How long the client waits for the server's one reply line — the client
 /// half of the reply-timeout ladder (`docs/design.md` §7.6): above the
@@ -87,6 +87,86 @@ pub(crate) fn run(
         );
     }
     Ok(())
+}
+
+/// Run `caucus signal post --discover` — the env-less fallback of [`run`]
+/// (`docs/design.md` §7.8).
+///
+/// The exact path needs `CAUCUS_SOCK`/`CAUCUS_SESSION_ID`/`CAUCUS_PANEL_ID`,
+/// which are inherited process env — and Claude Code can move a live
+/// conversation into a process that inherited nothing from the panel's PTY
+/// (the `claude daemon` re-hosts sessions across auto-update restarts and
+/// crash recovery, `--fork-session`). The hook still fires there; without this
+/// fallback every such turn signal silently dies and the panel wedges
+/// `Working` forever.
+///
+/// So: build an [`UnboundSignal`] from the hook payload alone and post it to
+/// **every** live caucus signal socket in the temp dir. Each server resolves
+/// from the payload whether the conversation is one of its panels
+/// (`Multiplexer::handle_unbound_signal`); non-owners answer allow. One reply
+/// line is read per socket — the owning server may ride a round delivery back
+/// on it exactly as on the exact path — and the first deliver reason wins
+/// (at most one server can own a conversation). Sockets that fail to connect
+/// (stale files, another user's) are skipped; no socket at all is a quiet
+/// no-op, matching the hook's behaviour on machines with no live caucus.
+pub(crate) fn run_discover(kind: TurnKind) -> Result<()> {
+    let mut payload_text = String::new();
+    std::io::stdin()
+        .read_to_string(&mut payload_text)
+        .context("read Claude hook payload from stdin")?;
+    let raw_hook_payload: serde_json::Value =
+        serde_json::from_str(payload_text.trim()).unwrap_or(serde_json::Value::Null);
+    let last_message = extract_last_message(&raw_hook_payload);
+    let signal = UnboundSignal::now(kind, last_message, raw_hook_payload);
+
+    if let Some(reason) = broadcast_unbound(&std::env::temp_dir(), &signal) {
+        println!(
+            "{}",
+            serde_json::json!({ "decision": "block", "reason": reason })
+        );
+    }
+    Ok(())
+}
+
+/// Post `signal` to every discovered caucus signal socket under `dir`, reading
+/// one reply line per socket; returns the first deliver reason, if any server
+/// sent one. Split from [`run_discover`] so tests can point it at a temp dir.
+fn broadcast_unbound(dir: &Path, signal: &UnboundSignal) -> Option<String> {
+    let mut reason = None;
+    for sock in discover_socks(dir) {
+        // A dead socket file or a foreign-user socket refuses the connect —
+        // skip it; the signal still reaches every live server.
+        let Ok(stream) = send_line_on(&sock, signal) else {
+            continue;
+        };
+        let delivered = read_deliver_reason(stream);
+        if reason.is_none() {
+            reason = delivered;
+        }
+    }
+    reason
+}
+
+/// Every caucus *signal* socket under `dir`: `caucus-*.sock`, excluding the
+/// MCP control sockets (`caucus-*-ctl.sock`), which speak a different
+/// protocol and must never receive a signal line. Sorted for a deterministic
+/// broadcast order.
+fn discover_socks(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut socks: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+                name.starts_with("caucus-")
+                    && name.ends_with(".sock")
+                    && !name.ends_with("-ctl.sock")
+            })
+        })
+        .collect();
+    socks.sort();
+    socks
 }
 
 /// Run `caucus signal note` — post one mid-turn [`AgentNote`].
@@ -401,6 +481,76 @@ mod tests {
         assert_eq!(sig.panel_id, panel_id);
         assert_eq!(sig.kind, TurnKind::Stop);
         assert_eq!(sig.last_message.as_deref(), Some("reviewer pass complete"));
+    }
+
+    /// [`discover_socks`] takes exactly the signal sockets: `caucus-*.sock`,
+    /// never the MCP control sockets, never unrelated files — and returns them
+    /// sorted.
+    #[test]
+    fn discover_socks_filters_and_sorts() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "caucus-B2.sock",
+            "caucus-A1.sock",
+            "caucus-A1-ctl.sock",
+            "other.sock",
+            "caucus-notes.txt",
+        ] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let got = discover_socks(dir.path());
+        assert_eq!(
+            got,
+            vec![
+                dir.path().join("caucus-A1.sock"),
+                dir.path().join("caucus-B2.sock"),
+            ],
+            "signal sockets only, sorted; control sockets and strangers excluded"
+        );
+    }
+
+    /// [`broadcast_unbound`] posts to every live socket in the dir, skips a
+    /// dead socket file without failing, and returns the deliver reason the
+    /// owning server sends back.
+    #[tokio::test]
+    async fn broadcast_unbound_reaches_live_servers_and_returns_the_deliver_reason() {
+        use crate::signal::server::SignalServer;
+
+        let dir = tempfile::tempdir().unwrap();
+        // A dead socket file sorted first: connect fails, must be skipped.
+        std::fs::write(dir.path().join("caucus-0dead.sock"), b"").unwrap();
+        let sock = dir.path().join("caucus-1live.sock");
+        let mut server = SignalServer::bind(&sock).unwrap();
+
+        let signal = UnboundSignal::now(
+            TurnKind::Stop,
+            Some("turn over".into()),
+            serde_json::json!({ "session_id": "conv-x" }),
+        );
+
+        // The poster blocks on its reply read; answer from the server side
+        // concurrently, as the runtime would.
+        let dir_path = dir.path().to_path_buf();
+        let poster =
+            tokio::task::spawn_blocking(move || broadcast_unbound(&dir_path, &signal.clone()));
+        let (event, reply) = server.signals().recv().await.expect("signal received");
+        let crate::signal::SignalEvent::Unbound(sig) = event else {
+            panic!("expected an unbound signal");
+        };
+        assert_eq!(sig.claude_session_id.as_deref(), Some("conv-x"));
+        reply
+            .expect("unbound signals always carry a reply slot")
+            .send(crate::signal::StopDirective::Deliver {
+                reason: "round 3 complete".into(),
+            })
+            .expect("server holds the receiver");
+
+        let reason = poster.await.unwrap();
+        assert_eq!(
+            reason.as_deref(),
+            Some("round 3 complete"),
+            "the owning server's deliver reason comes back to the poster"
+        );
     }
 
     /// Write `reply` to one end of a socket pair, signal end-of-input, and run

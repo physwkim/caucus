@@ -535,12 +535,21 @@ hook을 실행하게 되어 어떤 패널도 신호를 보내지 못하고 어�
 ```sh
 #!/bin/sh
 # CAUCUS_* env는 caucus가 패널 spawn 시 주입. Claude hook payload는 stdin JSON.
-exec caucus signal post \
-  --sock    "$CAUCUS_SOCK" \
-  --session "$CAUCUS_SESSION_ID" \
-  --panel   "$CAUCUS_PANEL_ID" \
-  --kind    stop
+if [ -n "$CAUCUS_SOCK" ]; then
+  exec caucus signal post \
+    --sock    "$CAUCUS_SOCK" \
+    --session "$CAUCUS_SESSION_ID" \
+    --panel   "$CAUCUS_PANEL_ID" \
+    --kind    stop
+fi
+set -- "${TMPDIR:-/tmp}"/caucus-*.sock
+[ -e "$1" ] || exit 0
+exec caucus signal post --discover --kind stop
 ```
+
+env가 없는데 caucus 소켓이 하나라도 살아 있으면 `--discover`로 fallback한다
+(§7.8) — env 부재가 "caucus 패널이 아니다"를 뜻하지 않기 때문이다(daemon
+re-host). 소켓도 없으면 종전처럼 조용한 no-op.
 
 `caucus signal post`는 stdin JSON에서 `last_message`를 추출해 소켓에 한 줄 JSON으로
 쓴다. 파일도, 폴링도 없다 — caucus 실행 프로세스가 소켓 read로 즉시 수신한다.
@@ -738,6 +747,71 @@ hook) 또는 codex(notify)라 대상 집합이 비어 있고, 아무도 밟지 �
 그때 결정하되, 제약은 지금 확정된 그대로다: settle로 쓴다면 반드시 기존
 turn-completion 단일 owner(`handle_signal` → `record_turn_completed`)를
 경유해야 하며 제2의 settle 경로는 만들지 않는다.
+
+### 7.8 Unbound 신호 — env 없는 hook의 패널 해석
+
+**문제**: §7.1의 패널 신원은 전부 프로세스 env 상속(`CAUCUS_*`)에 실려 있는데,
+Claude Code는 살아 있는 대화를 패널의 PTY에서 아무것도 상속받지 않은
+프로세스로 옮길 수 있다. 실측 사례: `claude daemon`이 auto-update/복구 시
+세션을 `--fork-session`으로 re-host한다 — 새 프로세스는 init 소속이고 env가
+없으며, fork라서 **새 conversation id**까지 발급된다. 이후 그 패널의 모든 Stop
+hook은 스크립트 첫 줄(`CAUCUS_SOCK` 없음 → exit 0)에서 조용히 죽는다: 패널은
+`Working`으로 영구 고착, main이면 hook-reply 경로도 함께 죽어 settle된 round가
+영원히 배달되지 않고, `session.json`의 `claude_session_id`도 낡아 `caucus
+resume`이 fork 이전 대화를 되살린다. env 상속을 끊는 **모든** 경로가 같은
+결함군이다 — daemon re-host는 그중 관측된 하나일 뿐이다.
+
+**구조적 해결**: 신원을 프로세스 상속이 아니라 **hook payload 자체**에서
+복원한다. payload에는 Claude가 스스로 아는 것 — `session_id`(conversation id),
+`transcript_path`, `cwd` — 이 이미 들어 있다.
+
+- **클라이언트** (`caucus signal post --discover`, §7.3 스크립트의 fallback):
+  payload만으로 `UnboundSignal`(wire 마커 `unbound: true`, untagged
+  `SignalEvent`가 shape로 판별)을 만들어 temp dir의 모든 `caucus-*.sock`
+  (`-ctl.sock` 제외)에 브로드캐스트하고, 소켓당 응답 한 줄을 읽는다. 소켓
+  파일이 곧 레지스트리다 — 별도 상태 파일 없음, 죽은 소켓은 connect 실패로
+  자체 스킵. 첫 deliver reason이 이긴다(한 대화의 owner는 최대 하나).
+- **서버**: unbound 라인은 항상 reply slot을 받는다(§7.6과 동일한 대기).
+  런타임의 `Multiplexer::handle_unbound_signal`이 단일 owner로서 unbound→bound
+  변환을 수행한다. 해석 순서:
+  1. **정확 일치** — payload의 conversation id를 이 세션의 manifest가 이미
+     보유(env만 잃은 re-host).
+  2. **계보(lineage)** — id가 처음 보는 것(fork의 새 id)이면, transcript
+     JSONL 머리(4 MiB 캡)의 top-level `sessionId`/`session_id` 필드들에서
+     부모 conversation id를 수집한다 — fork transcript는 부모에서 복사한
+     레코드를 머리에 지니고, 각 레코드는 자기 conversation id를 새긴다.
+     정확히 한 패널의 알려진 id가 나타나면 그 패널의 대화가 이어진 것.
+  3. 그 외 — 우리 것이 아님: reply sender를 drop(→ allow), 아무것도 안 바꿈.
+- **치유**: 해석된 신호는 기존 단일 owner(`handle_signal_with_reply` →
+  `record_turn_completed`)를 그대로 통과하고, 그 경로가 payload의
+  `session_id`로 manifest의 conversation id를 이미 덮어쓴다(§7.4의 기존
+  동작). 따라서 fork의 **첫** unbound 신호가 곧 치유다: 다음 신호부터는 1번
+  정확 일치로 풀리고, `caucus resume`도 fork를 되살린다. 제2의 settle 경로는
+  만들지 않았다 — unbound는 기존 owner 앞단의 *신원 해석기*일 뿐이다.
+
+비용 방어 두 겹, 정확성 방어 두 겹:
+
+- **cwd 게이트** (비용): payload `cwd`가 세션 repo 안도, 어떤 패널 워크트리
+  안도 아니면 transcript를 읽지 않고 not-ours로 캐시한다. `cwd` 없는
+  payload는 게이트를 건너뛴다 — 게이트는 비용 절약이지 정확성 조건이 아니다.
+- **not-ours 캐시** (비용): 완독한 lineage 스캔이 아무 패널도 못 찾은
+  conversation id는 `unbound_unclaimed`에 캐시 — 이 머신의 일반 Claude
+  세션(패널 아님)이 턴마다 transcript 읽기를 유발하지 않게. 정확 일치가
+  캐시보다 **먼저** 검사되므로 캐시가 나중에 스폰된 패널을 가릴 수 없고,
+  캡에 걸린 불완전 스캔은 캐시하지 않는다(다음 신호가 재시도).
+- **모호성 불청구** (정확성): 한 transcript 머리가 두 패널의 id를 지목하면
+  어느 쪽도 청구하지 않고 warn만 남긴다 — 잘못된 패널을 settle하느니 안 한다.
+  캐시하지 않아 이상 징후가 관측 가능하게 남는다.
+- **top-level 한정** (정확성): 레코드의 message 내용 안에 *언급된* id는
+  계보를 만들지 않는다 — main worker의 대화는 sub-agent들의 id를 일상적으로
+  인용한다.
+
+**알려진 한계**: 해석은 caucus가 그 패널의 conversation id를 한 번이라도
+학습했음을 전제한다(`--resume` spawn 또는 env 경로 신호 ≥1회 —
+`record_turn_completed`가 학습 지점). 첫 신호 전에 env가 끊긴 신생 패널은
+해석 불가로 남는다. 구버전 caucus 서버는 unbound 라인 파싱에 실패해 조용히
+버리고, 클라이언트는 그 소켓의 read timeout(2.5s)을 기다린 뒤 fail-open한다 —
+fallback 경로에서만 나는 지연이라 수용한다.
 
 ---
 

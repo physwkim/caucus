@@ -766,6 +766,7 @@ async fn event_loop(
                 crate::signal::SignalEvent::Turn(signal) => {
                     mux.handle_signal_with_reply(signal, reply)
                 }
+                crate::signal::SignalEvent::Unbound(sig) => mux.handle_unbound_signal(sig, reply),
                 crate::signal::SignalEvent::Note(note) => mux.handle_note(note),
             }
         }

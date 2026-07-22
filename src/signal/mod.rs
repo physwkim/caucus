@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::session::id::{PanelId, SessionId};
 
@@ -158,12 +159,15 @@ impl AgentNote {
     }
 }
 
-/// One parsed line off the signal socket: the historical turn signal, or a
-/// mid-turn note. Untagged so each client's wire line stays exactly what it
+/// One parsed line off the signal socket: the historical turn signal, a
+/// mid-turn note, or an unbound turn signal from a hook that lost its
+/// `CAUCUS_*` env. Untagged so each client's wire line stays exactly what it
 /// already posts — discrimination is by shape, which cannot collide: the two
 /// `kind` vocabularies are disjoint (`stop|tool_blocked|error` vs
-/// `progress|artifact|question`) and each requires a field the other lacks
-/// (`raw_hook_payload` vs `body`).
+/// `progress|artifact|question`), each of the historical shapes requires a
+/// field the others lack (`panel_id`+`raw_hook_payload` vs `body`), and an
+/// unbound line is the only one carrying the `unbound` marker while lacking
+/// `panel_id`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum SignalEvent {
@@ -171,6 +175,80 @@ pub enum SignalEvent {
     Turn(TurnSignal),
     /// A mid-turn note ([`AgentNote`]).
     Note(AgentNote),
+    /// A turn ended, but the posting hook does not know which panel it
+    /// belongs to ([`UnboundSignal`]).
+    Unbound(UnboundSignal),
+}
+
+/// A turn-completion signal posted **without** panel identity
+/// (`caucus signal post --discover`, `docs/design.md` §7.8).
+///
+/// The `CAUCUS_*` env the exact path relies on is inherited process state, and
+/// Claude Code can move a live conversation into a process that inherited
+/// nothing from the panel's PTY — the `claude daemon` re-hosts a session
+/// (`--fork-session`) on auto-update restarts and crash recovery. The hook then
+/// still fires, but knows neither the socket nor the panel. This shape carries
+/// what the hook payload itself knows — Claude's own conversation id, the
+/// transcript path, the cwd — and the *server* side resolves which panel (if
+/// any) it belongs to (`Multiplexer::handle_unbound_signal`).
+///
+/// The poster broadcasts it to every live caucus signal socket and always
+/// waits for one reply line per socket, so there is no `wants_reply` field:
+/// an unbound signal implies it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnboundSignal {
+    /// Wire discriminator for the untagged [`SignalEvent`]: its *presence*
+    /// (combined with the absent `panel_id`) is what routes a line here, so it
+    /// is a required field with no default.
+    pub unbound: bool,
+    pub ts: DateTime<Utc>,
+    pub kind: TurnKind,
+    /// Claude Code's own conversation id, lifted from the hook payload's
+    /// `session_id`. `None` when the payload carries none — such a signal can
+    /// never be resolved to a panel.
+    pub claude_session_id: Option<String>,
+    /// Conversation transcript path, lifted from the payload (as on
+    /// [`TurnSignal`]). Doubles as the lineage source when the conversation id
+    /// is one caucus has never seen (a fork's fresh id).
+    #[serde(default)]
+    pub transcript_path: Option<PathBuf>,
+    /// The agent process's working directory, lifted from the payload's
+    /// `cwd`. Used to cheaply bound which caucus session could own the signal
+    /// before any transcript is read.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    /// The agent's final assistant message, as on [`TurnSignal`].
+    pub last_message: Option<String>,
+    /// The raw Claude hook payload, retained verbatim — and re-used by
+    /// `record_turn_completed` to heal the manifest's conversation id.
+    pub raw_hook_payload: serde_json::Value,
+}
+
+impl UnboundSignal {
+    /// Construct an unbound signal stamped with `Utc::now()`, lifting the
+    /// conversation id, transcript path, and cwd out of `raw_hook_payload` so
+    /// a constructed signal can never disagree with its own payload.
+    pub fn now(kind: TurnKind, last_message: Option<String>, raw_hook_payload: Value) -> Self {
+        let claude_session_id = raw_hook_payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let transcript_path = extract_transcript_path(&raw_hook_payload);
+        let cwd = raw_hook_payload
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        Self {
+            unbound: true,
+            ts: Utc::now(),
+            kind,
+            claude_session_id,
+            transcript_path,
+            cwd,
+            last_message,
+            raw_hook_payload,
+        }
+    }
 }
 
 /// What the runtime tells a waiting main-panel Stop hook to do
@@ -325,6 +403,66 @@ mod tests {
             serde_json::from_str::<SignalReply>(r#"{"action":"reticulate"}"#).is_err(),
             "an unknown action must fail the parse (client fails open to allow)"
         );
+    }
+
+    /// `UnboundSignal::now` lifts identity out of the payload itself, so a
+    /// constructed signal can never disagree with the payload it carries.
+    #[test]
+    fn unbound_now_lifts_identity_from_payload() {
+        let sig = UnboundSignal::now(
+            TurnKind::Stop,
+            Some("done".into()),
+            serde_json::json!({
+                "session_id": "conv-1",
+                "transcript_path": "/logs/conv-1.jsonl",
+                "cwd": "/repo",
+            }),
+        );
+        assert!(sig.unbound);
+        assert_eq!(sig.claude_session_id.as_deref(), Some("conv-1"));
+        assert_eq!(
+            sig.transcript_path.as_deref(),
+            Some(std::path::Path::new("/logs/conv-1.jsonl"))
+        );
+        assert_eq!(sig.cwd.as_deref(), Some(std::path::Path::new("/repo")));
+    }
+
+    /// Untagged discrimination: an unbound line routes to `Unbound`, and the
+    /// two historical shapes still route where they always did — the `unbound`
+    /// marker is what separates a panel-less turn line from garbage.
+    #[test]
+    fn signal_event_discriminates_unbound_lines() {
+        let unbound = UnboundSignal::now(TurnKind::Stop, None, serde_json::json!({}));
+        let line = serde_json::to_string(&unbound).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SignalEvent>(&line).unwrap(),
+            SignalEvent::Unbound(_)
+        ));
+
+        let turn = TurnSignal::now(
+            SessionId::new(),
+            PanelId::new(),
+            TurnKind::Stop,
+            None,
+            serde_json::Value::Null,
+        );
+        let line = serde_json::to_string(&turn).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SignalEvent>(&line).unwrap(),
+            SignalEvent::Turn(_)
+        ));
+
+        let note = AgentNote::now(
+            SessionId::new(),
+            PanelId::new(),
+            NoteKind::Progress,
+            "half done".into(),
+        );
+        let line = serde_json::to_string(&note).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SignalEvent>(&line).unwrap(),
+            SignalEvent::Note(_)
+        ));
     }
 
     #[test]

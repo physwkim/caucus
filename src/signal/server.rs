@@ -143,8 +143,16 @@ async fn handle_connection(stream: UnixStream, tx: mpsc::UnboundedSender<SignalE
                 }
                 match ingest(&line) {
                     Ok(event) => {
-                        let wants_reply =
-                            matches!(&event, SignalEvent::Turn(sig) if sig.wants_reply);
+                        // An unbound signal always waits for a reply: its
+                        // poster broadcasts to every live caucus socket and
+                        // reads one line per socket to learn whether a deliver
+                        // directive rides back (`docs/design.md` §7.8). The
+                        // runtime answers a signal it does not own by dropping
+                        // the sender, which replies allow immediately.
+                        let wants_reply = matches!(
+                            &event,
+                            SignalEvent::Turn(sig) if sig.wants_reply
+                        ) || matches!(&event, SignalEvent::Unbound(_));
                         if !wants_reply {
                             if tx.send((event, None)).is_err() {
                                 // No consumer left; nothing more to do.
@@ -485,6 +493,35 @@ mod tests {
         assert!(
             matches!(serde_json::from_str(got.trim()), Ok(SignalReply::Allow)),
             "a dropped sender must answer allow, got: {got}"
+        );
+    }
+
+    /// An unbound line always carries a reply slot — the discovering poster
+    /// waits for one reply line per socket — and dropping it (a server that
+    /// resolves the signal to no panel, or to a non-main panel) answers allow.
+    #[tokio::test]
+    async fn server_gives_unbound_signals_a_reply_slot() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("caucus.sock");
+        let mut server = SignalServer::bind(&sock).unwrap();
+
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        let unbound =
+            crate::signal::UnboundSignal::now(TurnKind::Stop, None, serde_json::json!({}));
+        let line = serde_json::to_string(&unbound).unwrap();
+        stream.write_all(line.as_bytes()).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+
+        let (event, reply) = server.signals().recv().await.expect("signal received");
+        assert!(matches!(event, SignalEvent::Unbound(_)));
+        drop(reply.expect("an unbound signal always carries a reply slot"));
+
+        let got = read_reply_line(&mut stream).await;
+        assert!(
+            matches!(serde_json::from_str(got.trim()), Ok(SignalReply::Allow)),
+            "an unclaimed unbound signal must answer allow, got: {got}"
         );
     }
 
