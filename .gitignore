@@ -13,3 +13,6 @@ Cargo.lock.bak
 .idea/
 .vscode/
 *.swp
+
+# kodex (code-graph MCP) local cache
+kodex-out/
