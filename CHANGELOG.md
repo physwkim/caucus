@@ -7,6 +7,39 @@ versions.
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-07-22
+
+A panel's turn signals died silently whenever its agent process stopped
+inheriting the panel's environment — observed live when Claude Code's daemon
+re-hosted a running main worker's session (`--fork-session` on recovery): the
+panel wedged `Working` forever, settled rounds were never delivered to the
+main worker, and `caucus resume` revived the pre-fork conversation. This
+release closes that whole family: a hook that finds no `CAUCUS_*` env now
+recovers its identity from the hook payload itself.
+
+### Fixed
+
+- **An env-less Stop hook no longer silently drops the turn signal.** Panel
+  identity lived entirely in process-env inheritance, and Claude Code can move
+  a live conversation into a process that inherited nothing from the panel's
+  PTY. The hook script now falls back to `caucus signal post --discover`: it
+  broadcasts an *unbound* signal — built purely from the payload's
+  `session_id` / `transcript_path` / `cwd` — to every live caucus signal
+  socket, and each server resolves ownership itself
+  (`Multiplexer::handle_unbound_signal`): first by exact conversation-id
+  match against its manifests, then by fork lineage (the transcript head of a
+  forked conversation carries the records copied from its parent, which name
+  the parent's conversation id; a unique match claims the panel, ambiguity
+  claims nothing). A resolved signal rides the existing turn-completion path,
+  which also heals the manifest's stored conversation id — so the fork's first
+  signal restores exact-id matching and correct `caucus resume`, and a main
+  panel's due rounds ride the unbound reply exactly as on the env path. A cwd
+  gate and a not-ours cache keep ordinary (non-panel) Claude sessions on the
+  machine from costing a transcript read per turn. Known bound (design §7.8):
+  a panel whose env broke before caucus ever learned its conversation id
+  stays unresolvable. Run `caucus init --install-hook` to update the deployed
+  hook script — the fallback lives in the script body.
+
 ## [0.10.1] — 2026-07-21
 
 0.10.0 opened the middle of the main↔sub-agent channel; this release makes it
