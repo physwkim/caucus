@@ -8,7 +8,7 @@ use crate::signal::{
     AgentNote, CompactTrigger, LifecycleKind, LifecycleSignal, NoteKind, TurnSignal,
 };
 use std::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// How often [`Multiplexer::pump_all`] probes child-process liveness. PTYs are
 /// drained every tick, but `try_wait` (a `waitpid` syscall) per panel on the
@@ -265,6 +265,26 @@ impl Multiplexer {
         reply: Option<tokio::sync::oneshot::Sender<crate::signal::StopDirective>>,
     ) {
         use crate::signal::StopDirective;
+
+        // A Stop fired while the session still has backgrounded work in flight
+        // is a *pause*, not a completion — Claude Code says so on the payload
+        // (`TurnSignal::background_tasks_in_flight`), and the round-settle gate
+        // is panel state, so letting this through would latch the panel's
+        // contribution and deliver a still-working agent's "done" to main.
+        // Treat it like a mid-turn note: nothing transitions, nothing is
+        // recorded, the reply sender drops (allow) and the agent proceeds. The
+        // background task wakes the session and its real Stop lands later; the
+        // round's fallback deadline bounds the wait either way.
+        if let Some(in_flight) = signal.background_tasks_in_flight()
+            && in_flight > 0
+        {
+            debug!(
+                panel = %signal.panel_id,
+                in_flight,
+                "turn signal paused on background work; not a turn boundary"
+            );
+            return;
+        }
 
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == signal.panel_id) else {
             // An unknown panel's reply sender (if any) drops here — allow.
@@ -885,6 +905,93 @@ mod tests {
             kind,
             serde_json::Value::Null,
         ));
+    }
+
+    /// One case per boundary of the background-work predicate — the field is
+    /// absent, present-but-empty, or present with entries — because only the
+    /// last one may hold the turn open.
+    ///
+    /// A Stop arriving while the session still has backgrounded work in flight
+    /// is a pause: Claude Code pre-filters `background_tasks` to `running` /
+    /// `pending` **and** backgrounded work, so a non-empty array means the
+    /// agent is waiting to be woken, not finished. Settling there latches the
+    /// panel's contribution into the round and delivers a still-working
+    /// agent's "done" to main.
+    #[tokio::test]
+    async fn a_stop_waiting_on_background_work_is_not_a_turn_boundary() {
+        use crate::agent::derive_state::DerivedState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+        let session = mux.session.id;
+
+        let stop = |payload: serde_json::Value| {
+            TurnSignal::now(
+                session,
+                id,
+                crate::signal::TurnKind::Stop,
+                Some("done".into()),
+                payload,
+            )
+        };
+
+        // In flight: the turn stays open.
+        mux.handle_signal(stop(serde_json::json!({
+            "background_tasks": [
+                { "id": "t1", "type": "shell", "status": "running", "description": "cargo build" }
+            ]
+        })));
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "a paused Stop must not end the turn"
+        );
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(
+            on_disk.derived_state(),
+            DerivedState::Working,
+            "and must not settle the round"
+        );
+        assert!(
+            !on_disk
+                .lane_events()
+                .iter()
+                .any(|e| matches!(&e.kind, LaneEventKind::TurnCompleted)),
+            "no completion may reach the timeline: {:?}",
+            on_disk.lane_events()
+        );
+
+        // Present but empty: the documented "session is done" shape.
+        mux.handle_signal(stop(serde_json::json!({ "background_tasks": [] })));
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Idle,
+            "an empty array is Claude Code saying the session IS done"
+        );
+        mux.shutdown();
+    }
+
+    /// The absent-field boundary, kept separate because it is the compatibility
+    /// case: a Claude Code predating `background_tasks`, or a backend whose
+    /// payload has no counterpart (codex notify). Absence is not evidence of
+    /// in-flight work — the turn ends exactly as it always did.
+    #[tokio::test]
+    async fn a_stop_without_the_background_field_ends_the_turn() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+        let session = mux.session.id;
+
+        mux.handle_signal(TurnSignal::now(
+            session,
+            id,
+            crate::signal::TurnKind::Stop,
+            Some("done".into()),
+            serde_json::json!({ "session_id": "conv-1" }),
+        ));
+
+        assert_eq!(panel_state(&mux, id), PanelState::Idle);
+        mux.shutdown();
     }
 
     /// The wedge this whole change closes: a manual `/compact` — no Stop hook

@@ -757,6 +757,31 @@ hook) 또는 codex(notify)라 대상 집합이 비어 있고, 아무도 밟지 �
 turn-completion 단일 owner(`handle_signal` → `record_turn_completed`)를
 경유해야 하며 제2의 settle 경로는 만들지 않는다.
 
+### 7.7b Background work — "끝난 것"과 "깨워지길 기다리는 것"
+
+Stop hook이 발화했다고 해서 에이전트의 작업이 끝난 것은 아니다. Claude Code는
+`Stop` payload에 `background_tasks` 배열을 실어 이것을 명시한다 — 자기 설명으로
+*"lets hooks distinguish 'session is done' from 'session is paused waiting for
+background work to wake it'"*. 배열은 이미 **in-flight만** 담도록 필터링되어
+있다: status가 `running` 또는 `pending`이고 backgrounded인 작업만 들어간다.
+따라서 비어있지 않다 ⟺ 세션은 깨워지길 기다리는 중이다.
+
+caucus의 round settle 게이트는 **패널 상태**다(§9 `poll_round_panels`:
+`Working`/`Spawning`이 아니면 latch). 그러므로 이런 Stop을 그대로 통과시키면
+아직 일하는 worker의 기여가 latch되고 그 "done"이 main에 배달된다. 규칙:
+
+> **MUST NOT**: `background_tasks`가 비어있지 않은 turn signal은 턴 경계가
+> 아니다. `Multiplexer::handle_signal_with_reply`(turn-completion 단일 owner)가
+> 이를 mid-turn note처럼 취급한다 — 상태 전이 없음, 매니페스트 기록 없음, reply
+> sender는 drop(=allow)되어 에이전트는 그대로 진행한다.
+
+백그라운드 작업이 세션을 깨우면 진짜 Stop이 나중에 도착한다. 그 사이 round는
+자신의 `fallback_deadline`이 상한을 준다.
+
+필드가 **없는** 경우(그 필드 이전의 Claude Code, 또는 대응물이 없는 codex
+notify)는 "in-flight 없음"이 아니라 "알 수 없음"이며, 종전과 동일하게 턴을
+닫는다.
+
 ### 7.8 Unbound 신호 — env 없는 hook의 패널 해석
 
 **문제**: §7.1의 패널 신원은 전부 프로세스 env 상속(`CAUCUS_*`)에 실려 있는데,

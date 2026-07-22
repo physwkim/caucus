@@ -83,6 +83,30 @@ impl TurnSignal {
             raw_hook_payload,
         }
     }
+
+    /// Background work this session is still waiting on, as the hook payload
+    /// reports it — `Some(n)` with `n > 0` means the agent stopped *paused*,
+    /// not finished.
+    ///
+    /// Claude Code puts a `background_tasks` array on the `Stop` payload for
+    /// exactly this question, describing it as what "lets hooks distinguish
+    /// 'session is done' from 'session is paused waiting for background work
+    /// to wake it'". The array is pre-filtered to in-flight work only — a task
+    /// is included only when its status is `running` or `pending` *and* it is
+    /// backgrounded — so its emptiness is the whole predicate; caucus does not
+    /// re-interpret the entries.
+    ///
+    /// `None` means the payload does not carry the field at all: a Claude Code
+    /// old enough to predate it, or a non-Claude backend (codex's notify JSON
+    /// has no counterpart). Absence is not evidence of in-flight work, so it
+    /// reads as "nothing known", and the caller treats the turn as it always
+    /// did.
+    pub fn background_tasks_in_flight(&self) -> Option<usize> {
+        self.raw_hook_payload
+            .get("background_tasks")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+    }
 }
 
 /// What a mid-turn [`AgentNote`] carries. Serialised lowercase:
