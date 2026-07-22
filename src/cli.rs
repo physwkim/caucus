@@ -159,14 +159,32 @@ pub enum SignalCommand {
     /// script, not by a human.
     Post {
         /// Path to the caucus turn-signal socket.
-        #[arg(long)]
-        sock: PathBuf,
+        #[arg(
+            long,
+            required_unless_present = "discover",
+            conflicts_with = "discover"
+        )]
+        sock: Option<PathBuf>,
         /// Session id (`CAUCUS_SESSION_ID`).
-        #[arg(long)]
-        session: String,
+        #[arg(
+            long,
+            required_unless_present = "discover",
+            conflicts_with = "discover"
+        )]
+        session: Option<String>,
         /// Panel id (`CAUCUS_PANEL_ID`).
+        #[arg(
+            long,
+            required_unless_present = "discover",
+            conflicts_with = "discover"
+        )]
+        panel: Option<String>,
+        /// No `CAUCUS_*` env (the conversation was re-hosted outside the
+        /// panel's process tree): broadcast the payload as an unbound signal
+        /// to every live caucus signal socket instead; each server decides
+        /// from the payload whether it owns the conversation.
         #[arg(long)]
-        panel: String,
+        discover: bool,
         /// Signal kind.
         #[arg(long, value_enum, default_value = "stop")]
         kind: SignalKindArg,
@@ -421,8 +439,22 @@ fn run_signal(cmd: SignalCommand) -> Result<ExitCode> {
             sock,
             session,
             panel,
+            discover,
             kind,
         } => {
+            if discover {
+                // No env, no identity: broadcast the payload as an unbound
+                // signal; each live caucus server resolves ownership itself
+                // (`docs/design.md` §7.8).
+                crate::signal::post::run_discover(kind.into())?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            // clap enforces the three flags whenever --discover is absent.
+            let (sock, session, panel) = (
+                sock.expect("clap requires --sock without --discover"),
+                session.expect("clap requires --session without --discover"),
+                panel.expect("clap requires --panel without --discover"),
+            );
             let session_id = SessionId::from_str(&session)
                 .with_context(|| format!("invalid --session id '{session}'"))?;
             let panel_id = PanelId::from_str(&panel)
@@ -691,6 +723,46 @@ mod tests {
             cli.command,
             Some(Command::Signal(SignalCommand::Post { .. }))
         ));
+    }
+
+    /// `signal post --discover` parses with no identity flags at all, an
+    /// identity flag alongside `--discover` conflicts, and omitting both
+    /// `--discover` and the identity flags is an error — the clap wiring the
+    /// dispatch's `expect`s rely on.
+    #[test]
+    fn signal_post_discover_parses_and_excludes_identity_flags() {
+        let cli = Cli::try_parse_from(["caucus", "signal", "post", "--discover", "--kind", "stop"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Signal(SignalCommand::Post {
+                sock,
+                session,
+                panel,
+                discover,
+                ..
+            })) => {
+                assert!(discover);
+                assert!(sock.is_none() && session.is_none() && panel.is_none());
+            }
+            other => panic!("expected signal post, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "caucus",
+                "signal",
+                "post",
+                "--discover",
+                "--sock",
+                "/tmp/c.sock",
+            ])
+            .is_err(),
+            "--sock conflicts with --discover"
+        );
+        assert!(
+            Cli::try_parse_from(["caucus", "signal", "post", "--kind", "stop"]).is_err(),
+            "without --discover the identity flags are required"
+        );
     }
 
     /// `signal note` parses with explicit flags, and the kind defaults to
