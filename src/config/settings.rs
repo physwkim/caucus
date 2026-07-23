@@ -16,12 +16,12 @@ use thiserror::Error;
 
 use crate::render::LayoutMode;
 
-/// Default round safety-net deadline (seconds). A round panel is delivered when
-/// it settles, or force-delivered when this deadline passes — whichever comes
-/// first, per panel (`docs/design.md` §4).
+/// Default watch safety-net deadline (seconds). A watched worker is delivered
+/// when it settles, or force-delivered when this deadline passes — whichever
+/// comes first, per worker (`docs/design.md` §4).
 pub(crate) const ROUND_FALLBACK_DEFAULT_SECS: u64 = 600;
-/// Hard cap on the round fallback deadline — bounds a misconfigured
-/// `round_fallback_secs` setting and any per-`register_round` override alike.
+/// Hard cap on the watch fallback deadline — bounds a misconfigured
+/// `round_fallback_secs` setting and any per-`queue_tasks` override alike.
 pub(crate) const ROUND_FALLBACK_MAX_SECS: u64 = 3600;
 
 /// Hard ceiling on `scrollback_lines` — bounds per-panel scrollback memory

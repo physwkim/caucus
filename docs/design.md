@@ -13,9 +13,9 @@
 | 1 | 이름: `caucus`. 경로: `~/codes/caucus`. |
 | 2 | 실행 모델 = **caucus 자체 멀티플렉서**. 장기 실행 풀스크린 TUI 프로세스. agent는 caucus가 관리하는 **패널별 PTY**에서 도는 `claude` / `codex` CLI 프로세스. tmux / zellij 의존 없음 — 둘은 분석 레퍼런스(kodex 적재)일 뿐. |
 | 3 | VT 레이어 = **공개 크레이트** (경로 B-i): `vte`(escape-sequence 파서) + `portable-pty`(PTY 관리) + `ratatui`(패널 레이아웃·렌더). caucus가 직접 짜는 것은 grid `vte::Perform` 구현(~2-4k LOC) 하나뿐이며 zellij `zellij-server/src/panes/grid.rs`를 라인 단위 레퍼런스로 쓴다. zellij 크레이트 통째 vendor는 기각 — grid가 `output`/`tab`/`ui`/`route`/`screen`/`thread_bus` + `zellij-utils` ~140k LOC와 결합되어 깨끗한 추출 불가. |
-| 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버**의 14개 툴(`send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `register_round` / `round_status` / `cancel_round` / `read_menu` / `select_option`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. main 백엔드 CLI는 `--agent-cli claude\|codex`로 선택한다(기본 `claude`). codex를 고르면 caucus MCP 서버를 `-c mcp_servers.caucus.command/args`로 등록한다 — codex에는 `--mcp-config`가 없고 `[mcp_servers.<name>]` config로만 MCP를 받기 때문(claude는 `--mcp-config`를 쓴다). 어느 백엔드든 동일한 14개 툴로 sub-agent를 지휘한다. |
-| 5 | 턴 완료 신호 = Claude `Stop` hook이 **caucus 실행 프로세스의 소켓에 post**한다. 파일 sentinel(`*.sentinel.json`) + 폴링 watcher는 폐기. codex에는 Stop hook이 없으므로 codex 패널마다 `-c notify=[caucus, "signal", "codex-notify", …]`를 주입한다 — codex는 `agent-turn-complete`에 그 program을 호출하며 이벤트 JSON을 마지막 argv로 붙인다(실측 검증). `caucus signal codex-notify`가 그 JSON을 파싱해 claude Stop hook과 **동일한 `TurnSignal{Stop}`을 같은 소켓에 post**하므로, 두 백엔드가 단일 턴-완료 소유자(`handle_signal`)로 수렴한다. 이게 없으면 codex 패널은 영원히 `Working`으로 남아 라운드가 fallback 마감에만 발화한다. |
-| 6 | "라운드" 개념은 유지하되 **라이브화** — 파일 안건 broadcast + `response-*.md` 수집 대신, CEO가 패널에 라이브로 키를 입력하고 §5의 턴 완료 신호로 라운드 진행을 판정한다. |
+| 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버**의 14개 툴(`send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `queue_tasks` / `collect_workers` / `stop_watching` / `read_menu` / `select_option`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. main 백엔드 CLI는 `--agent-cli claude\|codex`로 선택한다(기본 `claude`). codex를 고르면 caucus MCP 서버를 `-c mcp_servers.caucus.command/args`로 등록한다 — codex에는 `--mcp-config`가 없고 `[mcp_servers.<name>]` config로만 MCP를 받기 때문(claude는 `--mcp-config`를 쓴다). 어느 백엔드든 동일한 14개 툴로 sub-agent를 지휘한다. |
+| 5 | 턴 완료 신호 = Claude `Stop` hook이 **caucus 실행 프로세스의 소켓에 post**한다. 파일 sentinel(`*.sentinel.json`) + 폴링 watcher는 폐기. codex에는 Stop hook이 없으므로 codex 패널마다 `-c notify=[caucus, "signal", "codex-notify", …]`를 주입한다 — codex는 `agent-turn-complete`에 그 program을 호출하며 이벤트 JSON을 마지막 argv로 붙인다(실측 검증). `caucus signal codex-notify`가 그 JSON을 파싱해 claude Stop hook과 **동일한 `TurnSignal{Stop}`을 같은 소켓에 post**하므로, 두 백엔드가 단일 턴-완료 소유자(`handle_signal`)로 수렴한다. 이게 없으면 codex 패널은 영원히 `Working`으로 남아 그 워커의 배달이 fallback 마감에만 발화한다. |
+| 6 | "라운드" 개념은 **폐지** — 파일 안건 broadcast + `response-*.md` 수집도, 여러 패널을 한 묶음으로 기다리는 배리어도 없다. main이 패널에 라이브로 키를 입력하면 caucus가 그 워커를 감시하고, §5의 턴 완료 신호로 **워커 하나씩** 결과를 되돌린다. |
 | 7 | Role 정의: `~/.caucus/roles.toml` (전역) + `<repo>/.caucus/roles.toml` (프로젝트 오버라이드, 우선). |
 | 8 | 실행 단계 worktree per role 유지. Agent manifest 위치: `<repo>/.caucus/sessions/<session_id>/agents/<agent_id>.{md,json}`. `.gitignore`에 `.caucus/` 추가 권장. |
 | 9 | agent 백엔드 CLI = **다중**: `claude` / `codex`. role의 `agent_cli` 필드로 선택. main은 `spawn_role` 시 모델과 백엔드 CLI를 **자체 판단으로** 지정한다 — caucus 코어는 메커니즘만 제공하고 어떤 모델/CLI를 쓸지는 main의 판단. |
@@ -87,7 +87,7 @@ sync). 사용자는 main worker 패널과 대화하고, main worker는 작업을
 | **Round** | main worker가 여러 패널에 같은 안건을 라이브로 던지고 각 패널의 turn signal로 완료를 판정하는 한 묶음. |
 | **Manifest** | 한 agent의 LaneEvent 타임라인 + derived_state + commit_provenance 영속화. |
 | **Lane** | 한 agent의 작업 흐름. claw-code 용어 차용. |
-| **MCP 서버** | caucus가 main worker에게 노출하는 제어 인터페이스 — 14개 툴(`send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `register_round` / `round_status` / `cancel_round` / `read_menu` / `select_option`). |
+| **MCP 서버** | caucus가 main worker에게 노출하는 제어 인터페이스 — 14개 툴(`send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `queue_tasks` / `collect_workers` / `stop_watching` / `read_menu` / `select_option`). |
 | **Session record** | 한 세션의 패널 roster 영속 스냅샷(`.caucus/sessions/<id>/session.json`). `caucus resume`가 이를 읽어 패널을 재생성. |
 
 ---
@@ -102,7 +102,7 @@ caucus는 장기 실행 프로세스다. Session = 그 프로세스가 들고 �
 
 ```
 [active] ─────────────────────────────► [closed]
-   패널 spawn/kill · 라운드 · 실행이          모든 패널 종료 또는
+   패널 spawn/kill · 워커 감시 · 실행이       모든 패널 종료 또는
    전부 이 안에서 일어남                      사용자가 caucus 종료
 ```
 
@@ -145,11 +145,12 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
 
 ---
 
-## 4. Round 프로토콜 (라이브)
+## 4. 워커 감시 프로토콜 (라이브)
 
-라운드 = main worker가 여러 sub-agent 패널에 sub-task를 라이브로 던지고, 각
-패널의 turn signal로 완료를 감지한 caucus가 결과를 모아 main에 push하는 한
-묶음. 파일 안건도, `response-*.md` 수집도 없다.
+main worker가 sub-agent 패널에 sub-task를 라이브로 던지면, caucus가 그 패널을
+**자동으로 감시**하고 turn signal로 완료를 감지해 그 워커 하나의 결과를 main에
+push한다. 라운드라는 묶음도, 파일 안건도, `response-*.md` 수집도 없다 — 워커
+단위다.
 
 ```
 1. main worker가 MCP 툴 호출 — 작업을 sub-task로 분해해 병렬 분배하고
@@ -157,12 +158,13 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
      broadcast(panels=[<worker-1>,<worker-2>,<worker-3>], text="<공통 안건>", enter=true)
      (패널별로 다른 sub-task면 send_keys를 패널마다)
    caucus가 프롬프트를 전달한 sub-panel은 **그 순간 자동으로 감시 대상**이 된다
-   (`arm_worker_watch`) — 등록 단계가 없다. 옵션이 필요할 때만 register_round를
-   덧붙인다:
-     register_round(panels=[...], backlog={<panel>:[후속 task,...]})  — 아래 **백로그**
-     register_round(panels=[...], selection_hints={prefer:[...],avoid:[...]}) — 아래 **선택 힌트**
-   register_round는 즉시 반환하고, 이미 armed된 암묵 watch를 흡수해(latch·캡처분을
-   그대로 넘겨받아) 대체한다. 어느 쪽이든 main worker는 턴을 끝내고 자유로워진다.
+   (`arm_worker_watch`) — 등록 단계가 없다. 워커 하나에 옵션이나 후속 task 큐가
+   필요할 때만 queue_tasks를 덧붙인다:
+     queue_tasks(panel=<worker>, tasks=[후속 task,...])                    — 아래 **백로그**
+     queue_tasks(panel=<worker>, selection_hints={prefer:[...],avoid:[...]}) — 아래 **선택 힌트**
+   queue_tasks는 이미 armed된 그 패널의 watch를 **설정**할 뿐 새로 만들지 않는다
+   (패널당 watch는 항상 하나 — I-10이 원장 없이 성립하는 이유). 어느 쪽이든 main
+   worker는 턴을 끝내고 자유로워진다.
 
 2. 각 패널의 sub-agent가 작업 → 턴 종료 시 Claude Stop hook이 caucus 소켓에
    turn signal을 post (panel_id, last_message 포함, §7).
@@ -198,19 +200,18 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
 프롬프트에 재무장한다. 이전에는 라운드가 배달과 함께 은퇴해서, main이 워커에게
 다음 task를 보내도 다시 `register_round` 하지 않으면 그 워커가 깜깜해졌다 —
 패널 단위 스트리밍을 넣은 뒤에도 라운드가 여전히 배리어처럼 느껴진 진짜 이유다.
+그 뒤 라운드 객체 자체를 걷어내고 watch를 **패널 하나짜리**로 만들었다: 배달 =
+watch 제거이므로 정확히-한-번이 원장 없이 구조적으로 성립한다.
 arm 지점은 `note_prompt_delivered`(유일한 Idle→Working 소유자)라 모든 분배
 경로(MCP `send_keys`, `broadcast`, 백로그 급여, 사람이 패널에 직접 입력)가
 정확히 한 번 arm 한다. main 패널 자신과 이미 감시 중인 패널은 arm 되지 않는다.
 
-**백로그(조기 완료 워커 연속)**: `register_round`에 패널별 후속 task 큐
-`backlog={<panel>:["task1","task2",...]}`를 함께 넘기면, 그 패널의 watch는 idle이
-될
-때마다 큐의 다음 task를 워커에게 먹여(`feed_round_backlog`) 다시 Working으로
-돌린다 —
-일찍 끝난 워커가 barrier에서 놀지 않고 자기 백로그를 계속 처리한다. 패널이
-watch에 대해 settle하는 건 idle이고 *큐까지 빈* 순간뿐이다(백로그 없는 패널은
-첫 idle에 settle — 기존 단일 task 동작). 등록 시 감시하지 않는 패널의 큐와 빈
-큐는 버려진다. watch의 단일 owner `poll_worker_watch`가 매 tick 이 판정을 하며,
+**백로그(조기 완료 워커 연속)**: `queue_tasks(panel=<worker>, tasks=[...])`로 그
+워커의 후속 task 큐를 채우면, watch는 패널이 idle이 될 때마다 큐의 다음 task를
+워커에게 먹여(`feed_round_backlog`) 다시 Working으로 돌린다 — 일찍 끝난 워커가
+놀지 않고 자기 백로그를 계속 처리한다. 패널이 watch에 대해 settle하는 건 idle이고
+*큐까지 빈* 순간뿐이다(백로그 없는 패널은 첫 idle에 settle — 기존 단일 task 동작).
+watch의 단일 owner `poll_worker_watch`가 매 tick 이 판정을 하며,
 큐의 task를 보내기 직전(패널이 아직 idle일 때)과 패널이 최종 settle하는 순간에
 막 끝난 턴의 출력을 `read_mode`로 캡처해 latch한다(**Invariant I-9**) — 전달
 보고서가 마지막 턴만이 아니라 모든 task 산출물을 담도록, 그리고 배달 시점에
@@ -218,57 +219,53 @@ watch에 대해 settle하는 건 idle이고 *큐까지 빈* 순간뿐이다(백�
 주입된다(단일 task면 헤더 없이 기존과 동일; fallback 시 미완 패널은 끝낸 task들
 + "still working" 마커).
 
-**라운드 식별(status·cancel)**: `register_round`는 라운드 id(ULID)를 반환한다.
-그 id로 main worker는 라운드를 들여다보거나(`round_status` — 패널별
-working/draining backlog/settled/delivered/gone 상태, 남은 백로그 수, fallback
-데드라인까지 남은 초) 취소할 수 있다(`cancel_round` — caucus가 그 라운드 감시·전달을
-멈춘다; 패널은 건드리지 않아 진행 중 작업은 계속 돌고 백로그 급여만 끊긴다). 정상
-흐름은 워커에게 일을 주고 턴을 닫은 뒤 caucus의 완료 push를 기다리는 것이다 — 그게
-더 싸고, 감시는 자동이라 register 없이도 성립한다. 배달은 **패널 단위 스트리밍**이다:
-배리어 없이 각 패널이 정착하는 즉시 그
-패널의 결과만 따로 도착하므로, main은 최후미 워커를 기다리지 않고 라운드당 패널
-수만큼 interaction 한다(**Invariant I-10**). 다만 push는 main 패널이 idle일 때만
+**pull 경로와 감시 중단**: 정상 흐름은 워커에게 일을 주고 턴을 닫은 뒤 caucus의
+완료 push를 기다리는 것이다 — 그게 더 싸고, 감시는 자동이라 등록 없이도 성립한다.
+배달은 **워커 단위 스트리밍**이다: 배리어 없이 각 워커가 정착하는 즉시 그 워커의
+결과만 따로 도착하므로, main은 최후미 워커를 기다리지 않고 워커 수만큼
+interaction 한다(**Invariant I-10**). 다만 push는 main 패널이 idle일 때만
 착지하므로(즉 main이 턴을 끝낸 뒤에만), 턴 안에서 기다리는 main은 영원히 못 받는다.
-그래서 `round_status`는 **pull 경로**를 겸한다: 준비된 패널을 모두 스트림으로 반환하고,
-남은 패널이 있으면 상태 텍스트와 함께 라운드를 pending에 유지한다. 라운드 id는
-**라이브 전용**: 재시작을 못 넘기므로(sub-agent
-프로세스가 새로 뜬다 — `ingest_resumed_rounds`) 영속화하지 않고, caucus가 더 이상
-감시하지 않는 id(전달 완료/취소됨)는 에러다.
+그래서 `collect_workers`가 **pull 경로**로 존재한다: 인자 없이 준비된 워커를 모두
+스트림으로 반환하고(그 watch들을 소진), 남은 워커는 상태 텍스트(working / draining
+backlog / settled, 남은 백로그 수, fallback 데드라인까지 남은 초)로 보고하며 계속
+감시한다. 감시를 끊고 싶으면 `stop_watching(panel=<worker>)` — caucus가 그 워커의
+백로그 급여와 결과 전달을 멈춘다; 패널은 건드리지 않아 진행 중 작업은 계속 돌고,
+다음 프롬프트가 watch를 다시 무장시킨다.
 
 **턴 계약(완료 신호의 전제)**: caucus가 패널의 완료를 아는 유일한 신호는 백엔드의
-turn-completion hook — 즉 **턴의 끝**이다. I-9에 따라 라운드는 바로 그 순간 패널의
+turn-completion hook — 즉 **턴의 끝**이다. I-9에 따라 watch는 바로 그 순간 패널의
 결과를 latch하므로, 턴을 끝내는 것은 "작업이 끝났다"는 주장이다. 이 신호는 에이전트의
 턴 규율만큼만 정확하다: 긴 명령을 백그라운드 셸에 던지고 턴을 끝내거나, 그 셸을 턴을
 넘겨 가며 폴링하는 wait-loop를 걸면, 작업이 도는 중에 "완료"를 신고하는 셈이고 caucus는
 반쯤 된 결과를 캡처한다. 나중에 셸이 끝나면 CLI가 caucus가 준 적 없는 턴을 스스로
-시작하는데, 그 출력은 어느 라운드에도 속하지 않는다. 그래서 모든 sub-agent의 시스템
+시작하는데, 그 출력은 어느 배달에도 속하지 않는다. 그래서 모든 sub-agent의 시스템
 프롬프트에 턴 계약(`role::prompt::SUBAGENT_TURN_CONTRACT` — 작업이 도는 채로 턴을 끝내지
 말 것, 긴 명령은 foreground에서 기다릴 것, 한 턴에 못 끝내면 조용히 남겨 두지 말고 텍스트로
 보고하고 턴을 끝낼 것)이 덧붙는다(`agent::spawn::build_command`). main worker는 예외 —
-main은 라운드에 settle하는 쪽이 아니라 *등록하는* 쪽이다.
+main은 settle하는 쪽이 아니라 결과를 *받는* 쪽이다.
 
-**선택 프롬프트 엣지**: 라운드 패널의 sub-agent가 턴을 끝내지 않고 대화형
-선택 메뉴에서 멈추면 turn signal이 안 와 라운드가 settle하지
+**선택 프롬프트 엣지**: 감시 중인 sub-agent가 턴을 끝내지 않고 대화형
+선택 메뉴에서 멈추면 turn signal이 안 와 그 워커가 settle하지
 못한다 — 그대로 두면 fallback_secs까지 멈춰 있다. 모델 주도 메뉴는 spawn에서
 원천 차단한다: 모든 sub-agent는 claude 백엔드에 `--disallowedTools
 AskUserQuestion`이 걸리고, 양 백엔드의 시스템 프롬프트에 질문 계약
 (`role::prompt::SUBAGENT_QUESTION_CONTRACT` — 질문을 텍스트로 쓰고 턴을 끝내면
-main이 라운드 보고서에서 읽고 답한다)이 덧붙는다(`agent::spawn::build_command`).
+main이 배달 보고서에서 읽고 답한다)이 덧붙는다(`agent::spawn::build_command`).
 그래도 메뉴가 뜨는 경우 — plan-mode 승인, codex 승인 프롬프트 등 하네스가
 그리는 chooser — 를 위해 감지 경로가 fallback으로 남는다: caucus는 매 tick
-`poll_round_blocked_panels`로 라운드 패널이 멈춘 프롬프트를 감지해 main worker에
-push 알림을 보낸다(round 완료 push와 같은 idle·quiet 게이트, tick당 1건). 감지
+`poll_round_blocked_panels`로 감시 중인 패널이 멈춘 프롬프트를 감지해 main worker에
+push 알림을 보낸다(완료 push와 같은 idle·quiet 게이트, tick당 1건). 감지
 대상은 선택 메뉴(`scan_menu`)뿐 아니라 tool/shell이 띄운 raw `[y/n]`
 프롬프트(`scan_yes_no_prompt`)까지다 — 둘 다 Stop hook이 안 떠 패널이 `Working`에
-묶이고 라운드가 settle하지 못하는 같은 부류이기 때문이다. main은 메뉴면
+묶이고 워커가 settle하지 못하는 같은 부류이기 때문이다. main은 메뉴면
 `read_menu`/`select_option`으로, `[y/n]`이면 `send_keys`로 답해 패널을 풀어 준다 —
 §8.3.
 
 **선택 힌트(방향 메뉴 자동 응답)**: 위 감지·push는 main을 깨운다 —
 `dangerously-skip-permissions` 환경에선 permission 프롬프트가 사라져 남는 방해의
-대부분이 이 "방향 선택" 메뉴다. `register_round`에
-`selection_hints={prefer:[...], avoid:[...]}`(라운드당 단일 키워드 세트)를 함께
-넘기면, 라운드 패널에 선택 메뉴가 떴을 때 caucus가 옵션 라벨을 키워드로 매칭해
+대부분이 이 "방향 선택" 메뉴다. `queue_tasks`에
+`selection_hints={prefer:[...], avoid:[...]}`(워커당 단일 키워드 세트)를 함께
+넘기면, 그 패널에 선택 메뉴가 떴을 때 caucus가 옵션 라벨을 키워드로 매칭해
 (ASCII 대소문자 무시 부분일치; prefer 1개 이상 포함 — 빈 prefer는 전체 통과 — AND
 avoid 0개) **유일하게 하나로 좁혀질 때만** 그 옵션을 `select_option`으로 직접 골라
 준다 — push 알림 없이(`resolve_selection`). 0개·복수 매치, 또는 raw `[y/n]`
@@ -281,11 +278,11 @@ avoid 0개) **유일하게 하나로 좁혀질 때만** 그 옵션을 `select_op
 main이 어떤 방향을 택했는지 본다 — 추가 방해 없이(`push_auto_answers`).
 
 라이브 모델에는 `max_rounds` 같은 강제 캡이 없다 — main worker가 자기 토큰
-예산(§0 #12)에 맞춰 라운드를 몇 번 돌지 스스로 판단한다.
+예산(§0 #12)에 맞춰 워커를 몇 번 돌릴지 스스로 판단한다.
 
-**순차 의존**이 필요하면 main worker가 선행 패널에 `send_keys` → 그 패널만으로
-`register_round` → 완료 push를 받은 뒤 후행 패널에 `send_keys` 하면 된다. caucus
-코어에 별도 `--lead` 메커니즘은 필요 없다.
+**순차 의존**이 필요하면 main worker가 선행 패널에 `send_keys` → 완료 push를 받은
+뒤 후행 패널에 `send_keys` 하면 된다. 감시는 자동이므로 등록도, `--lead` 메커니즘도
+필요 없다.
 
 ---
 
@@ -393,11 +390,11 @@ role의 system prompt가 되어 template을 대체한다(없으면 spec의 templ
 `agent_cli` 미지정 시 `claude`. `model` 미지정 시 해당 CLI 기본. main worker는
 `spawn_role` 호출 시 role의 기본 `model`·`agent_cli`를 무시하고 자체 판단으로
 덮어쓸 수 있다(§0 #9) — 예: 같은 `worker` role을 교차검증엔 `codex`로, 또는
-어려운 라운드는 `opus`로.
+어려운 작업은 `opus`로.
 
 `<repo>/.caucus/roles.toml`로 프로젝트별 오버라이드 가능. 같은 role 이름이면 프로젝트가 우선.
 
-**튜너블 — `settings.toml`의 `[settings]` 테이블.** 스크롤백 깊이·라운드 fallback
+**튜너블 — `settings.toml`의 `[settings]` 테이블.** 스크롤백 깊이·감시 fallback
 기본값·캡처 한도 등 예전엔 하드코딩이던 값을 `~/.caucus/settings.toml`(전역) +
 `<repo>/.caucus/settings.toml`(프로젝트, 우선)로 노출한다. roles.toml과 동일한
 레이어링: 키별로 미설정이면 아래 레이어로, 끝내 컴파일된 기본값(예전 상수)으로
@@ -406,7 +403,7 @@ role의 system prompt가 되어 template을 대체한다(없으면 spec의 templ
 ```toml
 [settings]
 scrollback_lines        = 10000  # 패널별 스크롤백 깊이(행)
-round_fallback_secs     = 600    # 라운드 안전망 데드라인 기본값([1, 3600]로 clamp)
+round_fallback_secs     = 600    # 워커 감시 안전망 데드라인 기본값([1, 3600]로 clamp)
 capture_turn_limit      = 64     # 패널당 메모리에 유지하는 닫힌 턴 수
 capture_open_turn_bytes = 4194304 # 열린(진행 중) 턴 하나의 메모리 바이트 상한
 mouse                   = false  # 마우스 캡처: 기본 off면 터미널 네이티브 드래그-선택/복사 유지,
@@ -708,7 +705,7 @@ compose 중, 런타임 종료)가 코드 0줄로 allow에 정합한다. allow를
 3. compose hold가 없다 (`main_compose_quiet` — "사람이 작성 중이면 자동 전달
    없음" 규칙은 경로 불문이다; hold면 allow, 배달은 grace 해소 후 push가 전달).
 4. 배달할 것이 있다: 준비된 워커 (`take_ready_round_deliveries` —
-   `round_status` pull을 watch 큐 전체로 일반화한 것: latch 갱신(I-9) → push와
+   `collect_workers` pull을 hook reply로 일반화한 것: latch 갱신(I-9) → push와
    동일한 `watch_ready` 판정 → 준비된 워커마다 `render_watch_delivery` 후 그
    watch 제거(I-10))
    **또는** 대기 중인 question notice (`take_question_notice_texts` — §7.5 큐
@@ -798,7 +795,7 @@ caucus의 watch settle 게이트는 **패널 상태**다(§9 `poll_worker_watch`
 > 이를 mid-turn note처럼 취급한다 — 상태 전이 없음, 매니페스트 기록 없음, reply
 > sender는 drop(=allow)되어 에이전트는 그대로 진행한다.
 
-백그라운드 작업이 세션을 깨우면 진짜 Stop이 나중에 도착한다. 그 사이 round는
+백그라운드 작업이 세션을 깨우면 진짜 Stop이 나중에 도착한다. 그 사이 watch는
 자신의 `fallback_deadline`이 상한을 준다.
 
 필드가 **없는** 경우(그 필드 이전의 Claude Code, 또는 대응물이 없는 codex
@@ -1088,15 +1085,15 @@ caucus가 감지할 수단조차 없는 상태를 보고할 수 있다고 광고
 `Continue? [y/N]` 류 yes/no 프롬프트(`term::prompt_scan::scan_yes_no_prompt` —
 화면 맨 아래 non-empty 줄 끝의 y/n 토큰에만 보수적으로 매치, 본문 중간의 `[y/n]`
 언급은 무시). `awaiting_selection`과 동일 경로로 `list_panels` 시 `working`/`idle`
-위에 덮어씌우고(`overlay_blocked_state`), 라운드 소속이면 `poll_round_blocked_panels`로
+위에 덮어씌우고(`overlay_blocked_state`), 감시 중이면 `poll_round_blocked_panels`로
 매 tick 감지해 main worker에 push한다. 자동 yes는 안 한다(위험) — main이 `send_keys`로 답한다.
 
 `awaiting_selection`: 패널 grid에 AskUserQuestion 류 선택 메뉴(`❯` 커서 + footer
 `Enter to select · ↑/↓ to navigate`)가 보일 때 — agent가 turn을 끝내지 않고 선택을
 기다리며 멈춘 상태라 turn signal이 안 온다. `term::prompt_scan`이 메뉴를 파싱하고,
 `list_panels` 읽는 시점에 `working`/`idle` 위로 덮어씌운다(더 강한 상태는 안 가린다).
-이 패널이 라운드 소속이면 caucus가 매 tick `poll_round_blocked_panels`로 감지해
-main worker에 push 알림을 보낸다(라운드는 settle 못 하므로 — §4). main은 `read_menu`로
+이 패널이 감시 중이면 caucus가 매 tick `poll_round_blocked_panels`로 감지해
+main worker에 push 알림을 보낸다(워커가 settle 못 하므로 — §4). main은 `read_menu`로
 선택지를 읽고 `select_option(panel, n)`으로 답한다(caucus가 화살표 n칸 + Enter 주입);
 자유 입력은 메뉴의 'type something' 옵션을 고른 뒤 `send_keys`. `list_panels` 표면 문자열은
 이 §8.3 이름 그대로 `awaiting_selection` — 모든 state 문자열은 `DerivedState::as_str`(serde
@@ -1142,7 +1139,7 @@ manifest만 보는 순수 함수 — turn signal 수신 시 재계산한다. gri
    유지한다(zellij/tmux와 동일).
 2. **턴 단위 출력 로그.** caucus는 패널 PTY 출력을 턴 경계로 구간해 append-only로
    캡처한다 — `PromptDelivered`부터 `TurnCompleted`까지가 한 턴.
-   `.caucus/sessions/<id>/panels/<panel_id>.log`(메모리 링 + 디스크 spill). 라운드가
+   `.caucus/sessions/<id>/panels/<panel_id>.log`(메모리 링 + 디스크 spill). 배달이
    settle하면 caucus가 이 캡처에서 각 패널 결과를 모아 main 패널에 push하고(§4),
    main worker는 더 필요한 디테일을 `read_panel`로 자기 페이스로 읽는다 — 경주 없음.
    hook-reply 배달(§7.6)은 main의 캡처 턴을 턴 경계에서 다시 열어(`begin_turn`)
@@ -1195,7 +1192,7 @@ caucus/
     ├── input/               (키 라우팅: `Ctrl-A` 프리픽스 키맵, focus·임의 키 → PTY, §9.2)
     ├── panel/
     │   └── lifecycle.rs     (Panel 구조체 + spawn/kill + 레이아웃 reflow, transition 단일 owner)
-    ├── mcp/                 (main worker용 MCP 서버: 14개 툴 — send_keys/send_key/broadcast/ctrl_c/read_panel/spawn_role/kill_panel/restart_panel/list_panels/register_round/round_status/cancel_round/read_menu/select_option)
+    ├── mcp/                 (main worker용 MCP 서버: 14개 툴 — send_keys/send_key/broadcast/ctrl_c/read_panel/spawn_role/kill_panel/restart_panel/list_panels/queue_tasks/collect_workers/stop_watching/read_menu/select_option)
     ├── signal/              (turn-signal 소켓 서버 + `caucus signal post` 클라이언트)
     ├── agent/
     │   ├── spawn.rs         (RoleSpec → 새 패널 + 새 AgentManifest)
@@ -1211,7 +1208,7 @@ caucus/
 
 **폐기된 모듈**: `tmux/`(자체 멀티플렉서로 대체), `sentinel/`(turn-signal 소켓으로
 대체), `status/poller`(라이브 turn signal로 불필요), `notify/`(소켓이 곧 알림),
-`round/`·`consensus/`·`execute/lifecycle`(라운드·병합·실행은 이제 caucus 모듈
+`round/`·`consensus/`·`execute/lifecycle`(감시·병합·실행은 이제 caucus 모듈
 lifecycle이 아니라 main worker가 MCP 툴로 라이브 수행). worktree 생성/정리만 모듈로 남는다.
 
 ### 9.1 모듈 owner 매트릭스 (불변식 enforcement)
@@ -1237,7 +1234,7 @@ repo·느린 디스크에서 수백 ms가 걸려 단일 스레드 이벤트 루�
 그래서 라이브 제어 소켓 경로는 이를 워커 스레드로 미룬다: 요청 빌드(저렴)만 루프에서
 하고, `git worktree add`는 스레드에서 돌리며, MCP 툴 콜의 응답은 워크트리가 준비되고
 패널이 뜬 *나중* tick에 `poll_pending_spawns`가 보낸다(`session::runtime::spawn_async`).
-`register_round`와 함께 제어 프로토콜의 둘뿐인 **지연 응답(deferred-reply)** 경로다 —
+제어 프로토콜의 유일한 **지연 응답(deferred-reply)** 경로다 —
 나머지 요청은 같은 tick에 동기 응답한다. 동시 같은-role spawn이 같은 브랜치명을 만들지
 않도록, 시퀀스 번호는 완료된 spawn(`role_counts`)에 in-flight spawn(`pending_spawns`)을
 더해 센다.
@@ -1548,7 +1545,7 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
   워커 한 명의 assemble + spill(`rounds/<panel>-<n>.md`) + summary의 유일한 지점이다.
 - **MUST**: 세 배달 경로 모두 배달과 watch 제거를 같은 지점에서 한다 — **push** =
   `poll_worker_watches()` (메인 패널이 idle일 때 준비된 워커를 tick당 하나씩 타이핑해 넣고, 확인된
-  전송에서만 watch를 버림), **pull** = `round_status()` (준비된 워커를 모두 스트림으로 반환하며
+  전송에서만 watch를 버림), **pull** = `collect_workers()` (준비된 워커를 모두 스트림으로 반환하며
   그 watch들을 버리고, 남은 워커는 상태 텍스트와 함께 계속 감시), **hook-reply** =
   `take_ready_round_deliveries()` (§7.6 — main의 Stop hook 응답에 준비된 워커들의 배달을 실음;
   push와 같은 `watch_ready` 판정을 쓴다).
@@ -1569,12 +1566,12 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 - caucus 멀티플렉서 TUI — 풀스크린, 패널별 PTY(`portable-pty`), `vte` 기반 grid, `ratatui` 렌더
 - 패널 동적 spawn / kill + 레이아웃 reflow
 - 입력 라우팅 — focus 패널 전환, `Enter` / `Ctrl-C` / 임의 키, 완전 양방향 인터랙티브 입력(로그인·OAuth 흐름 포함)
-- main worker용 MCP 서버 — 14개 툴: `send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `register_round` / `round_status` / `cancel_round` / `read_menu` / `select_option`
+- main worker용 MCP 서버 — 14개 툴: `send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `queue_tasks` / `collect_workers` / `stop_watching` / `read_menu` / `select_option`
 - 레이아웃 제어 — `Ctrl-A` 프리픽스 키맵, 4종 레이아웃 모드 순환, transcript 오버레이 + 스크롤백 페이저(§9.2)
 - 세션 영속화 & resume — `session.json` 레코드, `caucus sessions` / `caucus resume`(§3.1)
 - agent 백엔드 다중화 — `claude` / `codex`, role별 `model`·`agent_cli` override, main worker 자체 판단 지정
 - Claude `Stop` hook → caucus 소켓 (턴 완료 라이브 신호)
-- 라이브화된 라운드 진행
+- 라이브화된 워커 감시 진행
 - 병렬 sub-agent worktree per agent
 - AgentManifest (이벤트 소싱, 유지)
 - 기본 role 8종 (`main` 오케스트레이터 + 기본 sub-agent `worker` + specialist 힌트 6종: architect / backend / reviewer / qa / scribe / serious-reviewer)

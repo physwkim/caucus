@@ -4,7 +4,7 @@ A pattern the **main worker** runs to drive a continuous loop over a given
 part of the codebase: one reviewer finds issues and records them in a doc, a
 fixer addresses them, a second reviewer regression-checks the fix, repeat
 until clean. caucus supplies the mechanism (`spawn_role`, `send_keys`,
-`register_round`, `read_panel`); this playbook is the *policy* main follows —
+`queue_tasks`, `read_panel`); this playbook is the *policy* main follows —
 it is not a built-in caucus feature.
 
 The loop's state lives in a **durable review doc**, not in any agent's
@@ -67,25 +67,26 @@ Rules for the doc:
 
 ## The loop (one pass)
 
-main runs this as its turn-by-turn orchestration. Each step ends main's turn
-with `register_round`; caucus wakes main when the panel settles.
+main runs this as its turn-by-turn orchestration. Each step just ends main's
+turn: caucus watches every panel it prompts and wakes main when that worker
+settles — there is nothing to register.
 
 1. **Review.** `send_keys(reviewer, "Review src/foo.rs. Write findings to
    $CAUCUS_SESSION_DIR/reviews/foo.md using the review-doc schema. Set status:
-   CLEAN if you find nothing.")`, then `register_round([reviewer])`, end turn.
+   CLEAN if you find nothing.")`, then end turn.
 2. On wake: `read_panel(reviewer, last_message)`, then read the doc. If the
    first scan is already `status: CLEAN`, do not report done yet — go to step 4
    to get a gate run, so even "nothing to fix" is confirmed by a green test run
    (the part may have a failure the scan did not name). Otherwise continue.
 3. **Fix.** `send_keys(backend, "Fix the open findings (fixed: no) in
    $CAUCUS_SESSION_DIR/reviews/foo.md. Mark each fixed: yes(it<n>). Do not
-   delete findings.")`, `register_round([backend])`, end turn.
+   delete findings.")`, end turn.
 4. **Regression.** On wake: `send_keys(serious-reviewer, "Regression-check the
    fix against $CAUCUS_SESSION_DIR/reviews/foo.md. Run the gate command, paste
    its real exit code and summary into the gate: block with at: set to this
    iteration. Set regression: pass|fail per finding; add any new finding with a
    fresh id. Set status: CLEAN only if the gate exited 0 and every finding is
-   fixed + pass.")`, `register_round([serious-reviewer])`, end turn.
+   fixed + pass.")`, end turn.
 5. On wake: read the doc. Apply the **termination rule** below. If not done,
    go to step 3 with the still-open findings (or step 1 to re-scan).
 
@@ -160,6 +161,6 @@ current code, do not defend prior findings".
 A single part's review→fix→regression chain is genuinely serial; do not try to
 parallelize it. To use more agents at once, run the loop over **independent
 parts** and stagger them: while the fixer works part X, a reviewer scans part
-Y. Independent review docs map cleanly onto `register_round`'s parallel
-fan-in. You can also fan in several reviewers on one part for breadth, then
+Y. Independent review docs map cleanly onto caucus's per-worker streaming
+delivery — each part reaches main on its own, never in lockstep. You can also fan in several reviewers on one part for breadth, then
 fold their findings into the one doc.

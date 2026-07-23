@@ -4,7 +4,7 @@
 //! The main worker (a Claude Code agent in one panel) drives every sub-agent
 //! panel through fourteen MCP tools: `send_keys`, `send_key`, `broadcast`,
 //! `ctrl_c`, `read_panel`, `spawn_role`, `kill_panel`, `restart_panel`,
-//! `list_panels`, `register_round`, `round_status`, `cancel_round`,
+//! `list_panels`, `queue_tasks`, `collect_workers`, `stop_watching`,
 //! `read_menu`, `select_option`.
 //!
 //! ## Architecture
@@ -120,7 +120,7 @@ pub enum McpError {
 /// the real backing store. The control-socket server routes each
 /// [`protocol::ControlRequest`] into one of these methods.
 pub trait McpToolSurface {
-    /// Type keys into a panel's PTY (the live round mechanism, `docs/design.md`
+    /// Type keys into a panel's PTY (the live task-delivery mechanism, `docs/design.md`
     /// §4). When `enter` is set, a trailing newline is appended.
     fn send_keys(&mut self, panel: PanelId, text: &str, enter: bool) -> Result<(), McpError>;
 
@@ -231,11 +231,11 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
         ToolDef {
             name: "broadcast",
             description: "Send the same text to several panels at once — a \
-                          round's fan-out. Equivalent to one send_keys per \
-                          panel. Follow with register_round on the same \
-                          panels, then end your turn; caucus delivers each \
-                          panel's result to you as that panel finishes, one \
-                          at a time — you do not wait for the slowest.",
+                          fan-out. Equivalent to one send_keys per panel. \
+                          caucus watches every panel it prompts, so just end \
+                          your turn afterwards: it delivers each worker's \
+                          result to you as that worker finishes, one at a \
+                          time — you do not wait for the slowest.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -397,72 +397,53 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
             input_schema: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
-            name: "register_round",
-            description: "Register a round: caucus watches the named panels and \
-                          delivers each panel's result to you the moment THAT \
-                          panel settles (finishes its turn — leaves the \
-                          'working' state), or when fallback_secs elapses. \
-                          There is NO barrier: you are re-prompted once per \
-                          panel, so a 3-panel round wakes you 3 separate times \
-                          and the first delivery arrives while the other panels \
-                          are still working. Act on each delivery as it lands — \
-                          send that worker its next task, or spawn/kill as you \
-                          see fit — do not sit waiting for the rest of the \
-                          round; the remaining panels will reach you on their \
-                          own. Each delivery names the panel it came from. \
-                          Returns immediately — after calling this, end your \
-                          turn; caucus re-prompts you per panel. \
-                          That push can only land while you are idle, so it \
-                          arrives only AFTER your turn ends: do NOT sleep-poll \
-                          list_panels waiting for it inside this turn — it will \
-                          never come and you will wait forever. If you must stay \
-                          in your turn, poll round_status instead: it hands you \
-                          every panel that is ready right now, and keeps the \
-                          round alive for the ones that are not. \
-                          Use `backlog` to keep \
-                          a panel busy across several tasks: caucus feeds it the \
-                          next queued task each time it goes idle, so an early \
-                          finisher never sits idle, and the panel settles only \
-                          once its queue drains. Use `selection_hints` to let \
-                          caucus answer a panel's recurring direction/approach \
-                          menus for you (by option-label keywords) without \
-                          interrupting your turn — it only auto-answers when the \
-                          keywords single out exactly one option, and escalates \
-                          anything ambiguous to you as usual.",
+            name: "queue_tasks",
+            description: "Queue follow-up tasks on ONE worker, and tune how \
+                          caucus watches it. You do NOT need this to hear back \
+                          from a worker: caucus watches every panel it hands a \
+                          prompt to, and re-prompts you with that worker's \
+                          result the moment it finishes — send_keys is enough. \
+                          Use this when you already know the worker's next few \
+                          tasks and do not want it idling between them: caucus \
+                          feeds it the next queued task each time it goes idle, \
+                          and delivers its result to you only once the queue \
+                          drains. Pass no `tasks` to set the options alone. \
+                          Each delivery names the panel it came from; workers \
+                          reach you one at a time, as each finishes — never \
+                          batched, never in lockstep, so act on each one as it \
+                          lands instead of waiting for the others. That push can \
+                          only land while you are idle, so it arrives only AFTER \
+                          your turn ends: do NOT sleep-poll list_panels waiting \
+                          for it inside this turn — it will never come and you \
+                          will wait forever. If you must stay in your turn, call \
+                          collect_workers instead.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "panels": {
+                    "panel": panel_prop(),
+                    "tasks": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Panel ids (ULIDs) in the round."
+                        "description": "Ordered follow-up task prompts, appended \
+                                        to this worker's queue. caucus feeds the \
+                                        next one whenever the panel goes idle; \
+                                        the worker's result reaches you only once \
+                                        the queue is empty. Omit to set the \
+                                        options below without queueing work."
                     },
                     "read_mode": {
                         "type": "string",
                         "enum": ["last_message", "since_last_turn"],
-                        "description": "What to read from each panel for the \
+                        "description": "What to read from this worker for the \
                                         delivered report (default last_message)."
                     },
                     "fallback_secs": {
                         "type": "integer",
-                        "description": "Safety-net seconds: a panel that never \
+                        "description": "Safety-net seconds: a worker that never \
                                         settles is delivered anyway after this, \
                                         marked still-working with whatever it \
-                                        produced (default 600, max 3600)."
-                    },
-                    "backlog": {
-                        "type": "object",
-                        "additionalProperties": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        },
-                        "description": "Optional per-panel follow-up queue, keyed \
-                                        by panel id (ULID) → ordered list of task \
-                                        prompts. caucus feeds a panel its next \
-                                        task whenever it goes idle; the panel \
-                                        settles only once its queue is empty. A \
-                                        panel omitted here settles on its first \
-                                        idle (one task)."
+                                        produced (default 600, max 3600). Set \
+                                        from now."
                     },
                     "selection_hints": {
                         "type": "object",
@@ -477,7 +458,7 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                             }
                         },
                         "description": "Optional keyword hints so caucus answers \
-                                        this round's selection menus for you \
+                                        this worker's selection menus for you \
                                         instead of interrupting your turn. An \
                                         option qualifies when its label contains \
                                         (case-insensitively) a `prefer` keyword \
@@ -486,64 +467,47 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                                         when exactly one option qualifies; zero or \
                                         several matches are escalated to you as a \
                                         normal blocked-panel notice. Each \
-                                        auto-answer is noted in that panel's \
+                                        auto-answer is noted in that worker's \
                                         delivered report. Omit to escalate every menu."
                     }
                 },
-                "required": ["panels"]
+                "required": ["panel"]
             }),
         },
         ToolDef {
-            name: "round_status",
-            description: "Collect whichever panels of a round are ready RIGHT \
-                          NOW, by the round id register_round returned. This \
-                          returns the report of every panel that has settled (or \
-                          passed the fallback deadline) and has not been \
-                          delivered yet — there is no barrier, so it hands you \
-                          the early finishers while the slow panels are still \
-                          working. Panels still running are reported as a status \
-                          line instead (working / draining backlog / settled / \
-                          delivered / gone, remaining backlog count, seconds left \
-                          on the fallback deadline), and the round stays alive for \
-                          them: call again later to collect them. This is the \
-                          in-turn path — a main worker that must stay inside its \
-                          turn can still collect results, instead of waiting on a \
-                          caucus push that can only land after the turn ends. \
-                          Ending your turn and letting caucus re-prompt you per \
-                          panel is still the cheaper path. Each panel is delivered \
-                          exactly once across both paths; a round id whose panels \
-                          are all delivered, or that was cancelled or never \
-                          registered, is an error.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "round": {
-                        "type": "string",
-                        "description": "Round id (a ULID) from register_round."
-                    }
-                },
-                "required": ["round"]
-            }),
+            name: "collect_workers",
+            description: "Collect every worker that is ready RIGHT NOW. Takes no \
+                          arguments — caucus watches every panel you have handed \
+                          work to, so this covers all of them. Returns the report \
+                          of each worker that has finished (or passed its \
+                          fallback deadline) and has not reached you yet; the \
+                          ones still running are reported as a status line \
+                          instead (working / draining backlog / settled, backlog \
+                          remaining, seconds left on the fallback deadline) and \
+                          stay watched, so call again later to collect them. \
+                          There is no barrier — this hands you the early \
+                          finishers while the slow workers are still going. This \
+                          is the in-turn path: a main worker that must stay \
+                          inside its turn can still collect results, instead of \
+                          waiting on a caucus push that can only land after the \
+                          turn ends. Ending your turn and letting caucus \
+                          re-prompt you per worker is still the cheaper path. \
+                          Each worker reaches you exactly once across both paths.",
+            input_schema: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
-            name: "cancel_round",
-            description: "Cancel a round you registered, by the round id \
-                          register_round returned, so caucus stops watching it \
-                          and never delivers its remaining panels (panels already \
-                          delivered stay delivered). The panels are left \
-                          exactly as they are — work already running keeps \
-                          running and any backlog simply stops being fed; this \
-                          does not kill or interrupt them. A round id caucus is \
-                          no longer watching is an error.",
+            name: "stop_watching",
+            description: "Stop watching one worker: caucus drops any queued \
+                          backlog for it and will not deliver its result to you. \
+                          The panel is left exactly as it is — work already \
+                          running keeps running; this does not kill or interrupt \
+                          it. Not permanent: the next prompt you send that panel \
+                          starts watching it again. A panel caucus is not \
+                          watching is an error.",
             input_schema: json!({
                 "type": "object",
-                "properties": {
-                    "round": {
-                        "type": "string",
-                        "description": "Round id (a ULID) from register_round."
-                    }
-                },
-                "required": ["round"]
+                "properties": { "panel": panel_prop() },
+                "required": ["panel"]
             }),
         },
         ToolDef {
@@ -611,9 +575,9 @@ mod tests {
                 "kill_panel",
                 "restart_panel",
                 "list_panels",
-                "register_round",
-                "round_status",
-                "cancel_round",
+                "queue_tasks",
+                "collect_workers",
+                "stop_watching",
                 "read_menu",
                 "select_option",
             ]

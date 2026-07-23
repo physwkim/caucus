@@ -9,6 +9,29 @@ versions.
 
 ### Changed
 
+- **BREAKING (MCP surface): `register_round` / `round_status` / `cancel_round`
+  are replaced by `queue_tasks` / `collect_workers` / `stop_watching`.** The
+  runtime had already stopped working in rounds, but the tools main reads still
+  taught the concept — and main follows its tool names, which is what made it
+  keep waiting for a round that no longer existed. The new surface is per
+  worker, with no round id anywhere:
+  - `queue_tasks(panel, tasks?, read_mode?, fallback_secs?, selection_hints?)`
+    — queue follow-up tasks on one worker and tune its watch. It configures the
+    watch caucus already armed rather than creating one, so a panel still has
+    exactly one watch. It is no longer needed to *hear back* from a worker at
+    all: `send_keys` is enough.
+  - `collect_workers()` — the in-turn pull, now argument-free: it hands back
+    every ready worker and reports the ones still running. This is the livelock
+    escape hatch (the push can only land while main is idle), so it survives the
+    redesign; it no longer needs an id, and covers workers main never registered.
+  - `stop_watching(panel)` — stop being woken by one worker and stop feeding it
+    backlog. The panel is untouched, and the next prompt re-arms the watch.
+
+  `RoundId` is deleted along with the `round` handle on the watch, so a watch is
+  now identified by its panel and nothing else. `broadcast` no longer tells main
+  to follow up with a registration, and `docs/review-loop.md` drops the
+  `register_round` step from every pass.
+
 - **The round object is gone: caucus now watches one worker at a time.** The
   `PendingRound` (a panel list plus four per-panel maps plus a `delivered`
   ledger) collapsed into a per-panel `WorkerWatch` — one panel, one settle

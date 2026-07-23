@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::role::spec::AgentCli;
-use crate::session::id::{PanelId, RoundId};
+use crate::session::id::PanelId;
 
 use super::ReadPanelMode;
 use super::jsonrpc::{ToolHandler, ToolOutcome};
@@ -115,16 +115,6 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
             .ok_or_else(|| "missing string argument `panel`".to_string())?;
         raw.parse::<PanelId>()
             .map_err(|e| format!("invalid panel id `{raw}`: {e}"))
-    }
-
-    /// Pull a required round-id argument and parse it.
-    fn round(args: &Value) -> std::result::Result<RoundId, String> {
-        let raw = args
-            .get("round")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "missing string argument `round`".to_string())?;
-        raw.parse::<RoundId>()
-            .map_err(|e| format!("invalid round id `{raw}`: {e}"))
     }
 
     match name {
@@ -247,21 +237,22 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
             panel: panel(args)?,
         }),
         "list_panels" => Ok(ControlRequest::ListPanels),
-        "register_round" => {
-            let raw = args
-                .get("panels")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "missing array argument `panels`".to_string())?;
-            let panels = raw
-                .iter()
-                .map(|v| {
-                    let s = v
-                        .as_str()
-                        .ok_or_else(|| "`panels` entries must be panel-id strings".to_string())?;
-                    s.parse::<PanelId>()
-                        .map_err(|e| format!("invalid panel id `{s}`: {e}"))
-                })
-                .collect::<std::result::Result<Vec<PanelId>, String>>()?;
+        "queue_tasks" => {
+            let tasks = match args.get("tasks") {
+                Some(v) => {
+                    let arr = v
+                        .as_array()
+                        .ok_or_else(|| "`tasks` must be an array of task strings".to_string())?;
+                    arr.iter()
+                        .map(|t| {
+                            t.as_str()
+                                .map(str::to_string)
+                                .ok_or_else(|| "`tasks` entries must be strings".to_string())
+                        })
+                        .collect::<std::result::Result<Vec<String>, String>>()?
+                }
+                None => Vec::new(),
+            };
             let read_mode = match args.get("read_mode").and_then(Value::as_str) {
                 Some(raw) => Some(serde_json::from_value(json!(raw)).map_err(|_| {
                     format!(
@@ -278,34 +269,6 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                     })?),
                     None => None,
                 };
-            let backlog = match args.get("backlog") {
-                Some(v) => {
-                    let obj = v.as_object().ok_or_else(|| {
-                        "`backlog` must be an object mapping panel id → array of task strings"
-                            .to_string()
-                    })?;
-                    let mut map = std::collections::HashMap::with_capacity(obj.len());
-                    for (key, tasks) in obj {
-                        let id = key
-                            .parse::<PanelId>()
-                            .map_err(|e| format!("invalid backlog panel id `{key}`: {e}"))?;
-                        let arr = tasks.as_array().ok_or_else(|| {
-                            format!("`backlog[{key}]` must be an array of task strings")
-                        })?;
-                        let tasks = arr
-                            .iter()
-                            .map(|t| {
-                                t.as_str().map(str::to_string).ok_or_else(|| {
-                                    format!("`backlog[{key}]` entries must be strings")
-                                })
-                            })
-                            .collect::<std::result::Result<Vec<String>, String>>()?;
-                        map.insert(id, tasks);
-                    }
-                    Some(map)
-                }
-                None => None,
-            };
             let selection_hints = match args.get("selection_hints") {
                 Some(v) => Some(
                     serde_json::from_value::<super::protocol::SelectionPolicy>(v.clone()).map_err(
@@ -319,19 +282,17 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                 ),
                 None => None,
             };
-            Ok(ControlRequest::RegisterRound {
-                panels,
+            Ok(ControlRequest::QueueTasks {
+                panel: panel(args)?,
+                tasks,
                 read_mode,
                 fallback_secs,
-                backlog,
                 selection_hints,
             })
         }
-        "round_status" => Ok(ControlRequest::RoundStatus {
-            round: round(args)?,
-        }),
-        "cancel_round" => Ok(ControlRequest::CancelRound {
-            round: round(args)?,
+        "collect_workers" => Ok(ControlRequest::CollectWorkers),
+        "stop_watching" => Ok(ControlRequest::StopWatching {
+            panel: panel(args)?,
         }),
         "read_menu" => Ok(ControlRequest::ReadMenu {
             panel: panel(args)?,
@@ -361,14 +322,6 @@ fn render_response(resp: ControlResponse) -> ToolOutcome {
             Ok(text) => ToolOutcome::Ok(text),
             Err(err) => ToolOutcome::Err(format!("serialise panel list: {err}")),
         },
-        ControlResponse::RoundRegistered { round_id, panels } => {
-            // The round id is the handle the main worker polls/cancels with, so
-            // it leads the result; the panel snapshot follows as JSON.
-            match serde_json::to_string_pretty(&panels) {
-                Ok(text) => ToolOutcome::Ok(format!("round {round_id}\n{text}")),
-                Err(err) => ToolOutcome::Err(format!("serialise panel list: {err}")),
-            }
-        }
         ControlResponse::Error { message } => ToolOutcome::Err(message),
     }
 }
@@ -612,13 +565,13 @@ mod tests {
     }
 
     #[test]
-    fn build_register_round_request() {
+    fn build_queue_tasks_request() {
         let a = PanelId::new();
-        let b = PanelId::new();
         let req = build_request(
-            "register_round",
+            "queue_tasks",
             &json!({
-                "panels": [a.to_string(), b.to_string()],
+                "panel": a.to_string(),
+                "tasks": ["CA-SR-2", "CA-SR-3"],
                 "read_mode": "since_last_turn",
                 "fallback_secs": 90
             }),
@@ -626,23 +579,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             req,
-            ControlRequest::RegisterRound {
-                panels: vec![a, b],
+            ControlRequest::QueueTasks {
+                panel: a,
+                tasks: vec!["CA-SR-2".to_string(), "CA-SR-3".to_string()],
                 read_mode: Some(super::super::ReadPanelMode::SinceLastTurn),
                 fallback_secs: Some(90),
-                backlog: None,
                 selection_hints: None,
             }
         );
     }
 
     #[test]
-    fn build_register_round_parses_selection_hints() {
+    fn build_queue_tasks_parses_selection_hints() {
         let a = PanelId::new();
         let req = build_request(
-            "register_round",
+            "queue_tasks",
             &json!({
-                "panels": [a.to_string()],
+                "panel": a.to_string(),
                 "selection_hints": {
                     "prefer": ["structural", "at source"],
                     "avoid": ["broad refactor"]
@@ -652,11 +605,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             req,
-            ControlRequest::RegisterRound {
-                panels: vec![a],
+            ControlRequest::QueueTasks {
+                panel: a,
+                tasks: vec![],
                 read_mode: None,
                 fallback_secs: None,
-                backlog: None,
                 selection_hints: Some(super::super::protocol::SelectionPolicy {
                     prefer: vec!["structural".to_string(), "at source".to_string()],
                     avoid: vec!["broad refactor".to_string()],
@@ -666,131 +619,84 @@ mod tests {
     }
 
     #[test]
-    fn build_register_round_rejects_bad_selection_hints() {
+    fn build_queue_tasks_rejects_bad_selection_hints() {
         let a = PanelId::new();
         // `prefer` must be an array of strings, not a bare string.
         let err = build_request(
-            "register_round",
-            &json!({"panels": [a.to_string()], "selection_hints": {"prefer": "structural"}}),
+            "queue_tasks",
+            &json!({"panel": a.to_string(), "selection_hints": {"prefer": "structural"}}),
         )
         .unwrap_err();
         assert!(err.contains("selection_hints"), "got: {err}");
     }
 
+    /// `tasks` and every option default when omitted: a bare panel id is a valid
+    /// call (it just re-arms/keeps the watch with caucus's defaults).
     #[test]
-    fn build_register_round_defaults_optional_fields() {
+    fn build_queue_tasks_defaults_optional_fields() {
         let a = PanelId::new();
-        let req = build_request("register_round", &json!({"panels": [a.to_string()]})).unwrap();
+        let req = build_request("queue_tasks", &json!({"panel": a.to_string()})).unwrap();
         assert_eq!(
             req,
-            ControlRequest::RegisterRound {
-                panels: vec![a],
+            ControlRequest::QueueTasks {
+                panel: a,
+                tasks: vec![],
                 read_mode: None,
                 fallback_secs: None,
-                backlog: None,
                 selection_hints: None,
             }
         );
     }
 
     #[test]
-    fn build_register_round_parses_backlog() {
-        let a = PanelId::new();
-        let req = build_request(
-            "register_round",
-            &json!({
-                "panels": [a.to_string()],
-                "backlog": { a.to_string(): ["CA-SR-2", "CA-SR-3"] }
-            }),
-        )
-        .unwrap();
-        assert_eq!(
-            req,
-            ControlRequest::RegisterRound {
-                panels: vec![a],
-                read_mode: None,
-                fallback_secs: None,
-                backlog: Some(std::collections::HashMap::from([(
-                    a,
-                    vec!["CA-SR-2".to_string(), "CA-SR-3".to_string()],
-                )])),
-                selection_hints: None,
-            }
+    fn build_queue_tasks_requires_a_panel() {
+        let err = build_request("queue_tasks", &json!({})).unwrap_err();
+        assert!(
+            err.contains("missing string argument `panel`"),
+            "got: {err}"
         );
     }
 
     #[test]
-    fn build_register_round_requires_panels_array() {
-        let err = build_request("register_round", &json!({})).unwrap_err();
-        assert!(err.contains("missing array argument `panels`"));
-    }
-
-    #[test]
-    fn build_register_round_rejects_bad_panel_id() {
-        let err = build_request("register_round", &json!({"panels": ["not-a-ulid"]})).unwrap_err();
-        assert!(err.contains("invalid panel id"));
-    }
-
-    #[test]
-    fn build_register_round_rejects_bad_backlog() {
+    fn build_queue_tasks_rejects_non_string_tasks() {
         let a = PanelId::new();
-        // A backlog whose entries are not string arrays is rejected.
         let err = build_request(
-            "register_round",
-            &json!({"panels": [a.to_string()], "backlog": {a.to_string(): "not-an-array"}}),
+            "queue_tasks",
+            &json!({"panel": a.to_string(), "tasks": "not-an-array"}),
         )
         .unwrap_err();
         assert!(
-            err.contains("must be an array of task strings"),
+            err.contains("`tasks` must be an array of task strings"),
             "got: {err}"
         );
-        // A backlog keyed by a non-ulid is rejected.
         let err = build_request(
-            "register_round",
-            &json!({"panels": [a.to_string()], "backlog": {"not-a-ulid": ["x"]}}),
+            "queue_tasks",
+            &json!({"panel": a.to_string(), "tasks": [1, 2]}),
         )
         .unwrap_err();
-        assert!(err.contains("invalid backlog panel id"), "got: {err}");
+        assert!(
+            err.contains("`tasks` entries must be strings"),
+            "got: {err}"
+        );
     }
 
     #[test]
-    fn build_round_status_request() {
-        let r = RoundId::new();
-        let req = build_request("round_status", &json!({"round": r.to_string()})).unwrap();
-        assert_eq!(req, ControlRequest::RoundStatus { round: r });
+    fn build_collect_workers_takes_no_args() {
+        let req = build_request("collect_workers", &json!({})).unwrap();
+        assert_eq!(req, ControlRequest::CollectWorkers);
     }
 
     #[test]
-    fn build_cancel_round_request() {
-        let r = RoundId::new();
-        let req = build_request("cancel_round", &json!({"round": r.to_string()})).unwrap();
-        assert_eq!(req, ControlRequest::CancelRound { round: r });
+    fn build_stop_watching_request() {
+        let a = PanelId::new();
+        let req = build_request("stop_watching", &json!({"panel": a.to_string()})).unwrap();
+        assert_eq!(req, ControlRequest::StopWatching { panel: a });
     }
 
     #[test]
-    fn build_round_status_requires_round() {
-        let err = build_request("round_status", &json!({})).unwrap_err();
-        assert!(err.contains("missing string argument `round`"));
-    }
-
-    #[test]
-    fn build_round_status_rejects_bad_round_id() {
-        let err = build_request("cancel_round", &json!({"round": "not-a-ulid"})).unwrap_err();
-        assert!(err.contains("invalid round id"));
-    }
-
-    #[test]
-    fn render_round_registered_response_leads_with_round_id() {
-        let r = RoundId::new();
-        match render_response(ControlResponse::RoundRegistered {
-            round_id: r,
-            panels: vec![],
-        }) {
-            ToolOutcome::Ok(text) => {
-                assert!(text.starts_with(&format!("round {r}")), "got: {text}");
-            }
-            ToolOutcome::Err(_) => panic!("expected Ok"),
-        }
+    fn build_stop_watching_rejects_bad_panel_id() {
+        let err = build_request("stop_watching", &json!({"panel": "not-a-ulid"})).unwrap_err();
+        assert!(err.contains("invalid panel id"), "got: {err}");
     }
 
     #[test]

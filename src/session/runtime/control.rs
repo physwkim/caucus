@@ -72,15 +72,15 @@ impl Multiplexer {
             ControlRequest::ListPanels => ControlResponse::Panels {
                 panels: self.list_panels(),
             },
-            ControlRequest::RegisterRound {
-                panels,
+            ControlRequest::QueueTasks {
+                panel,
+                tasks,
                 read_mode,
                 fallback_secs,
-                backlog,
                 selection_hints,
-            } => self.register_round(panels, read_mode, fallback_secs, backlog, selection_hints),
-            ControlRequest::RoundStatus { round } => self.round_status(round),
-            ControlRequest::CancelRound { round } => self.cancel_round(round),
+            } => self.queue_tasks(panel, tasks, read_mode, fallback_secs, selection_hints),
+            ControlRequest::CollectWorkers => self.collect_workers(),
+            ControlRequest::StopWatching { panel } => self.stop_watching(panel),
             ControlRequest::ReadMenu { panel } => match self.read_menu(panel) {
                 Ok(text) => ControlResponse::Panel { text },
                 Err(err) => ControlResponse::error(err),

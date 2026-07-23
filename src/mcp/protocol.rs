@@ -12,19 +12,17 @@
 //! [`crate::mcp::control_server`] event-loop integration trivial — one queued
 //! op, one reply.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::role::spec::AgentCli;
-use crate::session::id::{PanelId, RoundId};
+use crate::session::id::PanelId;
 
 use super::{PanelSummary, ReadPanelMode};
 
-/// Main-supplied hints for auto-answering a round panel's selection menu
-/// without disturbing the main worker. Attached to a round via
-/// [`ControlRequest::RegisterRound`] and consulted by
-/// [`crate::session::Multiplexer::poll_round_blocked_panels`] when a round
+/// Main-supplied hints for auto-answering a watched worker's selection menu
+/// without disturbing the main worker. Attached to a worker's watch via
+/// [`ControlRequest::QueueTasks`] and consulted by
+/// [`crate::session::Multiplexer::poll_round_blocked_panels`] when a watched
 /// panel stops mid-turn on an `AskUserQuestion`-style chooser.
 ///
 /// An option *qualifies* when its label contains (ASCII-case-insensitively) at
@@ -109,74 +107,65 @@ pub enum ControlRequest {
     RestartPanel { panel: PanelId },
     /// List every live panel with role + derived state.
     ListPanels,
-    /// Register a *round*: caucus watches `panels` and, once they have all
-    /// settled (left `Working`/`Spawning`) — or `fallback_secs` elapses —
-    /// assembles their results and injects them into the main worker's panel
-    /// as a fresh turn. Answered *immediately* with a snapshot of the named
-    /// panels: the round runs in the background, so the main worker ends its
-    /// turn and is re-prompted by caucus on completion (no blocking, no
-    /// timeout-shaped wait). `read_mode` selects what each panel's result is
-    /// read as, captured the instant each panel settles (default
-    /// `last_message`).
+    /// Queue follow-up tasks on one worker, and set how caucus watches it.
     ///
-    /// That injection is the *push* half of delivery and can only land while
-    /// the main panel is idle. A main worker that instead waits inside its turn
-    /// collects the round with [`ControlRequest::RoundStatus`] — the *pull*
-    /// half (see it for why both exist).
+    /// caucus already watches every panel it hands a prompt to, so this is not
+    /// how a worker becomes visible — it is how the main worker keeps one busy
+    /// across several tasks and tunes the watch. `tasks` is an ordered queue:
+    /// the panel is fed its next task each time it goes idle (so an early
+    /// finisher keeps working instead of reporting a half-done assignment), and
+    /// it settles — i.e. its result is delivered — only once it is idle *and*
+    /// the queue is empty. An empty `tasks` sets the options alone.
     ///
-    /// `backlog` is an optional per-panel task queue keyed by panel id: while
-    /// the round runs, a panel that goes idle with tasks still queued is fed
-    /// its next task (so an early finisher keeps working instead of reporting a
-    /// half-done assignment); the panel settles for the round only once it is
-    /// idle *and* its queue is empty. A panel absent from `backlog` settles on
-    /// its first idle, the original one-task-per-panel behaviour.
-    /// (`crate::session::runtime::Multiplexer::poll_worker_watches`).
-    RegisterRound {
-        panels: Vec<PanelId>,
+    /// `read_mode` selects what the worker's result is read as, captured the
+    /// instant it settles (default `last_message`). `fallback_secs` is the
+    /// safety net: a worker that never settles is delivered anyway after it,
+    /// marked still-working. `selection_hints` lets caucus auto-answer that
+    /// worker's selection menus without interrupting the main worker — see
+    /// [`SelectionPolicy`]; absent (default `None`) escalates every menu.
+    ///
+    /// Answered with a [`ControlResponse::Panel`] describing the resulting
+    /// watch, or an error if the panel is unknown or is the main panel.
+    QueueTasks {
+        panel: PanelId,
+        #[serde(default)]
+        tasks: Vec<String>,
         #[serde(default)]
         read_mode: Option<ReadPanelMode>,
         #[serde(default)]
         fallback_secs: Option<u64>,
         #[serde(default)]
-        backlog: Option<HashMap<PanelId, Vec<String>>>,
-        /// Optional keyword hints letting caucus auto-answer this round's
-        /// selection menus without interrupting the main worker — see
-        /// [`SelectionPolicy`]. Absent (default `None`) keeps the prior
-        /// behaviour: every selection menu is escalated to the main worker.
-        #[serde(default)]
         selection_hints: Option<SelectionPolicy>,
     },
-    /// Check a registered round by its id — and *collect* whichever panels are
-    /// ready right now. This is the **pull** half of round delivery.
+    /// Collect every watched worker that is ready right now. This is the
+    /// **pull** half of delivery.
     ///
-    /// Every panel that has settled (or passed the fallback deadline) and is not
-    /// yet delivered is answered with its own report and marked delivered; the
-    /// panels still running are reported as a status line instead — settled vs
-    /// working vs delivered, the per-panel backlog remaining, and the seconds
-    /// left until the fallback deadline — and the round stays pending for them.
-    /// There is no barrier: the early finishers come back while the slow panels
-    /// are still working. Each panel's status is read from the round's settle
-    /// latch, so a panel that finished and was later re-woken still reads
-    /// `settled`. The round is removed once every panel has been delivered.
+    /// Each worker that has settled (or passed its fallback deadline) is
+    /// answered with its own report and its watch is spent; the workers still
+    /// running are reported as a status line instead — settled vs working vs
+    /// draining backlog, the backlog remaining, and the seconds left until the
+    /// fallback deadline — and stay watched. There is no barrier: the early
+    /// finishers come back while the slow ones are still working. Each status is
+    /// read from the settle latch, so a worker that finished and was later
+    /// re-woken still reads `settled`.
     ///
     /// Both halves exist because the push
     /// (`crate::session::runtime::Multiplexer::poll_worker_watches`) types the
     /// report into the main panel and so can only fire while that panel is
     /// *idle* — i.e. after the main worker ends its turn. A main worker that
     /// stays in its turn polling is `Working` throughout, so the push can never
-    /// land: main waits for the round and the round waits for main to stop
+    /// land: main waits for its workers and the workers wait for main to stop
     /// waiting. The fallback deadline does not break that livelock — it makes a
-    /// panel *due*, not *deliverable*. Handing the report to the poller does.
+    /// worker *due*, not *deliverable*. Handing the report to the poller does.
     ///
-    /// Either way answered with a [`ControlResponse::Panel`] (text). Each panel
-    /// is delivered exactly once across both halves: an id whose panels are all
-    /// collected, cancelled, or never registered is an error.
-    RoundStatus { round: RoundId },
-    /// Cancel a registered round by its id: caucus stops watching it and never
-    /// delivers its remaining panels (panels already delivered stay delivered).
-    /// The sub-agent panels keep running — only the round watch is dropped.
-    /// Answered with [`ControlResponse::Ok`], or an error if the id is unknown.
-    CancelRound { round: RoundId },
+    /// Answered with a [`ControlResponse::Panel`] (text). A worker is delivered
+    /// exactly once across both halves, because delivering it removes its watch.
+    CollectWorkers,
+    /// Stop watching one worker: caucus drops its watch, stops feeding it any
+    /// queued backlog, and never delivers its result. The panel keeps running —
+    /// only the watch is dropped, and a later prompt re-arms one.
+    /// Answered with [`ControlResponse::Ok`], or an error if it is not watched.
+    StopWatching { panel: PanelId },
     /// Read the interactive selection menu shown in a panel (if any) as
     /// readable text. Answered with a [`ControlResponse::Panel`].
     ReadMenu { panel: PanelId },
@@ -198,13 +187,6 @@ pub enum ControlResponse {
     Spawned { panel: PanelId },
     /// `list_panels` succeeded.
     Panels { panels: Vec<PanelSummary> },
-    /// `register_round` succeeded; `round_id` identifies the round for later
-    /// `round_status` / `cancel_round`, and `panels` is the same snapshot
-    /// `list_panels` returns for the round's panels.
-    RoundRegistered {
-        round_id: RoundId,
-        panels: Vec<PanelSummary>,
-    },
     /// The tool call failed; `message` is human-readable.
     Error { message: String },
 }
@@ -343,42 +325,36 @@ mod tests {
     }
 
     #[test]
-    fn register_round_round_trips() {
-        let panel = PanelId::new();
-        let req = ControlRequest::RegisterRound {
-            panels: vec![panel, PanelId::new()],
+    fn queue_tasks_round_trips() {
+        let req = ControlRequest::QueueTasks {
+            panel: PanelId::new(),
+            tasks: vec!["CA-SR-2".to_string(), "CA-SR-3".to_string()],
             read_mode: Some(ReadPanelMode::SinceLastTurn),
             fallback_secs: Some(120),
-            backlog: Some(HashMap::from([(
-                panel,
-                vec!["CA-SR-2".to_string(), "CA-SR-3".to_string()],
-            )])),
             selection_hints: Some(SelectionPolicy {
                 prefer: vec!["structural".to_string()],
                 avoid: vec!["broad refactor".to_string()],
             }),
         };
         let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"op\":\"register_round\""));
+        assert!(line.contains("\"op\":\"queue_tasks\""));
         let back: ControlRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(req, back);
     }
 
     #[test]
-    fn register_round_optional_fields_default_to_none() {
-        // `read_mode`, `fallback_secs`, `backlog`, and `selection_hints` default
-        // to None when omitted.
+    fn queue_tasks_optional_fields_default() {
+        // `tasks` defaults to empty and the three option fields to None.
         let id = PanelId::new();
         let req: ControlRequest =
-            serde_json::from_str(&format!(r#"{{"op":"register_round","panels":["{id}"]}}"#))
-                .unwrap();
+            serde_json::from_str(&format!(r#"{{"op":"queue_tasks","panel":"{id}"}}"#)).unwrap();
         assert_eq!(
             req,
-            ControlRequest::RegisterRound {
-                panels: vec![id],
+            ControlRequest::QueueTasks {
+                panel: id,
+                tasks: vec![],
                 read_mode: None,
                 fallback_secs: None,
-                backlog: None,
                 selection_hints: None,
             }
         );
@@ -414,31 +390,17 @@ mod tests {
     }
 
     #[test]
-    fn round_status_and_cancel_round_trip() {
+    fn collect_workers_and_stop_watching_round_trip() {
         for req in [
-            ControlRequest::RoundStatus {
-                round: RoundId::new(),
-            },
-            ControlRequest::CancelRound {
-                round: RoundId::new(),
+            ControlRequest::CollectWorkers,
+            ControlRequest::StopWatching {
+                panel: PanelId::new(),
             },
         ] {
             let line = serde_json::to_string(&req).unwrap();
             let back: ControlRequest = serde_json::from_str(&line).unwrap();
             assert_eq!(req, back);
         }
-    }
-
-    #[test]
-    fn round_registered_response_round_trips() {
-        let resp = ControlResponse::RoundRegistered {
-            round_id: RoundId::new(),
-            panels: vec![],
-        };
-        let line = serde_json::to_string(&resp).unwrap();
-        assert!(line.contains("round_registered"));
-        let back: ControlResponse = serde_json::from_str(&line).unwrap();
-        assert_eq!(resp, back);
     }
 
     #[test]
