@@ -806,6 +806,14 @@ async fn event_loop(
         //     transition, no push — so it competes with nothing below.
         mux.poll_notifications();
 
+        // 4e. Lost-turn recovery — a panel wedged `Working` with no Stop hook
+        //     coming (a hookless local slash command like `/model`, or a
+        //     dropped Stop) is reconciled to `Idle` once its PTY has sat idle
+        //     at a static prompt long enough. Runs after the pump (grids are
+        //     fresh) and before the pushes below: a reconciled worker can then
+        //     settle, and a reconciled main becomes deliverable, this same tick.
+        mux.poll_lost_turns();
+
         // 5. Blocked panels — if a panel in a pending round has stopped on an
         //    interactive chooser or a raw `[y/n]` prompt (no Stop hook fires, so
         //    its round never settles), announce it to the main worker so it can

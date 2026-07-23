@@ -9,6 +9,22 @@ versions.
 
 ### Fixed
 
+- **A panel wedged `Working` by a hookless local slash command (`/model`,
+  `/help`, `/status`, …) — or a dropped Stop hook — is now recovered.** Only
+  `/compact` and `/clear` fire a lifecycle hook caucus can close a turn on;
+  every other local builtin fires none, and a directly-typed command cannot be
+  classified at submit time. caucus opened a capture turn for it and flipped the
+  panel `Working`, and nothing ever closed it: a watched worker could never
+  settle, and a wedged **main** panel — which carries no watch — never became
+  deliverable, so every finished worker was stranded with nothing able to push
+  it (the `/model` report: "workers all finish but no completion signal
+  arrives"). A new per-tick pass (`poll_lost_turns`) reconciles a panel that has
+  sat `Working` with an unchanging grid, and no blocked prompt, past a
+  quiescence window (20s) — the PTY signature of an agent idle at its prompt,
+  since a working agent repaints its status line continuously. Reconciliation
+  closes the phantom turn, clears its outstanding-prompt count, flips the panel
+  to `Idle`, and records a distinct `TurnReconciled` timeline event (not a
+  fabricated `TurnCompleted`), covering main and workers with one uniform rule.
 - **A worker prompted twice in a row no longer reports the first task's output
   as the second task's answer — and no longer goes dark on the second.** A
   prompt submitted while the panel's turn was already open is queued by the

@@ -922,12 +922,49 @@ fallback 경로에서만 나는 지연이라 수용한다.
    않게 하는 층이다. 직접 타이핑은 바이트 단위로 도착해 분류가 불가능하므로
    그 경로는 hook 층만이 커버한다.
 
+3. **Lost-turn 재조정(PTY-idle fallback)** — `/compact`·`/clear`만 lifecycle
+   hook을 방출한다. `/model`·`/help`·`/status`·`/config`·`/agents`·… 는 로컬
+   빌트인이면서 **어떤 hook도** 방출하지 않는다. 이들을 직접 타이핑하면
+   (제출 시점 분류 불가) 턴이 열린 채 닫을 producer가 전혀 없어 패널이
+   `Working`에 영구 wedge한다 — 워커면 그 watch가 정착 못 하고, **main이면
+   `main_deliverable`이 열리지 않아** 정착한 워커가 배달 경로 전체를 잃는다
+   (실측 증상: "/model로 바꿨더니 워커가 다 끝나도 종료 신호를 못 받음").
+   Stop hook이 유실된 경우도 형태가 같다.
+
+   턴이 실제로 안 돌고 있다는 caucus의 유일한 증거는 PTY다: 작업 중인 agent는
+   계속 repaint(Claude Code는 경과초·스피너 상태줄을 ~1초마다 갱신)하지만, idle
+   프롬프트에 멈춘 agent는 아무것도 방출하지 않는다. 그래서
+   `Multiplexer::poll_lost_turns`는 grid `generation`이
+   `LOST_TURN_RECONCILE_QUIESCENCE`(현재 20초) 동안 불변이고 **blocked prompt가
+   아닌** `Working` 패널을 lost turn으로 보고 재조정한다. grid가 조금이라도
+   바뀌면 창이 리셋되므로 진짜 작업 중인 패널은 절대 재조정되지 않는다(오탐
+   방지). blocked prompt(선택지/`[y/N]`)는 정적 grid지만 진짜 attention 상태로
+   `poll_round_blocked_panels`의 소관이라 제외한다. 단일 규칙이 hook 없는 로컬
+   커맨드 계열과 유실 Stop을, main·워커 가리지 않고 한 번에 닫는다.
+
+   재조정 owner `reconcile_lost_turn`은 **결과를 지어내지 않는다**: phantom
+   capture turn을 닫고, 그 패널의 `outstanding_prompts`를 비우고(phantom
+   프롬프트는 영영 Stop을 안 내므로), `Working → Idle`로 내린 뒤
+   `manifest::record_turn_reconciled`로 `TurnReconciled` lane event를 남긴다.
+   `TurnCompleted`가 아니라 별도 이벤트인 이유: caucus는 idle을 *추론*했을 뿐
+   턴 완료를 *관측*하지 않았으므로 타임라인이 완료를 주장해선 안 된다. I-2대로
+   `derived_state`는 lockstep으로 `Idle`이 된다.
+
 Stop hook이 유일한 `Working → Idle` producer라는 §8.3의 전제는 이제
-"turn-completion **또는** local-command completion"으로 읽는다 — 후자도 단일
-owner(`handle_lifecycle` → `record_local_command_completed`)를 경유하며,
-제2의 자유 settle 경로가 아니다.
+"turn-completion, local-command completion, **또는 lost-turn 재조정**"으로
+읽는다 — 셋 다 단일 owner를 경유한다(`handle_signal` /
+`handle_lifecycle → record_local_command_completed` / `reconcile_lost_turn →
+record_turn_reconciled`). 재조정은 정적 PTY라는 positive 증거와 넉넉한
+quiescence 창으로 게이트되어 있어 제2의 자유 settle 경로가 아니다.
 
 **알려진 한계**:
+
+- 재조정은 hook을 방출하지 않는 로컬 커맨드에 대해 최소 `LOST_TURN_RECONCILE_
+  QUIESCENCE`만큼 기다린 뒤에야 발화한다 — 즉시 복구가 아니라 지연 복구다.
+- quiescence는 "작업 중 agent는 grid를 계속 바꾼다"는 가정에 기댄다. Claude
+  Code는 상태줄 애니메이션으로 이를 만족하지만, 정적 화면으로 오래 작업하는
+  다른 CLI가 있다면 창을 넘길 수 있다 — 그때는 진행 중 턴이 조기 재조정될 수
+  있으므로 창 값은 보수적으로 크게 잡았다.
 
 - lifecycle 신호는 §7.8의 unbound 경로를 타지 못한다 — `UnboundSignal`이
   `TurnKind`만 싣고, lifecycle 소비자가 아직 거기에 연결되어 있지 않다. env가
@@ -1080,6 +1117,11 @@ caucus가 감지할 수단조차 없는 상태를 보고할 수 있다고 광고
 
 파일 기반 `finished_cleanable` / `finished_pending_report`는 제거 — 라이브엔 응답
 파일이 없다. turn signal 수신 = `idle`, 다음 `PromptDelivered`부터 다시 `working`.
+`idle`을 settle시키는 producer는 이제 셋이다 — turn signal
+(`record_turn_completed`), local-command completion
+(`record_local_command_completed`), lost-turn 재조정
+(`record_turn_reconciled`, §7.9 3층). 셋 다 `TurnReconciled`를 포함해 별개
+lane event를 남기므로 어떤 것이 settle시켰는지 타임라인에서 구분된다.
 
 `blocked_permission_prompt`: turn signal 없음 AND 패널 grid 끝에 tool/shell이 띄운
 `Continue? [y/N]` 류 yes/no 프롬프트(`term::prompt_scan::scan_yes_no_prompt` —

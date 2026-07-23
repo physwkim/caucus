@@ -480,6 +480,7 @@ impl Multiplexer {
         self.checked_branch_tips.remove(&panel_id);
         self.local_commands_without_turn.remove(&panel_id);
         self.outstanding_prompts.remove(&panel_id);
+        self.lost_turn_probe.remove(&panel_id);
 
         // Keep `main_panel_id` an accurate invariant: it points to a live
         // panel or is None. Without this, killing main leaves it Some(stale),

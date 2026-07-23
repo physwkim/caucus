@@ -78,6 +78,16 @@ pub enum LaneEventKind {
     /// way a turn signal would. Produced by
     /// `manifest::record_local_command_completed`.
     LocalCommandCompleted { command: String },
+    /// caucus reconciled a panel wedged `Working` with no turn boundary ever
+    /// coming: a hookless local slash command (`/model`, `/help`, `/status`,
+    /// …) or a dropped Stop hook left the capture turn open, and the panel's
+    /// PTY then sat idle at a static prompt. Unlike `/compact` / `/clear` these
+    /// fire no lifecycle hook, so nothing else would ever close the turn.
+    /// Produced by `manifest::record_turn_reconciled`
+    /// (`Multiplexer::reconcile_lost_turn`); settles the panel the way a turn
+    /// signal would, but records that no signal actually arrived — the timeline
+    /// must not claim a turn completed when caucus only inferred idleness.
+    TurnReconciled,
     /// The turn ended blocked (recoverable) — see `blocker`. Produced by
     /// `manifest::record_turn_completed` from a `tool_blocked` signal.
     Blocked { blocker: LaneEventBlocker },
@@ -203,6 +213,9 @@ mod tests {
                 }
                 LaneEventKind::LocalCommandCompleted { .. } => {
                     (manifest, "LaneEventKind::LocalCommandCompleted {")
+                }
+                LaneEventKind::TurnReconciled => {
+                    (manifest, "LaneEvent::now(LaneEventKind::TurnReconciled)")
                 }
                 LaneEventKind::Blocked { .. } => (manifest, "LaneEventKind::Blocked { blocker"),
                 LaneEventKind::Failed { .. } => (manifest, "LaneEventKind::Failed { blocker"),

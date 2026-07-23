@@ -199,6 +199,17 @@ pub struct Multiplexer {
     /// between turns — the boundary re-opens a capture turn and keeps the panel
     /// `Working`, so the watch cannot latch until the last queued prompt ends.
     outstanding_prompts: HashMap<PanelId, u32>,
+    /// Per-panel grid-quiescence probe for lost-turn reconciliation
+    /// ([`Multiplexer::poll_lost_turns`]). Value is the grid `generation` last
+    /// seen for the panel and the instant that generation was first observed —
+    /// i.e. how long the panel's screen has been unchanged. Only panels
+    /// currently `Working` carry an entry; it resets when the grid changes and
+    /// is dropped when the panel leaves `Working` (a real boundary) or is
+    /// detached. A panel `Working` but silent past
+    /// [`LOST_TURN_RECONCILE_QUIESCENCE`] has no turn actually running —
+    /// a hookless local command (`/model`, `/help`, …) or a dropped Stop hook
+    /// left the turn open — and is reconciled back to `Idle`.
+    lost_turn_probe: HashMap<PanelId, (u64, Instant)>,
     /// `question` notes posted by panel agents (`caucus signal note --kind
     /// question`), waiting to be announced to the main worker. FIFO, drained
     /// one per tick by [`Multiplexer::poll_question_notices`] under the same
@@ -424,6 +435,7 @@ impl Multiplexer {
                 auto_answered: HashMap::new(),
                 local_commands_without_turn: HashSet::new(),
                 outstanding_prompts: HashMap::new(),
+                lost_turn_probe: HashMap::new(),
                 main_stranded_last_nudge: None,
                 layout_mode,
                 zoom: None,

@@ -352,6 +352,30 @@ pub(crate) fn record_local_command_completed(
     to_disk(manifest, session_root)
 }
 
+/// Sibling of [`record_local_command_completed`] for lost-turn recovery
+/// ([`crate::session::Multiplexer::reconcile_lost_turn`]): appends a
+/// `TurnReconciled` lane event, clears any stale blocker (the panel is idle at
+/// its input prompt), and recomputes `derived_state` as settled — `Idle`, even
+/// though no turn signal ever arrived. The distinct event keeps the timeline
+/// honest: caucus inferred idleness from a quiescent PTY, it did not observe a
+/// turn complete.
+pub(crate) fn record_turn_reconciled(
+    manifest: &mut AgentManifest,
+    session_root: &Path,
+) -> Result<(), ManifestError> {
+    manifest
+        .lane_events
+        .push(LaneEvent::now(LaneEventKind::TurnReconciled));
+    manifest.current_blocker = None;
+    manifest.derived_state = super::derive_state::derive_agent_state(
+        manifest.status.as_str(),
+        true, // reconciliation settles the wedged turn phase
+        manifest.error.as_deref(),
+        manifest.current_blocker.as_ref(),
+    );
+    to_disk(manifest, session_root)
+}
+
 /// Record a delivered prompt on the manifest — the turn-phase transition *into*
 /// `Working` (`docs/design.md` §8.3). Single owner of the `PromptDelivered`
 /// transition (Invariant I-2): appends the event, clears any blocker the new
@@ -517,6 +541,7 @@ fn event_label(kind: &LaneEventKind) -> String {
         LaneEventKind::LocalCommandCompleted { command } => {
             format!("local_command_completed ({command})")
         }
+        LaneEventKind::TurnReconciled => "turn_reconciled".into(),
         LaneEventKind::Blocked { blocker } => {
             format!("blocked ({:?}: {})", blocker.failure_class, blocker.detail)
         }

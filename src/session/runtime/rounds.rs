@@ -2312,6 +2312,69 @@ mod tests {
         mux.shutdown();
     }
 
+    /// The reported symptom, end to end: the user runs `/model` on the **main**
+    /// panel. `/model` fires no Stop hook and no lifecycle hook, so main wedges
+    /// `Working` — and main carries no watch, so `main_deliverable` never opens.
+    /// A worker that finishes settles its watch but has nothing able to push it:
+    /// "워커들이 모두 끝나도 종료 신호를 못받음". `poll_lost_turns` reconciles the
+    /// silent main back to `Idle`, and the settled worker is delivered the same
+    /// tick.
+    #[tokio::test]
+    async fn a_wedged_main_is_reconciled_so_settled_workers_deliver() {
+        use std::time::{Duration, Instant};
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        // The worker finishes its task — its watch settles.
+        McpToolSurface::send_keys(&mut mux, worker, "audit the TLS path", true).unwrap();
+        stop_turn(&mut mux, worker, "TLS looks good");
+
+        // Main runs `/model` (typed directly): it opens a turn and wedges
+        // `Working`, with no Stop or lifecycle hook to ever close it.
+        mux.note_prompt_delivered(main);
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+        );
+
+        // While main is wedged, the settled worker cannot be delivered.
+        mux.poll_worker_watches();
+        assert!(
+            mux.watches.iter().any(|w| w.panel == worker),
+            "no delivery while main is wedged Working",
+        );
+
+        // The quiescence window elapses on the silent main.
+        mux.poll_lost_turns();
+        let (generation, _) = mux.lost_turn_probe[&main];
+        mux.lost_turn_probe.insert(
+            main,
+            (generation, Instant::now() - Duration::from_secs(3600)),
+        );
+        mux.poll_lost_turns();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "the wedged main is reconciled back to idle",
+        );
+
+        // Now the settled worker's result is delivered and its watch retires.
+        mux.poll_worker_watches();
+        assert!(
+            mux.watches.is_empty(),
+            "the reconciled main receives the stranded worker",
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the delivery push woke main with the worker's result",
+        );
+        mux.shutdown();
+    }
+
     /// `stop_watching` drops one worker's watch (leaving the panel alone) and
     /// errors on a panel that is not watched.
     #[tokio::test]
