@@ -2168,6 +2168,85 @@ mod tests {
         mux.shutdown();
     }
 
+    /// A prompt delivered while the panel's turn is **already open** is queued
+    /// by the agent CLI, not started — so the running turn's `Stop` is not its
+    /// boundary.
+    ///
+    /// The regression: the second prompt opened no turn (`begin_turn` no-ops on
+    /// an open one) and armed no watch (the panel was already watched), so
+    /// caucus held no record of it. The first turn's `Stop` then flipped the
+    /// panel `Idle`, the watch latched (Invariant I-9), and main was handed the
+    /// *first* task's output as the second task's answer — after which delivery
+    /// spent the watch, so the second task's real result was never reported at
+    /// all. One case per boundary of the outstanding count: `> 0` remaining
+    /// (the first `Stop`) and `== 0` remaining (the second).
+    #[tokio::test]
+    async fn a_queued_prompt_is_not_settled_by_the_running_turns_stop() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Working);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        McpToolSurface::send_keys(&mut mux, worker, "first task", true).unwrap();
+        assert_eq!(mux.watches.len(), 1, "the first prompt arms the watch");
+
+        // The second brief lands while the first turn is running: the CLI
+        // queues it. A panel has exactly one watch, so nothing new is armed.
+        McpToolSurface::send_keys(&mut mux, worker, "second task", true).unwrap();
+        assert_eq!(mux.watches.len(), 1);
+
+        // Boundary of the *first* prompt only.
+        stop_turn(&mut mux, worker, "first done");
+        mux.poll_worker_watches();
+        assert_eq!(
+            mux.panels()
+                .iter()
+                .find(|p| p.id == worker)
+                .unwrap()
+                .state(),
+            PanelState::Working,
+            "the queued prompt is about to run: this is not a return to idle",
+        );
+        assert!(
+            mux.watches[watch_of(&mux, worker)].settled.is_none(),
+            "no latch may be taken from the first task's turn",
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "main must not have been woken with the first task's output",
+        );
+
+        // A capture turn was re-opened, so the queued prompt's output is kept
+        // rather than dropped on the floor by `OutputCapture::push`.
+        let panel = mux.panels.iter_mut().find(|p| p.id == worker).unwrap();
+        assert_eq!(
+            panel.capture.turns().len(),
+            1,
+            "only the first turn is closed"
+        );
+        panel.capture.push(b"second task output");
+
+        // Boundary of the queued prompt: now the panel really is between turns.
+        stop_turn(&mut mux, worker, "second done");
+        mux.poll_worker_watches();
+        assert_eq!(
+            mux.watches[watch_of(&mux, worker)].settled,
+            Some(PanelState::Idle),
+            "the queued prompt's own Stop settles the watch",
+        );
+        let panel = mux.panels.iter().find(|p| p.id == worker).unwrap();
+        assert_eq!(panel.capture.turns().len(), 2, "both turns were captured");
+        assert_eq!(
+            panel.capture.turn_bytes(1),
+            Some(&b"second task output"[..]),
+            "the queued prompt's output landed in its own turn",
+        );
+
+        mux.shutdown();
+    }
+
     /// A prompt delivered while a **local slash command** is still running must
     /// not be settled by that command's completion.
     ///
@@ -2729,7 +2808,7 @@ mod tests {
         );
 
         // Worker finishes task 1 → main is woken with its result.
-        finish_turn(&mut mux, worker, "task one done");
+        stop_turn(&mut mux, worker, "task one done");
         mux.poll_worker_watches();
         assert_eq!(
             mux.panels().iter().find(|p| p.id == main).unwrap().state(),
@@ -2743,7 +2822,7 @@ mod tests {
 
         // Main acts on it and sends task 2. The watch re-arms — this is the step
         // that used to require a fresh register_round.
-        finish_turn(&mut mux, main, "ack");
+        stop_turn(&mut mux, main, "ack");
         mux.note_prompt_delivered(worker);
         assert_eq!(
             mux.watches.len(),
@@ -2752,7 +2831,7 @@ mod tests {
         );
 
         // Worker finishes task 2 → main is woken again.
-        finish_turn(&mut mux, worker, "task two done");
+        stop_turn(&mut mux, worker, "task two done");
         mux.poll_worker_watches();
         assert_eq!(
             mux.panels().iter().find(|p| p.id == main).unwrap().state(),
@@ -2865,7 +2944,7 @@ mod tests {
         );
 
         // The fast panel settles; the slow one keeps working.
-        finish_turn(&mut mux, fast, "fast finding");
+        stop_turn(&mut mux, fast, "fast finding");
         mux.poll_worker_watches();
 
         // Main was woken by the fast panel alone — no wait for the slow one.
@@ -2894,8 +2973,8 @@ mod tests {
         );
 
         // Drain main back to Idle, then the slow panel finishes.
-        finish_turn(&mut mux, main, "ack fast");
-        finish_turn(&mut mux, slow, "slow finding");
+        stop_turn(&mut mux, main, "ack fast");
+        stop_turn(&mut mux, slow, "slow finding");
         mux.poll_worker_watches();
 
         // The slow panel's own delivery lands and spends its watch.
@@ -3241,8 +3320,18 @@ mod tests {
     /// `last_message` (what `ReadPanelMode::LastMessage` reads) left holding
     /// `message`. Panel ends `Idle`.
     fn finish_turn(mux: &mut Multiplexer, panel: PanelId, message: &str) {
-        let session_id = mux.session.id;
         mux.note_prompt_delivered(panel);
+        stop_turn(mux, panel, message);
+    }
+
+    /// End the turn already running on `panel` with a `Stop` carrying
+    /// `message`, delivering no prompt of its own. For panels the test already
+    /// prompted: `finish_turn` would deliver a *second* prompt, which the agent
+    /// CLI queues behind the first, so this `Stop` would be the first prompt's
+    /// boundary with the second still to run — the panel stays `Working` and
+    /// never settles.
+    fn stop_turn(mux: &mut Multiplexer, panel: PanelId, message: &str) {
+        let session_id = mux.session.id;
         mux.handle_signal(TurnSignal::now(
             session_id,
             panel,
@@ -4095,7 +4184,7 @@ mod tests {
         );
         assert_eq!(mux.watches.len(), 1, "and the round stays pending");
 
-        finish_turn(&mut mux, sub, "done");
+        stop_turn(&mut mux, sub, "done");
         let deliveries = mux.take_ready_round_deliveries();
         assert_eq!(deliveries.len(), 1, "the settled panel is streamed once");
         assert!(

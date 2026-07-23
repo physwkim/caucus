@@ -286,11 +286,23 @@ impl Multiplexer {
             return;
         }
 
+        // This boundary belongs to the prompt whose turn just ended. Consume it,
+        // and learn whether caucus delivered a further prompt while that turn
+        // was open — the CLI queued it, so the agent runs it next and this is
+        // *not* the panel's return to idle.
+        let queued_prompt_pending = self.consume_outstanding_prompt(signal.panel_id);
+
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == signal.panel_id) else {
             // An unknown panel's reply sender (if any) drops here — allow.
             return;
         };
         panel.end_turn();
+        if queued_prompt_pending {
+            // Re-open immediately: with no turn open `OutputCapture::push`
+            // drops the bytes, so the queued prompt's output would be lost from
+            // both `since_last_turn` and the watch's capture.
+            panel.begin_turn();
+        }
 
         // Hook-reply delivery, decided before the Idle transition. The reason
         // carries every deliverable waiting for main's attention: each round
@@ -333,8 +345,10 @@ impl Multiplexer {
         }
 
         // A turn signal means the agent is idle, waiting for the next prompt —
-        // unless the hook delivery just continued the turn.
+        // unless the hook delivery just continued the turn, or a prompt caucus
+        // already delivered is queued behind this one and about to run.
         if !delivered_by_hook
+            && !queued_prompt_pending
             && let Some(panel) = self.panels.iter_mut().find(|p| p.id == signal.panel_id)
             && panel.state() == PanelState::Working
         {
@@ -407,6 +421,7 @@ impl Multiplexer {
             let _ = lifecycle::transition(panel, PanelState::Working);
         }
         self.record_prompt_delivered(panel_id);
+        self.note_prompt_outstanding(panel_id);
     }
 
     /// Ingest a lifecycle hook signal (`PostCompact` / `SessionStart`) — the
@@ -467,10 +482,16 @@ impl Multiplexer {
     /// `lifecycle::transition`, Invariant I-5).
     fn close_local_command(&mut self, panel_id: PanelId, command: &str) {
         let caucus_opened_no_turn = self.local_commands_without_turn.remove(&panel_id);
+        // A hand-typed command was counted as a prompt on the way in
+        // (`note_prompt_delivered` cannot classify keystrokes), so this close is
+        // its boundary and must consume it — otherwise the count never returns
+        // to zero and the panel can never settle again.
+        let queued_prompt_pending =
+            !caucus_opened_no_turn && self.consume_outstanding_prompt(panel_id);
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
             return;
         };
-        if !caucus_opened_no_turn {
+        if !caucus_opened_no_turn && !queued_prompt_pending {
             panel.end_turn();
             if panel.state() == PanelState::Working {
                 let _ = lifecycle::transition(panel, PanelState::Idle);
@@ -678,6 +699,39 @@ impl Multiplexer {
         // not main registered a round, and the watch re-arms on every later
         // prompt ([`Multiplexer::arm_worker_watch`]).
         self.arm_worker_watch(panel_id);
+        // Forward half of the outstanding-prompt accounting. Submitted while
+        // the panel's turn was already open, this prompt opens no turn of its
+        // own (the agent CLI queues it), so without this count the *earlier*
+        // turn's Stop would pass for its boundary.
+        self.note_prompt_outstanding(panel_id);
+    }
+
+    /// Forward half of `outstanding_prompts`: one more prompt is in flight on
+    /// `panel_id`. Called only from the two paths that actually submit one —
+    /// [`Multiplexer::note_prompt_delivered`] and
+    /// [`Multiplexer::reopen_turn_after_hook_delivery`].
+    fn note_prompt_outstanding(&mut self, panel_id: PanelId) {
+        *self.outstanding_prompts.entry(panel_id).or_insert(0) += 1;
+    }
+
+    /// Reverse half of `outstanding_prompts`, and its only decrement: consume
+    /// the prompt whose turn just ended on `panel_id`, and report whether
+    /// another one is still queued behind it.
+    ///
+    /// `true` means the panel is not between turns at all — the agent CLI is
+    /// about to run the next queued prompt — so the caller must keep the panel
+    /// `Working` and re-open a capture turn instead of treating this boundary
+    /// as the panel's return to idle.
+    fn consume_outstanding_prompt(&mut self, panel_id: PanelId) -> bool {
+        let Some(n) = self.outstanding_prompts.get_mut(&panel_id) else {
+            return false;
+        };
+        *n = n.saturating_sub(1);
+        let remaining = *n;
+        if remaining == 0 {
+            self.outstanding_prompts.remove(&panel_id);
+        }
+        remaining > 0
     }
 
     /// Single owner of lane-event appends for a live panel (Invariant I-2).
@@ -1049,6 +1103,11 @@ mod tests {
             )),
             "the completion is on the persisted timeline: {:?}",
             on_disk.lane_events()
+        );
+        assert!(
+            mux.outstanding_prompts.is_empty(),
+            "this close is the hand-typed command's own boundary: it consumes \
+             the prompt it was counted as, or the panel could never settle again",
         );
         mux.shutdown();
     }

@@ -1530,7 +1530,18 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
   뒤늦은 턴의 잡담("nothing new came out of it")으로 덮어썼다.
 - **MUST NOT (정착 트리거)**: 턴을 **연 주체만** 그 턴을 닫는다. `poll_worker_watch`는 패널이
   `Working`을 벗어난 것만 보고 정착시키므로, 자기가 열지 않은 턴을 닫는 경로는 곧 오탐 latch다.
-  구체적으로 로컬 슬래시 커맨드(`/compact`, `/clear`)의 lifecycle 훅(`close_local_command`)은
+  두 경로가 이를 위반했다.
+- **MUST (미결 프롬프트 회계)**: 턴이 이미 열려 있는 패널에 프롬프트를 보내면 agent CLI가
+  **큐에 넣을 뿐** 턴을 시작하지 않는다 — `begin_turn`은 no-op, `arm_worker_watch`도 이미 감시
+  중이라 no-op이므로 caucus에는 그 프롬프트의 흔적이 남지 않았다. 그래서 **앞선 턴의 Stop**이
+  큐에 대기 중인 프롬프트의 경계로 오인되어, 패널이 `Idle`이 되고 watch가 앞 턴 출력을 latch해
+  main에 배달했으며(오탐), 배달로 watch가 소멸해 **뒤 프롬프트의 진짜 결과는 영영 보고되지
+  않았다**. `outstanding_prompts`가 이를 닫는다: forward는 프롬프트를 실제로 제출하는
+  `note_prompt_delivered`(+ hook-reply 형제)만, reverse는 실제 턴 경계의
+  `consume_outstanding_prompt`만 수행한다. 잔량이 남으면 그 경계는 턴 사이가 아니라 **큐에 대기
+  중인 프롬프트 사이**이므로, 패널을 `Working`으로 유지하고 capture turn을 즉시 다시 연다
+  (열린 턴이 없으면 `OutputCapture::push`가 바이트를 버려 뒤 프롬프트의 출력이 사라진다).
+- **MUST NOT (로컬 커맨드)**: 로컬 슬래시 커맨드(`/compact`, `/clear`)의 lifecycle 훅(`close_local_command`)은
   **caucus가 분류해 턴을 열지 않은 경우**(`local_commands_without_turn` 마커) 턴도 패널 상태도
   건드리지 않는다. 그러지 않으면 compact 진행 중 도착해 CLI 큐에 대기 중인 프롬프트의 턴을
   compact 완료가 닫아버리고, watch는 그 프롬프트가 하지도 않은 작업의 **직전 턴 출력**을
@@ -1539,10 +1550,14 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 - **Enforcement**: `WorkerWatch.settled` / `.captured`는 private 필드이고 `poll_worker_watch`만
   쓴다. `watch_ready`는 latch(`settled`)와 fallback 기한만 읽고 `self.panels`의 상태로 재판정하지
   않는다(gone 판정 제외). `local_commands_without_turn`은 분류 지점(`send_keys`)에서만 삽입되고
-  `close_local_command`에서만 소비된다.
+  `close_local_command`에서만 소비된다. `outstanding_prompts`의 증가는
+  `note_prompt_outstanding`, 감소는 `consume_outstanding_prompt` 단 하나씩이며, 두 맵 모두
+  `detach_panel`에서 패널과 함께 사라진다.
 - **Tests**: latch 후 패널을 다시 `Working`으로 깨워도 watch가 미정착으로 돌아가지 않고 기여가
   남는지; latch 후 도착한 `Stop` 훅이 리포트의 `last_message`를 덮지 못하는지; backlog가 남은 채
-  fallback이 닫히면 latch는 되고 feed는 안 되는지.
+  fallback이 닫히면 latch는 되고 feed는 안 되는지. 미결 카운트의 경계마다 한 케이스씩 — 잔량
+  `> 0`(첫 Stop은 정착시키지 않고 capture turn을 다시 연다)과 `== 0`(큐 프롬프트 자신의 Stop이
+  정착시킨다); 손으로 친 `/compact`의 close가 자기 프롬프트를 소비해 카운트가 0으로 돌아오는지.
 
 ### Invariant I-10: 감시 중인 각 워커는 정확히 한 번 배달된다 (push, pull 또는 hook-reply)
 - **배리어 없음(streaming)**: watch는 패널 하나짜리다. 한 워커가 정착(I-9로 latch)하는 즉시

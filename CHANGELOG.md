@@ -9,6 +9,19 @@ versions.
 
 ### Fixed
 
+- **A worker prompted twice in a row no longer reports the first task's output
+  as the second task's answer — and no longer goes dark on the second.** A
+  prompt submitted while the panel's turn was already open is queued by the
+  agent CLI, not started, and caucus held no record of it: `begin_turn` no-ops
+  on an open turn and the panel was already watched. The *first* turn's Stop
+  therefore passed for the queued prompt's boundary — the panel went `Idle`, its
+  watch latched the first task's output and delivered it to main as the second
+  task's answer, and the delivery spent the watch, so the second task's real
+  result was never reported at all. caucus now counts outstanding prompts per
+  panel (incremented only where a prompt is submitted, decremented only at a
+  real turn boundary): while any remain the boundary keeps the panel `Working`
+  and re-opens a capture turn, so the watch settles on the last queued prompt's
+  own Stop and every task's output is captured in its own turn.
 - **A `/compact` completing no longer settles a prompt that arrived while it
   was still running.** caucus classifies a `/compact` it submits itself and
   deliberately opens no capture turn for it, but `close_local_command` decided

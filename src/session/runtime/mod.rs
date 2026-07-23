@@ -179,6 +179,26 @@ pub struct Multiplexer {
     /// arrive byte-by-byte and cannot be classified, so a turn *was* opened for
     /// it and the hook is the only thing that can close it.
     local_commands_without_turn: HashSet<PanelId>,
+    /// Prompts caucus delivered to a panel whose own turn has not closed yet.
+    ///
+    /// A prompt submitted while the panel's turn is already open does not start
+    /// a turn: the agent CLI queues it and runs it after the current one. caucus
+    /// would otherwise have no record of it at all — `begin_turn` no-ops on an
+    /// open turn and `arm_worker_watch` no-ops on a watched panel — so the
+    /// *earlier* turn's Stop looked like the queued prompt's boundary: the panel
+    /// went `Idle`, its watch latched (Invariant I-9), and main was handed the
+    /// earlier turn's output as the queued prompt's answer while the queued
+    /// prompt had not run. Delivery then spent the watch, so the queued prompt's
+    /// real result was never reported at all.
+    ///
+    /// Symmetric accounting through one owner each: incremented only by
+    /// [`Multiplexer::note_prompt_delivered`] (and its hook-reply sibling), the
+    /// paths that actually submit a prompt; decremented only by
+    /// [`Multiplexer::consume_outstanding_prompt`] at a real turn boundary. A
+    /// non-zero remainder means the panel is *between* queued prompts, not
+    /// between turns — the boundary re-opens a capture turn and keeps the panel
+    /// `Working`, so the watch cannot latch until the last queued prompt ends.
+    outstanding_prompts: HashMap<PanelId, u32>,
     /// `question` notes posted by panel agents (`caucus signal note --kind
     /// question`), waiting to be announced to the main worker. FIFO, drained
     /// one per tick by [`Multiplexer::poll_question_notices`] under the same
@@ -403,6 +423,7 @@ impl Multiplexer {
                 pending_question_notices: VecDeque::new(),
                 auto_answered: HashMap::new(),
                 local_commands_without_turn: HashSet::new(),
+                outstanding_prompts: HashMap::new(),
                 main_stranded_last_nudge: None,
                 layout_mode,
                 zoom: None,
