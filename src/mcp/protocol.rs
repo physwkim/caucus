@@ -126,8 +126,8 @@ pub enum ControlRequest {
     ///
     /// `backlog` is an optional per-panel task queue keyed by panel id: while
     /// the round runs, a panel that goes idle with tasks still queued is fed
-    /// its next task (so an early finisher keeps working instead of idling
-    /// until the barrier); the panel settles for the round only once it is
+    /// its next task (so an early finisher keeps working instead of reporting a
+    /// half-done assignment); the panel settles for the round only once it is
     /// idle *and* its queue is empty. A panel absent from `backlog` settles on
     /// its first idle, the original one-task-per-panel behaviour.
     /// (`crate::session::runtime::Multiplexer::poll_pending_rounds`).
@@ -146,16 +146,18 @@ pub enum ControlRequest {
         #[serde(default)]
         selection_hints: Option<SelectionPolicy>,
     },
-    /// Check a registered round by its id — and *collect* it once it is done.
-    /// This is the **pull** half of round delivery.
+    /// Check a registered round by its id — and *collect* whichever panels are
+    /// ready right now. This is the **pull** half of round delivery.
     ///
-    /// While the round is live this reports which panels have settled vs are
-    /// still working, the per-panel backlog remaining, and the seconds left
-    /// until the fallback deadline. Each panel's status is read from the round's
-    /// settle latch, so a panel that finished and was later re-woken still reads
-    /// `settled`. Once the round is complete (every panel settled, or the
-    /// fallback deadline passed) this answers with the assembled round report
-    /// itself and completes the round.
+    /// Every panel that has settled (or passed the fallback deadline) and is not
+    /// yet delivered is answered with its own report and marked delivered; the
+    /// panels still running are reported as a status line instead — settled vs
+    /// working vs delivered, the per-panel backlog remaining, and the seconds
+    /// left until the fallback deadline — and the round stays pending for them.
+    /// There is no barrier: the early finishers come back while the slow panels
+    /// are still working. Each panel's status is read from the round's settle
+    /// latch, so a panel that finished and was later re-woken still reads
+    /// `settled`. The round is removed once every panel has been delivered.
     ///
     /// Both halves exist because the push
     /// (`crate::session::runtime::Multiplexer::poll_pending_rounds`) types the
@@ -164,16 +166,16 @@ pub enum ControlRequest {
     /// stays in its turn polling is `Working` throughout, so the push can never
     /// land: main waits for the round and the round waits for main to stop
     /// waiting. The fallback deadline does not break that livelock — it makes a
-    /// round *due*, not *deliverable*. Handing the report to the poller does.
+    /// panel *due*, not *deliverable*. Handing the report to the poller does.
     ///
-    /// Either way answered with a [`ControlResponse::Panel`] (text). A round is
-    /// delivered exactly once: an id already collected (by either half),
-    /// cancelled, or never registered is an error.
+    /// Either way answered with a [`ControlResponse::Panel`] (text). Each panel
+    /// is delivered exactly once across both halves: an id whose panels are all
+    /// collected, cancelled, or never registered is an error.
     RoundStatus { round: RoundId },
     /// Cancel a registered round by its id: caucus stops watching it and never
-    /// delivers its report. The sub-agent panels keep running — only the round
-    /// watch is dropped. Answered with [`ControlResponse::Ok`], or an error if
-    /// the id is unknown.
+    /// delivers its remaining panels (panels already delivered stay delivered).
+    /// The sub-agent panels keep running — only the round watch is dropped.
+    /// Answered with [`ControlResponse::Ok`], or an error if the id is unknown.
     CancelRound { round: RoundId },
     /// Read the interactive selection menu shown in a panel (if any) as
     /// readable text. Answered with a [`ControlResponse::Panel`].

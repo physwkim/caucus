@@ -16,8 +16,9 @@ use thiserror::Error;
 
 use crate::render::LayoutMode;
 
-/// Default round safety-net deadline (seconds). A round is force-delivered when
-/// every panel settles or this deadline passes (`docs/design.md` §4).
+/// Default round safety-net deadline (seconds). A round panel is delivered when
+/// it settles, or force-delivered when this deadline passes — whichever comes
+/// first, per panel (`docs/design.md` §4).
 pub(crate) const ROUND_FALLBACK_DEFAULT_SECS: u64 = 600;
 /// Hard cap on the round fallback deadline — bounds a misconfigured
 /// `round_fallback_secs` setting and any per-`register_round` override alike.

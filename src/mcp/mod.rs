@@ -233,8 +233,9 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
             description: "Send the same text to several panels at once — a \
                           round's fan-out. Equivalent to one send_keys per \
                           panel. Follow with register_round on the same \
-                          panels, then end your turn; caucus delivers their \
-                          assembled results when the round settles.",
+                          panels, then end your turn; caucus delivers each \
+                          panel's result to you as that panel finishes, one \
+                          at a time — you do not wait for the slowest.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -397,18 +398,27 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "register_round",
-            description: "Register a round: caucus watches the named panels and, \
-                          when they ALL settle (finish their turn — leave the \
-                          'working' state) or fallback_secs elapses, delivers \
-                          their assembled results to you as a new message. \
+            description: "Register a round: caucus watches the named panels and \
+                          delivers each panel's result to you the moment THAT \
+                          panel settles (finishes its turn — leaves the \
+                          'working' state), or when fallback_secs elapses. \
+                          There is NO barrier: you are re-prompted once per \
+                          panel, so a 3-panel round wakes you 3 separate times \
+                          and the first delivery arrives while the other panels \
+                          are still working. Act on each delivery as it lands — \
+                          send that worker its next task, or spawn/kill as you \
+                          see fit — do not sit waiting for the rest of the \
+                          round; the remaining panels will reach you on their \
+                          own. Each delivery names the panel it came from. \
                           Returns immediately — after calling this, end your \
-                          turn; caucus re-prompts you when the round completes. \
+                          turn; caucus re-prompts you per panel. \
                           That push can only land while you are idle, so it \
                           arrives only AFTER your turn ends: do NOT sleep-poll \
                           list_panels waiting for it inside this turn — it will \
                           never come and you will wait forever. If you must stay \
                           in your turn, poll round_status instead: it hands you \
-                          the assembled report itself once the round completes. \
+                          every panel that is ready right now, and keeps the \
+                          round alive for the ones that are not. \
                           Use `backlog` to keep \
                           a panel busy across several tasks: caucus feeds it the \
                           next queued task each time it goes idle, so an early \
@@ -435,9 +445,10 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                     },
                     "fallback_secs": {
                         "type": "integer",
-                        "description": "Safety-net seconds: if the panels never \
-                                        all settle, caucus delivers a partial \
-                                        report after this (default 600, max 3600)."
+                        "description": "Safety-net seconds: a panel that never \
+                                        settles is delivered anyway after this, \
+                                        marked still-working with whatever it \
+                                        produced (default 600, max 3600)."
                     },
                     "backlog": {
                         "type": "object",
@@ -475,8 +486,8 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                                         when exactly one option qualifies; zero or \
                                         several matches are escalated to you as a \
                                         normal blocked-panel notice. Each \
-                                        auto-answer is noted in the delivered \
-                                        round report. Omit to escalate every menu."
+                                        auto-answer is noted in that panel's \
+                                        delivered report. Omit to escalate every menu."
                     }
                 },
                 "required": ["panels"]
@@ -484,22 +495,25 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "round_status",
-            description: "Check on a round you registered, by the round id \
-                          register_round returned — and collect it once it is \
-                          done. While the round is still running this reports \
-                          each panel's state (working / draining backlog / \
-                          settled / gone), its remaining backlog count, and the \
-                          seconds left on the fallback deadline. Once the round \
-                          COMPLETES (every panel settled, or the fallback \
-                          deadline passed) this returns the assembled round \
-                          report itself and completes the round — so a main \
-                          worker that must stay inside its turn can still collect \
-                          its results, instead of waiting on a caucus push that \
-                          can only land after the turn ends. Ending your turn and \
-                          letting caucus re-prompt you is still the cheaper path. \
-                          A round is delivered exactly once: an id already \
-                          collected (by either path), cancelled, or never \
-                          registered is an error.",
+            description: "Collect whichever panels of a round are ready RIGHT \
+                          NOW, by the round id register_round returned. This \
+                          returns the report of every panel that has settled (or \
+                          passed the fallback deadline) and has not been \
+                          delivered yet — there is no barrier, so it hands you \
+                          the early finishers while the slow panels are still \
+                          working. Panels still running are reported as a status \
+                          line instead (working / draining backlog / settled / \
+                          delivered / gone, remaining backlog count, seconds left \
+                          on the fallback deadline), and the round stays alive for \
+                          them: call again later to collect them. This is the \
+                          in-turn path — a main worker that must stay inside its \
+                          turn can still collect results, instead of waiting on a \
+                          caucus push that can only land after the turn ends. \
+                          Ending your turn and letting caucus re-prompt you per \
+                          panel is still the cheaper path. Each panel is delivered \
+                          exactly once across both paths; a round id whose panels \
+                          are all delivered, or that was cancelled or never \
+                          registered, is an error.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -515,7 +529,8 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
             name: "cancel_round",
             description: "Cancel a round you registered, by the round id \
                           register_round returned, so caucus stops watching it \
-                          and never delivers its report. The panels are left \
+                          and never delivers its remaining panels (panels already \
+                          delivered stay delivered). The panels are left \
                           exactly as they are — work already running keeps \
                           running and any backlog simply stops being fed; this \
                           does not kill or interrupt them. A round id caucus is \
