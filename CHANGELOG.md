@@ -9,6 +9,35 @@ versions.
 
 ### Changed
 
+- **Every worker caucus hands a prompt to is watched, and the watch re-arms
+  after each delivery.** Streaming round delivery removed the barrier, but a
+  round still retired when it was delivered — so once main sent a worker its
+  next task, nothing was watching that worker and main had to call
+  `register_round` again to hear about it. A worker main simply talked to,
+  without registering anything, was never reported at all. Now the watch is
+  armed at the moment caucus delivers the prompt (in the single
+  `Idle -> Working` owner, so `send_keys`, `broadcast`, a backlog feed and a
+  human typing into the panel all arm exactly once), spent on delivery, and
+  re-armed by the next prompt: `instruct → finish → instruct` runs as a
+  continuous loop with no registration step. `register_round` still exists for
+  per-round options (`backlog`, `selection_hints`, `read_mode`,
+  `fallback_secs`) and now absorbs the implicit watch on the panels it names,
+  carrying its latch and captured turns across. The stranded-main nudge
+  survives but only covers panels working on something caucus never handed
+  them, and no longer tells main to register a round. Design §8 flow.
+
+### Fixed
+
+- **The main worker's tool descriptions taught a barrier the runtime no longer
+  had.** `register_round` said caucus delivers "when they ALL settle" an
+  "assembled" report and `round_status` said it collects "once the round
+  completes", so a main worker that received one panel's streamed delivery
+  concluded the round was still in flight and waited instead of acting on that
+  worker. Rewritten across `register_round`, `round_status`, `cancel_round`,
+  `broadcast`, `fallback_secs`, and `selection_hints`.
+
+### Changed (earlier in this cycle)
+
 - **Round results now stream to the main worker per panel, instead of
   waiting for the whole round to finish.** A round that ran across several
   panels used to deliver only once every panel had settled — the main

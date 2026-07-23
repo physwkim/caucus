@@ -152,15 +152,17 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
 묶음. 파일 안건도, `response-*.md` 수집도 없다.
 
 ```
-1. main worker가 MCP 툴 호출 — 작업을 sub-task로 분해해 병렬 분배한 뒤
-   라운드를 등록하고 자기 턴을 닫는다:
+1. main worker가 MCP 툴 호출 — 작업을 sub-task로 분해해 병렬 분배하고
+   자기 턴을 닫는다:
      broadcast(panels=[<worker-1>,<worker-2>,<worker-3>], text="<공통 안건>", enter=true)
      (패널별로 다른 sub-task면 send_keys를 패널마다)
-     register_round(panels=[<worker-1>,<worker-2>,<worker-3>])
-     (조기 완료 워커를 계속 돌리려면 backlog={<panel>:[후속 task,...]}도 함께 — 아래 **백로그** 참조)
-     (방향 메뉴를 main 방해 없이 caucus가 답하게 하려면 selection_hints={prefer:[...],avoid:[...]}도 — 아래 **선택 힌트** 참조)
-   register_round는 즉시 반환한다 — 블로킹도 timeout 대기도 없다. main worker는
-   턴을 끝내고 자유로워진다.
+   caucus가 프롬프트를 전달한 sub-panel은 **그 순간 자동으로 감시 대상**이 된다
+   (`arm_worker_watch`) — 등록 단계가 없다. 옵션이 필요할 때만 register_round를
+   덧붙인다:
+     register_round(panels=[...], backlog={<panel>:[후속 task,...]})  — 아래 **백로그**
+     register_round(panels=[...], selection_hints={prefer:[...],avoid:[...]}) — 아래 **선택 힌트**
+   register_round는 즉시 반환하고, 이미 armed된 암묵 watch를 흡수해(latch·캡처분을
+   그대로 넘겨받아) 대체한다. 어느 쪽이든 main worker는 턴을 끝내고 자유로워진다.
 
 2. 각 패널의 sub-agent가 작업 → 턴 종료 시 Claude Stop hook이 caucus 소켓에
    turn signal을 post (panel_id, last_message 포함, §7).
@@ -183,11 +185,22 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
    idle이고 사용자가 입력 중이 아닐 때 전달된다. 안전망: fallback_secs가 지나면
    미완 패널을 "still working"으로 표시해 부분 결과를 전달한다.
 
-5. main worker가 주입된 라운드 결과를 받고 판단:
-     - 라운드 더  → 새 안건으로 broadcast + register_round 반복
+5. main worker가 주입된 패널 결과를 받고 그 워커에 대해 판단:
+     - 그 워커에 후속 작업 → 곧바로 send_keys. 프롬프트를 주는 순간 watch가
+       **재무장**되므로, 다음 완료도 같은 방식으로 통지된다(등록 불필요) —
+       instruct → finish → instruct 가 끊기지 않는 루프로 돈다
      - 병합 완료  → 결과를 종합해 사용자에게 보고
      - 막힘      → 사용자에게 보고
 ```
+
+**워커 감시(standing watch)**: caucus가 프롬프트를 전달한 sub-panel은 전부
+감시된다 — main이 준 일에는 항상 돌아올 길이 있다. watch는 배달로 소진되고 다음
+프롬프트에 재무장한다. 이전에는 라운드가 배달과 함께 은퇴해서, main이 워커에게
+다음 task를 보내도 다시 `register_round` 하지 않으면 그 워커가 깜깜해졌다 —
+패널 단위 스트리밍을 넣은 뒤에도 라운드가 여전히 배리어처럼 느껴진 진짜 이유다.
+arm 지점은 `note_prompt_delivered`(유일한 Idle→Working 소유자)라 모든 분배
+경로(MCP `send_keys`, `broadcast`, 백로그 급여, 사람이 패널에 직접 입력)가
+정확히 한 번 arm 한다. main 패널 자신과 이미 감시 중인 패널은 arm 되지 않는다.
 
 **백로그(조기 완료 워커 연속)**: `register_round`에 패널별 후속 task 큐
 `backlog={<panel>:["task1","task2",...]}`를 함께 넘기면, 그 패널은 idle이 될
@@ -208,8 +221,9 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
 working/draining backlog/settled/delivered/gone 상태, 남은 백로그 수, fallback
 데드라인까지 남은 초) 취소할 수 있다(`cancel_round` — caucus가 그 라운드 감시·전달을
 멈춘다; 패널은 건드리지 않아 진행 중 작업은 계속 돌고 백로그 급여만 끊긴다). 정상
-흐름은 여전히 register 후 턴을 닫고 caucus의 완료 push를 기다리는 것이다 — 그게 더
-싸다. 배달은 **패널 단위 스트리밍**이다: 배리어 없이 각 패널이 정착하는 즉시 그
+흐름은 워커에게 일을 주고 턴을 닫은 뒤 caucus의 완료 push를 기다리는 것이다 — 그게
+더 싸고, 감시는 자동이라 register 없이도 성립한다. 배달은 **패널 단위 스트리밍**이다:
+배리어 없이 각 패널이 정착하는 즉시 그
 패널의 결과만 따로 도착하므로, main은 최후미 워커를 기다리지 않고 라운드당 패널
 수만큼 interaction 한다(**Invariant I-10**). 다만 push는 main 패널이 idle일 때만
 착지하므로(즉 main이 턴을 끝낸 뒤에만), 턴 안에서 기다리는 main은 영원히 못 받는다.
