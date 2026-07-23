@@ -2282,8 +2282,9 @@ mod tests {
             other => panic!("expected an immediate RoundRegistered ack, got {other:?}"),
         };
         assert_eq!(mux.pending_rounds.len(), 1, "round must be stashed");
-        assert_eq!(mux.pending_rounds[0].id, acked_id, "acked id must match");
-        assert_eq!(mux.pending_rounds[0].read_mode, ReadPanelMode::LastMessage);
+        let i = round_of(&mux, ghost);
+        assert_eq!(mux.pending_rounds[i].id, acked_id, "acked id must match");
+        assert_eq!(mux.pending_rounds[i].read_mode, ReadPanelMode::LastMessage);
     }
 
     /// `round_status` reports a live round by its registered id: each panel's
@@ -2379,7 +2380,7 @@ mod tests {
             None,
         );
 
-        let backlog = &mux.pending_rounds[0].backlog;
+        let backlog = &mux.pending_rounds[round_of(&mux, keep)].backlog;
         assert_eq!(
             backlog.len(),
             1,
@@ -2751,11 +2752,15 @@ mod tests {
             "a ready panel must be held while the live main panel is busy"
         );
         assert!(
-            !mux.pending_rounds[0].delivered.contains(&sub),
+            !mux.pending_rounds[round_of(&mux, sub)]
+                .delivered
+                .contains(&sub),
             "the held panel must not be marked delivered"
         );
         assert!(
-            mux.pending_rounds[0].settled.contains_key(&sub),
+            mux.pending_rounds[round_of(&mux, sub)]
+                .settled
+                .contains_key(&sub),
             "the held panel is latched (settled), just not yet delivered"
         );
 
@@ -2886,7 +2891,7 @@ mod tests {
             "handing a worker a prompt watches it, with no registration",
         );
         assert!(
-            mux.pending_rounds[0].implicit,
+            mux.pending_rounds[round_of(&mux, worker)].implicit,
             "the watch was armed by caucus, not by register_round",
         );
 
@@ -3038,7 +3043,9 @@ mod tests {
             "round held while both panels work"
         );
         assert!(
-            mux.pending_rounds[0].delivered.is_empty(),
+            mux.pending_rounds[round_of(&mux, fast)]
+                .delivered
+                .is_empty(),
             "no panel delivered while both work",
         );
 
@@ -3057,7 +3064,7 @@ mod tests {
             1,
             "round still pending: the slow panel is undelivered",
         );
-        let round = &mux.pending_rounds[0];
+        let round = &mux.pending_rounds[round_of(&mux, fast)];
         assert!(round.delivered.contains(&fast), "fast panel delivered");
         assert!(
             !round.delivered.contains(&slow),
@@ -3151,7 +3158,7 @@ mod tests {
             "round held while the sub works"
         );
         assert!(
-            mux.pending_rounds[0]
+            mux.pending_rounds[round_of(&mux, sub)]
                 .backlog
                 .get(&sub)
                 .is_none_or(VecDeque::is_empty),
@@ -3219,7 +3226,10 @@ mod tests {
         // First feed: idle sub with task-1 queued → captures the pre-backlog turn.
         mux.poll_pending_rounds();
         assert_eq!(
-            mux.pending_rounds[0].captured.get(&sub).map(Vec::len),
+            mux.pending_rounds[round_of(&mux, sub)]
+                .captured
+                .get(&sub)
+                .map(Vec::len),
             Some(1),
             "the first feed must capture exactly one finished turn",
         );
@@ -3234,7 +3244,10 @@ mod tests {
         ));
         mux.poll_pending_rounds();
         assert_eq!(
-            mux.pending_rounds[0].captured.get(&sub).map(Vec::len),
+            mux.pending_rounds[round_of(&mux, sub)]
+                .captured
+                .get(&sub)
+                .map(Vec::len),
             Some(2),
             "the second feed must capture a second finished turn",
         );
@@ -3253,12 +3266,17 @@ mod tests {
         mux.main_compose_since = Some(Instant::now());
         mux.poll_pending_rounds();
         assert_eq!(
-            mux.pending_rounds[0].captured.get(&sub).map(Vec::len),
+            mux.pending_rounds[round_of(&mux, sub)]
+                .captured
+                .get(&sub)
+                .map(Vec::len),
             Some(3),
             "the queue-empty settle must capture the panel's final turn",
         );
         assert!(
-            mux.pending_rounds[0].settled.contains_key(&sub),
+            mux.pending_rounds[round_of(&mux, sub)]
+                .settled
+                .contains_key(&sub),
             "the drained panel must latch as settled for the round",
         );
 
@@ -3374,7 +3392,7 @@ mod tests {
         let new = PanelId::new();
         mux.remap_round_membership(old, new);
 
-        let r = &mux.pending_rounds[0];
+        let r = &mux.pending_rounds[round_of(&mux, new)];
         assert_eq!(r.panels, vec![new], "round member re-keyed to the new id");
         assert!(
             !r.backlog.contains_key(&old) && r.backlog.contains_key(&new),
@@ -3411,7 +3429,8 @@ mod tests {
             Some(HashMap::from([(sub, vec!["late task".to_string()])])),
             None,
         );
-        mux.pending_rounds[0].fallback_deadline = Instant::now() - Duration::from_secs(1);
+        let i = round_of(&mux, sub);
+        mux.pending_rounds[i].fallback_deadline = Instant::now() - Duration::from_secs(1);
 
         mux.poll_pending_rounds();
 
@@ -3491,7 +3510,9 @@ mod tests {
             "the push is gated on idle main"
         );
         assert!(
-            mux.pending_rounds[0].settled.contains_key(&sub),
+            mux.pending_rounds[round_of(&mux, sub)]
+                .settled
+                .contains_key(&sub),
             "the settled sub-panel must latch",
         );
 
@@ -3506,14 +3527,14 @@ mod tests {
 
         mux.poll_pending_rounds();
         assert!(
-            mux.round_settled(&mux.pending_rounds[0]),
+            mux.round_settled(&mux.pending_rounds[round_of(&mux, sub)]),
             "a re-woken panel must not un-settle a round it already finished",
         );
 
         let c = mux
-            .round_panel_contribution(&mux.pending_rounds[0], sub)
+            .round_panel_contribution(&mux.pending_rounds[round_of(&mux, sub)], sub)
             .unwrap();
-        let report = mux.assemble_panel_report(&mux.pending_rounds[0], sub, &c);
+        let report = mux.assemble_panel_report(&mux.pending_rounds[round_of(&mux, sub)], sub, &c);
         assert!(
             report.contains("finished the audit: 3 findings"),
             "the latched contribution must survive the wake-up: {report}",
@@ -3560,7 +3581,11 @@ mod tests {
         // Latch the sub while main is mid-turn (the push is gated).
         mux.note_prompt_delivered(main);
         mux.poll_pending_rounds();
-        assert!(mux.pending_rounds[0].settled.contains_key(&sub));
+        assert!(
+            mux.pending_rounds[round_of(&mux, sub)]
+                .settled
+                .contains_key(&sub)
+        );
 
         // The leftover shell finishes; the CLI runs a turn caucus never prompted
         // and its `Stop` hook overwrites the manifest's `last_message`.
@@ -3573,9 +3598,9 @@ mod tests {
         ));
 
         let c = mux
-            .round_panel_contribution(&mux.pending_rounds[0], sub)
+            .round_panel_contribution(&mux.pending_rounds[round_of(&mux, sub)], sub)
             .unwrap();
-        let report = mux.assemble_panel_report(&mux.pending_rounds[0], sub, &c);
+        let report = mux.assemble_panel_report(&mux.pending_rounds[round_of(&mux, sub)], sub, &c);
         assert!(
             report.contains("PARITY REPORT: 3 divergences, all fixed"),
             "the round must report the result captured at settle-time: {report}",
@@ -4659,13 +4684,16 @@ Enter to select - up/down to navigate - Esc to cancel";
         );
         // The round records the answered fork for the delivered report.
         assert_eq!(
-            mux.pending_rounds[0].auto_answers.len(),
+            mux.pending_rounds[round_of(&mux, sub)].auto_answers.len(),
             1,
             "the auto-answer must be recorded on the round",
         );
-        assert_eq!(mux.pending_rounds[0].auto_answers[0].number, 2);
+        assert_eq!(
+            mux.pending_rounds[round_of(&mux, sub)].auto_answers[0].number,
+            2
+        );
         assert!(
-            mux.pending_rounds[0].auto_answers[0]
+            mux.pending_rounds[round_of(&mux, sub)].auto_answers[0]
                 .label
                 .contains("Structural")
         );
