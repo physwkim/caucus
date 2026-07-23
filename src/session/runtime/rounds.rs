@@ -4,7 +4,7 @@ use crate::mcp::protocol::{ControlResponse, SelectionPolicy};
 use crate::mcp::{McpToolSurface, ReadPanelMode};
 use crate::panel::lifecycle::{Panel, PanelState};
 use crate::session::id::{PanelId, RoundId};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -38,25 +38,24 @@ const STRANDED_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
 /// with a warning — the newest question is the one still worth answering.
 pub(super) const QUESTION_NOTICE_CAP: usize = 32;
 
-/// Per-captured-turn byte budget in the **on-disk** round report
-/// ([`Multiplexer::assemble_round_report`]). A turn body over this is head/tail
+/// Per-captured-turn byte budget in the **on-disk** panel report
+/// ([`Multiplexer::assemble_panel_report`]). A turn body over this is head/tail
 /// truncated in the report and its full text spilled to
 /// `<session_root>/round-spills/`. Without it a `scrollback` read (up to 10k
-/// rows × the panel width per panel) concatenated across a multi-panel round
-/// would inflate even the spilled report file without bound. (The report is no
-/// longer injected into the main PTY — finding 24: the main worker is handed
-/// the teaser-bounded [`Multiplexer::render_round_summary`] that points at the
-/// report file. This bound keeps the file itself readable.) Split evenly
-/// between the head and tail kept around the elision.
+/// rows × the panel width) would inflate even the spilled report file without
+/// bound. (The report is no longer injected into the main PTY — the main worker
+/// is handed the teaser-bounded [`Multiplexer::render_panel_summary`] that
+/// points at the report file. This bound keeps the file itself readable.) Split
+/// evenly between the head and tail kept around the elision.
 const MAX_ROUND_BODY_BYTES: usize = 16 * 1024;
 
-/// Per-panel teaser budget in the *injected* round-delivery summary
-/// ([`Multiplexer::render_round_summary`]). The full assembled report is
-/// spilled to `<session_root>/rounds/<round_id>.md` and the main worker is
-/// handed only a compact summary that points at it — so the bracketed paste
-/// caucus injects into the main PTY stays small (per-panel teaser, not the
-/// whole report). Each panel contributes at most this many bytes of its latest
-/// output as a teaser; the rest is in the report file.
+/// Per-panel teaser budget in the *injected* panel-delivery summary
+/// ([`Multiplexer::render_panel_summary`]). The full report is spilled to
+/// `<session_root>/rounds/<round_id>-<panel>.md` and the main worker is handed
+/// only a compact summary that points at it — so the bracketed paste caucus
+/// injects into the main PTY stays small (a teaser, not the whole report). The
+/// panel contributes at most this many bytes of its latest output as a teaser;
+/// the rest is in the report file.
 const ROUND_SUMMARY_TEASER_BYTES: usize = 1024;
 
 /// Largest char-boundary byte index `<= idx` in `s` (stable stand-in for the
@@ -98,38 +97,30 @@ fn summary_teaser(body: &str, budget: usize) -> String {
     )
 }
 
-/// The shared opening line of both the full round report and the injected
-/// summary — panel count plus a fallback note when the deadline forced
-/// delivery before every panel settled.
-fn round_header(panel_count: usize, all_settled: bool) -> String {
-    format!(
-        "[caucus] Round complete — {panel_count} panel(s){}.\n",
-        if all_settled {
-            ""
-        } else {
-            " (fallback deadline reached; some panels did not finish)"
-        }
-    )
-}
-
-/// Append the "caucus auto-answered" audit block shared by the full report and
-/// the injected summary: one line per selection menu caucus resolved for this
-/// round under the main worker's pre-authorized [`SelectionPolicy`], so the
-/// delivered message shows which direction forks were taken on its behalf —
-/// without the main worker ever having been interrupted. Nothing is emitted
-/// when the round auto-answered no menu.
-fn push_auto_answers(out: &mut String, round: &PendingRound) {
-    if round.auto_answers.is_empty() {
+/// Append the "caucus auto-answered" audit lines for a **single** panel — the
+/// forks caucus resolved for it under the round's pre-authorized
+/// [`SelectionPolicy`], so the streamed delivery shows which direction caucus
+/// took on the worker's behalf without ever interrupting the main worker.
+/// Streamed delivery hands the main worker one panel at a time, so it shows only
+/// *that* panel's auto-answers; nothing is emitted when caucus auto-answered
+/// none of its menus.
+fn push_panel_auto_answers(out: &mut String, round: &PendingRound, id: PanelId) {
+    let mine: Vec<&AutoAnswerRecord> = round
+        .auto_answers
+        .iter()
+        .filter(|a| a.panel == id)
+        .collect();
+    if mine.is_empty() {
         return;
     }
     out.push_str(&format!(
-        "caucus auto-answered {} selection menu(s) per your hints (you were not interrupted):\n",
-        round.auto_answers.len()
+        "caucus auto-answered {} selection menu(s) on this panel per your hints (you were not interrupted):\n",
+        mine.len()
     ));
-    for a in &round.auto_answers {
+    for a in mine {
         out.push_str(&format!(
-            "  panel {} (role: {}) → option {} \"{}\"\n",
-            a.panel, a.role, a.number, a.label
+            "  → option {} \"{}\" (role: {})\n",
+            a.number, a.label, a.role
         ));
     }
 }
@@ -283,11 +274,16 @@ fn label_contains_kw(label: &str, keyword: &str) -> bool {
 ///
 /// Unlike a control request (each answered immediately), a round carries no
 /// reply channel — `register_round` already acked at registration. Instead
-/// the event loop watches it each tick and, once every panel has settled (or
-/// `fallback_deadline` passes), assembles the panels' results, spills the full
-/// report to `<session_root>/rounds/<id>.md`, and *injects* a compact summary
-/// pointing at that file into the main worker's panel as a fresh turn. This is
-/// the caucus→main push that the pull-only MCP transport cannot do.
+/// the event loop watches it each tick and, as **each** panel settles (or when
+/// `fallback_deadline` passes), spills that one panel's result to
+/// `<session_root>/rounds/<id>-<panel>.md` and *injects* a compact summary
+/// pointing at it into the main worker's panel as a fresh turn. This is the
+/// caucus→main push that the pull-only MCP transport cannot do.
+///
+/// Delivery is **streamed per panel**, not barriered: a round no longer waits
+/// for its slowest worker before waking main. Each panel is handed to main the
+/// tick it settles, and the round is retired once every (still-live) panel has
+/// been delivered ([`Multiplexer::round_fully_delivered`]).
 pub(super) struct PendingRound {
     /// Stable identity handed back at registration ([`ControlResponse::RoundRegistered`]),
     /// the handle the main worker uses to poll ([`Multiplexer::round_status`]) or
@@ -307,16 +303,28 @@ pub(super) struct PendingRound {
     /// renders.
     ///
     /// Presence is the latch: once a panel is here, neither its later state nor
-    /// its later output can change the round's dueness or its contribution.
-    /// This is what makes the barrier hold. A round's delivery is gated on the
-    /// *main* panel being idle ([`Multiplexer::main_deliverable`]), so an
-    /// arbitrary amount of time can pass between a panel settling and the round
-    /// landing — and any path that re-opens a settled panel's turn in that
-    /// window (an MCP `send_keys`, an auto-answered menu, a human Enter typed
-    /// into the panel) would otherwise un-settle the round and, worse, make
+    /// its later output can change its contribution. A panel's delivery is gated
+    /// on the *main* panel being idle ([`Multiplexer::main_deliverable`]), so an
+    /// arbitrary amount of time can pass between a panel settling and its
+    /// delivery landing — and any path that re-opens a settled panel's turn in
+    /// that window (an MCP `send_keys`, an auto-answered menu, a human Enter
+    /// typed into the panel) would otherwise make
     /// [`Multiplexer::round_panel_contribution`] skip the finished panel's read
     /// and deliver it as "still working, no output captured".
     settled: HashMap<PanelId, PanelState>,
+    /// The round's **per-panel delivery ledger** (Invariant I-10): a panel is
+    /// inserted here at the instant its frozen contribution is handed off to the
+    /// main worker — typed into an idle main ([`Multiplexer::poll_pending_rounds`]),
+    /// returned to a polling main ([`Multiplexer::round_status`]), or carried on
+    /// the Stop-hook reply ([`Multiplexer::take_ready_round_deliveries`]). A gone
+    /// (killed) panel is inserted with no push — it has no contribution.
+    ///
+    /// Presence is the per-panel exactly-once latch: a delivered panel is never
+    /// delivered again by any path, and the round is retired once every panel is
+    /// here ([`Multiplexer::round_fully_delivered`]). This replaces the old
+    /// all-panels-settled *barrier* — delivery no longer waits for the slowest
+    /// worker; each panel streams to main the tick it settles.
+    delivered: HashSet<PanelId>,
     /// Per-panel follow-up task queue. A round panel that goes idle with a
     /// non-empty queue is fed its next task (popped front) by
     /// [`Multiplexer::feed_round_backlog`], flipping it back to `Working` — so
@@ -352,17 +360,17 @@ pub(super) struct PendingRound {
     /// before. `None` keeps every menu an escalation.
     selection_hints: Option<SelectionPolicy>,
     /// Selection menus caucus auto-answered for this round under
-    /// `selection_hints`, in answer order. Rendered into the delivered
-    /// report/summary ([`push_auto_answers`]) so the main worker sees which
+    /// `selection_hints`, in answer order. Rendered per panel into the streamed
+    /// delivery ([`push_panel_auto_answers`]) so the main worker sees which
     /// forks were resolved on its behalf, without ever being interrupted.
     auto_answers: Vec<AutoAnswerRecord>,
 }
 
 /// One round panel's contribution, collected once and rendered into both the
-/// full report ([`Multiplexer::assemble_round_report`]) and the injected
-/// summary ([`Multiplexer::render_round_summary`]) — so the two always show the
-/// *same* captured text (the per-panel `read_panel` happens exactly once, in
-/// [`Multiplexer::round_panel_contribution`]).
+/// full per-panel report ([`Multiplexer::assemble_panel_report`]) and the
+/// injected summary ([`Multiplexer::render_panel_summary`]) — so the two always
+/// show the *same* captured text (the per-panel `read_panel` happens exactly
+/// once, in [`Multiplexer::round_panel_contribution`]).
 struct RoundPanelContribution {
     /// The panel's role label.
     role: String,
@@ -426,6 +434,7 @@ impl Multiplexer {
             id: round_id,
             panels,
             settled: HashMap::new(),
+            delivered: HashSet::new(),
             backlog,
             captured: HashMap::new(),
             read_mode: read_mode.unwrap_or(ReadPanelMode::LastMessage),
@@ -442,38 +451,37 @@ impl Multiplexer {
         }
     }
 
-    /// Check on a registered round by id — and, once it is **complete**, hand
-    /// its assembled report straight back to the caller. This is the *pull* half
-    /// of round delivery (Invariant I-10).
+    /// Check on a registered round by id — and hand back every panel that has
+    /// settled since the last poll, streamed. This is the *pull* half of round
+    /// delivery (Invariant I-10, per panel).
     ///
-    /// A complete round (every panel latched, or the fallback deadline passed)
-    /// is delivered right here: it is removed from `pending_rounds`, completed
-    /// through [`Multiplexer::complete_round`] — the same owner the push half
-    /// uses — and its summary returned as the response. Otherwise the round is
-    /// left pending and the caller gets its live status: per-panel state
-    /// (working / draining backlog / settled / gone), remaining backlog count,
-    /// and seconds left on the fallback deadline.
+    /// Every [`Multiplexer::panel_ready`] panel is delivered right here: rendered,
+    /// marked `delivered`, and returned in the response, followed by the live
+    /// status of the panels still working (state, remaining backlog, seconds
+    /// left on the fallback deadline). The round is removed only once all its
+    /// panels are delivered ([`Multiplexer::round_fully_delivered`]); otherwise
+    /// it stays pending and a later poll (or the push) streams the rest — a main
+    /// worker polling in a loop hears each worker the tick it finishes, never
+    /// waiting for the slowest.
     ///
     /// The pull half exists because the *push* half
-    /// ([`Multiplexer::poll_pending_rounds`]) types the report into the main
-    /// panel, so it can only land while that panel is `Idle` — i.e. only after
-    /// the main worker ends its turn. A main worker that instead polls this from
-    /// inside its turn is `Working` for the whole poll, so the push can never
-    /// fire: main waits for the round, and the round waits for main to stop
-    /// waiting. The fallback deadline does not break that livelock — it makes a
-    /// round *due*, not *deliverable*. Handing the report to the poller does, by
-    /// construction. Completing the round here (rather than leaving it pending
-    /// for a push that would deliver it a second time) is what keeps delivery
-    /// exactly-once.
+    /// ([`Multiplexer::poll_pending_rounds`]) types into the main panel, so it
+    /// can only land while that panel is `Idle` — i.e. only after the main
+    /// worker ends its turn. A main worker that instead polls this from inside
+    /// its turn is `Working` for the whole poll, so the push can never fire:
+    /// main waits for the round, and the round waits for main to stop waiting.
+    /// Handing ready panels to the poller breaks that livelock by construction,
+    /// and marking them delivered here (so no later push re-delivers them) is
+    /// what keeps each panel exactly-once.
     ///
     /// The round's single owner ([`Multiplexer::poll_round_panels`]) is run
-    /// first, so both the status and the completion check see the *current*
-    /// settle latch. Without it they would lag the panels by a tick — the event
-    /// loop drains control requests before it polls rounds.
+    /// first, so both the readiness and the status see the *current* settle
+    /// latch. Without it they would lag the panels by a tick — the event loop
+    /// drains control requests before it polls rounds.
     ///
     /// Round ids are live-only (not persisted across a restart), so a status
     /// poll only ever resolves rounds the current caucus instance is watching. A
-    /// round already delivered — by either half — is an unknown id.
+    /// round already fully delivered — by any path — is an unknown id.
     pub(crate) fn round_status(&mut self, round_id: RoundId) -> ControlResponse {
         let Some(idx) = self.pending_rounds.iter().position(|r| r.id == round_id) else {
             return ControlResponse::error(format!(
@@ -481,33 +489,54 @@ impl Multiplexer {
             ));
         };
         // Take the round out so the owner poll can borrow `self`; it goes back
-        // at `idx` unless it completes here.
+        // at `idx` unless every panel is delivered here.
         let mut round = self.pending_rounds.remove(idx);
         let fallback_due = Instant::now() >= round.fallback_deadline;
-        let changed = self.poll_round_panels(&mut round, fallback_due);
-        let all_settled = self.round_settled(&round);
+        self.poll_round_panels(&mut round, fallback_due);
+        self.retire_gone_round_panels(&mut round);
 
-        if all_settled || fallback_due {
-            let summary = self.complete_round(&round, all_settled);
-            // `round` is already out of `pending_rounds`, so persisting now
-            // records it as delivered — and no push can deliver it again.
-            self.persist_pending_rounds();
-            return ControlResponse::Panel { text: summary };
+        // Stream every panel ready now (one pull return is one continuing main
+        // turn, so batch them like the hook reply). Each is marked delivered so
+        // no later push re-delivers it.
+        let mut parts: Vec<String> = Vec::new();
+        for id in self.ready_round_panels(&round, fallback_due) {
+            if let Some(summary) = self.render_panel_delivery(&round, id) {
+                parts.push(summary);
+            }
+            round.delivered.insert(id);
         }
 
-        let text = self.render_round_status(&round);
+        if Self::round_fully_delivered(&round) {
+            // Round retired: it is already out of `pending_rounds`; persist so
+            // the durable snapshot records it gone and no push revisits it.
+            self.persist_pending_rounds();
+            let text = if parts.is_empty() {
+                format!("Round {round_id} complete — every panel already delivered.")
+            } else {
+                parts.join("\n\n")
+            };
+            return ControlResponse::Panel { text };
+        }
+
+        // Panels still outstanding: return whatever streamed now, then the live
+        // status of the rest, and keep the round pending.
+        let status = self.render_round_status(&round);
         self.pending_rounds.insert(idx, round);
-        if changed {
-            self.persist_pending_rounds();
-        }
+        self.persist_pending_rounds();
+        let text = if parts.is_empty() {
+            status
+        } else {
+            format!("{}\n\n{status}", parts.join("\n\n"))
+        };
         ControlResponse::Panel { text }
     }
 
     /// Render a round's per-panel status line-by-line. Each panel's status comes
-    /// from the round's **settle latch**, not its live state: a panel that
-    /// settled and was later re-woken (a leftover background shell, an answered
-    /// menu) has already contributed to this round and stays `settled` here,
-    /// exactly as the delivered report will render it.
+    /// from the round's ledgers, not its live state: a panel already streamed to
+    /// main reads `delivered`; one that settled but is awaiting the
+    /// deliverability gate reads `settled` (and was re-woken after — a leftover
+    /// background shell, an answered menu — still reads `settled`, exactly as
+    /// its frozen contribution will render).
     fn render_round_status(&self, round: &PendingRound) -> String {
         let remaining = round
             .fallback_deadline
@@ -521,6 +550,14 @@ impl Multiplexer {
         for &id in &round.panels {
             let backlog = round.backlog.get(&id).map(VecDeque::len).unwrap_or(0);
             let (role, status) = match self.panels.iter().find(|p| p.id == id) {
+                _ if round.delivered.contains(&id) => (
+                    self.panels
+                        .iter()
+                        .find(|p| p.id == id)
+                        .map(|p| p.role.as_str())
+                        .unwrap_or("(gone)"),
+                    "delivered",
+                ),
                 None => ("(gone)", "gone"),
                 Some(p) if round.settled.contains_key(&id) => (p.role.as_str(), "settled"),
                 // Not latched: either mid-turn, or idle with queued work left
@@ -555,35 +592,38 @@ impl Multiplexer {
         ControlResponse::Ok
     }
 
-    /// Deliver one due, deliverable round to the main worker — the caucus→main
-    /// push. Called once per event-loop tick, after signals + pump have
-    /// updated panel state.
+    /// Stream one ready round panel to the main worker — the caucus→main push.
+    /// Called once per event-loop tick, after signals + pump have updated panel
+    /// state.
     ///
-    /// A round is *due* when all its panels have settled, or its
-    /// `fallback_deadline` has passed. It is *delivered* only while the main
-    /// panel exists, is `Idle`, and has no un-submitted human keystroke within
-    /// `COMPOSE_GRACE` — so an injected turn never collides with a line the
-    /// user is composing. At most one round is delivered per tick: the
-    /// injection flips the main panel to `Working`, so any other due round
-    /// naturally holds until the main worker is idle again.
+    /// Delivery is **per panel**, not barriered: a panel is *ready*
+    /// ([`Multiplexer::panel_ready`]) the tick it settles (or when the
+    /// `fallback_deadline` forces the round out while it is still working). Its
+    /// frozen contribution is *delivered* only while the main panel exists, is
+    /// `Idle`, and has no un-submitted human keystroke within `COMPOSE_GRACE` —
+    /// so an injected turn never collides with a line the user is composing. At
+    /// most one panel is delivered per tick across all rounds: the injection
+    /// flips the main panel to `Working`, so every other ready panel naturally
+    /// holds until the main worker is idle again. A round is retired once all
+    /// its panels are delivered ([`Multiplexer::round_fully_delivered`]) — main
+    /// never waits for the slowest worker before hearing from the fast ones.
     ///
-    /// A due round whose main worker is *gone* — no main panel id, the panel
-    /// no longer exists, or it has `Exited` (the agent process died on its
-    /// own; only `kill_panel` clears the id, so a self-exit leaves
-    /// `main_panel_id` pointing at an `Exited` panel) — is dropped after its
-    /// assembled report is spilled to `dropped-rounds.log`: no caucus→main
-    /// push can ever land, so re-queuing it would spin forever, and discarding
-    /// it silently would lose every sub-agent's work. A delivery that *fails*
-    /// (e.g. the main PTY writer went away mid-tick) keeps the round for a
-    /// later tick rather than dropping it.
+    /// A ready panel whose main worker is *gone* — no main panel id, the panel
+    /// no longer exists, or it has `Exited` (the agent process died on its own;
+    /// only `kill_panel` clears the id, so a self-exit leaves `main_panel_id`
+    /// pointing at an `Exited` panel) — has its contribution spilled to
+    /// `dropped-rounds.log` and is marked delivered: no caucus→main push can
+    /// ever land, so re-queuing would spin forever, and discarding silently
+    /// would lose the sub-agent's work. A delivery that *fails* (e.g. the main
+    /// PTY writer went away mid-tick) leaves the panel undelivered so a later
+    /// tick retries rather than dropping it.
     ///
-    /// Before the due-check, each non-expired round's backlog is fed
-    /// (`Multiplexer::feed_round_backlog`): a panel that finished early with
-    /// queued tasks is handed its next task and flips back to `Working`, so it
-    /// is not yet settled and the round is not yet due — the early finisher
-    /// keeps working its backlog instead of idling at the barrier. Once the
-    /// fallback deadline has passed, no new backlog work starts; the round
-    /// delivers the partial report.
+    /// [`Multiplexer::poll_round_panels`] runs first each round: it latches
+    /// every panel that settled this tick (capturing its finished turn) and,
+    /// while there is still time, hands an early finisher its next queued task —
+    /// so a backlog panel keeps working its queue and only becomes ready once
+    /// the queue drains. Once the fallback deadline has passed, no new backlog
+    /// work starts.
     pub fn poll_pending_rounds(&mut self) {
         if self.pending_rounds.is_empty() {
             return;
@@ -594,7 +634,7 @@ impl Multiplexer {
 
         // Resolve main's liveness once. Main is *gone* — no caucus→main push
         // can ever land — when there is no main panel id, the panel no longer
-        // exists, or it has `Exited`. A due round against a gone main is
+        // exists, or it has `Exited`. A ready panel against a gone main is
         // spilled and dropped, never re-queued forever.
         let main = self.main_panel_id.and_then(|id| {
             self.panels
@@ -606,57 +646,63 @@ impl Multiplexer {
         let main_id = main.map(|(id, _)| id);
         let deliverable = self.main_deliverable();
 
-        let mut delivered = false;
-        // Whether the pending-round set changed this tick (a round dropped,
-        // delivered, or had backlog fed) — only then is the durable snapshot
+        // At most one panel is pushed per tick (each push flips main to
+        // `Working`). Once set, later rounds only latch/retire and re-queue.
+        let mut pushed = false;
+        // Whether the pending-round set changed this tick (a panel delivered,
+        // retired, or had backlog fed) — only then is the durable snapshot
         // re-written, so the common idle tick does no I/O.
         let mut changed = false;
         for mut round in rounds {
             let fallback_due = now >= round.fallback_deadline;
-            // Latch every panel that has settled for this round (capturing its
-            // finished turn) and, while there is still time, hand an early
-            // finisher its next queued task. Runs on the fallback tick too —
-            // only the *feeding* stops there: a panel that settled with queued
-            // work left must still have its finished turn captured, or the
-            // partial report the deadline forces would carry nothing for it.
             changed |= self.poll_round_panels(&mut round, fallback_due);
-            let all_settled = self.round_settled(&round);
-            let due = fallback_due || all_settled;
+            // Gone panels carry no contribution: retire them so they never hold
+            // the round open, before any main-state gate.
+            changed |= self.retire_gone_round_panels(&mut round);
 
-            if !due {
-                // Sub-agents still working: keep watching, whatever main's state.
-                self.pending_rounds.push(round);
-                continue;
-            }
             if main_gone {
-                // No wake path will ever exist. Spill the assembled report so
-                // the sub-agents' work is not silently lost, then drop.
-                let report = self.assemble_round_report(&round, all_settled);
-                self.record_dropped_round(&report);
-                changed = true;
-                continue;
-            }
-            if deliverable && !delivered {
-                let summary = self.complete_round(&round, all_settled);
-                // `deliverable` implies a live, idle main panel exists.
-                let mid = main_id.expect("deliverable implies a main panel");
-                match McpToolSurface::send_keys(self, mid, &summary, true) {
-                    Ok(()) => {
-                        delivered = true;
-                        changed = true;
+                // No wake path will ever exist. Spill each ready panel's frozen
+                // contribution so the sub-agents' work is not silently lost,
+                // then mark it delivered.
+                for id in self.ready_round_panels(&round, fallback_due) {
+                    if let Some(report) = self.render_panel_delivery(&round, id) {
+                        self.record_dropped_round(&report);
                     }
-                    Err(err) => {
-                        // Delivery failed (e.g. the main PTY writer went away
-                        // mid-tick): keep the round so a later tick retries,
-                        // rather than discarding every sub-agent's result.
-                        warn!(error = %err, "round delivery to main panel failed; will retry");
-                        self.pending_rounds.push(round);
+                    round.delivered.insert(id);
+                    changed = true;
+                }
+            } else if deliverable && !pushed {
+                // Deliver the first ready panel; the rest hold for later ticks.
+                if let Some(id) = self
+                    .ready_round_panels(&round, fallback_due)
+                    .first()
+                    .copied()
+                    && let Some(summary) = self.render_panel_delivery(&round, id)
+                {
+                    // `deliverable` implies a live, idle main panel exists.
+                    let mid = main_id.expect("deliverable implies a main panel");
+                    match McpToolSurface::send_keys(self, mid, &summary, true) {
+                        // Mark delivered only on a confirmed send (mirrors the
+                        // backlog feed): a failed push leaves the panel ready so
+                        // the next tick retries, never dropping its result.
+                        Ok(()) => {
+                            round.delivered.insert(id);
+                            pushed = true;
+                            changed = true;
+                        }
+                        Err(err) => {
+                            warn!(error = %err, panel = %id, "round panel delivery to main failed; will retry");
+                        }
                     }
                 }
-            } else {
-                // Gate closed (main busy / mid-compose) or one already
-                // delivered this tick: keep it for a later tick.
+            }
+
+            // Retire the round once every panel has landed; otherwise keep
+            // watching (more panels to settle, or the gate was closed this tick).
+            if !Self::round_fully_delivered(&round) {
                 self.pending_rounds.push(round);
+            } else {
+                changed = true;
             }
         }
         if changed {
@@ -664,71 +710,111 @@ impl Multiplexer {
         }
     }
 
-    /// Complete and take the first *due* pending round, returning its summary
-    /// — the hook-reply half of round delivery (`docs/design.md` §7.6),
-    /// called by [`Multiplexer::handle_signal_with_reply`] when the main
-    /// worker's own Stop hook is waiting for a directive.
+    /// Take every round panel ready to deliver right now, per panel, returning
+    /// one compact summary each — the hook-reply half of round delivery
+    /// (`docs/design.md` §7.6), called by
+    /// [`Multiplexer::handle_signal_with_reply`] when the main worker's own Stop
+    /// hook is waiting for a directive.
     ///
-    /// The [`Multiplexer::round_status`] pull generalised from one named round
-    /// to the whole queue: each round's latch is refreshed first
+    /// The main worker's Stop hook is one *continuing* turn, so — like the
+    /// question-notice queue that rides the same reply — every ready panel is
+    /// carried at once rather than one round per turn: a panel held back would
+    /// wait an entire further main turn for the push path, which is the latency
+    /// this delivery exists to remove. Each round's latch is refreshed first
     /// ([`Multiplexer::poll_round_panels`], Invariant I-9 — the judgement must
-    /// see panels that settled this very tick), then judged by the same due
-    /// predicate as the keystroke push (`fallback_due || all_settled`, so a
-    /// partial fallback report travels this path too). The first due round is
-    /// removed, completed ([`Multiplexer::complete_round`], Invariant I-10 —
-    /// removal-before-completion is what makes delivery exactly-once across
-    /// all three paths), and the changed set is persisted before the summary
-    /// is returned. Rounds that are not due stay pending, exactly as the push
-    /// leaves them.
-    pub(super) fn take_due_round_summary(&mut self) -> Option<String> {
+    /// see panels that settled this very tick), gone panels are retired, then
+    /// every [`Multiplexer::panel_ready`] panel is rendered and **marked
+    /// delivered** (Invariant I-10, per panel). A round with all panels
+    /// delivered is retired; the rest stay pending, exactly as the push leaves
+    /// them.
+    ///
+    /// The caller lands the returned texts (hook reply → keystroke fallback →
+    /// `dropped-rounds.log`), so marking delivered as they are taken keeps each
+    /// panel exactly-once even if the reply channel then dies.
+    pub(super) fn take_ready_round_deliveries(&mut self) -> Vec<String> {
         if self.pending_rounds.is_empty() {
-            return None;
+            return Vec::new();
         }
         let now = Instant::now();
         let mut changed = false;
-        let mut summary = None;
+        let mut out = Vec::new();
         let rounds = std::mem::take(&mut self.pending_rounds);
         for mut round in rounds {
-            if summary.is_some() {
-                // One directive carries one round; the rest keep their place.
-                self.pending_rounds.push(round);
-                continue;
-            }
             let fallback_due = now >= round.fallback_deadline;
             changed |= self.poll_round_panels(&mut round, fallback_due);
-            let all_settled = self.round_settled(&round);
-            if fallback_due || all_settled {
-                summary = Some(self.complete_round(&round, all_settled));
+            changed |= self.retire_gone_round_panels(&mut round);
+            for id in self.ready_round_panels(&round, fallback_due) {
+                if let Some(summary) = self.render_panel_delivery(&round, id) {
+                    out.push(summary);
+                }
+                round.delivered.insert(id);
                 changed = true;
-            } else {
+            }
+            if !Self::round_fully_delivered(&round) {
                 self.pending_rounds.push(round);
             }
         }
         if changed {
             self.persist_pending_rounds();
         }
-        summary
+        out
     }
 
-    /// Complete a round: assemble its full per-panel report, spill it to
-    /// `<session_root>/rounds/<id>.md`, and return the compact summary that
-    /// points at it. The single owner of round completion (Invariant I-10),
-    /// shared by every delivery path — the push
-    /// ([`Multiplexer::poll_pending_rounds`], which types the summary into an
-    /// idle main panel), the pull ([`Multiplexer::round_status`], which hands
-    /// it to a main worker polling from inside its own turn), and the
-    /// hook-reply ([`Multiplexer::take_due_round_summary`], which injects it
-    /// into the main worker's continuing turn through its Stop hook).
+    /// Whether round panel `id` is **ready to deliver** this tick: its
+    /// contribution is frozen and it has not yet been delivered. A panel is
+    /// ready once it settled (latched by [`Multiplexer::poll_round_panels`], the
+    /// normal path), or the `fallback_deadline` forced the round out while it
+    /// was still working (delivered with a "still working" marker), or it is
+    /// gone (killed — ready, but with no contribution to render).
     ///
-    /// The caller must already have removed the round from `pending_rounds`, so
-    /// a round is completed exactly once no matter which half reaches it first.
-    /// Never the whole report into the main PTY: a multi-panel round's results
-    /// can run to hundreds of KB, and one giant bracketed paste risks the
-    /// backend's paste-handling pathologies.
-    fn complete_round(&self, round: &PendingRound, all_settled: bool) -> String {
-        let report = self.assemble_round_report(round, all_settled);
-        let report_path = self.spill_round_report(round.id, &report);
-        self.render_round_summary(round, all_settled, report_path.as_deref())
+    /// This is the per-panel replacement for the old round-level barrier
+    /// (`round_settled`): a round no longer waits for its slowest worker; each
+    /// ready panel is streamed to main independently.
+    fn panel_ready(&self, round: &PendingRound, id: PanelId, fallback_due: bool) -> bool {
+        if round.delivered.contains(&id) {
+            return false;
+        }
+        let gone = !self.panels.iter().any(|p| p.id == id);
+        gone || fallback_due || round.settled.contains_key(&id)
+    }
+
+    /// Whether every panel in the round has been delivered — the retirement
+    /// condition that replaces the all-settled barrier. A gone panel counts only
+    /// once it has been marked `delivered` (its silent retirement); until then
+    /// the round stays pending. The single reader of `round.delivered` used to
+    /// decide a round is done.
+    fn round_fully_delivered(round: &PendingRound) -> bool {
+        round.panels.iter().all(|id| round.delivered.contains(id))
+    }
+
+    /// Mark every gone (killed) round panel as delivered — they carry no
+    /// contribution and need no caucus→main push, so they must not hold the
+    /// round open (mirrors the old `round_settled` counting a missing panel as
+    /// settled). Returns `true` if any panel was newly retired, so the caller
+    /// re-persists. Called at the top of each delivery path after
+    /// [`Multiplexer::poll_round_panels`].
+    fn retire_gone_round_panels(&self, round: &mut PendingRound) -> bool {
+        let mut changed = false;
+        for &id in &round.panels {
+            if !round.delivered.contains(&id) && !self.panels.iter().any(|p| p.id == id) {
+                round.delivered.insert(id);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The panels in `round` that are [`Multiplexer::panel_ready`] this tick, in
+    /// round order — the ones a delivery path may hand to main now. Gone panels
+    /// are already retired by [`Multiplexer::retire_gone_round_panels`], so this
+    /// only ever returns panels with a real contribution to render.
+    fn ready_round_panels(&self, round: &PendingRound, fallback_due: bool) -> Vec<PanelId> {
+        round
+            .panels
+            .iter()
+            .copied()
+            .filter(|&id| self.panel_ready(round, id, fallback_due))
+            .collect()
     }
 
     /// Append a dropped round's assembled report to the session's
@@ -777,6 +863,10 @@ impl Multiplexer {
                 let panels = r
                     .panels
                     .iter()
+                    // A delivered panel's work already reached main — do not
+                    // record it as dropped, or a restart would tell the resumed
+                    // main worker to re-issue work it already has.
+                    .filter(|id| !r.delivered.contains(id))
                     .map(|&id| RoundPanelRecord {
                         role: self
                             .panels
@@ -936,13 +1026,10 @@ impl Multiplexer {
     /// no live worker left to feed, even if a stale backlog entry exists for
     /// that id.
     ///
-    /// This reads the latch, never the panels' live state. A round is delivered
-    /// only when the *main* panel is idle, so an unbounded amount of time can
-    /// pass between the last panel settling and the round landing; judging live
-    /// state here would let anything that re-opens a settled panel's turn in
-    /// that window (an MCP `send_keys`, an auto-answered menu, a human Enter,
-    /// the CLI waking itself when a leftover background shell finishes) silently
-    /// un-settle a finished round.
+    /// Test-only: streaming delivery no longer gates on the whole round settling
+    /// ([`Self::panel_ready`] drives delivery per panel now), but the latch
+    /// tests still assert the I-9 completeness this expresses.
+    #[cfg(test)]
     fn round_settled(&self, round: &PendingRound) -> bool {
         round
             .panels
@@ -954,11 +1041,11 @@ impl Multiplexer {
     /// swaps its `PanelId` (a fresh PTY is a fresh id). The restarted panel is
     /// the *same* logical round member — same role, same resumed conversation,
     /// same worktree — so every pending round that referenced `old` must now
-    /// reference `new` across all four id-keyed fields (`panels`, `settled`,
-    /// `backlog`, `captured`). Without this the round resolves `old` to a missing panel
-    /// (see [`Self::round_settled`]) and silently drops the member, settling
-    /// without its contribution. `restart_panel` is the only id-changing path:
-    /// every other spawn allocates a genuinely new panel, and `kill_panel`
+    /// reference `new` across all five id-keyed fields (`panels`, `settled`,
+    /// `delivered`, `backlog`, `captured`). Without this the round resolves
+    /// `old` to a missing panel and silently drops the member — retiring it
+    /// (gone) or losing its contribution. `restart_panel` is the only id-changing
+    /// path: every other spawn allocates a genuinely new panel, and `kill_panel`
     /// detaches permanently with no replacement.
     pub(super) fn remap_round_membership(&mut self, old: PanelId, new: PanelId) {
         for round in &mut self.pending_rounds {
@@ -969,6 +1056,9 @@ impl Multiplexer {
             }
             if let Some(state) = round.settled.remove(&old) {
                 round.settled.insert(new, state);
+            }
+            if round.delivered.remove(&old) {
+                round.delivered.insert(new);
             }
             if let Some(backlog) = round.backlog.remove(&old) {
                 round.backlog.insert(new, backlog);
@@ -1591,121 +1681,158 @@ impl Multiplexer {
         })
     }
 
-    /// Assemble a round's **full** report: a self-describing block per panel —
-    /// role + current state, plus its result(s). A panel that ran a single task
-    /// contributes that one output read via `read_mode`; a panel that ran a
-    /// multi-task `backlog` contributes every finished turn — the outputs
-    /// captured in `captured` (each prior turn, in feed order) followed by its
-    /// final turn read live — under `### task N` headers so the main worker can
-    /// tell them apart. A panel still `working` when the fallback deadline
-    /// forced delivery contributes whatever it already finished plus an
-    /// "unfinished" marker. A panel id that no longer exists is reported as
-    /// gone. This is the report spilled to disk
-    /// ([`Multiplexer::spill_round_report`]) and the one appended to
-    /// `dropped-rounds.log` when there is no main worker to deliver to; the
-    /// main worker is handed the compact [`Multiplexer::render_round_summary`]
-    /// that points at it, never this whole block.
-    fn assemble_round_report(&self, round: &PendingRound, all_settled: bool) -> String {
-        let mut out = round_header(round.panels.len(), all_settled);
-        push_auto_answers(&mut out, round);
-        for &id in &round.panels {
-            let Some(c) = self.round_panel_contribution(round, id) else {
-                out.push_str(&format!("\n## panel {id} — gone (killed)\n"));
-                continue;
-            };
-            out.push_str(&format!(
-                "\n## panel {id} (role: {}) — {}\n",
-                c.role,
-                c.state.label()
-            ));
-            // One output stays header-less, identical to the pre-backlog
-            // report; two or more get `### task N` headers.
-            let total = c.bodies.len();
-            for (i, body) in c.bodies.iter().enumerate() {
-                if total > 1 {
-                    out.push_str(&format!("\n### task {}\n", i + 1));
-                }
-                let body = body.trim();
-                if body.is_empty() {
-                    out.push_str("(no output captured)\n");
-                } else {
-                    // Bound each turn's body so a `scrollback` read cannot
-                    // inflate even the on-disk report without limit; the full
-                    // text is spilled to `round-spills/` and pointed at.
-                    out.push_str(&self.bound_round_body(id, body));
-                    out.push('\n');
-                }
+    /// Render one panel's **full** block — role + settled state, every finished
+    /// turn (under `### task N` headers when it ran more than one), and the
+    /// trailing footer — into `out`. The shared body of the per-panel delivery
+    /// report ([`Multiplexer::assemble_panel_report`]), used both for a live
+    /// delivery and for the main-gone spill to `dropped-rounds.log`.
+    fn push_panel_report_block(&self, out: &mut String, id: PanelId, c: &RoundPanelContribution) {
+        out.push_str(&format!(
+            "\n## panel {id} (role: {}) — {}\n",
+            c.role,
+            c.state.label()
+        ));
+        // One output stays header-less, identical to the pre-backlog report;
+        // two or more get `### task N` headers.
+        let total = c.bodies.len();
+        for (i, body) in c.bodies.iter().enumerate() {
+            if total > 1 {
+                out.push_str(&format!("\n### task {}\n", i + 1));
             }
-            push_round_panel_footer(&mut out, &c);
+            let body = body.trim();
+            if body.is_empty() {
+                out.push_str("(no output captured)\n");
+            } else {
+                // Bound each turn's body so a `scrollback` read cannot inflate
+                // even the on-disk report without limit; the full text is
+                // spilled to `round-spills/` and pointed at.
+                out.push_str(&self.bound_round_body(id, body));
+                out.push('\n');
+            }
         }
+        push_round_panel_footer(out, c);
+    }
+
+    /// Render one panel's **compact** teaser block — role + state + output
+    /// count, then its latest output trimmed to the teaser budget, then the
+    /// footer — into `out`. The shared per-panel body of the per-panel delivery
+    /// summary ([`Multiplexer::render_panel_summary`]).
+    fn push_panel_summary_block(&self, out: &mut String, id: PanelId, c: &RoundPanelContribution) {
+        out.push_str(&format!(
+            "\n## panel {id} (role: {}) — {} · {} output(s)\n",
+            c.role,
+            c.state.label(),
+            c.bodies.len()
+        ));
+        // Teaser: the panel's latest output, trimmed to the teaser budget — the
+        // full text is in the report file.
+        let latest = c.bodies.last().map(|b| b.trim()).unwrap_or("");
+        if latest.is_empty() {
+            out.push_str("(no output captured)\n");
+        } else {
+            out.push_str(&summary_teaser(latest, ROUND_SUMMARY_TEASER_BYTES));
+            out.push('\n');
+        }
+        push_round_panel_footer(out, c);
+    }
+
+    /// The opening line of a single panel's streamed delivery: which round it
+    /// belongs to, which panel + role, and whether it settled on its own or was
+    /// forced out mid-turn by the fallback deadline. The per-panel analogue of
+    /// [`round_header`].
+    fn panel_delivery_header(round_id: RoundId, id: PanelId, role: &str, settled: bool) -> String {
+        format!(
+            "[caucus] Round {round_id} — panel {id} (role: {role}) {}.\n",
+            if settled {
+                "finished"
+            } else {
+                "forced out by the fallback deadline (still working)"
+            }
+        )
+    }
+
+    /// Assemble one settled panel's **full** delivery report. Spilled to
+    /// `<session_root>/rounds/<round>-<panel>.md` and pointed at by the compact
+    /// summary the main worker is handed. Any selection menus caucus
+    /// auto-answered *on this panel* are noted, so the delivered result still
+    /// shows the fork caucus took on the worker's behalf.
+    fn assemble_panel_report(
+        &self,
+        round: &PendingRound,
+        id: PanelId,
+        c: &RoundPanelContribution,
+    ) -> String {
+        let mut out = Self::panel_delivery_header(round.id, id, &c.role, c.settled);
+        push_panel_auto_answers(&mut out, round, id);
+        self.push_panel_report_block(&mut out, id, c);
         out
     }
 
-    /// Assemble the **compact** round-delivery message injected into the main
-    /// worker's panel: a one-line-per-panel summary (role, state, output count)
-    /// with a short teaser of each panel's latest output, plus a pointer to the
-    /// full report spilled to disk. This is the structural fix for "never inject
-    /// the whole unstructured report into the main PTY": a multi-panel round's
-    /// full results can run to hundreds of KB, and pasting that in one bracketed
-    /// paste risks the backend's paste-handling pathologies. The main worker
-    /// reads `report_path` when a teaser is not enough; `report_path` is `None`
-    /// only when the spill itself failed.
-    fn render_round_summary(
+    /// Assemble the **compact** streamed delivery for one settled panel: the
+    /// per-panel header, this panel's auto-answer audit, a pointer to the
+    /// spilled full report, and a teaser of the panel's latest output. Never the
+    /// whole body into the main PTY (a `scrollback` panel can run to hundreds of
+    /// KB, and one giant bracketed paste risks the backend's paste
+    /// pathologies). `report_path` is `None` only when the spill itself failed.
+    fn render_panel_summary(
         &self,
         round: &PendingRound,
-        all_settled: bool,
+        id: PanelId,
+        c: &RoundPanelContribution,
         report_path: Option<&std::path::Path>,
     ) -> String {
-        let mut out = round_header(round.panels.len(), all_settled);
-        push_auto_answers(&mut out, round);
+        let mut out = Self::panel_delivery_header(round.id, id, &c.role, c.settled);
+        push_panel_auto_answers(&mut out, round, id);
         match report_path {
             Some(path) => out.push_str(&format!(
-                "Full per-panel report: {} — read that file for each panel's complete output.\n",
+                "Full report: {} — read that file for this panel's complete output.\n",
                 path.display()
             )),
             None => out.push_str(
-                "(the full report could not be written to disk; the teasers below are all that is available)\n",
+                "(the full report could not be written to disk; the teaser below is all that is available)\n",
             ),
         }
-        for &id in &round.panels {
-            let Some(c) = self.round_panel_contribution(round, id) else {
-                out.push_str(&format!("\n## panel {id} — gone (killed)\n"));
-                continue;
-            };
-            out.push_str(&format!(
-                "\n## panel {id} (role: {}) — {} · {} output(s)\n",
-                c.role,
-                c.state.label(),
-                c.bodies.len()
-            ));
-            // Teaser: the panel's latest output (final live read, else last
-            // captured), trimmed to the teaser budget — the full text is in the
-            // report file.
-            let latest = c.bodies.last().map(|b| b.trim()).unwrap_or("");
-            if latest.is_empty() {
-                out.push_str("(no output captured)\n");
-            } else {
-                out.push_str(&summary_teaser(latest, ROUND_SUMMARY_TEASER_BYTES));
-                out.push('\n');
-            }
-            push_round_panel_footer(&mut out, &c);
-        }
+        self.push_panel_summary_block(&mut out, id, c);
         out
     }
 
-    /// Write a round's full assembled report to
-    /// `<session_root>/rounds/<round_id>.md` and return its path, so the
-    /// caucus→main delivery can inject a compact summary that points at it
-    /// rather than the whole report. The file name is the round's id (a ULID),
-    /// unique per round. Best-effort: a failure is logged and yields `None`, and
-    /// the summary then says the spill failed.
-    fn spill_round_report(&self, round_id: RoundId, report: &str) -> Option<std::path::PathBuf> {
+    /// Render one round panel's frozen contribution into the compact message
+    /// streamed to the main worker, spilling its full output to
+    /// `<session_root>/rounds/<round>-<panel>.md` and pointing at it. The
+    /// per-panel replacement for the old whole-round `complete_round`: each
+    /// panel is delivered on its own, the tick it settles, instead of waiting
+    /// for the barrier.
+    ///
+    /// Pure render + spill — it does **not** mark the panel delivered. Marking
+    /// `round.delivered` is the caller's job, done at the handoff point so
+    /// per-panel exactly-once (Invariant I-10) holds: typed-and-confirmed for
+    /// the push, returned for the pull/hook-reply. Returns `None` for a gone
+    /// panel — it has no contribution to deliver.
+    fn render_panel_delivery(&self, round: &PendingRound, id: PanelId) -> Option<String> {
+        let c = self.round_panel_contribution(round, id)?;
+        let report = self.assemble_panel_report(round, id, &c);
+        let path = self.spill_panel_report(round.id, id, &report);
+        Some(self.render_panel_summary(round, id, &c, path.as_deref()))
+    }
+
+    /// Write one panel's full delivery report to
+    /// `<session_root>/rounds/<round_id>-<panel>.md` and return its path, so the
+    /// streamed delivery can inject a compact summary that points at it rather
+    /// than the whole body. The file name is the round id (a ULID) plus the
+    /// panel id, unique per (round, panel). Best-effort: a failure is logged and
+    /// yields `None`, and the summary then says the spill failed.
+    fn spill_panel_report(
+        &self,
+        round_id: RoundId,
+        panel: PanelId,
+        report: &str,
+    ) -> Option<std::path::PathBuf> {
         let dir = self.session.root_dir.join("rounds");
         if let Err(err) = std::fs::create_dir_all(&dir) {
             warn!(error = %err, "round report dir create failed");
             return None;
         }
-        let path = dir.join(format!("{round_id}.md"));
+        let path = dir.join(format!("{round_id}-{panel}.md"));
         match std::fs::write(&path, report) {
             Ok(()) => Some(path),
             Err(err) => {
@@ -1915,6 +2042,7 @@ mod tests {
             id: RoundId::new(),
             panels,
             settled,
+            delivered: HashSet::new(),
             backlog,
             captured,
             read_mode,
@@ -1988,7 +2116,7 @@ mod tests {
                 assert!(text.contains("reviewer"), "status: {text}");
                 assert!(text.contains("working"), "status: {text}");
                 assert!(text.contains("writer"), "status: {text}");
-                assert!(text.contains("settled"), "status: {text}");
+                assert!(text.contains("delivered"), "status: {text}");
             }
             other => panic!("expected Panel status, got {other:?}"),
         }
@@ -2077,10 +2205,11 @@ mod tests {
         assert!(!backlog.contains_key(&stray), "stray panel must be dropped");
     }
 
-    /// `assemble_round_report` reports an id that no longer exists as gone
-    /// rather than panicking or omitting it silently.
+    /// A panel whose id no longer exists has no contribution to stream:
+    /// `render_panel_delivery` yields `None` (the retire path marks it delivered
+    /// with no push), rather than panicking or emitting an empty block.
     #[tokio::test]
-    async fn assemble_round_report_marks_a_missing_panel_gone() {
+    async fn render_panel_delivery_skips_a_gone_panel() {
         let tmp = TempDir::new().unwrap();
         let mux = mux(&tmp);
         let ghost = PanelId::new();
@@ -2091,20 +2220,18 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         );
-        let report = mux.assemble_round_report(&round, true);
-        assert!(report.contains("Round complete"), "report: {report}");
         assert!(
-            report.contains("gone"),
-            "a missing panel must be marked gone: {report}"
+            mux.render_panel_delivery(&round, ghost).is_none(),
+            "a gone panel must render no delivery"
         );
     }
 
-    /// `assemble_round_report` marks a panel still `Working` (the fallback
-    /// case) as unfinished rather than reading a half-done turn.
+    /// `assemble_panel_report` marks a panel still `Working` (the fallback case,
+    /// `settled == false`) as unfinished rather than reading a half-done turn.
     ///
     /// Spawning a panel needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
-    async fn assemble_round_report_marks_a_working_panel_unfinished() {
+    async fn panel_report_marks_a_working_panel_unfinished() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let Ok(sub) = mux.spawn_panel("reviewer", None, None, None) else {
@@ -2117,29 +2244,36 @@ mod tests {
             PanelState::Working,
         );
 
+        // No latch → contribution.settled is false → "forced out" header +
+        // "still working" footer.
         let round = pending_round(
             vec![sub],
             ReadPanelMode::LastMessage,
             HashMap::new(),
             HashMap::new(),
         );
-        let report = mux.assemble_round_report(&round, false);
+        let c = mux.round_panel_contribution(&round, sub).unwrap();
+        let report = mux.assemble_panel_report(&round, sub, &c);
         assert!(
             report.contains("still working"),
             "a Working panel must be marked unfinished: {report}"
+        );
+        assert!(
+            report.contains("forced out by the fallback deadline"),
+            "an unsettled panel's header must say it was forced out: {report}"
         );
 
         mux.shutdown();
     }
 
-    /// `assemble_round_report` emits a `### task N` section for every captured
+    /// `assemble_panel_report` emits a `### task N` section for every captured
     /// turn — so a multi-task backlog delivers all of its intermediate outputs,
     /// not only the last. Boundary: three captured turns (two backlog feeds plus
     /// the settle capture) → three numbered sections, each body present.
     ///
     /// Spawning a panel needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
-    async fn assemble_round_report_emits_a_section_per_captured_task() {
+    async fn panel_report_emits_a_section_per_captured_task() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
 
@@ -2165,7 +2299,8 @@ mod tests {
             captured,
             HashMap::new(),
         );
-        let report = mux.assemble_round_report(&round, true);
+        let c = mux.round_panel_contribution(&round, sub).unwrap();
+        let report = mux.assemble_panel_report(&round, sub, &c);
 
         for (n, body) in [
             (1, "output of task one"),
@@ -2182,29 +2317,25 @@ mod tests {
         mux.shutdown();
     }
 
-    /// A single-output panel (no backlog → empty `captured`) keeps the original
+    /// A single-output panel (no backlog → one captured turn) keeps the original
     /// header-less report shape: `### task N` sections appear only when there is
     /// more than one output to disambiguate. Backward-compat boundary against
     /// the multi-task case above.
-    ///
-    /// Spawning a panel needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
-    async fn assemble_round_report_omits_task_headers_for_a_single_output() {
+    async fn panel_report_omits_task_headers_for_a_single_output() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
 
-        let Some(sub) = spawn_idle(&mut mux, "reviewer") else {
-            eprintln!("skipping: no agent CLI on PATH");
-            return;
-        };
-
+        let captured = HashMap::from([(sub, vec!["the only output".to_string()])]);
         let round = pending_round(
             vec![sub],
             ReadPanelMode::LastMessage,
-            HashMap::new(),
+            captured,
             HashMap::new(),
         );
-        let report = mux.assemble_round_report(&round, true);
+        let c = mux.round_panel_contribution(&round, sub).unwrap();
+        let report = mux.assemble_panel_report(&round, sub, &c);
         assert!(
             !report.contains("### task"),
             "a single-output panel must not get task headers: {report}"
@@ -2213,15 +2344,13 @@ mod tests {
         mux.shutdown();
     }
 
-    /// Finding 24: a round's full results are no longer injected wholesale into
-    /// the main PTY. `spill_round_report` writes the complete report to
-    /// `rounds/<round_id>.md`, and `render_round_summary` injects only a compact
-    /// summary that points at that file. A small body is teased inline so a
-    /// trivial round needs no file read. (A `Working` panel + a captured turn
-    /// stands in for a finished sub-agent turn without a live read of the
-    /// hermetic cat panel, which has no real output.)
+    /// A panel's full result is no longer injected wholesale into the main PTY.
+    /// `spill_panel_report` writes the complete per-panel report to
+    /// `rounds/<round_id>-<panel>.md`, and `render_panel_summary` injects only a
+    /// compact summary that points at that file. A small body is teased inline
+    /// so a trivial delivery needs no file read.
     #[tokio::test]
-    async fn round_summary_points_at_a_spilled_full_report() {
+    async fn panel_summary_points_at_a_spilled_full_report() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let panel = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
@@ -2233,13 +2362,22 @@ mod tests {
             HashMap::new(),
         );
 
-        let report = mux.assemble_round_report(&round, false);
+        let c = mux.round_panel_contribution(&round, panel).unwrap();
+        let report = mux.assemble_panel_report(&round, panel, &c);
         let path = mux
-            .spill_round_report(round.id, &report)
+            .spill_panel_report(round.id, panel, &report)
             .expect("report spilled");
         assert!(
             path.starts_with(mux.session.root_dir.join("rounds")),
             "report must land in rounds/: {}",
+            path.display()
+        );
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(&panel.to_string()),
+            "the per-panel report file name must carry the panel id: {}",
             path.display()
         );
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -2248,10 +2386,10 @@ mod tests {
             "the disk report must hold the full body: {on_disk}"
         );
 
-        let summary = mux.render_round_summary(&round, false, Some(path.as_path()));
+        let summary = mux.render_panel_summary(&round, panel, &c, Some(path.as_path()));
         assert!(
-            summary.contains("Round complete"),
-            "summary header missing: {summary}"
+            summary.contains(&format!("panel {panel}")),
+            "summary header must name the panel: {summary}"
         );
         assert!(
             summary.contains(&path.display().to_string()),
@@ -2265,12 +2403,11 @@ mod tests {
         mux.shutdown();
     }
 
-    /// A body far over the teaser budget is bounded in the *injected* summary
-    /// (with an elision marker) while the spilled report file keeps it in full
-    /// — the whole point of finding 24: the main PTY gets a teaser, the file
-    /// gets the body.
+    /// A body far over the teaser budget is bounded in the *injected* per-panel
+    /// summary (with an elision marker) while the spilled report file keeps it
+    /// in full: the main PTY gets a teaser, the file gets the body.
     #[tokio::test]
-    async fn round_summary_teases_a_large_body_kept_full_in_the_report() {
+    async fn panel_summary_teases_a_large_body_kept_full_in_the_report() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let panel = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
@@ -2283,9 +2420,10 @@ mod tests {
             HashMap::new(),
         );
 
-        let report = mux.assemble_round_report(&round, false);
-        let path = mux.spill_round_report(round.id, &report).unwrap();
-        let summary = mux.render_round_summary(&round, false, Some(path.as_path()));
+        let c = mux.round_panel_contribution(&round, panel).unwrap();
+        let report = mux.assemble_panel_report(&round, panel, &c);
+        let path = mux.spill_panel_report(round.id, panel, &report).unwrap();
+        let summary = mux.render_panel_summary(&round, panel, &c, Some(path.as_path()));
 
         // The injected summary is bounded — it must not inline the whole body.
         assert!(
@@ -2327,32 +2465,39 @@ mod tests {
         );
     }
 
-    /// A due round whose main worker has *exited on its own* (process crash/
+    /// A ready panel whose main worker has *exited on its own* (process crash/
     /// OOM) must drop, not re-queue forever. `pump_all` flips the panel to
     /// `Exited` but does not clear `main_panel_id` (only `kill_panel` does), so
     /// before this fix the round saw `main_panel_id == Some(..)` yet
     /// `deliverable == false`, falling into the re-queue arm every tick. The
-    /// dropped report is spilled rather than silently lost.
+    /// settled panel's contribution is spilled rather than silently lost.
     #[tokio::test]
     async fn poll_pending_rounds_drops_when_main_has_exited() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let main = push_cat_panel(&mut mux, "main", PanelState::Exited);
         mux.main_panel_id = Some(main);
+        // A live idle sub-panel that will latch (settle) on the first poll, so
+        // it carries a real contribution the main-gone path must preserve.
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
 
-        // A round on a non-existent id is due immediately (a missing id counts
-        // as settled).
-        mux.register_round(vec![PanelId::new()], None, Some(600), None, None);
+        mux.register_round(vec![sub], None, Some(600), None, None);
         assert_eq!(mux.pending_rounds.len(), 1);
 
         mux.poll_pending_rounds();
         assert!(
             mux.pending_rounds.is_empty(),
-            "a due round against an exited main must drop, not re-queue forever"
+            "a ready panel against an exited main must drop, not re-queue forever"
         );
+        let log = mux.session.root_dir.join("dropped-rounds.log");
         assert!(
-            mux.session.root_dir.join("dropped-rounds.log").exists(),
-            "the dropped round's report must be spilled to the session dir"
+            log.exists(),
+            "the settled panel's report must be spilled to the session dir"
+        );
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            body.contains(&format!("panel {sub}")),
+            "the dropped report must name the settled panel: {body}"
         );
 
         mux.shutdown();
@@ -2392,7 +2537,7 @@ mod tests {
         mux.shutdown();
     }
 
-    /// A due round is *held*, not delivered, while the main panel is alive but
+    /// A ready panel is *held*, not delivered, while the main panel is alive but
     /// busy (not `Idle`). The round stays pending for a later tick rather than
     /// landing mid-turn. (A main that is *gone* — missing/exited — is dropped,
     /// not held: that is the wedge guarded by
@@ -2403,13 +2548,25 @@ mod tests {
         let mut mux = mux(&tmp);
         let main = push_cat_panel(&mut mux, "main", PanelState::Working);
         mux.main_panel_id = Some(main);
+        // A live idle sub that latches (settles) on the poll, so it is ready to
+        // deliver — the round is held only because main is busy, not because the
+        // panel is gone.
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
 
-        mux.register_round(vec![PanelId::new()], None, Some(600), None, None);
+        mux.register_round(vec![sub], None, Some(600), None, None);
         mux.poll_pending_rounds();
         assert_eq!(
             mux.pending_rounds.len(),
             1,
-            "round must be held while the live main panel is busy"
+            "a ready panel must be held while the live main panel is busy"
+        );
+        assert!(
+            !mux.pending_rounds[0].delivered.contains(&sub),
+            "the held panel must not be marked delivered"
+        );
+        assert!(
+            mux.pending_rounds[0].settled.contains_key(&sub),
+            "the held panel is latched (settled), just not yet delivered"
         );
 
         mux.shutdown();
@@ -2502,6 +2659,115 @@ mod tests {
                 .is_ok_and(|mut d| d.next().is_some()),
             "delivering a round spills its full report to rounds/",
         );
+
+        mux.shutdown();
+    }
+
+    /// Streaming delivery: a multi-panel round wakes main the instant *each*
+    /// panel settles, without waiting for the slowest. The fast panel is
+    /// delivered while the slow one is still `Working`; the round stays pending
+    /// (the slow panel undelivered) and lands its own delivery only once it
+    /// finishes. No barrier — main interacts once per panel, N times per round.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn poll_pending_rounds_streams_each_panel_as_it_settles() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Some(main) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+        let Some(fast) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        let Some(slow) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+
+        // Both sub-panels open a turn (→ Working); a generous fallback so only a
+        // real settle, not the deadline, drives delivery.
+        mux.note_prompt_delivered(fast);
+        mux.note_prompt_delivered(slow);
+        let round_id = match mux.register_round(vec![fast, slow], None, Some(3600), None, None) {
+            ControlResponse::RoundRegistered { round_id, .. } => round_id,
+            other => panic!("expected RoundRegistered, got {other:?}"),
+        };
+
+        // Both working: nothing delivered, round held.
+        mux.poll_pending_rounds();
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "round held while both panels work"
+        );
+        assert!(
+            mux.pending_rounds[0].delivered.is_empty(),
+            "no panel delivered while both work",
+        );
+
+        // The fast panel settles; the slow one keeps working.
+        finish_turn(&mut mux, fast, "fast finding");
+        mux.poll_pending_rounds();
+
+        // Main was woken by the fast panel alone — no wait for the slow one.
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the fast panel's settle wakes main immediately",
+        );
+        assert_eq!(
+            mux.pending_rounds.len(),
+            1,
+            "round still pending: the slow panel is undelivered",
+        );
+        let round = &mux.pending_rounds[0];
+        assert!(round.delivered.contains(&fast), "fast panel delivered");
+        assert!(
+            !round.delivered.contains(&slow),
+            "slow panel not yet delivered",
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == slow).unwrap().state(),
+            PanelState::Working,
+            "the slow panel is still working when the fast one already delivered",
+        );
+
+        // Drain main back to Idle, then the slow panel finishes.
+        finish_turn(&mut mux, main, "ack fast");
+        finish_turn(&mut mux, slow, "slow finding");
+        mux.poll_pending_rounds();
+
+        // The slow panel's own delivery lands and retires the round.
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "the round retires once every panel is delivered",
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the slow panel's delivery wakes main again",
+        );
+
+        // One spilled report per panel — two deliveries, not a single barrier dump.
+        let spills = mux
+            .session
+            .root_dir
+            .join("rounds")
+            .read_dir()
+            .expect("rounds dir exists")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&round_id.to_string())
+            })
+            .count();
+        assert_eq!(spills, 2, "one spilled report per streamed panel");
 
         mux.shutdown();
     }
@@ -2786,6 +3052,10 @@ mod tests {
             !r.captured.contains_key(&old) && r.captured.contains_key(&new),
             "captured turns re-keyed to the new id"
         );
+        assert!(
+            !r.settled.contains_key(&old) && r.settled.contains_key(&new),
+            "settle latch re-keyed to the new id"
+        );
 
         mux.shutdown();
     }
@@ -2908,7 +3178,10 @@ mod tests {
             "a re-woken panel must not un-settle a round it already finished",
         );
 
-        let report = mux.assemble_round_report(&mux.pending_rounds[0], true);
+        let c = mux
+            .round_panel_contribution(&mux.pending_rounds[0], sub)
+            .unwrap();
+        let report = mux.assemble_panel_report(&mux.pending_rounds[0], sub, &c);
         assert!(
             report.contains("finished the audit: 3 findings"),
             "the latched contribution must survive the wake-up: {report}",
@@ -2967,7 +3240,10 @@ mod tests {
             serde_json::Value::Null,
         ));
 
-        let report = mux.assemble_round_report(&mux.pending_rounds[0], true);
+        let c = mux
+            .round_panel_contribution(&mux.pending_rounds[0], sub)
+            .unwrap();
+        let report = mux.assemble_panel_report(&mux.pending_rounds[0], sub, &c);
         assert!(
             report.contains("PARITY REPORT: 3 divergences, all fixed"),
             "the round must report the result captured at settle-time: {report}",
@@ -3025,23 +3301,24 @@ mod tests {
             "the push cannot land in a working main panel",
         );
 
-        // The pull delivers the round to the poller instead.
+        // The pull streams the settled panel to the poller instead.
         let ControlResponse::Panel { text } = mux.round_status(round_id) else {
             panic!("a completed round must answer with its report");
         };
         assert!(
-            text.contains("Round complete"),
-            "the poller must get the assembled report, not a status line: {text}",
+            text.contains(&format!("panel {sub}")),
+            "the poller must get the panel's delivery, not a status line: {text}",
         );
         assert!(
             text.contains("the sub-agent's result"),
             "the report must carry the panel's captured result: {text}",
         );
 
-        // Exactly-once: the round is completed, not left for a second delivery.
+        // Exactly-once: the panel is delivered and the round retired, not left
+        // for a second delivery.
         assert!(
             mux.pending_rounds.is_empty(),
-            "a pulled round must be completed, not re-queued for the push",
+            "a fully-pulled round must be retired, not re-queued for the push",
         );
         mux.poll_pending_rounds();
         assert!(matches!(
@@ -3083,8 +3360,8 @@ mod tests {
             "an unfinished panel must be reported as working: {text}",
         );
         assert!(
-            !text.contains("Round complete"),
-            "an unfinished round must not be delivered: {text}",
+            !text.contains("Full report:"),
+            "an unfinished panel must not be delivered: {text}",
         );
         assert_eq!(
             mux.pending_rounds.len(),
@@ -3141,7 +3418,10 @@ mod tests {
             "no new backlog work starts after the deadline",
         );
 
-        let report = mux.assemble_round_report(&mux.pending_rounds[0], false);
+        let c = mux
+            .round_panel_contribution(&mux.pending_rounds[0], sub)
+            .unwrap();
+        let report = mux.assemble_panel_report(&mux.pending_rounds[0], sub, &c);
         assert!(
             report.contains("what the panel got through"),
             "the partial report must carry the work the panel finished: {report}",
@@ -3393,15 +3673,15 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        let (main, _sub) = due_round_with_working_main(&mut mux);
+        let (main, sub) = due_round_with_working_main(&mut mux);
 
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
 
         let StopDirective::Deliver { reason } = rx.try_recv().expect("directive must be sent");
         assert!(
-            reason.contains("Round complete"),
-            "the directive carries the round summary: {reason}"
+            reason.contains(&format!("panel {sub}")),
+            "the directive carries the panel's streamed delivery: {reason}"
         );
         assert!(
             mux.pending_rounds.is_empty(),
@@ -3656,7 +3936,9 @@ mod tests {
         mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
 
         let StopDirective::Deliver { reason } = rx.try_recv().expect("directive must be sent");
-        let round_at = reason.find("Round complete").expect("round in reason");
+        let round_at = reason
+            .find(&format!("panel {sub}"))
+            .expect("round in reason");
         let notice_at = reason.find("which schema?").expect("notice in reason");
         assert!(
             round_at < notice_at,
@@ -3676,34 +3958,39 @@ mod tests {
         mux.shutdown();
     }
 
-    /// `take_due_round_summary` judges dueness fresh and takes at most one
-    /// round: an unfinished round is left pending and yields `None`; once due
-    /// it is completed, removed, and a second call finds nothing.
+    /// `take_ready_round_deliveries` judges readiness fresh and takes each ready
+    /// panel exactly once: an unfinished round yields nothing and stays pending;
+    /// once the panel settles it is streamed, marked delivered, the round
+    /// retired, and a second call finds nothing.
     #[tokio::test]
-    async fn take_due_round_summary_takes_exactly_the_due_round() {
+    async fn take_ready_round_deliveries_takes_each_ready_panel_once() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
         mux.note_prompt_delivered(sub);
         mux.register_round(vec![sub], None, Some(3600), None, None);
 
-        assert_eq!(
-            mux.take_due_round_summary(),
-            None,
-            "an unfinished round is not taken"
+        assert!(
+            mux.take_ready_round_deliveries().is_empty(),
+            "a working panel is not ready to deliver"
         );
-        assert_eq!(mux.pending_rounds.len(), 1, "and it stays pending");
+        assert_eq!(mux.pending_rounds.len(), 1, "and the round stays pending");
 
         finish_turn(&mut mux, sub, "done");
-        let summary = mux
-            .take_due_round_summary()
-            .expect("a settled round is due");
-        assert!(summary.contains("Round complete"), "got: {summary}");
-        assert!(mux.pending_rounds.is_empty());
-        assert_eq!(
-            mux.take_due_round_summary(),
-            None,
-            "a taken round cannot be taken twice"
+        let deliveries = mux.take_ready_round_deliveries();
+        assert_eq!(deliveries.len(), 1, "the settled panel is streamed once");
+        assert!(
+            deliveries[0].contains(&format!("panel {sub}")),
+            "got: {}",
+            deliveries[0]
+        );
+        assert!(
+            mux.pending_rounds.is_empty(),
+            "the round retires once drained"
+        );
+        assert!(
+            mux.take_ready_round_deliveries().is_empty(),
+            "a delivered panel cannot be taken twice"
         );
         mux.shutdown();
     }
@@ -4228,38 +4515,49 @@ Enter to select - up/down to navigate - Esc to cancel";
         );
     }
 
-    /// `push_auto_answers` emits nothing for a round that auto-answered no menu,
-    /// and one line per recorded auto-answer otherwise.
+    /// `push_panel_auto_answers` emits nothing for a panel caucus auto-answered
+    /// no menu on, and one line per recorded auto-answer for that panel — never
+    /// another panel's, since streamed delivery hands main one panel at a time.
     #[test]
-    fn auto_answers_block_lists_each_resolved_menu() {
+    fn auto_answers_block_lists_each_resolved_menu_for_the_panel() {
+        let p = PanelId::new();
+        let other = PanelId::new();
         let mut round = pending_round(
-            vec![],
+            vec![p, other],
             ReadPanelMode::LastMessage,
             HashMap::new(),
             HashMap::new(),
         );
 
         let mut out = String::new();
-        push_auto_answers(&mut out, &round);
+        push_panel_auto_answers(&mut out, &round, p);
         assert!(out.is_empty(), "no auto-answers → no block");
 
-        let p = PanelId::new();
         round.auto_answers.push(AutoAnswerRecord {
             panel: p,
             role: "reviewer".to_string(),
             number: 2,
             label: "Structural fix at source".to_string(),
         });
-        push_auto_answers(&mut out, &round);
+        // An auto-answer on a *different* panel must not leak into this one's.
+        round.auto_answers.push(AutoAnswerRecord {
+            panel: other,
+            role: "qa".to_string(),
+            number: 9,
+            label: "Some other fork".to_string(),
+        });
+        push_panel_auto_answers(&mut out, &round, p);
         assert!(
-            out.contains("caucus auto-answered 1 selection menu(s)"),
+            out.contains("caucus auto-answered 1 selection menu(s) on this panel"),
             "got: {out}"
         );
         assert!(
-            out.contains(&format!(
-                "panel {p} (role: reviewer) → option 2 \"Structural fix at source\""
-            )),
+            out.contains("→ option 2 \"Structural fix at source\" (role: reviewer)"),
             "got: {out}"
+        );
+        assert!(
+            !out.contains("Some other fork"),
+            "another panel's auto-answer must not appear: {out}"
         );
     }
 

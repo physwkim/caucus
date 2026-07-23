@@ -247,10 +247,10 @@ impl Multiplexer {
     /// (`main_last_boundary_hook_continued`, the alternation gate — caucus
     /// never continues the main on two consecutive boundaries, so it always
     /// reaches a real idle boundary where Claude Code can compact and the user
-    /// can type); and a round is actually due
-    /// ([`Multiplexer::take_due_round_summary`]). Every precondition that fails
-    /// simply drops the sender — allow — and the signal is handled exactly as
-    /// before; the still-due round then rides the keystroke push.
+    /// can type); and a round panel is actually ready to deliver
+    /// ([`Multiplexer::take_ready_round_deliveries`]). Every precondition that
+    /// fails simply drops the sender — allow — and the signal is handled exactly
+    /// as before; the still-ready panels then ride the keystroke push.
     ///
     /// A delivered reply means the turn *continues*: the panel skips the
     /// `Idle` transition and its capture turn is reopened
@@ -293,10 +293,10 @@ impl Multiplexer {
         panel.end_turn();
 
         // Hook-reply delivery, decided before the Idle transition. The reason
-        // carries every deliverable waiting for main's attention: the first
-        // due round (the primary deliverable, so it leads), then the whole
-        // question-notice queue — the reply is one continuing turn, so a
-        // notice held back would wait an entire further main turn for the
+        // carries every deliverable waiting for main's attention: each round
+        // panel ready to deliver (the primary deliverable, so it leads), then
+        // the whole question-notice queue — the reply is one continuing turn,
+        // so anything held back would wait an entire further main turn for the
         // push path, which is the latency this delivery exists to remove.
         // Both takes are gated behind the checks, so nothing is consumed on a
         // path that cannot deliver; with nothing pending the sender drops —
@@ -310,7 +310,7 @@ impl Multiplexer {
             && !self.main_last_boundary_hook_continued
         {
             let mut parts: Vec<String> = Vec::new();
-            parts.extend(self.take_due_round_summary());
+            parts.extend(self.take_ready_round_deliveries());
             parts.extend(self.take_question_notice_texts());
             if !parts.is_empty() {
                 let reason = parts.join("\n\n");

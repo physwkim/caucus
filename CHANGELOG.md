@@ -5,6 +5,25 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [Unreleased]
+
+### Changed
+
+- **Round results now stream to the main worker per panel, instead of
+  waiting for the whole round to finish.** A round that ran across several
+  panels used to deliver only once every panel had settled — the main
+  worker sat idle behind the single slowest sub-agent. The all-settled
+  barrier is gone: each panel's contribution is delivered the instant that
+  panel settles (latched by Invariant I-9), so the main worker starts
+  interacting with the early finishers while the slow ones are still
+  working. A round now wakes the main worker once per panel (N times) rather
+  than once total. Delivery is tracked by a per-panel `delivered` ledger
+  (Invariant I-10, revised from round-once to panel-once), and every path —
+  the keystroke push, the `round_status` pull, and the Stop hook-reply —
+  streams each ready panel exactly once. Each panel spills its own full
+  report to `rounds/<round-id>-<panel-id>.md`. Design §8 flow, §7.6, and
+  Invariant I-10. No hook reinstall or config change needed.
+
 ## [0.10.3] — 2026-07-23
 
 Two ways a panel's real state and caucus's belief about it could diverge,

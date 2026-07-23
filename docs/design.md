@@ -167,19 +167,21 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
 
 3. caucus가 turn signal 수신 → 해당 패널 manifest에 TurnCompleted LaneEvent
    append → derived_state를 idle로. caucus는 매 tick `poll_pending_rounds`로
-   등록된 라운드의 패널이 모두 settle했는지 확인한다.
+   등록된 라운드에서 **정착한(settle) 패널을 하나씩** 골라낸다 — 배리어 없이,
+   모든 패널을 기다리지 않는다.
 
-4. 라운드의 패널이 모두 idle이 되면 caucus가 각 패널 결과(read_mode 기본
-   last_message, since_last_turn도 가능)를 모아 **전체 보고서를
-   `<session_root>/rounds/<round-id>.md`에 spill**하고, 그 파일을 가리키는
-   **압축 요약**(패널별 한 줄 상태 + 최신 출력 teaser + 보고서 경로)만 main
-   worker 패널에 새 turn으로 주입한다 — pull-only MCP가 못 하는 caucus→main
-   push다(§8.5). 전체 보고서를 통째로 PTY에 붙여 넣지 않는 이유: 다중 패널
-   라운드 결과는 수백 KB까지 가고, 그 크기의 단일 bracketed paste는 백엔드의
-   paste 처리 병리를 건드린다. main worker는 teaser로 부족하면 보고서 파일을
-   Read한다. main worker가 idle이고 사용자가 입력 중이 아닐 때 전달된다. 안전망:
-   fallback_secs가 지나면 미완 패널을 "still working"으로 표시해 부분 결과를
-   전달한다.
+4. 패널이 정착하는 즉시 caucus가 **그 패널 하나의** 결과(read_mode 기본
+   last_message, since_last_turn도 가능)로 **전체 보고서를
+   `<session_root>/rounds/<round-id>-<panel-id>.md`에 spill**하고, 그 파일을
+   가리키는 **압축 요약**(패널 한 줄 상태 + 최신 출력 teaser + 보고서 경로)만
+   main worker 패널에 새 turn으로 주입한다 — pull-only MCP가 못 하는 caucus→main
+   push다(§8.5). 최후미 워커를 기다리지 않으므로 라운드는 패널 수만큼 main과
+   interaction 하고, 배달된 패널은 `delivered` 원장에 기입되어 다시 배달되지
+   않는다(I-10). 전체 보고서를 통째로 PTY에 붙여 넣지 않는 이유: 패널 결과가 수백
+   KB까지 가고, 그 크기의 단일 bracketed paste는 백엔드의 paste 처리 병리를
+   건드린다. main worker는 teaser로 부족하면 보고서 파일을 Read한다. main worker가
+   idle이고 사용자가 입력 중이 아닐 때 전달된다. 안전망: fallback_secs가 지나면
+   미완 패널을 "still working"으로 표시해 부분 결과를 전달한다.
 
 5. main worker가 주입된 라운드 결과를 받고 판단:
      - 라운드 더  → 새 안건으로 broadcast + register_round 반복
@@ -203,14 +205,17 @@ agent별 manifest는 `agents/`에 남지만, *roster*(어떤 role이 어떤 순�
 
 **라운드 식별(status·cancel)**: `register_round`는 라운드 id(ULID)를 반환한다.
 그 id로 main worker는 라운드를 들여다보거나(`round_status` — 패널별
-working/draining backlog/settled/gone 상태, 남은 백로그 수, fallback 데드라인까지
-남은 초) 취소할 수 있다(`cancel_round` — caucus가 그 라운드 감시·전달을 멈춘다;
-패널은 건드리지 않아 진행 중 작업은 계속 돌고 백로그 급여만 끊긴다). 정상 흐름은
-여전히 register 후 턴을 닫고 caucus의 완료 push를 기다리는 것이다 — 그게 더 싸다.
-다만 push는 main 패널이 idle일 때만 착지하므로(즉 main이 턴을 끝낸 뒤에만), 턴
-안에서 기다리는 main은 영원히 못 받는다. 그래서 `round_status`는 **pull 경로**를
-겸한다: 라운드가 완료됐으면 조립된 보고서를 그대로 반환하고 라운드를 완료시킨다
-(**Invariant I-10**). 라운드 id는 **라이브 전용**: 재시작을 못 넘기므로(sub-agent
+working/draining backlog/settled/delivered/gone 상태, 남은 백로그 수, fallback
+데드라인까지 남은 초) 취소할 수 있다(`cancel_round` — caucus가 그 라운드 감시·전달을
+멈춘다; 패널은 건드리지 않아 진행 중 작업은 계속 돌고 백로그 급여만 끊긴다). 정상
+흐름은 여전히 register 후 턴을 닫고 caucus의 완료 push를 기다리는 것이다 — 그게 더
+싸다. 배달은 **패널 단위 스트리밍**이다: 배리어 없이 각 패널이 정착하는 즉시 그
+패널의 결과만 따로 도착하므로, main은 최후미 워커를 기다리지 않고 라운드당 패널
+수만큼 interaction 한다(**Invariant I-10**). 다만 push는 main 패널이 idle일 때만
+착지하므로(즉 main이 턴을 끝낸 뒤에만), 턴 안에서 기다리는 main은 영원히 못 받는다.
+그래서 `round_status`는 **pull 경로**를 겸한다: 준비된 패널을 모두 스트림으로 반환하고,
+남은 패널이 있으면 상태 텍스트와 함께 라운드를 pending에 유지한다. 라운드 id는
+**라이브 전용**: 재시작을 못 넘기므로(sub-agent
 프로세스가 새로 뜬다 — `ingest_resumed_rounds`) 영속화하지 않고, caucus가 더 이상
 감시하지 않는 id(전달 완료/취소됨)는 에러다.
 
@@ -686,9 +691,10 @@ compose 중, 런타임 종료)가 코드 0줄로 allow에 정합한다. allow를
 2. 신호의 패널이 main 패널이다.
 3. compose hold가 없다 (`main_compose_quiet` — "사람이 작성 중이면 자동 전달
    없음" 규칙은 경로 불문이다; hold면 allow, round는 grace 해소 후 push가 전달).
-4. 배달할 것이 있다: due인 round (`take_due_round_summary` — `round_status`
-   pull을 큐 전체로 일반화한 것: latch 갱신(I-9) → push와 동일한 due 판정
-   (`fallback_due || all_settled`) → 제거 후 `complete_round`(I-10) → 영속화)
+4. 배달할 것이 있다: 준비된 round 패널 (`take_ready_round_deliveries` —
+   `round_status` pull을 큐 전체로 일반화한 것: latch 갱신(I-9) → push와 동일한
+   `panel_ready` 판정 → 준비된 패널마다 `render_panel_delivery` + `delivered`
+   기입, 라운드가 전부 배달되면 제거(I-10))
    **또는** 대기 중인 question notice (`take_question_notice_texts` — §7.5 큐
    전체를 batch; push는 push마다 main 턴을 하나 여니까 tick당 1건이지만, reply는
    하나의 이어지는 턴이라 나눠 보내면 notice가 main 턴 하나를 통째로 더
@@ -712,13 +718,14 @@ EOF, 크기 초과, 파싱 실패, 미지의 action — 아무것도 출력하�
 경로는 없다.
 
 **수신자 소실 경합**: liveness 확인과 send 사이에 클라이언트가 타임아웃하면
-round는 이미 완료·제거된 상태다. 이때 요약은 즉시 키스트로크로 전달되고(방금
-Idle로 전이한 main — push가 착지하는 바로 그 상태), 그것도 실패하면
+그 패널은 이미 `delivered`로 기입된 상태다. 이때 요약은 즉시 키스트로크로
+전달되고(방금 Idle로 전이한 main — push가 착지하는 바로 그 상태), 그것도 실패하면
 `dropped-rounds.log`에 남는다. 전체 리포트는 어느 경우든 이미 디스크에 있다
-(`rounds/<id>.md`).
+(`rounds/<round-id>-<panel-id>.md`).
 
-**종결 논증**: block 1회 = due round 1개 + question notice 큐 전체 소비이므로,
-연속 block은 그 사이 새로 도착한 deliverable이 있어야만 가능하다 — 종결은
+**종결 논증**: block 1회 = 준비된 round 패널 전체 + question notice 큐 전체
+소비이므로, 연속 block은 그 사이 새로 도착한 deliverable(새로 정착한 패널 또는
+새 notice)이 있어야만 가능하다 — 종결은
 구조적이고 `stop_hook_active` 파싱이 필요 없다. Claude의 연속 block 8회 하드
 캡은 추가 안전망으로만 존재한다.
 
@@ -1500,8 +1507,8 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
   terminal) **첫 tick**에, 그 시점의 결과를 `read_mode`로 읽어 `captured`에 넣고 `settled`에
   등록한다. 이후 그 패널의 상태나 출력은 라운드의 due 판정에도, 배달되는 기여에도 영향을 주지
   않는다.
-- **MUST NOT**: 배달 시점에 패널을 다시 읽거나(`round_panel_contribution`), 라이브 상태로 배리어를
-  다시 판정하지 않는다(`round_settled`).
+- **MUST NOT**: 배달 시점에 패널을 다시 읽거나(`round_panel_contribution`), 라이브 상태로 패널의
+  준비 여부(`panel_ready`)를 다시 판정하지 않는다 — 정착은 latch로 고정된다.
 - **왜**: 배달은 *메인* 패널이 idle이 되어야 일어나므로 정착과 배달 사이 간격은 무한정 커질 수 있다.
   그 창에서 정착한 패널의 턴을 다시 여는 경로(MCP `send_keys`, auto-answer `select_option`, 사용자가
   패널에 친 Enter, 그리고 **남은 백그라운드 셸이 끝나 CLI가 스스로 새 턴을 시작하는 것**)가 존재한다.
@@ -1509,34 +1516,48 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
   읽기를 건너뛰어 완료된 작업을 "still working, no output captured"로 배달하며, (3) `last_message`를
   뒤늦은 턴의 잡담("nothing new came out of it")으로 덮어썼다.
 - **Enforcement**: `PendingRound.settled` / `.captured`는 private 필드이고 `poll_round_panels`만
-  쓴다. `round_settled`는 latch만 읽고 `self.panels`의 상태를 보지 않는다.
+  쓴다. `panel_ready`는 latch(`settled`) / `delivered`만 읽고 `self.panels`의 상태로 재판정하지
+  않는다(gone 판정 제외).
 - **Tests**: latch 후 패널을 다시 `Working`으로 깨워도 라운드가 미정착으로 돌아가지 않고 기여가
   남는지; latch 후 도착한 `Stop` 훅이 리포트의 `last_message`를 덮지 못하는지; backlog가 남은 채
   fallback이 닫히면 latch는 되고 feed는 안 되는지.
 
-### Invariant I-10: 라운드는 정확히 한 번 배달된다 (push, pull 또는 hook-reply)
-- **Owner**: `Multiplexer::complete_round()` — assemble + spill + summary의 유일한 지점.
-  호출 전에 라운드는 이미 `pending_rounds`에서 제거되어 있어야 한다.
-- **MUST**: 세 배달 경로 모두 이 owner를 지난다. **push** =
-  `poll_pending_rounds()` (메인 패널이 idle일 때 요약을 타이핑해 넣음),
-  **pull** = `round_status()` (완료된 라운드면 조립된 리포트를 호출자에게 그대로 반환),
-  **hook-reply** = `take_due_round_summary()` (§7.6 — main의 Stop hook 응답에 요약을
-  실음; push와 같은 due 판정을 쓰고, 같은 제거-후-`complete_round` 규율을 지킨다).
-- **MUST NOT**: pull이 라운드를 pending에 남겨 두지 않는다 (남기면 push가 두 번째로
-  배달한다). hook-reply가 꺼낸 요약을 oneshot send 실패 시 조용히 버리지 않는다 —
-  라운드는 이미 완료됐으므로 키스트로크 fallback, 최후에는 `dropped-rounds.log`로
-  반드시 어딘가에 착지시킨다.
+### Invariant I-10: 라운드의 각 패널은 정확히 한 번 배달된다 (push, pull 또는 hook-reply)
+- **배리어 없음(streaming)**: 라운드는 모든 패널이 정착하기를 기다리지 않는다. 패널이
+  정착(I-9로 latch)하는 즉시 그 패널의 기여만 따로 main에 전달되고, 라운드는 나머지
+  미배달 패널을 위해 pending에 남는다. 조기 완료 워커가 최후미 워커를 기다리지 않으므로
+  라운드는 main과 패널 수만큼(N회) interaction 한다.
+- **Owner / 원장**: 배달 여부는 `PendingRound.delivered: HashSet<PanelId>` — 패널별
+  정확히-한-번 원장이 정한다. `panel_ready`(정착했거나·gone·fallback due이고 아직
+  `delivered`에 없음)가 배달 대상을 고르고, 배달 성공 시에만 그 패널 id를 `delivered`에
+  넣는다. `render_panel_delivery`가 그 패널 한 명의 assemble + spill(`rounds/<round>-<panel>.md`)
+  + summary의 유일한 지점이다. `round_fully_delivered`(모든 패널이 `delivered`)면 라운드를
+  `pending_rounds`에서 제거한다.
+- **MUST**: 세 배달 경로 모두 이 원장을 지난다 — 배달 전 `panel_ready`로 걸러 아직 안 준
+  패널만, 배달 후 `delivered`에 기입. **push** = `poll_pending_rounds()` (메인 패널이 idle일
+  때 준비된 패널을 tick당 하나씩 타이핑해 넣음), **pull** = `round_status()` (준비된 패널을
+  모두 스트림으로 반환하고, 남은 패널이 있으면 상태 텍스트와 함께 라운드를 pending에 유지),
+  **hook-reply** = `take_ready_round_deliveries()` (§7.6 — main의 Stop hook 응답에 준비된
+  패널들의 배달을 실음; push와 같은 `panel_ready` 판정을 쓴다).
+- **MUST NOT**: 이미 `delivered`인 패널을 다시 배달하지 않는다 (경로 간·tick 간 중복 배달
+  금지). hook-reply가 꺼낸 배달을 oneshot send 실패 시 조용히 버리지 않는다 — 해당 패널은
+  이미 `delivered`로 기입됐으므로 키스트로크 fallback, 최후에는 `dropped-rounds.log`로
+  반드시 어딘가에 착지시킨다. main이 이미 나갔으면 준비된 패널을 `dropped-rounds.log`로
+  흘리고 `delivered`에 기입한다.
 - **왜**: push는 메인 패널이 idle일 때만 착지한다 — 즉 메인 워커가 **턴을 끝낸 뒤에만**. 턴 안에서
   기다리며 폴링하는 메인 워커는 내내 `Working`이므로 push는 영원히 못 온다: 메인은 라운드를 기다리고
   라운드는 메인이 기다림을 멈추기를 기다린다. `fallback_deadline`은 이 라이브락을 못 끊는다 — 그것은
-  라운드를 *due*로 만들 뿐 *deliverable*로 만들지 않는다. pull이 구조적으로 끊는다.
-- **Enforcement**: 세 경로 다 라운드를 `pending_rounds`에서 꺼낸 뒤에만 `complete_round`를 부른다.
-  셋 다 같은 이벤트 루프 스레드에서 실행되므로 (signal drain → control drain → poll) 겹칠 수 없다.
-- **Tests**: 메인이 `Working`인 채로 `round_status`가 리포트를 반환하고 라운드를 완료시키는지;
-  그 뒤 `poll_pending_rounds`가 아무것도 배달하지 않고 같은 id의 두 번째 `round_status`가 에러인지;
-  아직 안 끝난 라운드는 pull 되지 않고 상태 텍스트만 반환하며 pending으로 남는지;
-  hook-reply 배달 후 push가 같은 라운드를 다시 배달하지 않는지, 수신자가 죽은 hook은
-  아무것도 소비하지 않고 push 경로에 라운드를 남기는지.
+  패널을 *due*로 만들 뿐 *deliverable*로 만들지 않는다. pull이 구조적으로 끊는다.
+- **Enforcement**: `delivered`는 private 필드이고 세 경로 모두 배달 후에만 기입한다. 셋 다 같은
+  이벤트 루프 스레드에서 실행되므로 (signal drain → control drain → poll) 겹칠 수 없다.
+  gone 패널은 `retire_gone_round_panels`가 조용히 `delivered`에 넣어 라운드가 영원히 pending에
+  남지 않게 한다.
+- **Tests**: 2-패널 라운드에서 빠른 패널이 정착하면 느린 패널이 아직 `Working`인 채로 main이
+  즉시 깨어나고 라운드는 pending에 남으며(느린 패널 미배달), 느린 패널이 끝나면 자기 배달만
+  따로 착지하고 라운드가 은퇴하는지(패널당 spill 파일 하나씩, 총 2개); 메인이 `Working`인 채로
+  `round_status`가 준비된 패널을 스트림하고 남은 패널엔 상태 텍스트를 반환하는지;
+  `take_ready_round_deliveries`가 각 준비된 패널을 정확히 한 번만 꺼내는지;
+  hook-reply 배달 후 push가 같은 패널을 다시 배달하지 않는지.
 
 
 ---
