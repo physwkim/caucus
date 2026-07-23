@@ -783,6 +783,28 @@ impl Multiplexer {
         if Some(panel_id) == self.main_panel_id {
             self.main_compose_since = None;
         }
+        // Does this submission add a turn, or resume the one already running?
+        //
+        // A panel paused on a blocked prompt (selection menu, `[y/N]`) has an
+        // open turn that has *not* ended — the agent is waiting inside it. A
+        // submission there is an **answer**: it resumes that same turn, so
+        // exactly one Stop still follows. Counting it as a second outstanding
+        // prompt makes that single Stop read as "a queued prompt is still
+        // pending", which pins the panel `Working` forever and its watch never
+        // settles — the worker finishes and main is never told.
+        //
+        // A submission into a *running but unblocked* turn is the opposite: the
+        // agent CLI queues it and runs it next, so it does bring its own Stop
+        // and must be counted. Computed here, before the mutable borrow, so the
+        // rule is uniform across every caller (`send_keys`, `select_option`, a
+        // human typing) rather than a flag each one has to get right.
+        let resumes_open_turn = self
+            .panels
+            .iter()
+            .find(|p| p.id == panel_id)
+            .is_some_and(|p| {
+                p.state() == PanelState::Working && Self::panel_blocked_prompt(p).is_some()
+            });
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
             return;
         };
@@ -807,8 +829,11 @@ impl Multiplexer {
         // Forward half of the outstanding-prompt accounting. Submitted while
         // the panel's turn was already open, this prompt opens no turn of its
         // own (the agent CLI queues it), so without this count the *earlier*
-        // turn's Stop would pass for its boundary.
-        self.note_prompt_outstanding(panel_id);
+        // turn's Stop would pass for its boundary. An answer to a blocked
+        // prompt is excluded: it resumes the open turn and brings no extra Stop.
+        if !resumes_open_turn {
+            self.note_prompt_outstanding(panel_id);
+        }
     }
 
     /// Forward half of `outstanding_prompts`: one more prompt is in flight on

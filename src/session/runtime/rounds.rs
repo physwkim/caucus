@@ -2452,6 +2452,91 @@ mod tests {
         mux.shutdown();
     }
 
+    /// Answering a blocked prompt resumes the turn already running — it is not a
+    /// second prompt, and exactly one Stop still follows.
+    ///
+    /// The regression the outstanding-prompt counter introduced: `select_option`
+    /// routes through `note_prompt_delivered`, which counted the answer as
+    /// another prompt. The resumed turn's single Stop then decremented 2 → 1,
+    /// read as "a queued prompt is still pending", and pinned the panel
+    /// `Working` — its watch never settled, so a worker that had finished was
+    /// never reported to main. Observed: `outstanding=2`, then after the Stop
+    /// `settled=None`, `watches=1`, main still `Idle`. The auto-answer path
+    /// (`poll_round_blocked_panels`) drives the same `select_option`, so it had
+    /// the same hole.
+    #[tokio::test]
+    async fn answering_a_blocked_prompt_is_not_a_second_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        McpToolSurface::send_keys(&mut mux, worker, "real task", true).unwrap();
+        assert_eq!(mux.outstanding_prompts.get(&worker), Some(&1));
+
+        // The agent pauses *inside* that turn on a selection menu.
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == worker)
+            .unwrap()
+            .grid
+            .advance(
+                "\r\n  1. alpha\r\n\u{276f} 2. beta\r\nEnter to select \u{b7} \u{2191}/\u{2193} to navigate\r\n"
+                    .as_bytes(),
+            );
+        McpToolSurface::select_option(&mut mux, worker, 1).unwrap();
+        assert_eq!(
+            mux.outstanding_prompts.get(&worker),
+            Some(&1),
+            "answering the menu resumes the open turn — it adds no prompt",
+        );
+
+        // The resumed turn ends: one Stop, and it *is* the turn's boundary.
+        stop_turn(&mut mux, worker, "task done");
+        assert_eq!(
+            mux.panels()
+                .iter()
+                .find(|p| p.id == worker)
+                .unwrap()
+                .state(),
+            PanelState::Idle,
+            "the single Stop closes the turn — the panel is not pinned Working",
+        );
+
+        // The poll latches the answered turn and delivers it — the delivery is
+        // what proves the watch settled rather than staying pinned.
+        mux.poll_worker_watches();
+        assert!(mux.watches.is_empty(), "the finished worker is delivered");
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "main is woken with the worker's result",
+        );
+        mux.shutdown();
+    }
+
+    /// The other side of the same boundary: a submission into a turn that is
+    /// running but **not** blocked really is a queued prompt — the CLI runs it
+    /// next, so it brings its own Stop and must still be counted.
+    #[tokio::test]
+    async fn a_queued_prompt_into_an_unblocked_turn_is_still_counted() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        McpToolSurface::send_keys(&mut mux, worker, "first task", true).unwrap();
+        McpToolSurface::send_keys(&mut mux, worker, "second task", true).unwrap();
+        assert_eq!(
+            mux.outstanding_prompts.get(&worker),
+            Some(&2),
+            "no blocked prompt on screen: the second submission is genuinely queued",
+        );
+        mux.shutdown();
+    }
+
     /// `stop_watching` drops one worker's watch (leaving the panel alone) and
     /// errors on a panel that is not watched.
     #[tokio::test]
