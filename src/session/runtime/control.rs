@@ -106,7 +106,7 @@ impl Multiplexer {
     /// (`Multiplexer::begin_spawn_role_worktree`) and its reply is sent later
     /// from `Multiplexer::poll_pending_spawns`. `register_round` is
     /// non-blocking in a different way: it acks now and the round is delivered
-    /// later by the caucus→main push in [`Multiplexer::poll_pending_rounds`].
+    /// later by the caucus→main push in [`Multiplexer::poll_worker_watches`].
     pub fn drain_control(&mut self, server: &mut ControlServer) {
         while let Ok(job) = server.jobs().try_recv() {
             let ControlJob { request, reply } = job;

@@ -33,7 +33,7 @@ impl Multiplexer {
                 let is_main = Some(panel) == self.main_panel_id;
                 // A non-submit keystroke to the main panel means the user may
                 // be composing an un-submitted line: open the compose hold so a
-                // round delivery never lands mid-line (see `poll_pending_rounds`
+                // round delivery never lands mid-line (see `poll_worker_watches`
                 // / `COMPOSE_GRACE`). A submit is not a compose — it is handled
                 // by `note_prompt_delivered` below, which clears the hold.
                 if is_main && !submit {

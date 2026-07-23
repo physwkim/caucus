@@ -1,18 +1,18 @@
-//! Persistent in-flight-round record — the durable shadow of the memory-only
-//! `PendingRound` (`src/session/runtime/rounds.rs`).
+//! Persistent watched-worker record — the durable shadow of the memory-only
+//! `WorkerWatch` (`src/session/runtime/rounds.rs`).
 //!
-//! A `PendingRound` lives only in `Multiplexer::pending_rounds`, so a quit or
-//! crash loses every in-flight round silently: on `caucus resume` the main
-//! worker's claude conversation reloads still believing its `register_round`
-//! call is live, yet caucus has no round to ever deliver — it would wait
-//! forever, and the sub-agents' captured work would be gone with no trace.
+//! A `WorkerWatch` lives only in `Multiplexer::watches`, so a quit or crash
+//! loses every in-flight worker silently: on `caucus resume` the main worker's
+//! claude conversation reloads still believing the work it handed out is live,
+//! yet caucus has nothing left to ever deliver — it would wait forever, and the
+//! sub-agents' captured work would be gone with no trace.
 //!
 //! These records close that gap. The multiplexer writes a compact snapshot of
-//! its pending rounds to `<session_root>/pending-rounds.json` whenever the set
+//! its live watches to `<session_root>/pending-rounds.json` whenever the set
 //! changes; resume reads it to (a) preserve the captured work in
-//! `dropped-rounds.log` and (b) tell the main worker the round was dropped so
-//! it stops waiting and can re-issue it. The sub-agent *processes* cannot be
-//! resumed mid-turn — they restart fresh — so a round is never silently
+//! `dropped-rounds.log` and (b) tell the main worker the work was dropped so it
+//! stops waiting and can re-issue it. The sub-agent *processes* cannot be
+//! resumed mid-turn — they restart fresh — so a watch is never silently
 //! "continued"; it is surfaced and closed.
 
 use std::path::{Path, PathBuf};
@@ -32,13 +32,12 @@ pub const PENDING_ROUNDS_FILE: &str = "pending-rounds.json";
 /// told, so the drop is delivered at-least-once instead of being silently lost.
 pub const RESUME_NOTICE_FILE: &str = "resume-notice.txt";
 
-/// One panel's slice of an in-flight round, snapshotted for resume.
+/// One watched worker, snapshotted for resume.
 ///
-/// Keyed by position (the panel's index within the round), not by panel id:
-/// panel ids are regenerated on resume, so the id cannot be the link. The role
-/// label and the captured work are what survive.
+/// Carries no panel id: ids are regenerated on resume, so the id cannot be the
+/// link. The role label and the captured work are what survive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RoundPanelRecord {
+pub struct WorkerWatchRecord {
     /// Role label of the panel at snapshot time, or `(gone)` if its id had
     /// already vanished from the roster.
     pub role: String,
@@ -49,15 +48,7 @@ pub struct RoundPanelRecord {
     /// Count of backlog tasks still queued (not yet run) at snapshot time.
     #[serde(default)]
     pub pending_backlog: usize,
-}
-
-/// One in-flight round, snapshotted for resume.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PendingRoundRecord {
-    /// One entry per round panel, in round order.
-    #[serde(default)]
-    pub panels: Vec<RoundPanelRecord>,
-    /// How the round read each panel's result.
+    /// How the watch reads the worker's result.
     pub read_mode: ReadPanelMode,
 }
 
@@ -69,7 +60,7 @@ pub fn path(session_root: &Path) -> PathBuf {
 /// Persist `rounds` to `<session_root>/pending-rounds.json`, or remove the file
 /// when there are none — so resume sees a clean state once every round has been
 /// delivered. Atomic write-to-temp + rename, mirroring `SessionRecord::write`.
-pub fn write(session_root: &Path, rounds: &[PendingRoundRecord]) -> std::io::Result<()> {
+pub fn write(session_root: &Path, rounds: &[WorkerWatchRecord]) -> std::io::Result<()> {
     let path = path(session_root);
     if rounds.is_empty() {
         return match std::fs::remove_file(&path) {
@@ -88,7 +79,7 @@ pub fn write(session_root: &Path, rounds: &[PendingRoundRecord]) -> std::io::Res
 /// Read the persisted rounds. A missing or unparseable file yields an empty
 /// list — a corrupt pending-rounds record is not worth aborting resume over;
 /// the worst case is the same silent loss this feature otherwise prevents.
-pub fn read(session_root: &Path) -> Vec<PendingRoundRecord> {
+pub fn read(session_root: &Path) -> Vec<WorkerWatchRecord> {
     let Ok(bytes) = std::fs::read(path(session_root)) else {
         return Vec::new();
     };
@@ -133,29 +124,28 @@ pub fn clear_notice(session_root: &Path) {
 mod tests {
     use super::*;
 
-    fn sample() -> Vec<PendingRoundRecord> {
-        vec![PendingRoundRecord {
-            panels: vec![
-                RoundPanelRecord {
-                    role: "backend".into(),
-                    captured: vec!["task one output".into()],
-                    pending_backlog: 2,
-                },
-                RoundPanelRecord {
-                    role: "(gone)".into(),
-                    captured: vec![],
-                    pending_backlog: 0,
-                },
-            ],
-            read_mode: ReadPanelMode::SinceLastTurn,
-        }]
+    fn sample() -> Vec<WorkerWatchRecord> {
+        vec![
+            WorkerWatchRecord {
+                role: "backend".into(),
+                captured: vec!["task one output".into()],
+                pending_backlog: 2,
+                read_mode: ReadPanelMode::SinceLastTurn,
+            },
+            WorkerWatchRecord {
+                role: "(gone)".into(),
+                captured: vec![],
+                pending_backlog: 0,
+                read_mode: ReadPanelMode::LastMessage,
+            },
+        ]
     }
 
     #[test]
     fn round_trips_through_json() {
         let recs = sample();
         let json = serde_json::to_string_pretty(&recs).unwrap();
-        let back: Vec<PendingRoundRecord> = serde_json::from_str(&json).unwrap();
+        let back: Vec<WorkerWatchRecord> = serde_json::from_str(&json).unwrap();
         assert_eq!(recs, back);
     }
 

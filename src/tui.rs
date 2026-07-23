@@ -817,7 +817,7 @@ async fn event_loop(
         // 6. Round delivery — if a registered round's panels have now settled
         //    (or its fallback deadline passed), assemble their results and
         //    inject them into the main worker's panel (the caucus→main push).
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
 
         // 6b. Question notices — a panel agent posted a `question` note
         //     (`caucus signal note`); announce it to the main worker. After
@@ -828,7 +828,7 @@ async fn event_loop(
         // 7. Stranded-main guard — if the main worker went idle with no round
         //    registered while sub-panels still run, nothing above can ever
         //    re-prompt it (both pushes need a round). Nudge it. Runs last: it
-        //    only fires when `pending_rounds` is empty, so it never competes
+        //    only fires when `watches` is empty, so it never competes
         //    with steps 5–6 for the one-push-per-tick gate.
         mux.poll_stranded_main();
 

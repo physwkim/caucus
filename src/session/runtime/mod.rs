@@ -40,7 +40,7 @@ mod spawn_async;
 mod unbound;
 
 use self::mcp::PendingSubmit;
-use self::rounds::{PendingRound, QuestionNotice};
+use self::rounds::{QuestionNotice, WorkerWatch};
 pub(crate) use self::scroll::ScrollState;
 
 /// The live multiplexer: one [`Session`] plus every panel running in it.
@@ -84,21 +84,22 @@ pub struct Multiplexer {
     quit: bool,
     /// Monotonic counter for agent-name suffixes per role.
     role_counts: HashMap<String, usize>,
-    /// Rounds caucus is watching to deliver to the main worker
-    /// ([`Multiplexer::poll_pending_rounds`]).
-    pending_rounds: Vec<PendingRound>,
-    /// Panels a round still owes main while that round is *moved out* of
-    /// `pending_rounds` — each delivery path takes the queue so its per-round
-    /// poll can borrow `self` mutably.
+    /// One watch per worker caucus owes the main worker a result for
+    /// ([`Multiplexer::poll_worker_watches`]). Armed when caucus hands a
+    /// sub-panel a prompt, dropped when its result is delivered.
+    watches: Vec<WorkerWatch>,
+    /// Panels a watch still owes main while that watch is *moved out* of
+    /// `watches` — each delivery path takes the list so its per-watch poll can
+    /// borrow `self` mutably.
     ///
     /// Without this, "is this panel already watched"
     /// ([`Multiplexer::worker_watched`]) would read `false` for every panel
     /// mid-poll, and the backlog feed — which re-prompts a panel from *inside*
     /// the poll, through `send_keys` → `note_prompt_delivered` →
     /// [`Multiplexer::arm_worker_watch`] — would arm a second watch on a panel
-    /// its own round is already watching, delivering it to main twice. Holding
-    /// the owed panels here keeps that predicate true wherever the round
-    /// currently lives.
+    /// that already has one, delivering it to main twice. Holding the owed
+    /// panels here keeps that predicate true wherever the watch currently
+    /// lives.
     watched_in_flight: HashSet<PanelId>,
     /// `spawn_role(worktree=true)` calls whose `git worktree add` is running on
     /// a worker thread. Finished off the event loop so a slow worktree create
@@ -136,7 +137,7 @@ pub struct Multiplexer {
     /// next Stop is *allowed* — the main reaches a real `Idle` boundary, where
     /// Claude Code can compact and the user can type, and any still-due round
     /// rides the `main_deliverable`-gated keystroke push
-    /// ([`Multiplexer::poll_pending_rounds`]) instead. Without the bound a
+    /// ([`Multiplexer::poll_worker_watches`]) instead. Without the bound a
     /// stream of due rounds answers `Deliver` every turn and the main never
     /// returns to idle — it wedges in a continue→compact→continue loop. Set on
     /// every main Stop to whether *this* boundary was hook-continued, so an
@@ -167,7 +168,7 @@ pub struct Multiplexer {
     /// `main_deliverable` gate as every other caucus→main push. Capped at
     /// [`rounds::QUESTION_NOTICE_CAP`] (oldest dropped, with a warning) so a
     /// runaway agent cannot grow it unbounded. Ephemeral, like
-    /// `pending_rounds`: a notice does not survive a caucus restart.
+    /// `watches`: a notice does not survive a caucus restart.
     pending_question_notices: VecDeque<QuestionNotice>,
     /// Instant of the last stranded-main nudge, or `None` while not stranded.
     /// caucus's only caucus→main pushes require a registered round; if the
@@ -373,7 +374,7 @@ impl Multiplexer {
                 area,
                 quit: false,
                 role_counts: HashMap::new(),
-                pending_rounds: Vec::new(),
+                watches: Vec::new(),
                 watched_in_flight: HashSet::new(),
                 pending_spawns: Vec::new(),
                 pending_submits: Vec::new(),

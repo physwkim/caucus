@@ -9,6 +9,23 @@ versions.
 
 ### Changed
 
+- **The round object is gone: caucus now watches one worker at a time.** The
+  `PendingRound` (a panel list plus four per-panel maps plus a `delivered`
+  ledger) collapsed into a per-panel `WorkerWatch` — one panel, one settle
+  latch, one backlog queue, one captured list. `register_round` over N panels
+  arms N watches that share a `round` handle, which is all `round_status` and
+  `cancel_round` still need it for. Exactly-once delivery (Invariant I-10) is
+  now structural rather than book-kept: **delivering a worker removes its
+  watch**, so a spent watch cannot be asked again — the `delivered` set and the
+  `round_fully_delivered` / `retire_gone_round_panels` retirement logic it
+  needed are deleted, not re-implemented. Spilled reports move from
+  `rounds/<round-id>-<panel-id>.md` to `rounds/<panel-id>-<n>.md`, so a worker
+  re-prompted across a session no longer overwrites its previous assignment's
+  report. The resume snapshot (`pending-rounds.json`) flattens to one record
+  per watched worker; a snapshot written by an older caucus is unreadable and
+  is treated as "no rounds in flight" (the same best-effort path a corrupt
+  file already took). Design §8, §7.6, Invariants I-9/I-10.
+
 - **Every worker caucus hands a prompt to is watched, and the watch re-arms
   after each delivery.** Streaming round delivery removed the barrier, but a
   round still retired when it was delivered — so once main sent a worker its

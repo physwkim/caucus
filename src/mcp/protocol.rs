@@ -130,7 +130,7 @@ pub enum ControlRequest {
     /// half-done assignment); the panel settles for the round only once it is
     /// idle *and* its queue is empty. A panel absent from `backlog` settles on
     /// its first idle, the original one-task-per-panel behaviour.
-    /// (`crate::session::runtime::Multiplexer::poll_pending_rounds`).
+    /// (`crate::session::runtime::Multiplexer::poll_worker_watches`).
     RegisterRound {
         panels: Vec<PanelId>,
         #[serde(default)]
@@ -160,7 +160,7 @@ pub enum ControlRequest {
     /// `settled`. The round is removed once every panel has been delivered.
     ///
     /// Both halves exist because the push
-    /// (`crate::session::runtime::Multiplexer::poll_pending_rounds`) types the
+    /// (`crate::session::runtime::Multiplexer::poll_worker_watches`) types the
     /// report into the main panel and so can only fire while that panel is
     /// *idle* — i.e. after the main worker ends its turn. A main worker that
     /// stays in its turn polling is `Working` throughout, so the push can never
