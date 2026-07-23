@@ -2168,6 +2168,71 @@ mod tests {
         mux.shutdown();
     }
 
+    /// A prompt delivered while a **local slash command** is still running must
+    /// not be settled by that command's completion.
+    ///
+    /// The regression, seen live: main sent a worker `/compact`, then sent it
+    /// the next brief. `/compact` is classified at submit time and deliberately
+    /// opens no turn, so the panel was still `Idle` — the brief therefore looked
+    /// like an ordinary prompt, opened a capture turn, flipped the panel to
+    /// `Working`, and armed the watch. But the CLI was mid-compact, so the brief
+    /// sat in *its* input queue, unstarted. When the `PostCompact` hook landed,
+    /// `close_local_command` ended whatever turn was open and flipped the panel
+    /// back to `Idle` — closing the brief's turn, which the compact had nothing
+    /// to do with. The watch then settled and delivered the panel's *previous*
+    /// report as the brief's answer: a false positive main acted on.
+    #[tokio::test]
+    async fn a_local_command_close_does_not_settle_a_later_prompt() {
+        use crate::signal::{CompactTrigger, LifecycleKind, LifecycleSignal};
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let session_id = mux.session.id;
+        let main = push_cat_panel(&mut mux, "main", PanelState::Working);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        // Main compacts the worker. Classified at submit: no turn is opened, so
+        // the panel stays idle and nothing is watched.
+        McpToolSurface::send_keys(&mut mux, worker, "/compact", true).unwrap();
+        assert!(
+            mux.watches.is_empty(),
+            "a local slash command is not work: it must not arm a watch"
+        );
+
+        // Main immediately sends the next brief. The CLI is still compacting, so
+        // this queues there — but to caucus it is an ordinary prompt.
+        McpToolSurface::send_keys(&mut mux, worker, "audit the TLS path", true).unwrap();
+        assert_eq!(mux.watches.len(), 1, "the brief arms the watch");
+
+        // The compact finishes. This closes the *compact*, not the brief.
+        mux.handle_lifecycle(LifecycleSignal::now(
+            session_id,
+            worker,
+            LifecycleKind::PostCompact {
+                trigger: CompactTrigger::Manual,
+            },
+            serde_json::Value::Null,
+        ));
+
+        mux.poll_worker_watches();
+        assert!(
+            mux.watches.iter().any(|w| w.panel == worker),
+            "the brief has not run yet: the compact's close must not settle it",
+        );
+        assert!(
+            mux.watches[watch_of(&mux, worker)].settled.is_none(),
+            "no latch may be taken from a turn the brief never ran",
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "main must not have been woken with a false result",
+        );
+
+        mux.shutdown();
+    }
+
     /// `stop_watching` drops one worker's watch (leaving the panel alone) and
     /// errors on a panel that is not watched.
     #[tokio::test]

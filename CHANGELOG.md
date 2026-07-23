@@ -7,6 +7,20 @@ versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `/compact` completing no longer settles a prompt that arrived while it
+  was still running.** caucus classifies a `/compact` it submits itself and
+  deliberately opens no capture turn for it, but `close_local_command` decided
+  from the panel's *live* state — so when the next brief landed mid-compaction
+  (queued inside the CLI, not started), the compaction's `PostCompact` ended
+  that brief's turn and flipped the panel `Idle`. The watch settled and
+  delivered the worker's **previous** report as the brief's answer: a false
+  positive main acted on. The classification is now recorded
+  (`local_commands_without_turn`) and consumed by the close, so a local command
+  can only ever close a turn it opened; a hand-typed `/compact` (unclassifiable,
+  and with no Stop hook to follow) still closes its own turn as before.
+
 ### Changed
 
 - **BREAKING (MCP surface): `register_round` / `round_status` / `cancel_round`

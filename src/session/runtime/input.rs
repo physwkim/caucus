@@ -446,20 +446,35 @@ impl Multiplexer {
         }
     }
 
-    /// Close the turn phase a local slash command occupied: end the capture
-    /// turn, flip a `Working` panel back to `Idle` (via `lifecycle::transition`,
-    /// Invariant I-5), and record `LocalCommandCompleted` on the manifest so
-    /// `derived_state` follows in lockstep (Invariant I-2) and a pending round
-    /// on the panel can settle. A panel that was not `Working` (the submit
-    /// path already classified the command and never opened a turn) keeps its
-    /// state — the manifest still records the completion fact.
+    /// Close the turn phase a local slash command occupied, and record
+    /// `LocalCommandCompleted` on the manifest so `derived_state` follows in
+    /// lockstep (Invariant I-2).
+    ///
+    /// **Only a turn this command itself opened may be closed.** caucus knows
+    /// which those are: when the submit path classified the command it opened
+    /// no turn and marked the panel in `local_commands_without_turn`. With the
+    /// marker set this close touches neither the capture turn nor the panel
+    /// state — it consumes the marker and records the fact. Ending a turn here
+    /// would end whatever turn is open *now*, which after a prompt arrived
+    /// mid-command is that prompt's turn: the panel would flip to `Idle` and
+    /// its watch would latch the *previous* turn's output as the new prompt's
+    /// answer (a false positive main then acts on).
+    ///
+    /// Without the marker the command was typed by hand — unclassifiable, so a
+    /// turn *was* opened for it and no Stop hook will ever fire to close it.
+    /// That is the one case where this is the turn's owner: end the capture
+    /// turn and flip a `Working` panel back to `Idle` (via
+    /// `lifecycle::transition`, Invariant I-5).
     fn close_local_command(&mut self, panel_id: PanelId, command: &str) {
+        let caucus_opened_no_turn = self.local_commands_without_turn.remove(&panel_id);
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
             return;
         };
-        panel.end_turn();
-        if panel.state() == PanelState::Working {
-            let _ = lifecycle::transition(panel, PanelState::Idle);
+        if !caucus_opened_no_turn {
+            panel.end_turn();
+            if panel.state() == PanelState::Working {
+                let _ = lifecycle::transition(panel, PanelState::Idle);
+            }
         }
         if let Some(manifest) = self.manifests.get_mut(&panel_id)
             && let Err(err) =
@@ -1035,6 +1050,66 @@ mod tests {
             "the completion is on the persisted timeline: {:?}",
             on_disk.lane_events()
         );
+        mux.shutdown();
+    }
+
+    /// The other boundary of the same close: when *caucus* submitted the
+    /// `/compact` it classified it and opened no turn, so the close owns no
+    /// turn here. A prompt that arrived while the compaction was still running
+    /// did open one — closing it would end a turn the compaction never started
+    /// and flip the panel `Idle` while the prompt is still queued. The
+    /// completion fact still reaches the manifest either way.
+    #[tokio::test]
+    async fn lifecycle_manual_compact_leaves_a_later_prompts_turn_alone() {
+        use crate::mcp::McpToolSurface;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+        // Undo the helper's prompt: this panel is idle when the compact starts.
+        {
+            let panel = mux.panels.iter_mut().find(|p| p.id == id).unwrap();
+            panel.end_turn();
+            let _ = lifecycle::transition(panel, PanelState::Idle);
+        }
+
+        McpToolSurface::send_keys(&mut mux, id, "/compact", true).unwrap();
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Idle,
+            "a classified local command opens no turn"
+        );
+
+        // The brief lands while the compaction is still running: it opens a
+        // turn and flips the panel `Working`, but the agent has not run it.
+        McpToolSurface::send_keys(&mut mux, id, "audit the TLS path", true).unwrap();
+        assert_eq!(panel_state(&mux, id), PanelState::Working);
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::PostCompact {
+                trigger: CompactTrigger::Manual,
+            },
+        );
+
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "the compact's completion is not the brief's turn boundary"
+        );
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert!(
+            on_disk.lane_events().iter().any(|e| matches!(
+                &e.kind,
+                LaneEventKind::LocalCommandCompleted { command } if command == "/compact"
+            )),
+            "the completion fact is still recorded: {:?}",
+            on_disk.lane_events()
+        );
+
+        // The marker is spent: a *hand-typed* `/compact` later on this panel is
+        // unclassifiable, so that one's close does own the turn.
+        assert!(!mux.local_commands_without_turn.contains(&id));
         mux.shutdown();
     }
 

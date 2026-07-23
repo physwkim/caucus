@@ -1528,9 +1528,18 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
   라이브 판정은 이때 (1) 끝난 작업을 다시 미정착으로 되돌리고, (2) 패널이 `Working`이라는 이유로
   읽기를 건너뛰어 완료된 작업을 "still working, no output captured"로 배달하며, (3) `last_message`를
   뒤늦은 턴의 잡담("nothing new came out of it")으로 덮어썼다.
+- **MUST NOT (정착 트리거)**: 턴을 **연 주체만** 그 턴을 닫는다. `poll_worker_watch`는 패널이
+  `Working`을 벗어난 것만 보고 정착시키므로, 자기가 열지 않은 턴을 닫는 경로는 곧 오탐 latch다.
+  구체적으로 로컬 슬래시 커맨드(`/compact`, `/clear`)의 lifecycle 훅(`close_local_command`)은
+  **caucus가 분류해 턴을 열지 않은 경우**(`local_commands_without_turn` 마커) 턴도 패널 상태도
+  건드리지 않는다. 그러지 않으면 compact 진행 중 도착해 CLI 큐에 대기 중인 프롬프트의 턴을
+  compact 완료가 닫아버리고, watch는 그 프롬프트가 하지도 않은 작업의 **직전 턴 출력**을
+  latch해 main에 배달한다(실제 발생한 오탐). 마커가 없는 패널은 사람이 직접 친 경우로,
+  분류가 불가능해 턴이 열려 있고 Stop 훅도 오지 않으므로 이 훅이 유일한 owner다.
 - **Enforcement**: `WorkerWatch.settled` / `.captured`는 private 필드이고 `poll_worker_watch`만
   쓴다. `watch_ready`는 latch(`settled`)와 fallback 기한만 읽고 `self.panels`의 상태로 재판정하지
-  않는다(gone 판정 제외).
+  않는다(gone 판정 제외). `local_commands_without_turn`은 분류 지점(`send_keys`)에서만 삽입되고
+  `close_local_command`에서만 소비된다.
 - **Tests**: latch 후 패널을 다시 `Working`으로 깨워도 watch가 미정착으로 돌아가지 않고 기여가
   남는지; latch 후 도착한 `Stop` 훅이 리포트의 `last_message`를 덮지 못하는지; backlog가 남은 채
   fallback이 닫히면 latch는 되고 feed는 안 되는지.

@@ -162,6 +162,23 @@ pub struct Multiplexer {
     /// this tracks prompts caucus answered *for* it under its pre-authorized
     /// [`crate::mcp::protocol::SelectionPolicy`].
     auto_answered: HashMap<PanelId, u64>,
+    /// Panels on which caucus submitted a *local* slash command (`/compact`,
+    /// `/clear`) and, having classified it, deliberately opened **no** capture
+    /// turn for it ([`McpToolSurface::send_keys`]). Consumed by
+    /// [`Multiplexer::close_local_command`] when the command's lifecycle hook
+    /// fires: with the marker set there is no turn of caucus's to close, so the
+    /// close must touch neither the capture turn nor the panel state.
+    ///
+    /// This is the identity `close_local_command` otherwise lacks. Without it
+    /// the close decides from the *live* state and so cannot tell "the turn I
+    /// opened" from "a prompt that arrived while the command was still
+    /// running" — the second case ends a turn the command never started, flips
+    /// the panel to `Idle`, and lets its watch settle on the *previous* turn's
+    /// output (Invariant I-9's latch, taken from work the new prompt never
+    /// did). A panel *not* in this set typed the command by hand: keystrokes
+    /// arrive byte-by-byte and cannot be classified, so a turn *was* opened for
+    /// it and the hook is the only thing that can close it.
+    local_commands_without_turn: HashSet<PanelId>,
     /// `question` notes posted by panel agents (`caucus signal note --kind
     /// question`), waiting to be announced to the main worker. FIFO, drained
     /// one per tick by [`Multiplexer::poll_question_notices`] under the same
@@ -385,6 +402,7 @@ impl Multiplexer {
                 notified_blockers: HashMap::new(),
                 pending_question_notices: VecDeque::new(),
                 auto_answered: HashMap::new(),
+                local_commands_without_turn: HashSet::new(),
                 main_stranded_last_nudge: None,
                 layout_mode,
                 zoom: None,

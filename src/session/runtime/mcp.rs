@@ -32,8 +32,17 @@ impl McpToolSurface for Multiplexer {
         // close it, but this classification keeps the panel truthful either
         // way. Direct typing cannot be classified (keystrokes arrive
         // byte-by-byte) — that path is covered by the lifecycle hooks alone.
-        if enter && !is_local_slash_command(text) {
-            self.note_prompt_delivered(panel);
+        //
+        // The classification is *recorded*, not just acted on: it is the only
+        // evidence that this panel's open turn (if any) does not belong to the
+        // local command, and `close_local_command` needs it to avoid closing a
+        // turn some later prompt opened while the command was still running.
+        if enter {
+            if is_local_slash_command(text) {
+                self.local_commands_without_turn.insert(panel);
+            } else {
+                self.note_prompt_delivered(panel);
+            }
         }
         Ok(())
     }
