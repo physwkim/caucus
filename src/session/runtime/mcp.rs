@@ -23,25 +23,33 @@ impl McpToolSurface for Multiplexer {
         // the deferral is only the mechanical separation the agent needs to
         // accept the Enter.
         //
-        // A *local* slash command (`/compact`, `/clear`) is not a prompt: it
-        // runs entirely inside the agent client, starts no agent turn, and so
-        // fires no Stop hook — the only other `Working -> Idle` producer.
-        // Opening `Working` for it wedges the panel there on machines whose
-        // lifecycle hooks (`PostCompact`/`SessionStart`) are not installed;
-        // with the hooks installed [`Multiplexer::handle_lifecycle`] would
-        // close it, but this classification keeps the panel truthful either
-        // way. Direct typing cannot be classified (keystrokes arrive
-        // byte-by-byte) — that path is covered by the lifecycle hooks alone.
+        // A *local* slash command is not a prompt: it runs entirely inside the
+        // agent client, starts no agent turn, and so fires no Stop hook — the
+        // only other `Working -> Idle` producer. Treating one as work is not
+        // merely cosmetic: `note_prompt_delivered` opens a capture turn, flips
+        // the panel `Working`, **arms a worker watch**, and counts an
+        // outstanding prompt. The watch then reports the command's own screen
+        // to main as a finished task, and nothing ever closes the turn.
         //
-        // The classification is *recorded*, not just acted on: it is the only
-        // evidence that this panel's open turn (if any) does not belong to the
-        // local command, and `close_local_command` needs it to avoid closing a
-        // turn some later prompt opened while the command was still running.
+        // Two kinds, and the difference is what closes them:
+        //  * hook-closed (`/compact`, `/clear`) — a lifecycle hook follows, so
+        //    the panel is *marked*: that marker is the only evidence its open
+        //    turn (if any) is not the command's, which `close_local_command`
+        //    needs to avoid closing a turn some later prompt opened.
+        //  * hookless (`/model`, `/status`, …) — nothing ever arrives. Marking
+        //    would leave a marker no one consumes, which would later suppress a
+        //    legitimate hand-typed `/compact` close, so no marker is recorded.
+        //
+        // Direct typing cannot be classified (keystrokes arrive byte-by-byte,
+        // so the submitted line never exists here) — that path is covered by
+        // the lifecycle hooks and `poll_lost_turns` reconciliation instead.
         if enter {
-            if is_local_slash_command(text) {
-                self.local_commands_without_turn.insert(panel);
-            } else {
-                self.note_prompt_delivered(panel);
+            match classify_local_slash_command(text) {
+                Some(LocalCommandKind::HookClosed) => {
+                    self.local_commands_without_turn.insert(panel);
+                }
+                Some(LocalCommandKind::Hookless) => {}
+                None => self.note_prompt_delivered(panel),
             }
         }
         Ok(())
@@ -271,16 +279,77 @@ fn submit_delay_for(paste_len: usize) -> Duration {
     scaled.min(SUBMIT_DELAY_MAX)
 }
 
-/// Whether a submitted line invokes a *local* Claude Code slash command
-/// (`/compact`, `/clear`) — a client builtin that runs no agent turn and fires
-/// no Stop hook. First-token match on a word boundary: `/compact focus on X`
-/// is still `/compact` (it takes instructions), while `/compactify` is an
+/// Local slash commands that run no agent turn but *do* announce their
+/// completion through a lifecycle hook caucus installs (`PostCompact` /
+/// `SessionStart` — `docs/design.md` §7.9).
+const HOOK_CLOSED_LOCAL_COMMANDS: &[&str] = &["/compact", "/clear"];
+
+/// Local slash commands that run no agent turn and fire **no hook at all** —
+/// pure client-side UI inside the agent CLI.
+///
+/// Deliberately conservative, because the two failure directions are not
+/// symmetric:
+///  * **Omitting** a genuinely-local command degrades gracefully — the panel
+///    wedges `Working` until [`Multiplexer::poll_lost_turns`] reconciles it
+///    (§7.9 layer 3). Late, but correct.
+///  * **Wrongly listing** a command that really does run an agent turn is much
+///    worse — caucus would open no turn and arm no watch for real work, so the
+///    worker's result would never reach main at all.
+///
+/// So this lists only commands that are unambiguously client-local UI. Anything
+/// that can run a turn (`/init`, `/review`, `/security-review`, `/pr-comments`,
+/// and every user-defined command) is deliberately absent. When unsure, leave
+/// it out and let reconciliation handle it.
+const HOOKLESS_LOCAL_COMMANDS: &[&str] = &[
+    "/model",
+    "/status",
+    "/cost",
+    "/help",
+    "/config",
+    "/agents",
+    "/mcp",
+    "/memory",
+    "/permissions",
+    "/hooks",
+    "/doctor",
+    "/vim",
+    "/terminal-setup",
+    "/login",
+    "/logout",
+    "/resume",
+    "/release-notes",
+    "/upgrade",
+    "/privacy-settings",
+    "/exit",
+    "/quit",
+];
+
+/// How a submitted line classifies as a local slash command — the distinction
+/// is what, if anything, will later close it. See [`McpToolSurface::send_keys`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalCommandKind {
+    /// A lifecycle hook (`PostCompact` / `SessionStart`) will report completion.
+    HookClosed,
+    /// Nothing will ever report completion; the command is pure client UI.
+    Hookless,
+}
+
+/// Classify a submitted line as a *local* Claude Code slash command — a client
+/// builtin that runs no agent turn and fires no Stop hook — or `None` for an
 /// ordinary prompt.
-fn is_local_slash_command(text: &str) -> bool {
-    matches!(
-        text.split_whitespace().next(),
-        Some("/compact") | Some("/clear")
-    )
+///
+/// First-token match on a word boundary: `/compact focus on X` is still
+/// `/compact` (it takes instructions), while `/compactify` is an ordinary
+/// prompt.
+pub(crate) fn classify_local_slash_command(text: &str) -> Option<LocalCommandKind> {
+    let first = text.split_whitespace().next()?;
+    if HOOK_CLOSED_LOCAL_COMMANDS.contains(&first) {
+        Some(LocalCommandKind::HookClosed)
+    } else if HOOKLESS_LOCAL_COMMANDS.contains(&first) {
+        Some(LocalCommandKind::Hookless)
+    } else {
+        None
+    }
 }
 
 /// A submitting Enter held back from a bracketed paste, waiting to be delivered
@@ -728,16 +797,47 @@ mod tests {
     /// with* the letters (`/compactify`) or mentions the command mid-line does
     /// not.
     #[test]
-    fn is_local_slash_command_matches_first_token_only() {
-        assert!(is_local_slash_command("/compact"));
-        assert!(is_local_slash_command("/clear"));
-        assert!(is_local_slash_command("/compact focus on the parser"));
-        assert!(is_local_slash_command("  /compact"));
-        assert!(!is_local_slash_command("/compactify the structs"));
-        assert!(!is_local_slash_command("/clearance check"));
-        assert!(!is_local_slash_command("please run /compact"));
-        assert!(!is_local_slash_command("summarize the findings"));
-        assert!(!is_local_slash_command(""));
+    fn classify_local_slash_command_matches_first_token_only() {
+        use LocalCommandKind::{HookClosed, Hookless};
+        let c = classify_local_slash_command;
+
+        // Hook-closed: a lifecycle hook will report completion.
+        assert_eq!(c("/compact"), Some(HookClosed));
+        assert_eq!(c("/clear"), Some(HookClosed));
+        assert_eq!(c("/compact focus on the parser"), Some(HookClosed));
+        assert_eq!(c("  /compact"), Some(HookClosed));
+
+        // Hookless: nothing will ever report completion.
+        assert_eq!(c("/model"), Some(Hookless));
+        assert_eq!(c("/model opus"), Some(Hookless));
+        assert_eq!(c("/status"), Some(Hookless));
+        assert_eq!(c("/cost"), Some(Hookless));
+
+        // Word boundary, and ordinary prompts.
+        assert_eq!(c("/compactify the structs"), None);
+        assert_eq!(c("/clearance check"), None);
+        assert_eq!(c("/modelling the flow"), None);
+        assert_eq!(c("please run /compact"), None);
+        assert_eq!(c("summarize the findings"), None);
+        assert_eq!(c(""), None);
+
+        // Commands that really do run an agent turn must stay unclassified —
+        // skipping their turn would lose real work (no watch, no report).
+        for turn_running in ["/init", "/review", "/security-review", "/pr-comments"] {
+            assert_eq!(c(turn_running), None, "{turn_running} runs an agent turn");
+        }
+    }
+
+    /// The two sets must not overlap: a command can only have one closer, and an
+    /// entry in both would make the classification order-dependent.
+    #[test]
+    fn local_command_sets_are_disjoint() {
+        for hookless in HOOKLESS_LOCAL_COMMANDS {
+            assert!(
+                !HOOK_CLOSED_LOCAL_COMMANDS.contains(hookless),
+                "{hookless} is listed in both sets"
+            );
+        }
     }
 
     /// Insert a hermetic `/bin/cat` panel so `send_keys` tests do not depend

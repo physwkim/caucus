@@ -917,10 +917,32 @@ fallback 경로에서만 나는 지연이라 수용한다.
    무효화 경로 전체가 사라진다.
 
 2. **send_keys 분류(방어선)** — `send_keys(enter=true)`의 제출 텍스트 첫
-   토큰이 `/compact`·`/clear`면 `note_prompt_delivered`를 건너뛴다(턴을 열지
-   않는다). lifecycle hook이 설치되지 않은 머신에서도 MCP 경로만은 wedge하지
-   않게 하는 층이다. 직접 타이핑은 바이트 단위로 도착해 분류가 불가능하므로
-   그 경로는 hook 층만이 커버한다.
+   토큰이 로컬 슬래시 커맨드면 `note_prompt_delivered`를 건너뛴다. 이건
+   미관 문제가 아니다: `note_prompt_delivered`는 capture turn을 열고 패널을
+   `Working`으로 올리며 **worker watch를 arm하고** outstanding prompt를
+   센다. 즉 분류에 실패하면 그 커맨드가 *작업으로 등록*되어, 재조정 뒤 그
+   phantom watch가 정착해 **커맨드 자기 화면을 워커의 완료 보고로 main에
+   배달**한다(실측: 워커 패널 `/model` → `watches=1` → main에 가짜 리포트).
+
+   커맨드는 **무엇이 닫아주느냐**로 두 종류다
+   (`classify_local_slash_command`):
+   - `HOOK_CLOSED_LOCAL_COMMANDS`(`/compact`·`/clear`) — lifecycle hook이
+     뒤따르므로 패널을 `local_commands_without_turn`에 **표시**한다. 그
+     마커만이 "지금 열려 있는 턴은 이 커맨드 것이 아니다"의 증거이고
+     `close_local_command`가 그걸 필요로 한다(1층).
+   - `HOOKLESS_LOCAL_COMMANDS`(`/model`·`/status`·`/cost`·`/help`·`/config`
+     ·`/agents`·`/mcp`·… ) — 아무 hook도 오지 않는다. 마커를 남기면 아무도
+     소비하지 않아 영구히 남고, 나중에 손으로 친 `/compact`의 정당한 close를
+     억제한다. 그래서 **마커를 남기지 않는다**.
+
+   목록은 의도적으로 보수적이다. 두 실패 방향이 비대칭이기 때문이다 —
+   **빠뜨리면** 3층 재조정이 늦게나마 복구하지만, **잘못 넣으면**(실제로 턴을
+   도는 커맨드) 턴도 watch도 안 열려 진짜 작업 결과가 main에 영영 도달하지
+   않는다. `/init`·`/review`·`/security-review`·`/pr-comments`와 사용자 정의
+   커맨드는 턴을 돌므로 목록에 없다. 확신이 없으면 넣지 않는다.
+
+   직접 타이핑은 바이트 단위로 도착해 제출 라인이 이 지점에 존재하지 않으므로
+   분류가 불가능하다 — 그 경로는 1층(hook)과 3층(재조정)이 커버한다.
 
 3. **Lost-turn 재조정(PTY-idle fallback)** — `/compact`·`/clear`만 lifecycle
    hook을 방출한다. `/model`·`/help`·`/status`·`/config`·`/agents`·… 는 로컬

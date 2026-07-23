@@ -2375,6 +2375,83 @@ mod tests {
         mux.shutdown();
     }
 
+    /// A **hookless** local slash command sent to a worker panel is not work: it
+    /// must open no turn and — the part that made main act on a lie — arm no
+    /// watch.
+    ///
+    /// The regression: `/model` fell through the classifier (which knew only
+    /// `/compact` and `/clear`), so `note_prompt_delivered` opened a turn,
+    /// flipped the panel `Working`, armed a watch, and counted an outstanding
+    /// prompt. Nothing closes a hookless command, so the panel wedged; once
+    /// `poll_lost_turns` reconciled it to `Idle`, that phantom watch settled and
+    /// delivered the model-selector screen to main as the worker's finished
+    /// task. Observed: `watches=1 → main woken with a bogus report`.
+    #[tokio::test]
+    async fn a_hookless_local_command_is_not_work_and_arms_no_watch() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        McpToolSurface::send_keys(&mut mux, worker, "/model", true).unwrap();
+
+        assert!(
+            mux.watches.is_empty(),
+            "a client-local UI command must not be watched as a task",
+        );
+        assert_eq!(
+            mux.panels()
+                .iter()
+                .find(|p| p.id == worker)
+                .unwrap()
+                .state(),
+            PanelState::Idle,
+            "no turn is opened, so the panel never flips Working",
+        );
+        assert!(
+            !mux.outstanding_prompts.contains_key(&worker),
+            "no prompt was delivered, so nothing may be counted",
+        );
+        assert!(
+            !mux.local_commands_without_turn.contains(&worker),
+            "a hookless command has no hook to consume a marker — recording one \
+             would later suppress a legitimate hand-typed /compact close",
+        );
+
+        // Nothing to reconcile and nothing to deliver: main is left alone.
+        mux.poll_lost_turns();
+        mux.poll_worker_watches();
+        assert!(mux.watches.is_empty());
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "main must not be woken with a report for a command that ran no task",
+        );
+        mux.shutdown();
+    }
+
+    /// The other side of the classifier: a **hook-closed** command still records
+    /// its marker, because `close_local_command` needs it to tell its own turn
+    /// from one a later prompt opened.
+    #[tokio::test]
+    async fn a_hook_closed_local_command_still_records_its_marker() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        McpToolSurface::send_keys(&mut mux, worker, "/compact", true).unwrap();
+
+        assert!(mux.watches.is_empty(), "compaction is not a task either");
+        assert!(
+            mux.local_commands_without_turn.contains(&worker),
+            "the PostCompact hook that follows needs this marker",
+        );
+        mux.shutdown();
+    }
+
     /// `stop_watching` drops one worker's watch (leaving the panel alone) and
     /// errors on a panel that is not watched.
     #[tokio::test]

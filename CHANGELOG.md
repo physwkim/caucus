@@ -9,6 +9,21 @@ versions.
 
 ### Fixed
 
+- **A local slash command sent to a worker panel no longer registers as a task
+  and reports a bogus result to main.** The classifier knew only `/compact` and
+  `/clear`, so `/model` (and every other client-local builtin) fell through to
+  the prompt path: it opened a capture turn, flipped the panel `Working`, **armed
+  a worker watch**, and counted an outstanding prompt. Since nothing closes a
+  hookless command, the panel wedged — and once reconciliation returned it to
+  `Idle`, that phantom watch settled and delivered the command's own screen to
+  main as the worker's finished task. Local commands are now classified in two
+  kinds: hook-closed (`/compact`, `/clear`) still record the marker
+  `close_local_command` needs, while hookless ones (`/model`, `/status`,
+  `/cost`, …) open no turn, arm no watch, count nothing, and record no marker
+  (nothing would ever consume it, and a stale one would suppress a later
+  hand-typed `/compact` close). The hookless list is deliberately conservative:
+  omitting a command degrades to reconciliation, whereas wrongly listing one
+  that runs a real turn would lose the work entirely.
 - **A panel wedged `Working` by a hookless local slash command (`/model`,
   `/help`, `/status`, …) — or a dropped Stop hook — is now recovered.** Only
   `/compact` and `/clear` fire a lifecycle hook caucus can close a turn on;
