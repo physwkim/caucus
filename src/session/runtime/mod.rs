@@ -87,6 +87,19 @@ pub struct Multiplexer {
     /// Rounds caucus is watching to deliver to the main worker
     /// ([`Multiplexer::poll_pending_rounds`]).
     pending_rounds: Vec<PendingRound>,
+    /// Panels a round still owes main while that round is *moved out* of
+    /// `pending_rounds` — each delivery path takes the queue so its per-round
+    /// poll can borrow `self` mutably.
+    ///
+    /// Without this, "is this panel already watched"
+    /// ([`Multiplexer::worker_watched`]) would read `false` for every panel
+    /// mid-poll, and the backlog feed — which re-prompts a panel from *inside*
+    /// the poll, through `send_keys` → `note_prompt_delivered` →
+    /// [`Multiplexer::arm_worker_watch`] — would arm a second watch on a panel
+    /// its own round is already watching, delivering it to main twice. Holding
+    /// the owed panels here keeps that predicate true wherever the round
+    /// currently lives.
+    watched_in_flight: HashSet<PanelId>,
     /// `spawn_role(worktree=true)` calls whose `git worktree add` is running on
     /// a worker thread. Finished off the event loop so a slow worktree create
     /// never freezes the TUI; completed by [`Multiplexer::poll_pending_spawns`].
@@ -361,6 +374,7 @@ impl Multiplexer {
                 quit: false,
                 role_counts: HashMap::new(),
                 pending_rounds: Vec::new(),
+                watched_in_flight: HashSet::new(),
                 pending_spawns: Vec::new(),
                 pending_submits: Vec::new(),
                 pending_close: None,

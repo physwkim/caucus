@@ -658,6 +658,11 @@ impl Multiplexer {
         // to `Working` (what `list_panels` reports) in lockstep with the live
         // `PanelState` transition above.
         self.record_prompt_delivered(panel_id);
+        // Same reason this is the arming point: a worker that has been given
+        // work is watched from here on, so its result reaches main whether or
+        // not main registered a round, and the watch re-arms on every later
+        // prompt ([`Multiplexer::arm_worker_watch`]).
+        self.arm_worker_watch(panel_id);
     }
 
     /// Single owner of lane-event appends for a live panel (Invariant I-2).
