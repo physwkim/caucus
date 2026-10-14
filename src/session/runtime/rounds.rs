@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::derive_state::DerivedState;
+use crate::agent::manifest::TurnMark;
 use crate::mcp::protocol::{ControlResponse, SelectionPolicy};
 use crate::mcp::{McpToolSurface, ReadPanelMode};
 use crate::panel::lifecycle::{Panel, PanelState};
@@ -121,16 +122,33 @@ fn push_panel_auto_answers(out: &mut String, w: &WorkerWatch) {
 }
 
 /// Append the per-panel trailing markers shared by the full report and the
-/// summary: a "still working" note for a panel the fallback deadline caught
-/// mid-turn, and a count of backlog tasks that never ran.
+/// summary: for a panel the fallback deadline caught mid-turn, that its turn
+/// has no result yet and the last note it posted *during* that turn; and a
+/// count of backlog tasks that never ran.
 fn push_round_panel_footer(out: &mut String, c: &RoundPanelContribution) {
-    if !c.settled {
-        out.push_str("⏳ still working — did not finish within the fallback window.\n");
-    }
-    if c.pending_backlog > 0 {
+    let pending_backlog = match &c.outcome {
+        PanelOutcome::Finished {
+            pending_backlog, ..
+        } => *pending_backlog,
+        PanelOutcome::Running {
+            note,
+            pending_backlog,
+            ..
+        } => {
+            match note {
+                Some(note) => out.push_str(&format!(
+                    "⏳ turn still running, no result yet; last note: {note}\n"
+                )),
+                None => out.push_str(
+                    "⏳ turn still running, no result yet; no note posted during this turn.\n",
+                ),
+            }
+            *pending_backlog
+        }
+    };
+    if pending_backlog > 0 {
         out.push_str(&format!(
-            "⏳ {} queued backlog task(s) were not run before the fallback window closed.\n",
-            c.pending_backlog
+            "⏳ {pending_backlog} queued backlog task(s) were not run before the fallback window closed.\n"
         ));
     }
 }
@@ -335,6 +353,12 @@ pub(super) struct WorkerWatch {
     /// turn caucus never prompted) overwrites the manifest's `last_message` with
     /// a stray "nothing new came out of it" line.
     captured: Vec<String>,
+    /// Where the turn this watch is waiting on began on the panel's manifest
+    /// timeline: taken when the watch is armed and again as each backlog task
+    /// is fed. A body, `last_message` or note is reported only if it was
+    /// recorded since this mark, so no turn is ever handed an earlier turn's
+    /// output ([`Multiplexer::read_watched_turn`]).
+    turn_start: TurnMark,
     /// How this panel's result is read for the delivered report.
     pub(super) read_mode: ReadPanelMode,
     /// Wall-clock instant past which the panel is delivered regardless of state —
@@ -366,16 +390,28 @@ struct RoundPanelContribution {
     /// it never settled (only reachable on a fallback delivery, where it is
     /// `Working`/`Spawning`).
     state: PanelState,
-    /// Whether the panel latched for this round (Invariant I-9). `false` only on
-    /// a fallback delivery that caught the panel mid-turn.
-    settled: bool,
-    /// Every finished-turn body, in order, as captured by
-    /// [`Multiplexer::poll_worker_watch`] at the instant each turn ended. A
-    /// panel caught mid-turn by the fallback contributes whatever it had already
-    /// finished (empty if it never finished a turn).
-    bodies: Vec<String>,
-    /// Queued backlog tasks not yet run (non-zero only on a fallback delivery).
-    pending_backlog: usize,
+    outcome: PanelOutcome,
+}
+
+/// Whether the delivered panel finished, and what it has to show for it. The
+/// variant picks the delivery header ([`Multiplexer::panel_delivery_header`]).
+enum PanelOutcome {
+    /// Latched (Invariant I-9): every finished-turn body, in order, as
+    /// captured by [`Multiplexer::poll_worker_watch`] at the instant each turn
+    /// ended.
+    Finished {
+        bodies: Vec<String>,
+        /// Queued tasks that never ran (non-zero only for an `Exited` panel).
+        pending_backlog: usize,
+    },
+    /// Forced out by the fallback deadline mid-turn. The running turn has no
+    /// result, so there is no body for it — only the note it posted since it
+    /// began. `finished` holds the turns of this assignment that did end.
+    Running {
+        note: Option<String>,
+        finished: Vec<String>,
+        pending_backlog: usize,
+    },
 }
 
 impl Multiplexer {
@@ -487,6 +523,7 @@ impl Multiplexer {
             settled: None,
             backlog: VecDeque::new(),
             captured: Vec::new(),
+            turn_start: self.panel_turn_mark(panel),
             read_mode: ReadPanelMode::LastMessage,
             fallback_deadline: Instant::now() + Duration::from_secs(budget),
             selection_hints: None,
@@ -1024,9 +1061,13 @@ impl Multiplexer {
     /// path: every other spawn allocates a genuinely new panel, and `kill_panel`
     /// detaches permanently with no replacement.
     pub(super) fn remap_round_membership(&mut self, old: PanelId, new: PanelId) {
+        let turn_start = self.panel_turn_mark(new);
         for w in &mut self.watches {
             if w.panel == old {
                 w.panel = new;
+                // A mark is an index into one manifest's timeline, and the
+                // restarted panel has a fresh manifest.
+                w.turn_start = turn_start;
             }
         }
     }
@@ -1087,14 +1128,12 @@ impl Multiplexer {
         let feed = (state == PanelState::Idle && !w.backlog.is_empty() && !fallback_due)
             .then(|| w.backlog[0].clone());
         // Read the just-finished turn *now*, while the panel is still idle.
-        let done = self
-            .read_panel(w.panel, w.read_mode)
-            .unwrap_or_else(|e| format!("(could not read panel: {e})"));
+        let done = self.read_watched_turn(w);
 
         match feed {
             None => {
                 w.settled = Some(state);
-                w.captured.push(done);
+                w.captured.extend(done);
                 true
             }
             Some(task) => match McpToolSurface::send_keys(self, w.panel, &task, true) {
@@ -1104,7 +1143,8 @@ impl Multiplexer {
                 // not only the last.
                 Ok(()) => {
                     w.backlog.pop_front();
-                    w.captured.push(done);
+                    w.captured.extend(done);
+                    w.turn_start = self.panel_turn_mark(w.panel);
                     true
                 }
                 // Delivery failed: leave the task at the front and capture
@@ -1116,6 +1156,38 @@ impl Multiplexer {
                 }
             },
         }
+    }
+
+    /// The current end of `panel`'s manifest timeline (the start, for a panel
+    /// with no manifest).
+    fn panel_turn_mark(&self, panel: PanelId) -> TurnMark {
+        self.manifests
+            .get(&panel)
+            .map(|m| m.mark())
+            .unwrap_or_default()
+    }
+
+    /// Read the turn `w` is waiting on, which the caller has just observed
+    /// idle. `None` when no turn has ended since `w.turn_start`: the panel is
+    /// idle on a turn this watch never started (a `queue_tasks` armed on an
+    /// already-idle panel), and its output belongs to an earlier assignment.
+    /// A `last_message` read is likewise taken only from a turn signal since
+    /// the mark, so a turn closed without one (a reconciled wedge, a local
+    /// command) is not handed an earlier turn's message.
+    fn read_watched_turn(&self, w: &WorkerWatch) -> Option<String> {
+        let manifest = self.manifests.get(&w.panel);
+        if manifest.is_some_and(|m| !m.turn_ended_since(w.turn_start)) {
+            return None;
+        }
+        Some(match w.read_mode {
+            ReadPanelMode::LastMessage => manifest
+                .and_then(|m| m.last_message_since(w.turn_start))
+                .unwrap_or_default()
+                .to_string(),
+            mode => self
+                .read_panel(w.panel, mode)
+                .unwrap_or_else(|e| format!("(could not read panel: {e})")),
+        })
     }
 
     /// Whether a caucus→main push may land *this tick*: the main panel exists,
@@ -1600,15 +1672,33 @@ impl Multiplexer {
     /// entirely and delivered it as "still working, no output captured".
     fn worker_contribution(&self, w: &WorkerWatch) -> Option<RoundPanelContribution> {
         let panel = self.panels.iter().find(|p| p.id == w.panel)?;
+        let pending_backlog = w.backlog.len();
+        let (state, outcome) = match w.settled {
+            Some(state) => (
+                state,
+                PanelOutcome::Finished {
+                    bodies: w.captured.clone(),
+                    pending_backlog,
+                },
+            ),
+            // No latch: caught mid-turn by the fallback; the panel's live state
+            // (`Working`/`Spawning`) is what the report should say.
+            None => (
+                panel.state(),
+                PanelOutcome::Running {
+                    note: self
+                        .manifests
+                        .get(&w.panel)
+                        .and_then(|m| m.last_note_since(w.turn_start)),
+                    finished: w.captured.clone(),
+                    pending_backlog,
+                },
+            ),
+        };
         Some(RoundPanelContribution {
             role: panel.role.clone(),
-            // A watch with no latch was caught mid-turn by the fallback; the
-            // panel's live state (`Working`/`Spawning`) is what the report should
-            // say.
-            state: w.settled.unwrap_or_else(|| panel.state()),
-            settled: w.settled.is_some(),
-            bodies: w.captured.clone(),
-            pending_backlog: w.backlog.len(),
+            state,
+            outcome,
         })
     }
 
@@ -1624,9 +1714,13 @@ impl Multiplexer {
             c.state.label()
         ));
         // One output stays header-less, identical to the pre-backlog report;
-        // two or more get `### task N` headers.
-        let total = c.bodies.len();
-        for (i, body) in c.bodies.iter().enumerate() {
+        // two or more get `### task N` headers. A running turn is a task too:
+        // its finished predecessors are headed, and it has no body of its own.
+        let (bodies, total) = match &c.outcome {
+            PanelOutcome::Finished { bodies, .. } => (bodies, bodies.len()),
+            PanelOutcome::Running { finished, .. } => (finished, finished.len() + 1),
+        };
+        for (i, body) in bodies.iter().enumerate() {
             if total > 1 {
                 out.push_str(&format!("\n### task {}\n", i + 1));
             }
@@ -1641,6 +1735,9 @@ impl Multiplexer {
                 out.push('\n');
             }
         }
+        if total > 1 && matches!(c.outcome, PanelOutcome::Running { .. }) {
+            out.push_str(&format!("\n### task {total}\n"));
+        }
         push_round_panel_footer(out, c);
     }
 
@@ -1649,20 +1746,28 @@ impl Multiplexer {
     /// footer — into `out`. The shared per-panel body of the per-panel delivery
     /// summary ([`Multiplexer::render_watch_summary`]).
     fn push_panel_summary_block(&self, out: &mut String, id: PanelId, c: &RoundPanelContribution) {
+        let (bodies, running) = match &c.outcome {
+            PanelOutcome::Finished { bodies, .. } => (bodies, false),
+            PanelOutcome::Running { finished, .. } => (finished, true),
+        };
         out.push_str(&format!(
             "\n## panel {id} (role: {}) — {} · {} output(s)\n",
             c.role,
             c.state.label(),
-            c.bodies.len()
+            bodies.len()
         ));
         // Teaser: the panel's latest output, trimmed to the teaser budget — the
-        // full text is in the report file.
-        let latest = c.bodies.last().map(|b| b.trim()).unwrap_or("");
-        if latest.is_empty() {
-            out.push_str("(no output captured)\n");
-        } else {
-            out.push_str(&summary_teaser(latest, ROUND_SUMMARY_TEASER_BYTES));
-            out.push('\n');
+        // full text is in the report file. A running turn has none, and the
+        // footer says so; teasing a finished predecessor would read as its
+        // result.
+        if !running {
+            let latest = bodies.last().map(|b| b.trim()).unwrap_or("");
+            if latest.is_empty() {
+                out.push_str("(no output captured)\n");
+            } else {
+                out.push_str(&summary_teaser(latest, ROUND_SUMMARY_TEASER_BYTES));
+                out.push('\n');
+            }
         }
         push_round_panel_footer(out, c);
     }
@@ -1671,13 +1776,13 @@ impl Multiplexer {
     /// belongs to, which panel + role, and whether it settled on its own or was
     /// forced out mid-turn by the fallback deadline. The per-panel analogue of
     /// [`round_header`].
-    fn panel_delivery_header(id: PanelId, role: &str, settled: bool) -> String {
+    fn panel_delivery_header(id: PanelId, role: &str, outcome: &PanelOutcome) -> String {
         format!(
             "[caucus] panel {id} (role: {role}) {}.\n",
-            if settled {
-                "finished"
-            } else {
-                "forced out by the fallback deadline (still working)"
+            match outcome {
+                PanelOutcome::Finished { .. } => "finished",
+                PanelOutcome::Running { .. } =>
+                    "forced out by the fallback deadline (turn still running, no result yet)",
             }
         )
     }
@@ -1688,7 +1793,7 @@ impl Multiplexer {
     /// auto-answered *on this panel* are noted, so the delivered result still
     /// shows the fork caucus took on the worker's behalf.
     fn assemble_watch_report(&self, w: &WorkerWatch, c: &RoundPanelContribution) -> String {
-        let mut out = Self::panel_delivery_header(w.panel, &c.role, c.settled);
+        let mut out = Self::panel_delivery_header(w.panel, &c.role, &c.outcome);
         push_panel_auto_answers(&mut out, w);
         self.push_panel_report_block(&mut out, w.panel, c);
         out
@@ -1706,7 +1811,7 @@ impl Multiplexer {
         c: &RoundPanelContribution,
         report_path: Option<&std::path::Path>,
     ) -> String {
-        let mut out = Self::panel_delivery_header(w.panel, &c.role, c.settled);
+        let mut out = Self::panel_delivery_header(w.panel, &c.role, &c.outcome);
         push_panel_auto_answers(&mut out, w);
         match report_path {
             Some(path) => out.push_str(&format!(
@@ -1969,6 +2074,7 @@ mod tests {
             settled,
             backlog,
             captured,
+            turn_start: TurnMark::default(),
             read_mode,
             fallback_deadline: Instant::now() + Duration::from_secs(600),
             selection_hints: None,
@@ -2606,13 +2712,13 @@ mod tests {
             PanelState::Working,
         );
 
-        // No latch → contribution.settled is false → "forced out" header +
-        // "still working" footer.
+        // No latch → `PanelOutcome::Running` → "forced out" header + "no
+        // result yet" footer.
         let w = watch(sub, ReadPanelMode::LastMessage, Vec::new(), VecDeque::new());
         let c = mux.worker_contribution(&w).unwrap();
         let report = mux.assemble_watch_report(&w, &c);
         assert!(
-            report.contains("still working"),
+            report.contains("turn still running, no result yet"),
             "a Working panel must be marked unfinished: {report}"
         );
         assert!(
@@ -3865,6 +3971,120 @@ mod tests {
             report.contains("1 queued backlog task(s) were not run"),
             "the partial report must name the un-run work: {report}",
         );
+
+        mux.shutdown();
+    }
+
+    /// A hermetic `/bin/cat` worker with a manifest, so turn signals and notes
+    /// land on a real lane timeline, plus an idle cat main to deliver to.
+    fn worker_with_manifest(mux: &mut Multiplexer) -> (PanelId, PanelId) {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+        let main = push_cat_panel(mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let sub = push_cat_panel(mux, "reviewer", PanelState::Idle);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            sub,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        mux.manifests.insert(sub, mf);
+        (main, sub)
+    }
+
+    fn post_note(mux: &mut Multiplexer, panel: PanelId, body: &str) {
+        let session_id = mux.session.id;
+        mux.handle_note(crate::signal::AgentNote::now(
+            session_id,
+            panel,
+            crate::signal::NoteKind::Progress,
+            body.to_string(),
+        ));
+    }
+
+    /// Forced out mid-turn after an earlier, already-delivered turn: neither
+    /// that turn's message nor its note may appear under the forced-out
+    /// header. The path that used to leak it: `queue_tasks` arms a fresh watch
+    /// on the idle panel, the first poll captured the idle panel's old
+    /// `last_message` as task 1 before feeding, and every fallback after that
+    /// re-delivered it.
+    #[tokio::test]
+    async fn forced_out_after_an_earlier_turn_carries_no_old_message() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (main, sub) = worker_with_manifest(&mut mux);
+
+        post_note(&mut mux, sub, "old turn progress");
+        finish_turn(&mut mux, sub, "OLD REPORT");
+        mux.poll_worker_watches();
+        assert!(
+            mux.watches.is_empty(),
+            "the old turn is delivered and spent"
+        );
+        mux.panels.iter_mut().find(|p| p.id == main).unwrap().state = PanelState::Idle;
+
+        mux.queue_tasks(sub, vec!["long task".to_string()], None, Some(3600), None);
+        mux.main_compose_since = Some(Instant::now());
+        mux.poll_worker_watches();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == sub).unwrap().state(),
+            PanelState::Working,
+            "the queued task is fed",
+        );
+        post_note(&mut mux, sub, "halfway through the long task");
+
+        let i = watch_of(&mux, sub);
+        mux.watches[i].fallback_deadline = Instant::now() - Duration::from_secs(1);
+        let c = mux.worker_contribution(&mux.watches[i]).unwrap();
+        let report = mux.assemble_watch_report(&mux.watches[i], &c);
+        assert!(
+            report.contains("forced out by the fallback deadline"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("OLD REPORT"),
+            "an earlier turn's message must not be delivered as this turn's: {report}"
+        );
+        assert!(
+            !report.contains("old turn progress"),
+            "an earlier turn's note is not this turn's: {report}"
+        );
+        assert!(
+            report.contains("last note: [progress] halfway through the long task"),
+            "{report}"
+        );
+
+        mux.shutdown();
+    }
+
+    /// Forced out on the panel's first turn: no body, no note, and the report
+    /// says the turn has no result yet rather than "no output captured".
+    #[tokio::test]
+    async fn forced_out_on_the_first_turn_says_no_result_yet() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (_main, sub) = worker_with_manifest(&mut mux);
+
+        mux.note_prompt_delivered(sub);
+        let i = watch_of(&mux, sub);
+        mux.watches[i].fallback_deadline = Instant::now() - Duration::from_secs(1);
+        let c = mux.worker_contribution(&mux.watches[i]).unwrap();
+        let summary = {
+            let mut out = String::new();
+            mux.push_panel_summary_block(&mut out, sub, &c);
+            out
+        };
+        let report = mux.assemble_watch_report(&mux.watches[i], &c);
+        for text in [&report, &summary] {
+            assert!(
+                text.contains("turn still running, no result yet; no note posted during this turn"),
+                "{text}"
+            );
+            assert!(!text.contains("(no output captured)"), "{text}");
+        }
 
         mux.shutdown();
     }

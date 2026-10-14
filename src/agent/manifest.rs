@@ -42,6 +42,13 @@ impl AgentStatus {
     }
 }
 
+/// A position on one agent's lane-event timeline. Everything read "since" a
+/// mark was recorded after the moment the mark names, which is how a reader
+/// tells the current turn's message or note from an earlier turn's. Valid only
+/// against the manifest it was taken from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnMark(usize);
+
 /// Authoritative on-disk record for one agent (`docs/design.md` §8.1).
 ///
 /// Fields are `pub(crate)` so only this module can mutate them; external code
@@ -152,6 +159,55 @@ impl AgentManifest {
     /// posted one (`caucus signal note`) — surfaced by `list_panels`.
     pub fn last_note(&self) -> Option<&str> {
         self.last_note.as_deref()
+    }
+
+    /// The timeline's current end: whatever is recorded from here on happened
+    /// after this call.
+    pub fn mark(&self) -> TurnMark {
+        TurnMark(self.lane_events.len())
+    }
+
+    /// Whether a turn ended at or after `mark` — a turn signal, a finished
+    /// local command, or a reconciled wedge: the three ways a turn closes.
+    pub fn turn_ended_since(&self, mark: TurnMark) -> bool {
+        self.events_since(mark).iter().any(|e| {
+            matches!(
+                e.kind,
+                LaneEventKind::TurnCompleted
+                    | LaneEventKind::LocalCommandCompleted { .. }
+                    | LaneEventKind::TurnReconciled
+            )
+        })
+    }
+
+    /// The final message of a turn that **ended at or after `mark`**, or
+    /// `None` if no turn signal arrived since. `last_message` is written only
+    /// beside a `TurnCompleted` event ([`record_turn_completed`]), so a
+    /// `TurnCompleted` past `mark` is what proves the message is not an
+    /// earlier turn's.
+    pub fn last_message_since(&self, mark: TurnMark) -> Option<&str> {
+        self.events_since(mark)
+            .iter()
+            .any(|e| matches!(e.kind, LaneEventKind::TurnCompleted))
+            .then(|| self.last_message())
+            .flatten()
+    }
+
+    /// The latest mid-turn note posted at or after `mark`, as `[kind] body`.
+    pub fn last_note_since(&self, mark: TurnMark) -> Option<String> {
+        self.events_since(mark)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                LaneEventKind::NoteRecorded { note_kind, body } => {
+                    Some(format!("[{}] {}", note_kind.as_str(), body))
+                }
+                _ => None,
+            })
+    }
+
+    fn events_since(&self, mark: TurnMark) -> &[LaneEvent] {
+        self.lane_events.get(mark.0..).unwrap_or(&[])
     }
 
     /// The most recent in-band desktop notification (OSC 9 / 99 / 777) the
@@ -633,6 +689,54 @@ mod tests {
         // Persisted: a fresh read sees the same derived state.
         let back = read(tmp.path(), manifest.agent_id).unwrap();
         assert_eq!(back.derived_state(), DerivedState::Idle);
+    }
+
+    /// A read since a mark sees only what was recorded after it. Boundaries:
+    /// message and note before the mark → nothing; a turn closed after the
+    /// mark without a turn signal (reconciled) → ended, but no message; a turn
+    /// signal and a note after the mark → both.
+    #[test]
+    fn reads_since_a_mark_exclude_earlier_turns() {
+        use crate::signal::{AgentNote, NoteKind, TurnKind, TurnSignal};
+        let tmp = TempDir::new().unwrap();
+        let mut manifest = AgentManifest::new(
+            SessionId::new(),
+            PanelId::new(),
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        let (sid, pid) = (manifest.session_id, manifest.panel_id);
+        let stop = |msg: &str| {
+            TurnSignal::now(
+                sid,
+                pid,
+                TurnKind::Stop,
+                Some(msg.into()),
+                serde_json::Value::Null,
+            )
+        };
+        let note = |body: &str| AgentNote::now(sid, pid, NoteKind::Progress, body.into());
+        record_note(&mut manifest, tmp.path(), &note("old note")).unwrap();
+        record_turn_completed(&mut manifest, tmp.path(), &stop("old")).unwrap();
+
+        let mark = manifest.mark();
+        assert!(!manifest.turn_ended_since(mark));
+        assert_eq!(manifest.last_message_since(mark), None);
+        assert_eq!(manifest.last_note_since(mark), None);
+
+        record_turn_reconciled(&mut manifest, tmp.path()).unwrap();
+        assert!(manifest.turn_ended_since(mark));
+        assert_eq!(manifest.last_message_since(mark), None);
+
+        record_note(&mut manifest, tmp.path(), &note("new note")).unwrap();
+        record_turn_completed(&mut manifest, tmp.path(), &stop("new")).unwrap();
+        assert_eq!(manifest.last_message_since(mark), Some("new"));
+        assert_eq!(
+            manifest.last_note_since(mark).as_deref(),
+            Some("[progress] new note")
+        );
     }
 
     /// A delivered prompt reopens the turn: `derived_state` returns to `Working`
