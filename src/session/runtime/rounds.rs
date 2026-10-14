@@ -123,17 +123,23 @@ fn push_panel_auto_answers(out: &mut String, w: &WorkerWatch) {
 
 /// Append the per-panel trailing markers shared by the full report and the
 /// summary: for a panel the fallback deadline caught mid-turn, that its turn
-/// has no result yet and the last note it posted *during* that turn; and a
-/// count of backlog tasks that never ran.
+/// has no result yet, the last note it posted *during* that turn, and what is
+/// still queued behind it; for an exited panel, the tasks it never ran.
 fn push_round_panel_footer(out: &mut String, c: &RoundPanelContribution) {
-    let pending_backlog = match &c.outcome {
+    match &c.outcome {
         PanelOutcome::Finished {
             pending_backlog, ..
-        } => *pending_backlog,
+        } => {
+            if *pending_backlog > 0 {
+                out.push_str(&format!(
+                    "⏳ {pending_backlog} queued task(s) were not run: the panel exited.\n"
+                ));
+            }
+        }
         PanelOutcome::Running {
             note,
+            finished,
             pending_backlog,
-            ..
         } => {
             match note {
                 Some(note) => out.push_str(&format!(
@@ -143,13 +149,18 @@ fn push_round_panel_footer(out: &mut String, c: &RoundPanelContribution) {
                     "⏳ turn still running, no result yet; no note posted during this turn.\n",
                 ),
             }
-            *pending_backlog
+            if *finished > 0 {
+                out.push_str(&format!(
+                    "⏳ {finished} earlier task(s) finished; their output comes with the final result.\n"
+                ));
+            }
+            if *pending_backlog > 0 {
+                out.push_str(&format!("⏳ {pending_backlog} task(s) still queued.\n"));
+            }
+            out.push_str(
+                "caucus is still watching this panel: its result is delivered when it finishes.\n",
+            );
         }
-    };
-    if pending_backlog > 0 {
-        out.push_str(&format!(
-            "⏳ {pending_backlog} queued backlog task(s) were not run before the fallback window closed.\n"
-        ));
     }
 }
 
@@ -361,9 +372,13 @@ pub(super) struct WorkerWatch {
     turn_start: TurnMark,
     /// How this panel's result is read for the delivered report.
     pub(super) read_mode: ReadPanelMode,
-    /// Wall-clock instant past which the panel is delivered regardless of state —
-    /// the safety net, marking a still-`working` panel unfinished.
+    /// Wall-clock instant past which a panel still mid-turn is reported to main
+    /// anyway, as an interim notice ([`PanelOutcome::Running`]) — the safety
+    /// net. It never touches the backlog, and the notice does not spend the
+    /// watch: it re-arms `fallback_budget` from then ([`Multiplexer::after_handoff`]).
     fallback_deadline: Instant,
+    /// The fallback window, re-applied each time the deadline forces a notice.
+    fallback_budget: Duration,
     /// Optional main-supplied keyword hints for auto-answering this panel's
     /// selection menus ([`SelectionPolicy`]). When the panel stops on a chooser,
     /// [`Multiplexer::poll_round_blocked_panels`] resolves it against these; a
@@ -404,12 +419,14 @@ enum PanelOutcome {
         /// Queued tasks that never ran (non-zero only for an `Exited` panel).
         pending_backlog: usize,
     },
-    /// Forced out by the fallback deadline mid-turn. The running turn has no
-    /// result, so there is no body for it — only the note it posted since it
-    /// began. `finished` holds the turns of this assignment that did end.
+    /// Forced out by the fallback deadline mid-turn: an interim notice, not
+    /// the panel's result. It carries no body at all — the running turn has
+    /// none yet, and the turns of this assignment that did end (`finished`
+    /// of them) are delivered with the final result, once — only the note the
+    /// running turn posted since it began.
     Running {
         note: Option<String>,
-        finished: Vec<String>,
+        finished: usize,
         pending_backlog: usize,
     },
 }
@@ -461,8 +478,8 @@ impl Multiplexer {
             w.read_mode = mode;
         }
         if let Some(secs) = fallback_secs {
-            w.fallback_deadline =
-                Instant::now() + Duration::from_secs(secs.clamp(1, ROUND_FALLBACK_MAX_SECS));
+            w.fallback_budget = Duration::from_secs(secs.clamp(1, ROUND_FALLBACK_MAX_SECS));
+            w.fallback_deadline = Instant::now() + w.fallback_budget;
         }
         if selection_hints.is_some() {
             w.selection_hints = selection_hints;
@@ -526,6 +543,7 @@ impl Multiplexer {
             turn_start: self.panel_turn_mark(panel),
             read_mode: ReadPanelMode::LastMessage,
             fallback_deadline: Instant::now() + Duration::from_secs(budget),
+            fallback_budget: Duration::from_secs(budget),
             selection_hints: None,
             auto_answers: Vec::new(),
         });
@@ -564,7 +582,8 @@ impl Multiplexer {
     /// the *pull* half of delivery (Invariant I-10, per worker).
     ///
     /// Every [`Multiplexer::watch_ready`] worker is delivered right here:
-    /// rendered, its watch removed, and returned in the response, followed by the
+    /// rendered, its watch spent ([`Multiplexer::after_handoff`]), and returned
+    /// in the response, followed by the
     /// live status of the workers still running. Their watches stay live; a later
     /// poll (or the push) streams them — a main worker polling in a loop hears
     /// each worker the tick it finishes, never waiting for the slowest.
@@ -598,11 +617,12 @@ impl Multiplexer {
         let mut status: Vec<String> = Vec::new();
         for mut w in watches {
             let fallback_due = now >= w.fallback_deadline;
-            self.poll_worker_watch(&mut w, fallback_due);
+            self.poll_worker_watch(&mut w);
             if self.watch_ready(&w, fallback_due) {
                 if let Some(summary) = self.render_watch_delivery(&w) {
                     parts.push(summary);
                 }
+                self.watches.extend(Self::after_handoff(w));
                 continue;
             }
             status.push(self.render_watch_status(&w));
@@ -700,18 +720,16 @@ impl Multiplexer {
     /// longer exists, or it has `Exited` (the agent process died on its own; only
     /// `kill_panel` clears the id, so a self-exit leaves `main_panel_id` pointing
     /// at an `Exited` panel) — has its contribution spilled to
-    /// `dropped-rounds.log` and its watch dropped: no caucus→main push can ever
+    /// `dropped-rounds.log` and its watch spent: no caucus→main push can ever
     /// land, so re-queuing would spin forever, and discarding silently would lose
     /// the sub-agent's work. A delivery that *fails* (e.g. the main PTY writer
     /// went away mid-tick) keeps the watch so a later tick retries rather than
     /// dropping it.
     ///
     /// [`Multiplexer::poll_worker_watches`] runs first on each watch: it latches
-    /// a panel that settled this tick (capturing its finished turn) and, while
-    /// there is still time, hands an early finisher its next queued task — so a
-    /// backlog panel keeps working its queue and only becomes ready once the
-    /// queue drains. Once the fallback deadline has passed, no new backlog work
-    /// starts.
+    /// a panel that settled this tick (capturing its finished turn) and hands an
+    /// early finisher its next queued task — so a backlog panel keeps working
+    /// its queue and only settles once the queue drains, deadline or not.
     pub fn poll_worker_watches(&mut self) {
         if self.watches.is_empty() {
             return;
@@ -742,7 +760,7 @@ impl Multiplexer {
         let mut changed = false;
         for mut w in watches {
             let fallback_due = now >= w.fallback_deadline;
-            changed |= self.poll_worker_watch(&mut w, fallback_due);
+            changed |= self.poll_worker_watch(&mut w);
             // A watch that can never deliver carries no contribution: drop it
             // before any main-state gate, so it never lingers.
             if self.watch_undeliverable(&w) {
@@ -759,6 +777,7 @@ impl Multiplexer {
                 if let Some(report) = self.render_watch_delivery(&w) {
                     self.record_dropped_round(&report);
                 }
+                self.watches.extend(Self::after_handoff(w));
                 changed = true;
                 continue;
             }
@@ -779,6 +798,7 @@ impl Multiplexer {
                 Ok(()) => {
                     pushed = true;
                     changed = true;
+                    self.watches.extend(Self::after_handoff(w));
                 }
                 Err(err) => {
                     warn!(error = %err, panel = %w.panel, "worker delivery to main failed; will retry");
@@ -820,7 +840,7 @@ impl Multiplexer {
         let watches = self.take_watches_for_poll();
         for mut w in watches {
             let fallback_due = now >= w.fallback_deadline;
-            changed |= self.poll_worker_watch(&mut w, fallback_due);
+            changed |= self.poll_worker_watch(&mut w);
             if self.watch_undeliverable(&w) {
                 changed = true;
                 continue;
@@ -832,6 +852,7 @@ impl Multiplexer {
             if let Some(summary) = self.render_watch_delivery(&w) {
                 out.push(summary);
             }
+            self.watches.extend(Self::after_handoff(w));
             changed = true;
         }
         self.end_round_poll();
@@ -845,15 +866,30 @@ impl Multiplexer {
     /// frozen. A watch is ready once its panel settled (latched by
     /// [`Multiplexer::poll_worker_watches`], the normal path) or the
     /// `fallback_deadline` forced it out while the panel was still working
-    /// (delivered with a "still working" marker).
+    /// (delivered as an interim [`PanelOutcome::Running`] notice).
     ///
-    /// There is no "already delivered" case to exclude: delivery *removes* the
-    /// watch, so a spent watch cannot be asked. That is the per-panel replacement
+    /// There is no "already delivered" case to exclude: delivering a settled
+    /// watch *removes* it ([`Multiplexer::after_handoff`]), so a spent watch
+    /// cannot be asked. That is the per-panel replacement
     /// for the old round-level barrier and its `delivered` ledger — a round no
     /// longer waits for its slowest worker, and exactly-once holds by
     /// construction rather than by a bookkeeping set.
     fn watch_ready(&self, w: &WorkerWatch, fallback_due: bool) -> bool {
         fallback_due || w.settled.is_some()
+    }
+
+    /// What handing a ready watch's delivery to main does to the watch — the
+    /// one place every delivery path (push, pull, hook-reply, main-gone spill)
+    /// decides it. A latched watch is spent (Invariant I-10). A forced-out one
+    /// is not: its panel is still running, so the watch keeps its backlog and
+    /// finished turns, gets a fresh fallback window, and delivers the turn's
+    /// result when it ends — as if the deadline had never fired.
+    fn after_handoff(mut w: WorkerWatch) -> Option<WorkerWatch> {
+        if w.settled.is_some() {
+            return None;
+        }
+        w.fallback_deadline = Instant::now() + w.fallback_budget;
+        Some(w)
     }
 
     /// Whether this watch can never be delivered and must simply be dropped:
@@ -1083,11 +1119,10 @@ impl Multiplexer {
     ///   a selection menu is here for free: a chooser fires no `Stop` hook, so it
     ///   stays coarse `Working` and [`Multiplexer::poll_round_blocked_panels`]
     ///   routes it to the main worker instead.
-    /// - `Idle` with queued backlog, before the deadline — **feed**: read the
+    /// - `Idle` with queued backlog — **feed**: read the
     ///   finished turn, then send the next task, which flips the panel back to
     ///   `Working`. Not latched: the panel has more of this round's work to do.
-    /// - otherwise (an empty backlog, a terminal `Exited`, or the fallback
-    ///   deadline having closed the feeding window) — **latch**: read the
+    /// - otherwise (an empty backlog, or a terminal `Exited`) — **latch**: read the
     ///   finished turn and record the panel in `round.settled`. Its contribution
     ///   to this round is now frozen.
     ///
@@ -1104,7 +1139,7 @@ impl Multiplexer {
     ///
     /// Returns `true` if the round's persistable state changed (a panel latched
     /// or a task was fed), so the caller re-writes the durable snapshot.
-    fn poll_worker_watch(&mut self, w: &mut WorkerWatch, fallback_due: bool) -> bool {
+    fn poll_worker_watch(&mut self, w: &mut WorkerWatch) -> bool {
         // Latched: its contribution is frozen, whatever the panel is doing now.
         if w.settled.is_some() {
             return false;
@@ -1125,8 +1160,8 @@ impl Multiplexer {
         // panel with work left and time on the clock gets fed; everything else
         // settles. The queue's front is cloned, not popped — it is consumed only
         // on a confirmed send below.
-        let feed = (state == PanelState::Idle && !w.backlog.is_empty() && !fallback_due)
-            .then(|| w.backlog[0].clone());
+        let feed =
+            (state == PanelState::Idle && !w.backlog.is_empty()).then(|| w.backlog[0].clone());
         // Read the just-finished turn *now*, while the panel is still idle.
         let done = self.read_watched_turn(w);
 
@@ -1690,7 +1725,7 @@ impl Multiplexer {
                         .manifests
                         .get(&w.panel)
                         .and_then(|m| m.last_note_since(w.turn_start)),
-                    finished: w.captured.clone(),
+                    finished: w.captured.len(),
                     pending_backlog,
                 },
             ),
@@ -1714,12 +1749,12 @@ impl Multiplexer {
             c.state.label()
         ));
         // One output stays header-less, identical to the pre-backlog report;
-        // two or more get `### task N` headers. A running turn is a task too:
-        // its finished predecessors are headed, and it has no body of its own.
-        let (bodies, total) = match &c.outcome {
-            PanelOutcome::Finished { bodies, .. } => (bodies, bodies.len()),
-            PanelOutcome::Running { finished, .. } => (finished, finished.len() + 1),
+        // two or more get `### task N` headers.
+        let bodies: &[String] = match &c.outcome {
+            PanelOutcome::Finished { bodies, .. } => bodies,
+            PanelOutcome::Running { .. } => &[],
         };
+        let total = bodies.len();
         for (i, body) in bodies.iter().enumerate() {
             if total > 1 {
                 out.push_str(&format!("\n### task {}\n", i + 1));
@@ -1735,9 +1770,6 @@ impl Multiplexer {
                 out.push('\n');
             }
         }
-        if total > 1 && matches!(c.outcome, PanelOutcome::Running { .. }) {
-            out.push_str(&format!("\n### task {total}\n"));
-        }
         push_round_panel_footer(out, c);
     }
 
@@ -1746,21 +1778,16 @@ impl Multiplexer {
     /// footer — into `out`. The shared per-panel body of the per-panel delivery
     /// summary ([`Multiplexer::render_watch_summary`]).
     fn push_panel_summary_block(&self, out: &mut String, id: PanelId, c: &RoundPanelContribution) {
-        let (bodies, running) = match &c.outcome {
-            PanelOutcome::Finished { bodies, .. } => (bodies, false),
-            PanelOutcome::Running { finished, .. } => (finished, true),
-        };
         out.push_str(&format!(
-            "\n## panel {id} (role: {}) — {} · {} output(s)\n",
+            "\n## panel {id} (role: {}) — {}",
             c.role,
             c.state.label(),
-            bodies.len()
         ));
         // Teaser: the panel's latest output, trimmed to the teaser budget — the
         // full text is in the report file. A running turn has none, and the
-        // footer says so; teasing a finished predecessor would read as its
-        // result.
-        if !running {
+        // footer says so.
+        if let PanelOutcome::Finished { bodies, .. } = &c.outcome {
+            out.push_str(&format!(" · {} output(s)\n", bodies.len()));
             let latest = bodies.last().map(|b| b.trim()).unwrap_or("");
             if latest.is_empty() {
                 out.push_str("(no output captured)\n");
@@ -1768,6 +1795,8 @@ impl Multiplexer {
                 out.push_str(&summary_teaser(latest, ROUND_SUMMARY_TEASER_BYTES));
                 out.push('\n');
             }
+        } else {
+            out.push('\n');
         }
         push_round_panel_footer(out, c);
     }
@@ -2077,6 +2106,7 @@ mod tests {
             turn_start: TurnMark::default(),
             read_mode,
             fallback_deadline: Instant::now() + Duration::from_secs(600),
+            fallback_budget: Duration::from_secs(600),
             selection_hints: None,
             auto_answers: Vec::new(),
         }
@@ -3509,7 +3539,7 @@ mod tests {
 
         // Idle with work queued: the owner feeds the task (flipping the panel
         // back to `Working`) rather than latching it.
-        assert!(mux.poll_worker_watch(&mut w, false));
+        assert!(mux.poll_worker_watch(&mut w));
         assert!(w.backlog.is_empty(), "the queued task must have been fed");
         assert!(
             w.settled.is_none(),
@@ -3523,7 +3553,7 @@ mod tests {
 
         // The fed task finishes with the queue now empty → the owner latches it.
         mux.panels.iter_mut().find(|p| p.id == sub).unwrap().state = PanelState::Idle;
-        assert!(mux.poll_worker_watch(&mut w, false));
+        assert!(mux.poll_worker_watch(&mut w));
         assert!(w.settled.is_some(), "the drained queue latches the panel");
 
         mux.shutdown();
@@ -3550,7 +3580,7 @@ mod tests {
             "no panel is settled until the owner poll latches it"
         );
 
-        assert!(mux.poll_worker_watch(&mut w, false));
+        assert!(mux.poll_worker_watch(&mut w));
         assert!(
             w.settled.is_some(),
             "an exited panel with queued backlog latches — it can never drain"
@@ -3559,6 +3589,12 @@ mod tests {
             w.backlog.len(),
             1,
             "a terminal panel is never fed its queued work",
+        );
+        let c = mux.worker_contribution(&w).unwrap();
+        let report = mux.assemble_watch_report(&w, &c);
+        assert!(
+            report.contains("1 queued task(s) were not run: the panel exited"),
+            "{report}"
         );
 
         mux.shutdown();
@@ -3610,37 +3646,87 @@ mod tests {
         mux.shutdown();
     }
 
-    /// Once the fallback deadline has fired, polling must deliver the partial
-    /// report instead of starting another queued backlog task. Before this
-    /// guard, an idle panel at the deadline was fed first, flipping it back to
-    /// `Working` even though the round was already due by timeout.
+    /// The fallback deadline forces an interim notice for a panel still
+    /// mid-turn, but its queued backlog survives it: the watch stays armed with
+    /// a fresh window, the panel is fed on its next idle exactly as if the
+    /// deadline had never fired, and the final delivery carries every task.
     #[tokio::test]
-    async fn poll_worker_watches_does_not_feed_backlog_after_fallback() {
+    async fn a_forced_out_panel_keeps_its_backlog_and_is_fed_on_the_next_idle() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
-        mux.main_panel_id = Some(main);
-        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+        let (_main, sub) = worker_with_manifest(&mut mux);
 
-        mux.queue_tasks(sub, vec!["late task".to_string()], None, Some(3600), None);
+        mux.note_prompt_delivered(sub);
+        mux.queue_tasks(sub, vec!["second task".to_string()], None, Some(60), None);
         let i = watch_of(&mux, sub);
         mux.watches[i].fallback_deadline = Instant::now() - Duration::from_secs(1);
 
-        mux.poll_worker_watches();
-
+        let interim = mux.take_ready_round_deliveries();
+        assert_eq!(interim.len(), 1, "the deadline forces one interim notice");
         assert!(
-            mux.watches.is_empty(),
-            "fallback-due round should be delivered and dropped"
+            interim[0].contains("forced out by the fallback deadline"),
+            "{}",
+            interim[0]
         );
+        assert!(
+            interim[0].contains("1 task(s) still queued"),
+            "{}",
+            interim[0]
+        );
+        let i = watch_of(&mux, sub);
+        assert_eq!(mux.watches[i].backlog.len(), 1, "the backlog is kept");
+        assert!(
+            mux.watches[i].fallback_deadline > Instant::now(),
+            "the forced-out watch gets a fresh fallback window"
+        );
+
+        // The first task ends: fed the queued one, as with no deadline.
+        stop_turn(&mut mux, sub, "first done");
+        assert!(mux.take_ready_round_deliveries().is_empty());
         assert_eq!(
             mux.panels().iter().find(|p| p.id == sub).unwrap().state(),
-            PanelState::Idle,
-            "fallback delivery must not start another queued backlog task"
-        );
-        assert_eq!(
-            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
             PanelState::Working,
-            "delivery injects the partial report into the main panel"
+            "the kept backlog is fed on the next idle"
+        );
+        assert!(mux.watches[watch_of(&mux, sub)].backlog.is_empty());
+
+        stop_turn(&mut mux, sub, "second done");
+        let last = mux.take_ready_round_deliveries();
+        assert_eq!(last.len(), 1, "the drained panel delivers its result");
+        assert!(last[0].contains("finished"), "{}", last[0]);
+        assert!(
+            mux.watches.is_empty(),
+            "a finished delivery spends the watch"
+        );
+        let report = std::fs::read_dir(mux.session.root_dir.join("rounds"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .find(|r| r.contains("finished."))
+            .expect("the final report is spilled");
+        assert!(
+            report.contains("first done") && report.contains("second done"),
+            "{report}"
+        );
+
+        mux.shutdown();
+    }
+
+    /// Killing a watched panel is where its queued backlog is discarded: the
+    /// watch is retired with the panel, and nothing is fed or delivered.
+    #[tokio::test]
+    async fn killing_a_watched_panel_clears_its_backlog() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (_main, sub) = worker_with_manifest(&mut mux);
+
+        mux.note_prompt_delivered(sub);
+        mux.queue_tasks(sub, vec!["never run".to_string()], None, Some(60), None);
+        Multiplexer::kill_panel(&mut mux, sub).unwrap();
+
+        assert!(mux.take_ready_round_deliveries().is_empty());
+        assert!(
+            mux.watches.is_empty(),
+            "a killed panel's watch and its backlog are retired"
         );
 
         mux.shutdown();
@@ -3738,7 +3824,7 @@ mod tests {
             "the latched contribution must survive the wake-up: {report}",
         );
         assert!(
-            !report.contains("still working"),
+            !report.contains("turn still running"),
             "a latched panel must never be reported unfinished: {report}",
         );
 
@@ -3916,14 +4002,14 @@ mod tests {
         mux.shutdown();
     }
 
-    /// The fallback tick still **latches** (captures) a panel that settled with
-    /// queued work left — it only stops *feeding* it more. Without this the
-    /// partial report the deadline forces would carry nothing for a panel whose
-    /// finished turns were never read.
+    /// The fallback tick feeds an idle panel with queued work exactly as any
+    /// other tick does — the deadline never discards the backlog. The panel is
+    /// then mid-turn, so the deadline's notice is an interim one: it counts the
+    /// finished turn and holds its body for the final delivery.
     ///
     /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
-    async fn the_fallback_tick_latches_an_idle_panel_with_queued_backlog() {
+    async fn the_fallback_tick_feeds_an_idle_panel_with_queued_backlog() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
 
@@ -3952,24 +4038,24 @@ mod tests {
 
         let idx = watch_of(&mux, sub);
         assert!(
-            mux.watches[idx].settled.is_some(),
-            "the deadline latches an idle panel rather than leaving it unread",
+            mux.watches[idx].settled.is_none(),
+            "an idle panel with queued work is fed, not latched",
         );
-        assert_eq!(
-            mux.watches[idx].backlog.len(),
-            1,
-            "no new backlog work starts after the deadline",
+        assert!(
+            mux.watches[idx].backlog.is_empty(),
+            "the deadline does not hold back the backlog",
         );
+        assert_eq!(mux.watches[idx].captured, ["what the panel got through"]);
 
         let c = mux.worker_contribution(&mux.watches[idx]).unwrap();
         let report = mux.assemble_watch_report(&mux.watches[idx], &c);
         assert!(
-            report.contains("what the panel got through"),
-            "the partial report must carry the work the panel finished: {report}",
+            report.contains("1 earlier task(s) finished"),
+            "the interim notice counts the finished turn: {report}",
         );
         assert!(
-            report.contains("1 queued backlog task(s) were not run"),
-            "the partial report must name the un-run work: {report}",
+            !report.contains("what the panel got through"),
+            "the finished body comes once, with the final result: {report}",
         );
 
         mux.shutdown();

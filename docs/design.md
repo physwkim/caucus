@@ -184,8 +184,9 @@ push한다. 라운드라는 묶음도, 파일 안건도, `response-*.md` 수집�
    수 없다(I-10). 전체 보고서를 통째로 PTY에 붙여 넣지 않는 이유: 패널 결과가 수백
    KB까지 가고, 그 크기의 단일 bracketed paste는 백엔드의 paste 처리 병리를
    건드린다. main worker는 teaser로 부족하면 보고서 파일을 Read한다. main worker가
-   idle이고 사용자가 입력 중이 아닐 때 전달된다. 안전망: fallback_secs가 지나면
-   미완 패널을 "still working"으로 표시해 부분 결과를 전달한다.
+   idle이고 사용자가 입력 중이 아닐 때 전달된다. 안전망: fallback_secs가 지나도
+   턴이 안 끝난 패널은 중간 통지(결과 없음, 이번 턴의 마지막 note, 남은 큐 수)로
+   알리고, watch와 백로그는 그대로 둔 채 창을 다시 연다.
 
 5. main worker가 주입된 패널 결과를 받고 그 워커에 대해 판단:
      - 그 워커에 후속 작업 → 곧바로 send_keys. 프롬프트를 주는 순간 watch가
@@ -216,8 +217,9 @@ watch의 단일 owner `poll_worker_watch`가 매 tick 이 판정을 하며,
 막 끝난 턴의 출력을 `read_mode`로 캡처해 latch한다(**Invariant I-9**) — 전달
 보고서가 마지막 턴만이 아니라 모든 task 산출물을 담도록, 그리고 배달 시점에
 패널을 다시 읽지 않도록. 전달 시에는 캡처분이 `### task N` 섹션으로 main에
-주입된다(단일 task면 헤더 없이 기존과 동일; fallback 시 미완 패널은 끝낸 task들
-+ "still working" 마커).
+주입된다(단일 task면 헤더 없이 기존과 동일). fallback 중간 통지는 본문이 없다 —
+끝낸 task들의 본문은 최종 배달에 한 번만 실리고, 모든 읽기는 watch의 `turn_start`
+마크 이후로만 하므로 이전 턴의 메시지가 이번 턴의 결과로 나갈 수 없다.
 
 **pull 경로와 감시 중단**: 정상 흐름은 워커에게 일을 주고 턴을 닫은 뒤 caucus의
 완료 push를 기다리는 것이다 — 그게 더 싸고, 감시는 자동이라 등록 없이도 성립한다.
@@ -1618,8 +1620,8 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
   `note_prompt_outstanding`, 감소는 `consume_outstanding_prompt` 단 하나씩이며, 두 맵 모두
   `detach_panel`에서 패널과 함께 사라진다.
 - **Tests**: latch 후 패널을 다시 `Working`으로 깨워도 watch가 미정착으로 돌아가지 않고 기여가
-  남는지; latch 후 도착한 `Stop` 훅이 리포트의 `last_message`를 덮지 못하는지; backlog가 남은 채
-  fallback이 닫히면 latch는 되고 feed는 안 되는지. 미결 카운트의 경계마다 한 케이스씩 — 잔량
+  남는지; latch 후 도착한 `Stop` 훅이 리포트의 `last_message`를 덮지 못하는지; fallback이 와도 backlog가
+  유지되고 다음 idle에 급여되는지. 미결 카운트의 경계마다 한 케이스씩 — 잔량
   `> 0`(첫 Stop은 정착시키지 않고 capture turn을 다시 연다)과 `== 0`(큐 프롬프트 자신의 Stop이
   정착시킨다); 손으로 친 `/compact`의 close가 자기 프롬프트를 소비해 카운트가 0으로 돌아오는지.
 
@@ -1627,7 +1629,8 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 - **배리어 없음(streaming)**: watch는 패널 하나짜리다. 한 워커가 정착(I-9로 latch)하는 즉시
   그 워커의 기여만 따로 main에 전달되고, 다른 워커의 watch는 그대로 살아 있다. 조기 완료 워커가
   최후미 워커를 기다리지 않으므로 N명의 워커는 main과 N회 interaction 한다.
-- **구조적 정확히-한-번**: 배달 원장(`delivered` 집합) 자체가 없다. **배달 = watch 제거**이므로
+- **구조적 정확히-한-번**: 배달 원장(`delivered` 집합) 자체가 없다. **정착한 워커의 배달 = watch
+  제거**(`after_handoff`; fallback 중간 통지는 watch를 남기고 창만 다시 연다)이므로
   이미 배달된 워커는 물어볼 watch가 존재하지 않는다 — 중복 배달이 표현 불가능하다.
   `watch_ready`(정착했거나 fallback due)가 배달 대상을 고르고, `render_watch_delivery`가 그
   워커 한 명의 assemble + spill(`rounds/<panel>-<n>.md`) + summary의 유일한 지점이다.

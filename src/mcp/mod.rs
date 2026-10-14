@@ -439,11 +439,13 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                     },
                     "fallback_secs": {
                         "type": "integer",
-                        "description": "Safety-net seconds: a worker that never \
-                                        settles is delivered anyway after this, \
-                                        marked still-working with whatever it \
-                                        produced (default 600, max 3600). Set \
-                                        from now."
+                        "description": "Safety-net seconds: a worker still \
+                                        mid-turn after this is reported to you \
+                                        anyway as an interim notice (no result \
+                                        yet, its last note, tasks still queued); \
+                                        it stays watched with its queue intact \
+                                        and the window restarts (default 600, \
+                                        max 3600). Set from now."
                     },
                     "selection_hints": {
                         "type": "object",
