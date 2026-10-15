@@ -5,7 +5,77 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
-## [Unreleased]
+## [0.11.0] — 2026-10-15
+
+caucus no longer works in rounds. A main worker used to register a round over
+the panels it had briefed and hear back once, when the last of them settled;
+now every panel caucus hands a prompt to is watched on its own, its result is
+pushed to main the moment it finishes, and the watch re-arms when main sends
+the next task — instruct → finish → instruct is a loop with no registration
+step. The MCP surface changes with it (breaking, below), and a set of fixes
+closes the ways a panel could sit wedged `Working` or report the wrong turn's
+output as a task's answer. No hook reinstall or config change is needed.
+
+### Changed
+
+- **BREAKING (MCP surface): `register_round` / `round_status` / `cancel_round`
+  are replaced by `queue_tasks` / `collect_workers` / `stop_watching`.** The
+  runtime had already stopped working in rounds, but the tools main reads still
+  taught the concept — and main follows its tool names, which is what made it
+  keep waiting for a round that no longer existed. The new surface is per
+  worker, with no round id anywhere:
+  - `queue_tasks(panel, tasks?, read_mode?, fallback_secs?, selection_hints?)`
+    — queue follow-up tasks on one worker and tune its watch. It configures the
+    watch caucus already armed rather than creating one, so a panel still has
+    exactly one watch. It is no longer needed to *hear back* from a worker at
+    all: `send_keys` is enough.
+  - `collect_workers()` — the in-turn pull, now argument-free: it hands back
+    every ready worker and reports the ones still running. This is the livelock
+    escape hatch (the push can only land while main is idle), so it survives the
+    redesign; it no longer needs an id, and covers workers main never registered.
+  - `stop_watching(panel)` — stop being woken by one worker and stop feeding it
+    backlog. The panel is untouched, and the next prompt re-arms the watch.
+
+  `RoundId` is deleted along with the `round` handle on the watch, so a watch is
+  now identified by its panel and nothing else. `broadcast` no longer tells main
+  to follow up with a registration, and `docs/review-loop.md` drops the
+  `register_round` step from every pass.
+
+- **Results reach the main worker one worker at a time; the all-settled
+  barrier is gone.** A round that ran across several panels delivered only once every
+  panel had settled — the main worker sat idle behind the single slowest
+  sub-agent. Each worker's result is now delivered the instant that worker
+  settles (latched by Invariant I-9), so the main worker starts on the early
+  finishers while the slow ones are still working, and is woken once per
+  worker rather than once total. Every path — the keystroke push, the
+  `collect_workers` pull, and the Stop hook-reply — delivers each worker
+  exactly once. Design §8 flow, §7.6, Invariant I-10.
+
+- **Every worker caucus hands a prompt to is watched, and the watch re-arms
+  after each delivery.** A round retired when it was delivered, so once main
+  sent a worker its next task nothing was watching that worker until main
+  registered another round — and a worker main simply talked to, without
+  registering anything, was never reported at all. Now the watch is armed at
+  the moment caucus delivers the prompt (in the single `Idle -> Working`
+  owner, so `send_keys`, `broadcast`, a backlog feed and a human typing into
+  the panel all arm exactly once), spent on delivery, and re-armed by the
+  next prompt. The stranded-main nudge survives but only covers panels
+  working on something caucus never handed them. Design §8 flow.
+
+- **The round object is gone: caucus watches one worker at a time.** The
+  `PendingRound` (a panel list plus four per-panel maps plus a `delivered`
+  ledger) collapsed into a per-panel `WorkerWatch` — one panel, one settle
+  latch, one backlog queue, one captured list. Exactly-once delivery
+  (Invariant I-10) is now structural rather than book-kept: **delivering a
+  worker removes its watch**, so a spent watch cannot be asked again — the
+  `delivered` set and the `round_fully_delivered` / `retire_gone_round_panels`
+  retirement logic it needed are deleted, not re-implemented. Spilled reports
+  move from `rounds/<round-id>-<panel-id>.md` to `rounds/<panel-id>-<n>.md`,
+  so a worker re-prompted across a session no longer overwrites its previous
+  assignment's report. The resume snapshot (`pending-rounds.json`) flattens
+  to one record per watched worker; a snapshot written by an older caucus is
+  unreadable and is treated as "nothing in flight" (the same best-effort path
+  a corrupt file already took). Design §8, §7.6, Invariants I-9/I-10.
 
 ### Fixed
 
@@ -64,92 +134,32 @@ versions.
   (`local_commands_without_turn`) and consumed by the close, so a local command
   can only ever close a turn it opened; a hand-typed `/compact` (unclassifiable,
   and with no Stop hook to follow) still closes its own turn as before.
-
-### Changed
-
-- **BREAKING (MCP surface): `register_round` / `round_status` / `cancel_round`
-  are replaced by `queue_tasks` / `collect_workers` / `stop_watching`.** The
-  runtime had already stopped working in rounds, but the tools main reads still
-  taught the concept — and main follows its tool names, which is what made it
-  keep waiting for a round that no longer existed. The new surface is per
-  worker, with no round id anywhere:
-  - `queue_tasks(panel, tasks?, read_mode?, fallback_secs?, selection_hints?)`
-    — queue follow-up tasks on one worker and tune its watch. It configures the
-    watch caucus already armed rather than creating one, so a panel still has
-    exactly one watch. It is no longer needed to *hear back* from a worker at
-    all: `send_keys` is enough.
-  - `collect_workers()` — the in-turn pull, now argument-free: it hands back
-    every ready worker and reports the ones still running. This is the livelock
-    escape hatch (the push can only land while main is idle), so it survives the
-    redesign; it no longer needs an id, and covers workers main never registered.
-  - `stop_watching(panel)` — stop being woken by one worker and stop feeding it
-    backlog. The panel is untouched, and the next prompt re-arms the watch.
-
-  `RoundId` is deleted along with the `round` handle on the watch, so a watch is
-  now identified by its panel and nothing else. `broadcast` no longer tells main
-  to follow up with a registration, and `docs/review-loop.md` drops the
-  `register_round` step from every pass.
-
-- **The round object is gone: caucus now watches one worker at a time.** The
-  `PendingRound` (a panel list plus four per-panel maps plus a `delivered`
-  ledger) collapsed into a per-panel `WorkerWatch` — one panel, one settle
-  latch, one backlog queue, one captured list. `register_round` over N panels
-  arms N watches that share a `round` handle, which is all `round_status` and
-  `cancel_round` still need it for. Exactly-once delivery (Invariant I-10) is
-  now structural rather than book-kept: **delivering a worker removes its
-  watch**, so a spent watch cannot be asked again — the `delivered` set and the
-  `round_fully_delivered` / `retire_gone_round_panels` retirement logic it
-  needed are deleted, not re-implemented. Spilled reports move from
-  `rounds/<round-id>-<panel-id>.md` to `rounds/<panel-id>-<n>.md`, so a worker
-  re-prompted across a session no longer overwrites its previous assignment's
-  report. The resume snapshot (`pending-rounds.json`) flattens to one record
-  per watched worker; a snapshot written by an older caucus is unreadable and
-  is treated as "no rounds in flight" (the same best-effort path a corrupt
-  file already took). Design §8, §7.6, Invariants I-9/I-10.
-
-- **Every worker caucus hands a prompt to is watched, and the watch re-arms
-  after each delivery.** Streaming round delivery removed the barrier, but a
-  round still retired when it was delivered — so once main sent a worker its
-  next task, nothing was watching that worker and main had to call
-  `register_round` again to hear about it. A worker main simply talked to,
-  without registering anything, was never reported at all. Now the watch is
-  armed at the moment caucus delivers the prompt (in the single
-  `Idle -> Working` owner, so `send_keys`, `broadcast`, a backlog feed and a
-  human typing into the panel all arm exactly once), spent on delivery, and
-  re-armed by the next prompt: `instruct → finish → instruct` runs as a
-  continuous loop with no registration step. `register_round` still exists for
-  per-round options (`backlog`, `selection_hints`, `read_mode`,
-  `fallback_secs`) and now absorbs the implicit watch on the panels it names,
-  carrying its latch and captured turns across. The stranded-main nudge
-  survives but only covers panels working on something caucus never handed
-  them, and no longer tells main to register a round. Design §8 flow.
-
-### Fixed
-
-- **The main worker's tool descriptions taught a barrier the runtime no longer
-  had.** `register_round` said caucus delivers "when they ALL settle" an
-  "assembled" report and `round_status` said it collects "once the round
-  completes", so a main worker that received one panel's streamed delivery
-  concluded the round was still in flight and waited instead of acting on that
-  worker. Rewritten across `register_round`, `round_status`, `cancel_round`,
-  `broadcast`, `fallback_secs`, and `selection_hints`.
-
-### Changed (earlier in this cycle)
-
-- **Round results now stream to the main worker per panel, instead of
-  waiting for the whole round to finish.** A round that ran across several
-  panels used to deliver only once every panel had settled — the main
-  worker sat idle behind the single slowest sub-agent. The all-settled
-  barrier is gone: each panel's contribution is delivered the instant that
-  panel settles (latched by Invariant I-9), so the main worker starts
-  interacting with the early finishers while the slow ones are still
-  working. A round now wakes the main worker once per panel (N times) rather
-  than once total. Delivery is tracked by a per-panel `delivered` ledger
-  (Invariant I-10, revised from round-once to panel-once), and every path —
-  the keystroke push, the `round_status` pull, and the Stop hook-reply —
-  streams each ready panel exactly once. Each panel spills its own full
-  report to `rounds/<round-id>-<panel-id>.md`. Design §8 flow, §7.6, and
-  Invariant I-10. No hook reinstall or config change needed.
+- **A worker that paused on a selection menu, was answered, and then finished
+  is now reported to main.** A panel blocked on a prompt (selection menu,
+  `[y/N]`) has an open turn that the agent is waiting inside; answering
+  resumes that same turn, so exactly one Stop still follows. But
+  `select_option` — and the auto-answer from `selection_hints`, and a `[y/N]`
+  answered with `send_keys` — routed through `note_prompt_delivered`, which
+  counted the answer as another prompt: the resumed turn's single Stop
+  decremented the count from two to one, read as "a queued prompt is still
+  pending", and pinned the panel `Working`, so its watch never settled and the
+  finished worker was never delivered. The single owner now applies one rule:
+  a submission into a panel that is `Working` *and* showing a blocked prompt
+  is an answer that resumes the open turn and is not counted; a submission
+  into a running, unblocked turn is genuinely queued by the CLI, brings its
+  own Stop, and still is.
+- **A watch armed on an idle panel no longer delivers that panel's previous
+  output as its first task.** `queue_tasks` on an idle panel captured the
+  panel's old `last_message` as task 1, and every fallback notice re-delivered
+  it under the forced-out header as if it were new. The watch now marks the
+  panel's timeline when it arms and at each backlog feed, and reads nothing
+  older than that mark; a turn that has not ended has no body to deliver.
+- **A fallback notice no longer spends the watch.** The fallback deadline
+  stopped feeding the worker's backlog and its delivery removed the watch, so
+  a panel that was still alive lost its queued tasks and its eventual result.
+  A forced-out watch now keeps its backlog and finished turns and restarts its
+  fallback window; only a settled delivery spends the watch, and backlog is
+  discarded only on kill, exit, or `stop_watching`.
 
 ## [0.10.3] — 2026-07-23
 
