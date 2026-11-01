@@ -2329,6 +2329,81 @@ mod tests {
         assert_ne!(s2, s3, "a resize must change the render signature");
     }
 
+    /// `draw` paints a grid only through its layout slot: output from a
+    /// panel hidden behind a zoom must leave the signature alone, while the
+    /// zoomed panel's output, and the hidden panel's once unzoomed, change it.
+    #[tokio::test]
+    async fn render_signature_ignores_output_hidden_behind_a_zoom() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let shown = push_cat_panel(&mut mux, PanelState::Working);
+        let hidden = push_cat_panel(&mut mux, PanelState::Working);
+        let ingest = |mux: &mut Multiplexer, id: PanelId| {
+            let panel = mux.panels.iter_mut().find(|p| p.id == id).unwrap();
+            panel.grid.advance(b"output");
+        };
+        mux.focus.set_focus(Some(shown));
+        mux.toggle_zoom();
+        assert_eq!(mux.zoomed(), Some(shown));
+
+        let s0 = mux.render_signature();
+        ingest(&mut mux, hidden);
+        assert_eq!(
+            s0,
+            mux.render_signature(),
+            "output behind a zoom must not repaint"
+        );
+        ingest(&mut mux, shown);
+        let s1 = mux.render_signature();
+        assert_ne!(s0, s1, "the zoomed panel's output must repaint");
+
+        mux.toggle_zoom();
+        let s2 = mux.render_signature();
+        ingest(&mut mux, hidden);
+        assert_ne!(
+            s2,
+            mux.render_signature(),
+            "a tiled panel's output must repaint"
+        );
+        mux.shutdown();
+    }
+
+    /// The transcript overlay shows every manifest's turn count and last
+    /// message, hidden panels included; a turn completion that leaves the
+    /// derived state unchanged must still change the signature.
+    #[tokio::test]
+    async fn render_signature_tracks_transcript_turns() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        mux.manifests.insert(id, mf);
+
+        let s0 = mux.render_signature();
+        let mf = mux.manifests.get_mut(&id).unwrap();
+        let state = mf.derived_state();
+        mf.lane_events
+            .push(LaneEvent::now(LaneEventKind::TurnCompleted));
+        mf.last_message = Some("done".to_string());
+        assert_eq!(mf.derived_state(), state);
+        assert_ne!(
+            s0,
+            mux.render_signature(),
+            "a turn completion must repaint the transcript"
+        );
+        mux.shutdown();
+    }
+
     /// `pump_all` probes child liveness on its first call, then throttles:
     /// a second pump within `LIVENESS_PROBE_INTERVAL` must not re-probe
     /// (the timestamp is unchanged), so per-panel `waitpid` does not run

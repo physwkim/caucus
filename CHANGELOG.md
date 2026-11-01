@@ -22,6 +22,11 @@ versions.
   already caches against the grid generation, so an unchanged screen is not
   rescanned. A quiet one-panel tick drops from ~10 µs to under 0.5 µs; with 50
   active panels, from ~39 µs to ~29 µs.
+- **Output from panels hidden behind a zoom no longer repaints the screen.**
+  Any panel's output used to redraw the whole frame on the next 16 ms tick,
+  visible or not; now only panels on screen do, and the transcript overlay
+  still refreshes when a turn completes. With 49 busy workers behind a zoomed
+  panel, caucus drops from ~54 frames/s to 1 and from ~28% to ~15% CPU.
 
 ## [0.11.0] — 2026-10-15
 

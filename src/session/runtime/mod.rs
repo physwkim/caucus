@@ -520,10 +520,14 @@ impl Multiplexer {
     ///
     /// The inputs partition cleanly by what can change them:
     /// - **PTY reads** bump each panel's grid `generation` (any byte ingest,
-    ///   including cursor moves — see `Grid::advance`).
+    ///   including cursor moves — see `Grid::advance`). Only panels holding a
+    ///   layout slot contribute it: `draw` paints no other grid, so output
+    ///   behind a zoom repaints nothing.
     /// - **Spawn/kill** change the panel set (ids + count).
-    /// - **Turn signals / exit reaping** change `state_label` and the
-    ///   manifest-derived state.
+    /// - **Turn signals / exit reaping** change `state_label`, the
+    ///   manifest-derived state, and the lane-event count (the transcript
+    ///   overlay's turn count and last message change only with an appended
+    ///   event).
     /// - **Keystrokes and terminal resizes** change the view with no other
     ///   counter, so they bump `view_epoch` (focus, layout, zoom, scroll,
     ///   transcript, prefix hint, close-confirm, resize reflow).
@@ -541,15 +545,15 @@ impl Multiplexer {
         }
         let mut acc = hash_one((self.view_epoch, self.focused(), self.panels.len()));
         for p in &self.panels {
-            acc ^= hash_one((
-                p.id,
-                p.grid().generation(),
-                p.state_label(),
-                p.role.as_str(),
-            ));
+            let generation = self.layout.rect_of(p.id).map(|_| p.grid().generation());
+            acc ^= hash_one((p.id, generation, p.state_label(), p.role.as_str()));
         }
         for (id, manifest) in &self.manifests {
-            acc ^= hash_one((*id, manifest.derived_state().as_str()));
+            acc ^= hash_one((
+                *id,
+                manifest.derived_state().as_str(),
+                manifest.lane_events().len(),
+            ));
         }
         acc
     }
