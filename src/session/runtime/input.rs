@@ -543,28 +543,31 @@ impl Multiplexer {
     /// family and dropped Stops at once, for main and workers alike.
     pub fn poll_lost_turns(&mut self) {
         let now = Instant::now();
+        let working: Vec<(PanelId, u64)> = self
+            .panels
+            .iter()
+            .filter(|p| p.state() == PanelState::Working)
+            .map(|p| (p.id, p.grid().generation()))
+            .collect();
         let mut due: Vec<PanelId> = Vec::new();
-        for panel in &self.panels {
-            if panel.state() != PanelState::Working {
-                continue;
-            }
+        for (id, generation) in working {
             // A live selection / [y/n] prompt is a static grid, but it is a real
-            // attention state owned elsewhere — never reconcile it away.
-            if Self::panel_blocked_prompt(panel).is_some() {
-                self.lost_turn_probe.remove(&panel.id);
+            // attention state owned elsewhere — never reconcile it away. This runs
+            // every tick, so only through the generation cache.
+            if self.panel_blocked_cached(id, generation).is_some() {
+                self.lost_turn_probe.remove(&id);
                 continue;
             }
-            let generation = panel.grid().generation();
-            match self.lost_turn_probe.get(&panel.id) {
+            match self.lost_turn_probe.get(&id) {
                 Some((seen, since)) if *seen == generation => {
                     if now.duration_since(*since) >= LOST_TURN_RECONCILE_QUIESCENCE {
-                        due.push(panel.id);
+                        due.push(id);
                     }
                 }
                 // First sight, or the grid changed since last tick: (re)start the
                 // clock. A changing grid is a live turn — the window never elapses.
                 _ => {
-                    self.lost_turn_probe.insert(panel.id, (generation, now));
+                    self.lost_turn_probe.insert(id, (generation, now));
                 }
             }
         }
@@ -798,13 +801,13 @@ impl Multiplexer {
         // and must be counted. Computed here, before the mutable borrow, so the
         // rule is uniform across every caller (`send_keys`, `select_option`, a
         // human typing) rather than a flag each one has to get right.
-        let resumes_open_turn = self
+        let working_generation = self
             .panels
             .iter()
-            .find(|p| p.id == panel_id)
-            .is_some_and(|p| {
-                p.state() == PanelState::Working && Self::panel_blocked_prompt(p).is_some()
-            });
+            .find(|p| p.id == panel_id && p.state() == PanelState::Working)
+            .map(|p| p.grid().generation());
+        let resumes_open_turn = working_generation
+            .is_some_and(|generation| self.panel_blocked_cached(panel_id, generation).is_some());
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
             return;
         };
@@ -1586,6 +1589,34 @@ mod tests {
         assert!(
             !mux.lost_turn_probe.contains_key(&id),
             "a blocked panel's probe is dropped, so the clock restarts when it unblocks"
+        );
+        mux.shutdown();
+    }
+
+    /// `poll_lost_turns` runs every tick, so it must take the blocked-prompt
+    /// answer from the generation cache, not re-scan an unchanged viewport. The
+    /// cat grid holds no prompt, so only a cache read sees the seeded one.
+    #[tokio::test]
+    async fn poll_lost_turns_reads_the_blocked_scan_cache() {
+        use super::super::rounds::BlockedPrompt;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        let generation = mux
+            .panels
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .grid()
+            .generation();
+        let prompt = BlockedPrompt::Permission("Continue? [y/N]".into());
+        mux.blocked_scan_cache
+            .insert(id, (generation, Some(prompt)));
+
+        mux.poll_lost_turns();
+        assert!(
+            !mux.lost_turn_probe.contains_key(&id),
+            "the cached prompt marks the panel blocked, so no probe is armed"
         );
         mux.shutdown();
     }

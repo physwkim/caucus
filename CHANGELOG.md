@@ -5,6 +5,17 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [Unreleased]
+
+### Performance
+
+- **Lost-turn recovery reads the cached prompt scan.** Every loop tick
+  (~250 Hz) re-rendered each `Working` panel's viewport to text to look for a
+  blocked prompt; it now shares the per-panel scan the blocked-panel announcer
+  already caches against the grid generation, so an unchanged screen is not
+  rescanned. A quiet one-panel tick drops from ~10 µs to under 0.5 µs; with 50
+  active panels, from ~39 µs to ~29 µs.
+
 ## [0.11.0] — 2026-10-15
 
 caucus no longer works in rounds. A main worker used to register a round over

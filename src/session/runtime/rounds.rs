@@ -2002,7 +2002,11 @@ impl Multiplexer {
     /// re-scans and refreshes the cache. This is what keeps the per-tick
     /// blocked-panel poll from re-scanning every idle round panel. Returns
     /// `None` for an unknown id.
-    fn panel_blocked_cached(&mut self, id: PanelId, generation: u64) -> Option<BlockedPrompt> {
+    pub(super) fn panel_blocked_cached(
+        &mut self,
+        id: PanelId,
+        generation: u64,
+    ) -> Option<BlockedPrompt> {
         if let Some((cached_gen, cached)) = self.blocked_scan_cache.get(&id)
             && *cached_gen == generation
         {
