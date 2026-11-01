@@ -589,6 +589,10 @@ fn session_suffix(session: &Session) -> String {
 #[cfg(test)]
 pub(crate) mod test_support;
 
+/// Per-pass loop-turn cost against panel count (`#[ignore]`d profile).
+#[cfg(test)]
+mod tick_profile;
+
 #[cfg(test)]
 mod tests {
     use super::*;

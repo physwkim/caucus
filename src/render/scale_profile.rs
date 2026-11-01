@@ -9,7 +9,6 @@
 //! terminal would receive.
 
 use std::cell::Cell;
-use std::fmt::Write as _;
 use std::io;
 use std::rc::Rc;
 use std::time::Instant;
@@ -19,15 +18,13 @@ use ratatui::layout::Rect as TuiRect;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use super::{Layout, LayoutMode, Rect, draw};
-use crate::bench_support::{Summary, cat_panel};
+use crate::bench_support::{PANEL_COUNTS, Summary, cat_panel, paint_screen, spin};
 use crate::panel::Panel;
 
 const COLS: u16 = 120;
 const ROWS: u16 = 40;
-const PANEL_COUNTS: [usize; 3] = [1, 15, 50];
 const WARMUP_FRAMES: usize = 50;
 const FRAMES: usize = 500;
-const SPINNER: [char; 4] = ['·', '✢', '✳', '✶'];
 
 /// Swallows the backend's output, keeping only its length. Shared because
 /// ratatui's accessor for the backend writer is unstable.
@@ -60,27 +57,6 @@ impl Activity {
     }
 }
 
-/// Fill the whole viewport with coloured text, one colour per row.
-fn paint_screen(panel: &mut Panel, seed: usize) {
-    let (cols, rows) = panel.grid.size();
-    let mut bytes = String::new();
-    for r in 0..rows {
-        let _ = write!(bytes, "\x1b[{};1H\x1b[3{}m", r + 1, (r + seed) % 7 + 1);
-        bytes.extend("lorem ipsum dolor sit amet ".chars().cycle().take(cols));
-        bytes.push_str("\x1b[0m");
-    }
-    panel.grid.advance(bytes.as_bytes());
-}
-
-/// One spinner step on the bottom row, the shape of an agent's working line.
-fn spin(panel: &mut Panel, frame: usize) {
-    let (_, rows) = panel.grid.size();
-    let glyph = SPINNER[frame % SPINNER.len()];
-    let line =
-        format!("\x1b[{rows};1H\x1b[33m{glyph}\x1b[0m Working… ({frame}s · esc to interrupt)");
-    panel.grid.advance(line.as_bytes());
-}
-
 /// Time `FRAMES` draws of `n` tiled panels; returns the frame-time summary
 /// and the mean bytes written per frame.
 fn profile(n: usize, activity: Activity) -> (Summary, usize) {
@@ -97,7 +73,7 @@ fn profile(n: usize, activity: Activity) -> (Summary, usize) {
         panel.resize(*rect).unwrap();
     }
     for (i, panel) in panels.iter_mut().enumerate() {
-        paint_screen(panel, i);
+        paint_screen(&mut panel.grid, i);
     }
     let focused = Some(ids[0]);
 
@@ -113,8 +89,8 @@ fn profile(n: usize, activity: Activity) -> (Summary, usize) {
     let mut bytes = 0;
     for frame in 0..WARMUP_FRAMES + FRAMES {
         match activity {
-            Activity::OneActive => spin(&mut panels[0], frame),
-            Activity::AllActive => panels.iter_mut().for_each(|p| spin(p, frame)),
+            Activity::OneActive => spin(&mut panels[0].grid, frame),
+            Activity::AllActive => panels.iter_mut().for_each(|p| spin(&mut p.grid, frame)),
         }
         let before = counter.0.get();
         let start = Instant::now();
