@@ -7,6 +7,13 @@ versions.
 
 ## [Unreleased]
 
+### Added
+
+- **`CAUCUS_PROF=1` logs where the event loop spends its time.** Once a
+  second, `.caucus/caucus.log` gets each loop pass's call count, mean and max
+  time, with the turn count and total busy time; the idle input wait is not
+  counted. Unset, it costs one branch per pass.
+
 ### Performance
 
 - **Lost-turn recovery reads the cached prompt scan.** Every loop tick
