@@ -28,5 +28,9 @@ pub mod worktree;
 #[cfg(test)]
 mod test_serial;
 
+/// Timing summaries and stand-in panels for the `#[ignore]`d profiles.
+#[cfg(test)]
+mod bench_support;
+
 /// Compile-time package version, exposed for `caucus --version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

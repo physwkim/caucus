@@ -31,6 +31,9 @@ use crate::term::grid::attr;
 mod tree;
 pub use tree::LayoutTree;
 
+#[cfg(test)]
+mod scale_profile;
+
 /// A rectangle of the terminal, in cells.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Rect {
