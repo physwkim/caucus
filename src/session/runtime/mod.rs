@@ -593,6 +593,10 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tick_profile;
 
+/// Loop stall from a control-socket burst (`#[ignore]`d profile).
+#[cfg(test)]
+mod control_profile;
+
 #[cfg(test)]
 mod tests {
     use super::*;
