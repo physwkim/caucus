@@ -159,7 +159,7 @@ impl Multiplexer {
     /// The [`PanelSummary`] for each id in `panels` that still exists, in the
     /// caller's order — missing ids are omitted (they were killed or the id
     /// was bad).
-    pub(crate) fn panel_summaries(&self, panels: &[PanelId]) -> Vec<PanelSummary> {
+    pub(crate) fn panel_summaries(&mut self, panels: &[PanelId]) -> Vec<PanelSummary> {
         let all = self.list_panels();
         panels
             .iter()

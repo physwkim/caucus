@@ -162,12 +162,12 @@ pub trait McpToolSurface {
     fn restart_panel(&mut self, panel: PanelId) -> Result<PanelId, McpError>;
 
     /// List every live panel with its derived state.
-    fn list_panels(&self) -> Vec<PanelSummary>;
+    fn list_panels(&mut self) -> Vec<PanelSummary>;
 
     /// Read the interactive selection menu shown in a panel, if any — the
     /// question, its numbered options, and the highlighted one as readable
     /// text. Empty when no menu is on screen (`docs/design.md` §8.3).
-    fn read_menu(&self, panel: PanelId) -> Result<String, McpError>;
+    fn read_menu(&mut self, panel: PanelId) -> Result<String, McpError>;
 
     /// Answer a panel's selection menu by picking option `index` (the displayed
     /// 1-based number): caucus navigates the chooser to that option and presses

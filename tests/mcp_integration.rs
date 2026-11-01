@@ -139,7 +139,7 @@ async fn list_panels_reports_a_spawned_panel() {
         return;
     };
 
-    let panels = McpToolSurface::list_panels(&mux);
+    let panels = McpToolSurface::list_panels(&mut mux);
     assert_eq!(panels.len(), 1);
     assert_eq!(panels[0].panel_id, panel);
     assert_eq!(panels[0].role, "reviewer");
@@ -248,7 +248,7 @@ async fn main_spawns_an_architect_and_three_reviewers() {
         }
     }
 
-    let panels = McpToolSurface::list_panels(&mux);
+    let panels = McpToolSurface::list_panels(&mut mux);
     eprintln!("--- team spawned: {} panels ---", panels.len());
     for p in &panels {
         eprintln!("  {} · {}", p.role, p.state);

@@ -153,10 +153,20 @@ impl McpToolSurface for Multiplexer {
             .map_err(|e| McpError::Tool(format!("restart_panel: {e:#}")))
     }
 
-    fn list_panels(&self) -> Vec<PanelSummary> {
+    fn list_panels(&mut self) -> Vec<PanelSummary> {
+        let generations: Vec<(PanelId, u64)> = self
+            .panels
+            .iter()
+            .map(|p| (p.id, p.grid().generation()))
+            .collect();
+        let blocked: Vec<_> = generations
+            .into_iter()
+            .map(|(id, generation)| self.panel_blocked_cached(id, generation))
+            .collect();
         self.panels
             .iter()
-            .map(|p| {
+            .zip(blocked)
+            .map(|(p, blocked)| {
                 let manifest = self.manifests.get(&p.id);
                 // Prefer the manifest's derived_state (turn-signal fed); fall
                 // back to the coarse panel-state label before the first turn.
@@ -165,10 +175,7 @@ impl McpToolSurface for Multiplexer {
                 // open, so the signal-derived state alone would read `working`.
                 let (state, agent_cli) = match manifest {
                     Some(m) => {
-                        let st = Self::overlay_blocked_state(
-                            m.derived_state(),
-                            Self::panel_blocked_prompt(p).as_ref(),
-                        );
+                        let st = Self::overlay_blocked_state(m.derived_state(), blocked.as_ref());
                         (st.as_str().to_string(), m.agent_cli)
                     }
                     None => (p.state_label().to_string(), AgentCli::Claude),
@@ -198,30 +205,23 @@ impl McpToolSurface for Multiplexer {
             .collect()
     }
 
-    fn read_menu(&self, panel: PanelId) -> Result<String, McpError> {
-        let p = self
-            .panels
-            .iter()
-            .find(|p| p.id == panel)
-            .ok_or(McpError::NoSuchPanel(panel))?;
-        Ok(match Self::panel_menu(p) {
+    fn read_menu(&mut self, panel: PanelId) -> Result<String, McpError> {
+        if !self.panels.iter().any(|p| p.id == panel) {
+            return Err(McpError::NoSuchPanel(panel));
+        }
+        Ok(match self.panel_menu(panel) {
             Some(menu) => Self::render_menu(&menu),
             None => "(no selection menu visible on this panel)".to_string(),
         })
     }
 
     fn select_option(&mut self, panel: PanelId, index: usize) -> Result<(), McpError> {
-        // Scan the menu (immutable) before writing (mutable) — no overlapping
-        // borrows of `self.panels`.
-        let menu = {
-            let p = self
-                .panels
-                .iter()
-                .find(|p| p.id == panel)
-                .ok_or(McpError::NoSuchPanel(panel))?;
-            Self::panel_menu(p)
-                .ok_or_else(|| McpError::Tool("no selection menu visible on this panel".into()))?
-        };
+        if !self.panels.iter().any(|p| p.id == panel) {
+            return Err(McpError::NoSuchPanel(panel));
+        }
+        let menu = self
+            .panel_menu(panel)
+            .ok_or_else(|| McpError::Tool("no selection menu visible on this panel".into()))?;
         let target = menu
             .options
             .iter()
@@ -756,7 +756,7 @@ mod tests {
 
         // A plain (non-worktree) panel: no path, no branch, no transcript or
         // note yet.
-        let plain = McpToolSurface::list_panels(&mux);
+        let plain = McpToolSurface::list_panels(&mut mux);
         assert_eq!(plain[0].worktree_path, None);
         assert_eq!(plain[0].branch, None);
         assert_eq!(plain[0].transcript_path, None);
@@ -778,7 +778,7 @@ mod tests {
         mux.worktree_branches
             .insert(panel, "caucus/reviewer-1".to_string());
 
-        let s = McpToolSurface::list_panels(&mux);
+        let s = McpToolSurface::list_panels(&mut mux);
         assert_eq!(s[0].worktree_path, Some(wt.display().to_string()));
         assert_eq!(s[0].branch.as_deref(), Some("caucus/reviewer-1"));
         assert_eq!(s[0].model.as_deref(), Some("opus"));
@@ -864,6 +864,47 @@ mod tests {
         });
         mux.rebuild_layout_tree();
         id
+    }
+
+    /// `list_panels` and `read_menu` take the blocked prompt from the
+    /// generation cache, as the per-tick passes do. The cat grid holds no
+    /// prompt, so only a cache read sees the seeded menu.
+    #[tokio::test]
+    async fn list_panels_and_read_menu_read_the_blocked_scan_cache() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::panel::lifecycle::PanelState;
+        use crate::term::{Menu, MenuOption};
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        mux.manifests.insert(id, mf);
+        let generation = mux.panels[0].grid().generation();
+        let menu = Menu {
+            question: "Proceed?".into(),
+            options: vec![MenuOption {
+                number: 1,
+                label: "Yes".into(),
+            }],
+            cursor: 0,
+        };
+        mux.blocked_scan_cache.insert(
+            id,
+            (generation, Some(rounds::BlockedPrompt::Selection(menu))),
+        );
+
+        let panels = McpToolSurface::list_panels(&mut mux);
+        assert_eq!(panels[0].state, "awaiting_selection");
+        let text = McpToolSurface::read_menu(&mut mux, id).unwrap();
+        assert!(text.contains("1. Yes"), "{text}");
+        mux.shutdown();
     }
 
     /// The defense line for machines without the lifecycle hooks: submitting a

@@ -1970,21 +1970,23 @@ impl Multiplexer {
         out
     }
 
-    /// Scan a panel's visible grid for an interactive selection menu
-    /// ([`crate::term::scan_menu`]). `None` unless one is confidently detected.
-    pub(crate) fn panel_menu(panel: &Panel) -> Option<crate::term::Menu> {
-        let (_, rows) = panel.grid().size();
-        let lines: Vec<String> = (0..rows)
-            .map(|r| panel.grid().row_text(r).trim_end().to_string())
-            .collect();
-        crate::term::scan_menu(&lines)
+    /// The selection menu on panel `id`'s screen, read through
+    /// [`Multiplexer::panel_blocked_cached`]: a visible menu is exactly a
+    /// [`BlockedPrompt::Selection`]. `None` for an unknown id.
+    pub(super) fn panel_menu(&mut self, id: PanelId) -> Option<crate::term::Menu> {
+        let generation = self.panels.iter().find(|p| p.id == id)?.grid().generation();
+        match self.panel_blocked_cached(id, generation)? {
+            BlockedPrompt::Selection(menu) => Some(menu),
+            BlockedPrompt::Permission(_) => None,
+        }
     }
 
     /// Scan a panel's visible grid for whatever it is stuck waiting on
     /// ([`BlockedPrompt`]): a numbered selection menu first (the richer,
     /// higher-confidence match), then a raw `[y/n]` yes/no prompt. `None` when
-    /// neither is confidently detected.
-    pub(crate) fn panel_blocked_prompt(panel: &Panel) -> Option<BlockedPrompt> {
+    /// neither is confidently detected. Private so every scan goes through
+    /// [`Multiplexer::panel_blocked_cached`].
+    fn panel_blocked_prompt(panel: &Panel) -> Option<BlockedPrompt> {
         let (_, rows) = panel.grid().size();
         let lines: Vec<String> = (0..rows)
             .map(|r| panel.grid().row_text(r).trim_end().to_string())

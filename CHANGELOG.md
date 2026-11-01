@@ -27,6 +27,12 @@ versions.
   visible or not; now only panels on screen do, and the transcript overlay
   still refreshes when a turn completes. With 49 busy workers behind a zoomed
   panel, caucus drops from ~54 frames/s to 1 and from ~28% to ~15% CPU.
+- **`list_panels`, `read_menu` and `select_option` reuse the cached prompt
+  scan.** Each call re-rendered panel screens to text to look for a blocked
+  prompt; they now read the per-panel scan the event loop already caches
+  against the grid generation. The loop time one `list_panels` request takes
+  drops from ~30–55 µs to ~2–3 µs over one panel, and from ~70–155 µs to
+  ~35–70 µs over 50.
 
 ## [0.11.0] — 2026-10-15
 
