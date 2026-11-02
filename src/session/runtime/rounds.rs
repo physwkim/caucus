@@ -790,7 +790,7 @@ impl Multiplexer {
     /// have updated panel state.
     ///
     /// Delivery is **per panel**, not barriered: a watch is *ready*
-    /// ([`Multiplexer::watch_ready`]) the tick its panel settles (or when its
+    /// (`Multiplexer::watch_ready`) the tick its panel settles (or when its
     /// stall alarm comes due while it is still working). Its frozen
     /// contribution is *delivered* only while the main panel exists, is `Idle`,
     /// and has no un-submitted human keystroke within `COMPOSE_GRACE` — so an
@@ -1384,7 +1384,7 @@ impl Multiplexer {
     ///
     /// Most of what this used to cover is now impossible by construction: every
     /// panel caucus hands a prompt is watched from that instant
-    /// ([`Multiplexer::arm_worker_watch`]), so a worker main gave work to always
+    /// (`Multiplexer::arm_worker_watch`), so a worker main gave work to always
     /// has a path back. What remains reachable is a panel that reached
     /// `Working`/`Spawning` **without caucus delivering it a prompt** — spawned
     /// and left un-tasked while main ended its turn, or an agent CLI that opened
@@ -1482,7 +1482,7 @@ impl Multiplexer {
 
     /// Announce queued `question` notes to the main worker, one per tick,
     /// under the same deliverability gate as every other caucus→main push
-    /// ([`Multiplexer::main_deliverable`]). Called once per event-loop tick,
+    /// (`Multiplexer::main_deliverable`). Called once per event-loop tick,
     /// after round delivery — a finished round is the primary deliverable.
     ///
     /// A failed injection keeps the notice queued so a later tick retries
@@ -1603,9 +1603,9 @@ impl Multiplexer {
     /// flipping the main panel to `Working`).
     ///
     /// A selection menu the round *pre-authorized* via its
-    /// [`SelectionPolicy`](crate::mcp::protocol::SelectionPolicy) is handled
+    /// [`SelectionPolicy`] is handled
     /// first: when the hints' keywords single out exactly one option
-    /// ([`resolve_selection`]) caucus answers it itself with `select_option` and
+    /// (`resolve_selection`) caucus answers it itself with `select_option` and
     /// pushes **no** notice — the main worker is never interrupted. This drives
     /// only the sub-agent's panel, so it is *not* gated by `main_deliverable`
     /// and is deduped separately (`Multiplexer::auto_answered`) so a menu still

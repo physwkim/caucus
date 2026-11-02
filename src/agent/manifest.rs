@@ -184,7 +184,7 @@ impl AgentManifest {
     }
 
     /// Whether a prompt submitted at or after `mark` stalled
-    /// ([`record_prompt_stalled`]).
+    /// (`record_prompt_stalled`).
     pub fn prompt_stalled_since(&self, mark: TurnMark) -> bool {
         self.events_since(mark)
             .iter()
@@ -193,7 +193,7 @@ impl AgentManifest {
 
     /// The final message of a turn that **ended at or after `mark`**, or
     /// `None` if no turn signal arrived since. `last_message` is written only
-    /// beside a `TurnCompleted` event ([`record_turn_completed`]), so a
+    /// beside a `TurnCompleted` event (`record_turn_completed`), so a
     /// `TurnCompleted` past `mark` is what proves the message is not an
     /// earlier turn's.
     pub fn last_message_since(&self, mark: TurnMark) -> Option<&str> {

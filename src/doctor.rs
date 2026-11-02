@@ -432,7 +432,7 @@ const SELFTEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3)
 /// End-to-end turn-signal delivery test: bind a throwaway socket, run the
 /// hook command exactly as Claude Code would (through `sh -c`, with the
 /// `CAUCUS_*` env a real panel spawn injects, a JSON payload on stdin), and
-/// require bytes to arrive on the socket within [`SELFTEST_DEADLINE`].
+/// require bytes to arrive on the socket within `SELFTEST_DEADLINE`.
 ///
 /// This is the check that actually mirrors production: it fails when the
 /// hook script is missing or not executable, when `caucus` does not resolve

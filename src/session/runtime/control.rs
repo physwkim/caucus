@@ -126,7 +126,7 @@ impl Multiplexer {
         self.events.publish(rows);
     }
 
-    /// Execute up to [`CONTROL_DRAIN_LIMIT`] queued control jobs from
+    /// Execute up to `CONTROL_DRAIN_LIMIT` queued control jobs from
     /// `server` in arrival order and answer each through its oneshot reply;
     /// the rest wait for the next loop turn. Called once per event-loop tick
     /// — the single point at which main worker MCP tool calls touch live

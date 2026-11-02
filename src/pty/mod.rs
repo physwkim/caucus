@@ -126,7 +126,7 @@ pub enum PtyError {
     /// The writer queue is full: the child has stopped draining its stdin and
     /// the bounded queue has filled. Transient — the input was not accepted and
     /// the caller may retry once the child reads again. Distinct from
-    /// [`WriterClosed`], which means the panel is dead.
+    /// [`PtyError::WriterClosed`], which means the panel is dead.
     #[error("pty writer full")]
     WriterFull,
 }

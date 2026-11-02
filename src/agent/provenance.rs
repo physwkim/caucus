@@ -114,7 +114,7 @@ pub enum SupersededBy {
     Unknown,
 }
 
-/// Decide whether `commit` — recorded earlier by [`extract_verified_commit`] —
+/// Decide whether `commit` — recorded earlier by [`extract_branch_commit`] —
 /// is still the commit its `branch` holds (`docs/design.md` §8.2).
 ///
 /// `None` means caucus makes no claim: the commit is still reachable from the
@@ -127,11 +127,11 @@ pub enum SupersededBy {
 /// whose `git patch-id` matches, among everything the branch gained since the
 /// old commit's parent. That names a rebase exactly, however far back it landed
 /// — the search is not depth-capped, because it does not cost per candidate:
-/// [`patch_ids_since`] prices the whole set at three git processes. An amend that
+/// `patch_ids_since` prices the whole set at three git processes. An amend that
 /// rewrote the content has no matching patch anywhere, and yields
 /// [`SupersededBy::Unknown`].
 ///
-/// Blocking, on the same narrow gate as [`extract_verified_commit`] (the panel
+/// Blocking, on the same narrow gate as [`extract_branch_commit`] (the panel
 /// owns a worktree *and* has a recorded commit), and every git call here is a
 /// local object-database read.
 pub fn detect_supersession(worktree: &Path, branch: &str, commit: &str) -> Option<SupersededBy> {
@@ -162,7 +162,7 @@ pub fn detect_supersession(worktree: &Path, branch: &str, commit: &str) -> Optio
 /// Reachability from a branch can only change when the branch ref moves, so an
 /// unchanged tip is proof that no recorded commit left the branch since the last
 /// look. One process answers for every commit on the lane, which is why
-/// [`crate::session::runtime::Multiplexer::record_commit_supersessions`] asks
+/// `crate::session::runtime::Multiplexer::record_commit_supersessions` asks
 /// this before asking [`detect_supersession`] anything.
 pub fn branch_tip(worktree: &Path, branch: &str) -> Option<String> {
     if branch.is_empty() {

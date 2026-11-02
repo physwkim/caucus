@@ -16,7 +16,7 @@ use super::lane_event::{LaneEventBlocker, LaneFailureClass};
 /// Coarse state surface for the main worker (`docs/design.md` §8.3).
 ///
 /// Every variant has exactly one producer, and there are only two: a blocker
-/// born from the turn signal ([`blocker_state`]) and a prompt seen on the live
+/// born from the turn signal (`blocker_state`) and a prompt seen on the live
 /// grid (`Multiplexer::overlay_blocked_state`). A variant with no producer is
 /// worse than absent — it tells the main worker caucus can report a condition
 /// it has no way to detect.

@@ -367,13 +367,13 @@ impl Multiplexer {
     /// never continues the main on two consecutive boundaries, so it always
     /// reaches a real idle boundary where Claude Code can compact and the user
     /// can type); and a round panel is actually ready to deliver
-    /// ([`Multiplexer::take_ready_round_deliveries`]). Every precondition that
+    /// (`Multiplexer::take_ready_round_deliveries`). Every precondition that
     /// fails simply drops the sender — allow — and the signal is handled exactly
     /// as before; the still-ready panels then ride the keystroke push.
     ///
     /// A delivered reply means the turn *continues*: the panel skips the
     /// `Idle` transition and its capture turn is reopened
-    /// ([`Multiplexer::reopen_turn_after_hook_delivery`]). If the receiver
+    /// (`Multiplexer::reopen_turn_after_hook_delivery`). If the receiver
     /// disappears between the check and the send (the client timed out at
     /// that instant), the round has already been completed and removed — the
     /// summary falls back to the keystroke path immediately, and failing
@@ -664,10 +664,10 @@ impl Multiplexer {
     ///
     /// The evidence that no turn is really running is the PTY. The screen
     /// shows it directly: a turn that rendered a live indicator and then
-    /// holds its idle prompt for [`SCREEN_IDLE_RECONCILE_HOLD`] has ended
-    /// ([`LostTurnProbe`]). Without that evidence (no live indicator yet, or
+    /// holds its idle prompt for `SCREEN_IDLE_RECONCILE_HOLD` has ended
+    /// (`LostTurnProbe`). Without that evidence (no live indicator yet, or
     /// a layout the detector does not know) only silence remains: a working
-    /// agent repaints (see [`LOST_TURN_RECONCILE_QUIESCENCE`]), an agent idle
+    /// agent repaints (see `LOST_TURN_RECONCILE_QUIESCENCE`), an agent idle
     /// at a static prompt emits nothing. A panel **sitting on a blocked
     /// prompt** is never reconciled — that is
     /// [`Multiplexer::poll_round_blocked_panels`]'s job, a live chooser is a

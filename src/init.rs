@@ -7,7 +7,7 @@
 //!
 //! The hook script is deliberately *not* project-local: a global `Stop` hook
 //! that names one project's path dies the moment that project does. See
-//! [`crate::hook::hook_script_path`].
+//! `crate::hook::hook_script_path`.
 
 use std::path::{Path, PathBuf};
 
