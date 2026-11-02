@@ -63,6 +63,13 @@ impl PanelState {
             PanelState::Exited => "exited",
         }
     }
+
+    /// Whether the agent manifest speaks for the panel's state. It does not
+    /// while the CLI boots: the manifest has no boot phase, so its settled
+    /// birth state would report a booting panel `idle`.
+    pub fn manifest_reports_state(self) -> bool {
+        self != PanelState::Spawning
+    }
 }
 
 /// One panel: a PTY-backed cell of the caucus screen.

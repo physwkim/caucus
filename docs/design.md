@@ -1022,7 +1022,7 @@ quiescence 창으로 게이트되어 있어 제2의 자유 settle 경로가 아�
     { "kind": "started", "ts": "2026-05-16T14:20:02Z" }
   ],
   "current_blocker": null,
-  "derived_state": "working",
+  "derived_state": "idle",
   "error": null
 }
 ```
@@ -1125,7 +1125,8 @@ manifest에 append한다 — 의도가 아니라 결과를 적는다. 그 시점
 
 ```
 working                     (PromptDelivered 후, 다음 turn signal 전)
-idle                        (turn signal 수신 — 다음 지시 대기)
+idle                        (turn signal 수신 — 다음 지시 대기. 프롬프트를 받은
+                             적 없는 새 manifest도 idle로 태어난다)
 awaiting_selection          (grid에 화살표-탐색 선택 메뉴 — turn signal 없이 중단, §8.3)
 blocked_permission_prompt   (turn이 tool_blocked로 끝났거나, grid 끝에 tool/shell
                              `[y/n]` 프롬프트가 보임)
@@ -1138,6 +1139,11 @@ blocker(`derive_state::blocker_state`)와 live grid에서 스캔한
 프롬프트(`overlay_blocked_state`). 생산자 없는 변형은 없느니만 못하다: main worker에게
 caucus가 감지할 수단조차 없는 상태를 보고할 수 있다고 광고하는 셈이다. 새 상태는
 그것을 만들어내는 신호와 *함께* 추가한다.
+
+manifest에는 boot 단계가 없다. 패널이 coarse `spawning`인 동안(CLI가 아직 첫
+출력을 내기 전) `list_panels`·`wait`·transcript 행은 manifest 대신 coarse
+`spawning`을 읽는다(`PanelState::manifest_reports_state`) — 그러지 않으면 막 띄운
+패널이 `idle`로 보고된다.
 
 파일 기반 `finished_cleanable` / `finished_pending_report`는 제거 — 라이브엔 응답
 파일이 없다. turn signal 수신 = `idle`, 다음 `PromptDelivered`부터 다시 `working`.

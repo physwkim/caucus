@@ -20,13 +20,14 @@ pub(crate) enum ReportedState {
 impl ReportedState {
     /// A live grid-detected prompt (selection menu or `[y/n]`) overlays the
     /// derived state: no Stop hook fires while one is open, so the
-    /// signal-derived state alone would read `working`.
+    /// signal-derived state alone would read `working`. A booting panel
+    /// reads its coarse `spawning` ([`PanelState::manifest_reports_state`]).
     fn of(
         manifest: Option<&AgentManifest>,
         coarse: PanelState,
         blocked: Option<&rounds::BlockedPrompt>,
     ) -> Self {
-        match manifest {
+        match manifest.filter(|_| coarse.manifest_reports_state()) {
             Some(m) => Self::Derived(Multiplexer::overlay_blocked_state(
                 m.derived_state(),
                 blocked,

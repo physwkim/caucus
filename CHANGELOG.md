@@ -69,6 +69,14 @@ versions.
   at most 64 per turn and leaves the rest for the next one, and the longest
   turn stays under 15 ms at any burst size.
 
+### Fixed
+
+- **A panel that has not been prompted yet reads `idle`, not `working`.** A
+  new panel's record started as `working`, so `list_panels`, the transcript
+  overlay and `wait` showed a freshly spawned panel as mid-turn until its
+  first turn ended, and a `wait` on it held until its deadline. It now reads
+  `spawning` while its CLI boots and `idle` after.
+
 ## [0.11.0] — 2026-10-15
 
 caucus no longer works in rounds. A main worker used to register a round over

@@ -100,8 +100,9 @@ pub struct AgentManifest {
 }
 
 impl AgentManifest {
-    /// Allocate a fresh manifest in the `Live` / `Working` initial state.
-    /// Persist it via `write()`.
+    /// Allocate a fresh manifest in the `Live` / `Idle` initial state: no
+    /// prompt has been delivered, so no turn is open until
+    /// `record_prompt_delivered`. Persist it via `write()`.
     pub fn new(
         session_id: SessionId,
         panel_id: PanelId,
@@ -126,7 +127,7 @@ impl AgentManifest {
             exited_at: None,
             lane_events: vec![LaneEvent::started(now)],
             current_blocker: None,
-            derived_state: DerivedState::Working,
+            derived_state: DerivedState::Idle,
             error: None,
             last_message: None,
             claude_session_id: None,
@@ -704,6 +705,8 @@ mod tests {
             AgentCli::Claude,
             None,
         );
+        assert_eq!(manifest.derived_state(), DerivedState::Idle, "no turn yet");
+        record_prompt_delivered(&mut manifest, tmp.path()).unwrap();
         assert_eq!(manifest.derived_state(), DerivedState::Working);
 
         let signal = TurnSignal::now(

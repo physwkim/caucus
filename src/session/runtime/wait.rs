@@ -208,6 +208,37 @@ mod tests {
         mux.shutdown();
     }
 
+    /// A never-prompted panel has no turn to wait on: it reads `spawning`
+    /// (busy) while its CLI boots and `idle` once it has drawn. Regression —
+    /// the manifest was born `working`, so a wait on a fresh panel held until
+    /// its deadline.
+    #[tokio::test]
+    async fn a_fresh_panel_is_waited_through_boot_then_answered_idle() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_panel(&mut mux, PanelState::Spawning);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "worker",
+            "worker-1",
+            AgentCli::Claude,
+            None,
+        );
+        mux.manifests.insert(id, mf);
+        let (tx, mut rx) = oneshot::channel();
+        mux.begin_wait(id, None, tx);
+        mux.poll_waits();
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+
+        set_state(&mut mux, id, PanelState::Idle);
+        mux.poll_waits();
+        assert_eq!(summary_state(rx.try_recv().unwrap()), "idle");
+        mux.shutdown();
+    }
+
     /// `wait` and `list_panels` read one state: a working panel stopped on a
     /// selection menu reports `awaiting_selection`, which is not busy.
     #[tokio::test]
