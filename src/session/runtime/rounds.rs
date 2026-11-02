@@ -783,19 +783,22 @@ impl Multiplexer {
         ControlResponse::Ok
     }
 
-    /// Stream one ready worker to the main worker — the caucus→main push. Called
-    /// once per event-loop tick, after signals + pump have updated panel state.
+    /// Push every ready worker to the main worker in one message — the
+    /// caucus→main push. Called once per event-loop tick, after signals + pump
+    /// have updated panel state.
     ///
     /// Delivery is **per panel**, not barriered: a watch is *ready*
     /// ([`Multiplexer::watch_ready`]) the tick its panel settles (or when its
     /// stall alarm comes due while it is still working). Its frozen
     /// contribution is *delivered* only while the main panel exists, is `Idle`,
     /// and has no un-submitted human keystroke within `COMPOSE_GRACE` — so an
-    /// injected turn never collides with a line the user is composing. At most
-    /// one worker is delivered per tick: the injection flips the main panel to
-    /// `Working`, so every other ready watch naturally holds until the main
-    /// worker is idle again. Main never waits for the slowest worker before
-    /// hearing from the fast ones.
+    /// injected turn never collides with a line the user is composing. Every
+    /// watch ready in the same tick rides one push, joined like the hook
+    /// reply: each push opens a main turn that re-reads main's whole context,
+    /// so a push per worker multiplied that cost by the workers that finished
+    /// while main was busy. The push flips main to `Working`, so a worker
+    /// ready later holds until main is idle again. Main never waits for the
+    /// slowest worker before hearing from the fast ones.
     ///
     /// A ready watch whose main worker is *gone* — no main panel id, the panel no
     /// longer exists, or it has `Exited` (the agent process died on its own; only
@@ -804,8 +807,8 @@ impl Multiplexer {
     /// `dropped-rounds.log` and its watch spent: no caucus→main push can ever
     /// land, so re-queuing would spin forever, and discarding silently would lose
     /// the sub-agent's work. A delivery that *fails* (e.g. the main PTY writer
-    /// went away mid-tick) keeps the watch so a later tick retries rather than
-    /// dropping it.
+    /// went away mid-tick) keeps every watch it carried so a later tick
+    /// retries rather than dropping them.
     ///
     /// [`Multiplexer::poll_worker_watches`] runs first on each watch: it latches
     /// a panel that settled this tick (capturing its finished turn) and hands an
@@ -832,9 +835,8 @@ impl Multiplexer {
         let main_id = main.map(|(id, _)| id);
         let deliverable = self.main_deliverable();
 
-        // At most one worker is pushed per tick (each push flips main to
-        // `Working`). Once set, later watches only latch and are re-queued.
-        let mut pushed = false;
+        // The workers ready this tick, rendered, for the one push below.
+        let mut batch: Vec<(WorkerWatch, String)> = Vec::new();
         // Whether the watch set changed this tick (a worker delivered, retired,
         // or had backlog fed) — only then is the durable snapshot re-written, so
         // the common idle tick does no I/O.
@@ -861,7 +863,7 @@ impl Multiplexer {
                 changed = true;
                 continue;
             }
-            if !deliverable || pushed {
+            if !deliverable {
                 self.watches.push(w);
                 continue;
             }
@@ -869,20 +871,29 @@ impl Multiplexer {
                 changed = true;
                 continue;
             };
+            batch.push((w, summary));
+        }
+        if !batch.is_empty() {
             // `deliverable` implies a live, idle main panel exists.
             let mid = main_id.expect("deliverable implies a main panel");
-            match McpToolSurface::send_keys(self, mid, &summary, true) {
-                // Drop the watch only on a confirmed send (mirrors the backlog
-                // feed): a failed push keeps it ready so the next tick retries,
-                // never dropping the worker's result.
+            let text = batch
+                .iter()
+                .map(|(_, summary)| summary.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            match McpToolSurface::send_keys(self, mid, &text, true) {
+                // Drop the watches only on a confirmed send (mirrors the
+                // backlog feed): a failed push keeps them ready so the next
+                // tick retries, never dropping a worker's result.
                 Ok(()) => {
-                    pushed = true;
                     changed = true;
-                    self.watches.extend(Self::after_handoff(w));
+                    for (w, _) in batch {
+                        self.watches.extend(Self::after_handoff(w));
+                    }
                 }
                 Err(err) => {
-                    warn!(error = %err, panel = %w.panel, "worker delivery to main failed; will retry");
-                    self.watches.push(w);
+                    warn!(error = %err, workers = batch.len(), "worker delivery to main failed; will retry");
+                    self.watches.extend(batch.into_iter().map(|(w, _)| w));
                 }
             }
         }
@@ -3403,7 +3414,7 @@ mod tests {
     /// panel settles, without waiting for the slowest. The fast panel is
     /// delivered while the slow one is still `Working`; the slow panel's watch
     /// stays armed and lands its own delivery only once it finishes. No barrier
-    /// — main interacts once per panel, N times per round.
+    /// — panels that settle apart reach main as separate pushes.
     ///
     /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
@@ -3498,6 +3509,41 @@ mod tests {
             })
             .count();
         assert_eq!(spills, 2, "one spilled report per streamed panel");
+
+        mux.shutdown();
+    }
+
+    /// Workers ready in the same tick reach main as one push: every watch is
+    /// spent and main is handed exactly one prompt, so main's context is
+    /// re-read once, not once per worker.
+    #[tokio::test]
+    async fn poll_worker_watches_pushes_workers_ready_together_as_one_message() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        // Idle subs latch (settle) on the poll, so both are ready this tick.
+        let first = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+        let second = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+        arm(&mut mux, first, 600);
+        arm(&mut mux, second, 600);
+
+        mux.poll_worker_watches();
+
+        assert!(
+            mux.watches.is_empty(),
+            "both ready workers are delivered in the same tick"
+        );
+        assert_eq!(
+            mux.outstanding_prompts.get(&main),
+            Some(&1),
+            "one push carried both workers"
+        );
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the push opened one main turn"
+        );
 
         mux.shutdown();
     }

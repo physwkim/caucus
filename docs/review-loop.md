@@ -162,5 +162,5 @@ A single part's review→fix→regression chain is genuinely serial; do not try 
 parallelize it. To use more agents at once, run the loop over **independent
 parts** and stagger them: while the fixer works part X, a reviewer scans part
 Y. Independent review docs map cleanly onto caucus's per-worker streaming
-delivery — each part reaches main on its own, never in lockstep. You can also fan in several reviewers on one part for breadth, then
+delivery — each part reaches main as it finishes, never in lockstep. You can also fan in several reviewers on one part for breadth, then
 fold their findings into the one doc.

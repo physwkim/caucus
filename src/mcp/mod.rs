@@ -413,10 +413,11 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                           feeds it the next queued task each time it goes idle, \
                           and delivers its result to you only once the queue \
                           drains. Pass no `tasks` to set the options alone. \
-                          Each delivery names the panel it came from; workers \
-                          reach you one at a time, as each finishes — never \
-                          batched, never in lockstep, so act on each one as it \
-                          lands instead of waiting for the others. That push can \
+                          Each delivery names the panel it came from; a worker \
+                          reaches you as it finishes, never held for the \
+                          others, and workers that finish while you are busy \
+                          arrive together in one message — act on each one as \
+                          it lands instead of waiting for the rest. That push can \
                           only land while you are idle, so it arrives only AFTER \
                           your turn ends: do NOT sleep-poll list_panels waiting \
                           for it inside this turn — it will never come and you \

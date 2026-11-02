@@ -64,6 +64,11 @@ versions.
   for that long, as "may be stuck", and once per silence until the screen
   changes again. In a 7-day main session the old repeating "forced out"
   notice made up 43.5% of main's API calls.
+- **Workers that finish while the main worker is busy arrive in one
+  message.** The push delivered one worker per main turn, so each further
+  ready worker cost another turn that re-read main's whole context; every
+  worker ready when main goes idle now rides one push, as the Stop
+  hook-reply already did.
 
 ### Performance
 

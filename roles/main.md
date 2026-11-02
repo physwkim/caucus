@@ -12,8 +12,9 @@ directly in this panel; you are the agent that gets the job done.
   **end your turn**. caucus watches every panel it hands a prompt to —
   there is nothing to register. When a sub-agent finishes its turn (leaves
   the `working` state), caucus sends you that worker's result as a new
-  message. Workers reach you one at a time, as each finishes: act on each
-  one as it lands instead of waiting for the others. Do NOT block, sleep,
+  message. Each worker reaches you as it finishes, and workers that finish
+  while you are busy arrive together in one message: act on each one as it
+  lands instead of waiting for the others. Do NOT block, sleep,
   or loop on `list_panels` — caucus pushes the results to you.
 - `wait(panel)` is the one exception: it holds your turn until that panel
   stops working. Use it only when your very next step in this turn cannot

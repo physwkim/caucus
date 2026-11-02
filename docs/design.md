@@ -15,7 +15,7 @@
 | 3 | VT 레이어 = **공개 크레이트** (경로 B-i): `vte`(escape-sequence 파서) + `portable-pty`(PTY 관리) + `ratatui`(패널 레이아웃·렌더). caucus가 직접 짜는 것은 grid `vte::Perform` 구현(~2-4k LOC) 하나뿐이며 zellij `zellij-server/src/panes/grid.rs`를 라인 단위 레퍼런스로 쓴다. zellij 크레이트 통째 vendor는 기각 — grid가 `output`/`tab`/`ui`/`route`/`screen`/`thread_bus` + `zellij-utils` ~140k LOC와 결합되어 깨끗한 추출 불가. |
 | 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버**의 15개 툴(`send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `queue_tasks` / `collect_workers` / `stop_watching` / `read_menu` / `select_option` / `wait`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. main 백엔드 CLI는 `--agent-cli claude\|codex`로 선택한다(기본 `claude`). codex를 고르면 caucus MCP 서버를 `-c mcp_servers.caucus.command/args/tool_timeout_sec`로 등록한다 — codex에는 `--mcp-config`가 없고 `[mcp_servers.<name>]` config로만 MCP를 받기 때문(claude는 `--mcp-config`를 쓴다). 어느 백엔드든 동일한 15개 툴로 sub-agent를 지휘한다. |
 | 5 | 턴 완료 신호 = Claude `Stop` hook이 **caucus 실행 프로세스의 소켓에 post**한다. 파일 sentinel(`*.sentinel.json`) + 폴링 watcher는 폐기. codex에는 Stop hook이 없으므로 codex 패널마다 `-c notify=[caucus, "signal", "codex-notify", …]`를 주입한다 — codex는 `agent-turn-complete`에 그 program을 호출하며 이벤트 JSON을 마지막 argv로 붙인다(실측 검증). `caucus signal codex-notify`가 그 JSON을 파싱해 claude Stop hook과 **동일한 `TurnSignal{Stop}`을 같은 소켓에 post**하므로, 두 백엔드가 단일 턴-완료 소유자(`handle_signal`)로 수렴한다. 이게 없으면 codex 패널은 영원히 `Working`으로 남아 그 워커는 정체 경보로만 main에 알려진다. |
-| 6 | "라운드" 개념은 **폐지** — 파일 안건 broadcast + `response-*.md` 수집도, 여러 패널을 한 묶음으로 기다리는 배리어도 없다. main이 패널에 라이브로 키를 입력하면 caucus가 그 워커를 감시하고, §5의 턴 완료 신호로 **워커 하나씩** 결과를 되돌린다. |
+| 6 | "라운드" 개념은 **폐지** — 파일 안건 broadcast + `response-*.md` 수집도, 여러 패널을 한 묶음으로 기다리는 배리어도 없다. main이 패널에 라이브로 키를 입력하면 caucus가 그 워커를 감시하고, §5의 턴 완료 신호로 **워커별로** 결과를 되돌린다(main이 바쁜 동안 정착한 워커들은 메시지 하나로 함께 간다). |
 | 7 | Role 정의: `~/.caucus/roles.toml` (전역) + `<repo>/.caucus/roles.toml` (프로젝트 오버라이드, 우선). |
 | 8 | 실행 단계 worktree per role 유지. Agent manifest 위치: `<repo>/.caucus/sessions/<session_id>/agents/<agent_id>.{md,json}`. `.gitignore`에 `.caucus/` 추가 권장. |
 | 9 | agent 백엔드 CLI = **다중**: `claude` / `codex`. role의 `agent_cli` 필드로 선택. main은 `spawn_role` 시 모델과 백엔드 CLI를 **자체 판단으로** 지정한다 — caucus 코어는 메커니즘만 제공하고 어떤 모델/CLI를 쓸지는 main의 판단. |
@@ -184,9 +184,10 @@ push한다. 라운드라는 묶음도, 파일 안건도, `response-*.md` 수집�
    `<session_root>/rounds/<panel-id>-<n>.md`에 spill**하고, 그 파일을
    가리키는 **압축 요약**(패널 한 줄 상태 + 최신 출력 teaser + 보고서 경로)만
    main worker 패널에 새 turn으로 주입한다 — pull-only MCP가 못 하는 caucus→main
-   push다(§8.5). 최후미 워커를 기다리지 않으므로 N명의 워커는 main과 N번
-   interaction 하고, 배달과 함께 그 워커의 watch가 소진(제거)되므로 다시 배달될
-   수 없다(I-10). 전체 보고서를 통째로 PTY에 붙여 넣지 않는 이유: 패널 결과가 수백
+   push다(§8.5). 최후미 워커를 기다리지 않으므로 워커는 정착하는 대로 배달되고,
+   main이 바쁜 동안 정착한 워커들은 main이 idle이 되는 tick에 push 하나로 함께
+   간다(push마다 main 턴이 열려 main 컨텍스트 전체를 다시 읽기 때문). 배달과
+   함께 그 워커의 watch가 소진(제거)되므로 다시 배달될 수 없다(I-10). 전체 보고서를 통째로 PTY에 붙여 넣지 않는 이유: 패널 결과가 수백
    KB까지 가고, 그 크기의 단일 bracketed paste는 백엔드의 paste 처리 병리를
    건드린다. main worker는 teaser로 부족하면 보고서 파일을 Read한다. main worker가
    idle이고 사용자가 입력 중이 아닐 때 전달된다. 안전망: 턴이 안 끝난 패널의
@@ -230,9 +231,9 @@ watch의 단일 owner `poll_worker_watch`가 매 tick 이 판정을 하며,
 
 **pull 경로와 감시 중단**: 정상 흐름은 워커에게 일을 주고 턴을 닫은 뒤 caucus의
 완료 push를 기다리는 것이다 — 그게 더 싸고, 감시는 자동이라 등록 없이도 성립한다.
-배달은 **워커 단위 스트리밍**이다: 배리어 없이 각 워커가 정착하는 즉시 그 워커의
-결과만 따로 도착하므로, main은 최후미 워커를 기다리지 않고 워커 수만큼
-interaction 한다(**Invariant I-10**). 다만 push는 main 패널이 idle일 때만
+배달은 **워커 단위 스트리밍**이다: 배리어 없이 각 워커가 정착하는 즉시 배달 대상이
+되므로 main은 최후미 워커를 기다리지 않는다. main이 바쁜 동안 정착한 워커들은 main이
+idle이 될 때 push 하나로 함께 도착한다(**Invariant I-10**). 다만 push는 main 패널이 idle일 때만
 착지하므로(즉 main이 턴을 끝낸 뒤에만), 턴 안에서 기다리는 main은 영원히 못 받는다.
 그래서 `collect_workers`가 **pull 경로**로 존재한다: 인자 없이 준비된 워커를 모두
 스트림으로 반환하고(그 watch들을 소진), 남은 워커는 상태 텍스트(working / draining
@@ -1699,16 +1700,17 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 
 ### Invariant I-10: 감시 중인 각 워커는 정확히 한 번 배달된다 (push, pull 또는 hook-reply)
 - **배리어 없음(streaming)**: watch는 패널 하나짜리다. 한 워커가 정착(I-9로 latch)하는 즉시
-  그 워커의 기여만 따로 main에 전달되고, 다른 워커의 watch는 그대로 살아 있다. 조기 완료 워커가
-  최후미 워커를 기다리지 않으므로 N명의 워커는 main과 N회 interaction 한다.
+  그 워커의 기여가 배달 대상이 되고, 다른 워커의 watch는 그대로 살아 있다. 조기 완료 워커는
+  최후미 워커를 기다리지 않는다. 같은 tick에 준비된 워커들의 기여는 push 하나에 함께 실린다 —
+  push마다 main 턴이 열려 main 컨텍스트 전체를 다시 읽기 때문이다.
 - **구조적 정확히-한-번**: 배달 원장(`delivered` 집합) 자체가 없다. **정착한 워커의 배달 = watch
   제거**(`after_handoff`; 정체 경보 중간 통지는 watch를 남기고, 화면이 다시 바뀔 때까지 경보를 끈다)이므로
   이미 배달된 워커는 물어볼 watch가 존재하지 않는다 — 중복 배달이 표현 불가능하다.
   `watch_ready`(정착했거나 정체 경보 due)가 배달 대상을 고르고, `render_watch_delivery`가 그
   워커 한 명의 assemble + spill(`rounds/<panel>-<n>.md`) + summary의 유일한 지점이다.
 - **MUST**: 세 배달 경로 모두 배달과 watch 제거를 같은 지점에서 한다 — **push** =
-  `poll_worker_watches()` (메인 패널이 idle일 때 준비된 워커를 tick당 하나씩 타이핑해 넣고, 확인된
-  전송에서만 watch를 버림), **pull** = `collect_workers()` (준비된 워커를 모두 스트림으로 반환하며
+  `poll_worker_watches()` (메인 패널이 idle일 때 그 tick에 준비된 워커를 모두 메시지 하나로 타이핑해
+  넣고, 확인된 전송에서만 그 watch들을 버림), **pull** = `collect_workers()` (준비된 워커를 모두 스트림으로 반환하며
   그 watch들을 버리고, 남은 워커는 상태 텍스트와 함께 계속 감시), **hook-reply** =
   `take_ready_round_deliveries()` (§7.6 — main의 Stop hook 응답에 준비된 워커들의 배달을 실음;
   push와 같은 `watch_ready` 판정을 쓴다).
