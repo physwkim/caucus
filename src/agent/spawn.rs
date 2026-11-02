@@ -383,7 +383,8 @@ fn claude_args(
     args
 }
 
-/// `codex` argv: `--model` (omitted when unset — codex rejects claude model
+/// `codex` argv: `--no-daemon` and `-c check_for_update_on_startup=false` (no
+/// startup chooser), `--model` (omitted when unset — codex rejects claude model
 /// ids), the role's system prompt as `-c instructions=<text>` (codex's base
 /// instructions config override — it has no `--append-system-prompt` flag),
 /// the caucus MCP server as `-c mcp_servers.caucus.*` for the main worker panel
@@ -404,7 +405,17 @@ fn codex_args(
     caucus_mcp: Option<&CaucusMcp>,
     notify: Option<&CodexNotify>,
 ) -> Vec<OsString> {
-    let mut args: Vec<OsString> = Vec::new();
+    // Two startup choosers would stop a codex panel before its first turn, and
+    // an Enter caucus sends there picks the highlighted option: "Update now"
+    // (runs the installer) or "Cancel" (codex exits when the shared background
+    // server's feature settings differ). The panel process must also own its
+    // agent, so codex runs in-process rather than on that shared server.
+    // Verified on codex 0.162; a codex without the daemon rejects --no-daemon.
+    let mut args: Vec<OsString> = vec![
+        "--no-daemon".into(),
+        "-c".into(),
+        "check_for_update_on_startup=false".into(),
+    ];
     if let Some(m) = model {
         args.push("--model".into());
         args.push(m.into());
@@ -1041,6 +1052,37 @@ mod tests {
         };
         let args = args_of(&build_command(&req, PanelId::new()));
         assert!(!args.iter().any(|a| a.starts_with("notify=[")));
+    }
+
+    /// Every codex panel, main or sub-agent, starts past both startup
+    /// choosers: on its own process, not the shared background server, and
+    /// without the update check.
+    #[test]
+    fn codex_argv_skips_the_startup_choosers() {
+        for caucus_mcp in [
+            None,
+            Some(CaucusMcp {
+                caucus_bin: PathBuf::from("/usr/local/bin/caucus"),
+                control_sock: PathBuf::from("/repo/.caucus/sessions/S1/control.sock"),
+            }),
+        ] {
+            let mut r = role();
+            r.agent_cli = AgentCli::Codex;
+            r.model = None;
+            let req = SpawnRequest {
+                role: r,
+                agent_name: "sr".into(),
+                caucus_mcp,
+                ..SpawnRequest::default()
+            };
+            let args = args_of(&build_command(&req, PanelId::new()));
+            assert!(args.contains(&"--no-daemon".to_string()), "{args:?}");
+            assert!(
+                args.windows(2)
+                    .any(|w| w == ["-c", "check_for_update_on_startup=false"]),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
