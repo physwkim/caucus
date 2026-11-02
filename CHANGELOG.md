@@ -31,6 +31,10 @@ versions.
   20 s. The watch report says the prompt may still sit unsubmitted in the
   panel's input, and a stalled worker's queued tasks are not fed, since the
   next paste would join the stuck one.
+- **The main worker's caucus tool calls run concurrently.** `mcp-serve`
+  answered one call at a time, so parallel calls queued behind the slowest;
+  each call now runs on its own task and is answered as it finishes. A call
+  the client cancels is dropped and not answered.
 
 ### Performance
 

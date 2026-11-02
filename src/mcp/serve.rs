@@ -28,9 +28,8 @@ const LIVENESS_FAILURES_TO_EXIT: u32 = 2;
 /// Run `caucus mcp-serve`: serve the caucus tools over stdio, forwarding
 /// each call to the control socket at `control_sock`.
 ///
-/// Builds its own multi-thread tokio runtime — the synchronous tool-handler
-/// path ([`ControlClient`]) blocks on the control-socket round-trip, which a
-/// current-thread runtime would deadlock.
+/// Builds its own multi-thread tokio runtime, so concurrent tool calls
+/// ([`serve_stdio`]) spread across threads.
 ///
 /// Exits when *either* stdin reaches EOF (the parent agent closed the pipe) or
 /// the caucus control socket becomes unreachable (`await_caucus_gone`). The
