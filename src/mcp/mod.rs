@@ -13,10 +13,11 @@
 //!
 //! 1. **`caucus mcp-serve`** ([`serve`]) — a thin stdio MCP server the main
 //!    worker's Claude Code instance spawns. It speaks JSON-RPC 2.0 over stdio
-//!    ([`jsonrpc`]) and forwards each tool call as a [`protocol::ControlRequest`]
-//!    over the *control socket* ([`control_client`]).
+//!    ([`jsonrpc`]) and forwards each tool call, undecoded, as a
+//!    [`protocol::ControlCall`] over the *control socket* ([`control_client`]).
 //! 2. **The main `caucus` process** owns the control socket
-//!    ([`control_server`]); its accept task queues each request as a
+//!    ([`control_server`]); its accept task decodes each call into a
+//!    [`protocol::ControlRequest`] and queues it as a
 //!    [`control_server::ControlJob`] for the [`crate::session::Multiplexer`]
 //!    event loop, which executes it against live panels (Invariant I-5's
 //!    single-owner discipline) and answers through the job's oneshot.
