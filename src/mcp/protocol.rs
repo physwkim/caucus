@@ -1,18 +1,22 @@
 //! Control-socket wire protocol (`docs/design.md` §0 #4, §9).
 //!
 //! The main `caucus` process opens a *control socket* — a unix-domain socket
-//! distinct from the turn-signal socket. The thin `caucus mcp-serve` process
-//! (spawned by the main worker's Claude Code instance) connects to it and forwards
-//! each MCP tool call as one [`ControlRequest`]; the main process executes it
-//! against the live [`crate::session::Multiplexer`] and writes back one
-//! [`ControlResponse`].
+//! distinct from the turn-signal socket. Its clients are `caucus mcp-serve`
+//! (the main worker's MCP server), `caucus ctl`, and any script that speaks
+//! the framing below; the main process executes each call against the live
+//! [`crate::session::Multiplexer`].
 //!
-//! The framing is newline-delimited JSON: exactly one request and one response
-//! per connection (request/response, no pipelining), which keeps the
-//! [`crate::mcp::control_server`] event-loop integration trivial — one queued
-//! op, one reply.
+//! Newline-delimited JSON, one call and one reply per connection:
+//!
+//! - call ([`ControlCall`]): `{"id": "<string>", "method": "<tool>",
+//!   "params": {...}}`. `method` is an MCP tool name and `params` that tool's
+//!   arguments, so every client shares one schema; [`ControlRequest::from_call`]
+//!   decodes them.
+//! - reply ([`ControlReply`]): `{"id": ..., "result": {"type": ..., ...}}` or
+//!   `{"id": ..., "error": {"code": ..., "message": ...}}`.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
@@ -46,18 +50,26 @@ pub struct SelectionPolicy {
     pub avoid: Vec<String>,
 }
 
-/// One control-socket request: an MCP tool call forwarded from `mcp-serve`.
-///
-/// `snake_case` tag mirrors the MCP tool names exposed to the main worker so a wire
-/// dump is self-describing.
+/// One control-socket call as it travels on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "op", rename_all = "snake_case")]
+pub struct ControlCall {
+    /// Caller-chosen id, echoed on the reply.
+    pub id: String,
+    /// An MCP tool name (`list_panels`, `send_keys`, …).
+    pub method: String,
+    /// That tool's arguments; absent or `null` reads as none.
+    #[serde(default)]
+    pub params: Value,
+}
+
+/// One decoded control call ([`ControlRequest::from_call`]), executed by
+/// [`crate::session::Multiplexer::execute_control`].
+#[derive(Debug, Clone, PartialEq)]
 pub enum ControlRequest {
     /// Type `text` into a panel's PTY; append a newline when `enter`.
     SendKeys {
         panel: PanelId,
         text: String,
-        #[serde(default)]
         enter: bool,
     },
     /// Send a single raw key to a panel's PTY — the escape hatch for keys
@@ -72,7 +84,6 @@ pub enum ControlRequest {
     Broadcast {
         panels: Vec<PanelId>,
         text: String,
-        #[serde(default)]
         enter: bool,
     },
     /// Send `Ctrl-C` (0x03) to a panel's PTY.
@@ -89,13 +100,9 @@ pub enum ControlRequest {
     /// main worker invents a role on the fly.
     SpawnRole {
         role: String,
-        #[serde(default)]
         worktree: bool,
-        #[serde(default)]
         model: Option<String>,
-        #[serde(default)]
         agent_cli: Option<AgentCli>,
-        #[serde(default)]
         prompt: Option<String>,
     },
     /// Kill a panel; its worktree (if any) is enqueued for cleanup.
@@ -129,13 +136,9 @@ pub enum ControlRequest {
     /// watch, or an error if the panel is unknown or is the main panel.
     QueueTasks {
         panel: PanelId,
-        #[serde(default)]
         tasks: Vec<String>,
-        #[serde(default)]
         read_mode: Option<ReadPanelMode>,
-        #[serde(default)]
         fallback_secs: Option<u64>,
-        #[serde(default)]
         selection_hints: Option<SelectionPolicy>,
     },
     /// Collect every watched worker that is ready right now. This is the
@@ -181,9 +184,232 @@ pub enum ControlRequest {
     /// timeout, for an unknown or vanished panel, or for the main panel.
     Wait {
         panel: PanelId,
-        #[serde(default)]
         timeout_secs: Option<u64>,
     },
+}
+
+impl ControlRequest {
+    /// Decode one call: `method` is an MCP tool name and `args` its
+    /// arguments, `null` reading as none. `Err` carries a human-readable
+    /// message naming the bad argument.
+    pub fn from_call(method: &str, args: &Value) -> Result<Self, String> {
+        /// Pull a required panel-id argument and parse it.
+        fn panel(args: &Value) -> Result<PanelId, String> {
+            let raw = args
+                .get("panel")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing string argument `panel`".to_string())?;
+            raw.parse::<PanelId>()
+                .map_err(|e| format!("invalid panel id `{raw}`: {e}"))
+        }
+
+        if !(args.is_null() || args.is_object()) {
+            return Err("`params` must be an object".to_string());
+        }
+
+        match method {
+            "send_keys" => {
+                let text = args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing string argument `text`".to_string())?
+                    .to_string();
+                let enter = args.get("enter").and_then(Value::as_bool).unwrap_or(false);
+                Ok(Self::SendKeys {
+                    panel: panel(args)?,
+                    text,
+                    enter,
+                })
+            }
+            "send_key" => {
+                let key = args
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing string argument `key`".to_string())?
+                    .to_string();
+                Ok(Self::SendKey {
+                    panel: panel(args)?,
+                    key,
+                })
+            }
+            "broadcast" => {
+                let raw = args
+                    .get("panels")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "missing array argument `panels`".to_string())?;
+                let panels = raw
+                    .iter()
+                    .map(|v| {
+                        let s = v.as_str().ok_or_else(|| {
+                            "`panels` entries must be panel-id strings".to_string()
+                        })?;
+                        s.parse::<PanelId>()
+                            .map_err(|e| format!("invalid panel id `{s}`: {e}"))
+                    })
+                    .collect::<Result<Vec<PanelId>, String>>()?;
+                let text = args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing string argument `text`".to_string())?
+                    .to_string();
+                let enter = args.get("enter").and_then(Value::as_bool).unwrap_or(false);
+                Ok(Self::Broadcast {
+                    panels,
+                    text,
+                    enter,
+                })
+            }
+            "ctrl_c" => Ok(Self::CtrlC {
+                panel: panel(args)?,
+            }),
+            "read_panel" => {
+                let mode_raw = args
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing string argument `mode`".to_string())?;
+                // `turn` carries its index in a sibling integer arg rather than in
+                // the mode string, so the mode stays a plain enum value.
+                let mode = if mode_raw == "turn" {
+                    let n = args.get("turn").and_then(Value::as_u64).ok_or_else(|| {
+                        "mode `turn` requires a non-negative integer argument `turn`".to_string()
+                    })? as usize;
+                    ReadPanelMode::Turn(n)
+                } else {
+                    serde_json::from_value(json!(mode_raw)).map_err(|_| {
+                        format!(
+                            "invalid mode `{mode_raw}` \
+                             (expected screen|scrollback|since_last_turn|last_message|turn)"
+                        )
+                    })?
+                };
+                Ok(Self::ReadPanel {
+                    panel: panel(args)?,
+                    mode,
+                })
+            }
+            "spawn_role" => {
+                let role = args
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing string argument `role`".to_string())?
+                    .to_string();
+                let worktree = args
+                    .get("worktree")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let model = args
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let agent_cli = match args.get("agent_cli").and_then(Value::as_str) {
+                    Some(raw) => Some(
+                        serde_json::from_value::<AgentCli>(json!(raw))
+                            .map_err(|_| format!("invalid agent_cli `{raw}`"))?,
+                    ),
+                    None => None,
+                };
+                let prompt = args
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                Ok(Self::SpawnRole {
+                    role,
+                    worktree,
+                    model,
+                    agent_cli,
+                    prompt,
+                })
+            }
+            "kill_panel" => Ok(Self::KillPanel {
+                panel: panel(args)?,
+            }),
+            "restart_panel" => Ok(Self::RestartPanel {
+                panel: panel(args)?,
+            }),
+            "list_panels" => Ok(Self::ListPanels),
+            "queue_tasks" => {
+                let tasks = match args.get("tasks") {
+                    Some(v) => {
+                        let arr = v.as_array().ok_or_else(|| {
+                            "`tasks` must be an array of task strings".to_string()
+                        })?;
+                        arr.iter()
+                            .map(|t| {
+                                t.as_str()
+                                    .map(str::to_string)
+                                    .ok_or_else(|| "`tasks` entries must be strings".to_string())
+                            })
+                            .collect::<Result<Vec<String>, String>>()?
+                    }
+                    None => Vec::new(),
+                };
+                let read_mode = match args.get("read_mode").and_then(Value::as_str) {
+                    Some(raw) => Some(serde_json::from_value(json!(raw)).map_err(|_| {
+                        format!(
+                            "invalid read_mode `{raw}` \
+                             (expected screen|scrollback|since_last_turn|last_message)"
+                        )
+                    })?),
+                    None => None,
+                };
+                let fallback_secs = match args.get("fallback_secs") {
+                    Some(v) => Some(v.as_u64().ok_or_else(|| {
+                        "`fallback_secs` must be a non-negative integer".to_string()
+                    })?),
+                    None => None,
+                };
+                let selection_hints = match args.get("selection_hints") {
+                    Some(v) => Some(
+                        serde_json::from_value::<SelectionPolicy>(v.clone()).map_err(|e| {
+                            format!(
+                                "`selection_hints` must be an object with optional \
+                                     `prefer` / `avoid` string arrays: {e}"
+                            )
+                        })?,
+                    ),
+                    None => None,
+                };
+                Ok(Self::QueueTasks {
+                    panel: panel(args)?,
+                    tasks,
+                    read_mode,
+                    fallback_secs,
+                    selection_hints,
+                })
+            }
+            "collect_workers" => Ok(Self::CollectWorkers),
+            "stop_watching" => Ok(Self::StopWatching {
+                panel: panel(args)?,
+            }),
+            "read_menu" => Ok(Self::ReadMenu {
+                panel: panel(args)?,
+            }),
+            "select_option" => {
+                let index = args
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "missing integer argument `index`".to_string())?
+                    as usize;
+                Ok(Self::SelectOption {
+                    panel: panel(args)?,
+                    index,
+                })
+            }
+            "wait" => {
+                let timeout_secs = match args.get("timeout_secs") {
+                    Some(v) => Some(v.as_u64().ok_or_else(|| {
+                        "`timeout_secs` must be a non-negative integer".to_string()
+                    })?),
+                    None => None,
+                };
+                Ok(Self::Wait {
+                    panel: panel(args)?,
+                    timeout_secs,
+                })
+            }
+            other => Err(format!("unknown method `{other}`")),
+        }
+    }
 }
 
 /// [`ControlRequest::Wait`]'s timeout when the caller names none.
@@ -194,10 +420,11 @@ pub const DEFAULT_WAIT_SECS: u64 = 600;
 /// so the client never abandons a wait caucus is still holding.
 pub const MAX_WAIT_SECS: u64 = 3600;
 
-/// One control-socket response — the result of executing a [`ControlRequest`]
-/// against the live multiplexer.
+/// The multiplexer's answer to a [`ControlRequest`]. On the wire it travels
+/// inside a [`ControlReply`]: a success as `result`, [`Self::Error`] as an
+/// `error` with code [`ErrorCode::Failed`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "result", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlResponse {
     /// `send_keys` / `ctrl_c` / `kill_panel` succeeded — no payload.
     Ok,
@@ -207,7 +434,9 @@ pub enum ControlResponse {
     Spawned { panel: PanelId },
     /// `list_panels` succeeded.
     Panels { panels: Vec<PanelSummary> },
-    /// The tool call failed; `message` is human-readable.
+    /// The tool call failed; `message` is human-readable. Never a `result`:
+    /// [`ControlReply::response`] sends it as an error.
+    #[serde(skip)]
     Error { message: String },
 }
 
@@ -220,83 +449,152 @@ impl ControlResponse {
     }
 }
 
+/// One control-socket reply line.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControlReply {
+    /// The call's `id`; `None` when the line carried no string `id`.
+    pub id: Option<String>,
+    #[serde(flatten)]
+    body: ReplyBody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ReplyBody {
+    Result(ControlResponse),
+    Error(ReplyError),
+}
+
+/// The `error` member of a failed [`ControlReply`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplyError {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+/// Why a call failed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// The line is not a valid call: not JSON, too long, no string `id`, an
+    /// unknown `method`, or bad `params`. Nothing was executed.
+    InvalidRequest,
+    /// The multiplexer executed the call and it failed.
+    Failed,
+    /// The multiplexer is shutting down and did not answer.
+    Unavailable,
+}
+
+impl ControlReply {
+    /// The reply carrying the multiplexer's `response`; a
+    /// [`ControlResponse::Error`] becomes a [`ErrorCode::Failed`] error.
+    pub fn response(id: Option<String>, response: ControlResponse) -> Self {
+        let body = match response {
+            ControlResponse::Error { message } => ReplyBody::Error(ReplyError {
+                code: ErrorCode::Failed,
+                message,
+            }),
+            response => ReplyBody::Result(response),
+        };
+        Self { id, body }
+    }
+
+    /// An error reply.
+    pub fn error(id: Option<String>, code: ErrorCode, message: impl std::fmt::Display) -> Self {
+        Self {
+            id,
+            body: ReplyBody::Error(ReplyError {
+                code,
+                message: message.to_string(),
+            }),
+        }
+    }
+
+    /// The result, or the error the server reported.
+    pub fn into_result(self) -> Result<ControlResponse, ReplyError> {
+        match self.body {
+            ReplyBody::Result(response) => Ok(response),
+            ReplyBody::Error(error) => Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn send_keys_round_trips() {
-        let req = ControlRequest::SendKeys {
-            panel: PanelId::new(),
-            text: "/compact".into(),
-            enter: true,
-        };
-        let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"op\":\"send_keys\""));
-        let back: ControlRequest = serde_json::from_str(&line).unwrap();
-        assert_eq!(req, back);
-    }
-
-    #[test]
-    fn wait_round_trips_and_defaults_its_timeout() {
-        let req = ControlRequest::Wait {
-            panel: PanelId::new(),
-            timeout_secs: Some(30),
-        };
-        let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"op\":\"wait\""));
-        let back: ControlRequest = serde_json::from_str(&line).unwrap();
-        assert_eq!(req, back);
-
+    fn build_send_keys_request() {
         let id = PanelId::new();
-        let req: ControlRequest =
-            serde_json::from_str(&format!(r#"{{"op":"wait","panel":"{id}"}}"#)).unwrap();
+        let req = ControlRequest::from_call(
+            "send_keys",
+            &json!({"panel": id.to_string(), "text": "/clear", "enter": true}),
+        )
+        .unwrap();
         assert_eq!(
             req,
-            ControlRequest::Wait {
+            ControlRequest::SendKeys {
                 panel: id,
-                timeout_secs: None,
+                text: "/clear".into(),
+                enter: true,
             }
         );
     }
 
     #[test]
-    fn send_key_round_trips() {
-        let req = ControlRequest::SendKey {
-            panel: PanelId::new(),
-            key: "ctrl-c".into(),
-        };
-        let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"op\":\"send_key\""));
-        let back: ControlRequest = serde_json::from_str(&line).unwrap();
-        assert_eq!(req, back);
-    }
-
-    #[test]
-    fn broadcast_round_trips() {
-        let req = ControlRequest::Broadcast {
-            panels: vec![PanelId::new(), PanelId::new()],
-            text: "the agenda".into(),
-            enter: true,
-        };
-        let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"op\":\"broadcast\""));
-        let back: ControlRequest = serde_json::from_str(&line).unwrap();
-        assert_eq!(req, back);
-    }
-
-    #[test]
-    fn broadcast_enter_defaults_to_false() {
-        // `enter` defaults to false when omitted from the wire form.
+    fn build_send_key_request() {
         let id = PanelId::new();
-        let req: ControlRequest = serde_json::from_str(&format!(
-            r#"{{"op":"broadcast","panels":["{id}"],"text":"hi"}}"#
-        ))
+        let req =
+            ControlRequest::from_call("send_key", &json!({"panel": id.to_string(), "key": "esc"}))
+                .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::SendKey {
+                panel: id,
+                key: "esc".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_send_key_requires_key() {
+        let id = PanelId::new();
+        let err =
+            ControlRequest::from_call("send_key", &json!({"panel": id.to_string()})).unwrap_err();
+        assert!(err.contains("missing string argument `key`"));
+    }
+
+    #[test]
+    fn build_broadcast_request_with_enter() {
+        let a = PanelId::new();
+        let b = PanelId::new();
+        let req = ControlRequest::from_call(
+            "broadcast",
+            &json!({"panels": [a.to_string(), b.to_string()], "text": "the agenda", "enter": true}),
+        )
         .unwrap();
         assert_eq!(
             req,
             ControlRequest::Broadcast {
-                panels: vec![id],
+                panels: vec![a, b],
+                text: "the agenda".into(),
+                enter: true,
+            }
+        );
+    }
+
+    #[test]
+    fn build_broadcast_request_defaults_enter() {
+        let a = PanelId::new();
+        let req = ControlRequest::from_call(
+            "broadcast",
+            &json!({"panels": [a.to_string()], "text": "hi"}),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::Broadcast {
+                panels: vec![a],
                 text: "hi".into(),
                 enter: false,
             }
@@ -304,37 +602,344 @@ mod tests {
     }
 
     #[test]
-    fn read_panel_carries_mode() {
-        let req = ControlRequest::ReadPanel {
-            panel: PanelId::new(),
-            mode: ReadPanelMode::SinceLastTurn,
-        };
-        let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("since_last_turn"));
-        let back: ControlRequest = serde_json::from_str(&line).unwrap();
-        assert_eq!(req, back);
+    fn build_broadcast_requires_panels_array() {
+        let err = ControlRequest::from_call("broadcast", &json!({"text": "hi"})).unwrap_err();
+        assert!(err.contains("missing array argument `panels`"));
     }
 
     #[test]
-    fn read_panel_turn_mode_round_trips() {
-        // The `turn` mode carries its index; the wire form tags it as a map
-        // variant, distinct from the string-valued unit modes.
-        let req = ControlRequest::ReadPanel {
-            panel: PanelId::new(),
-            mode: ReadPanelMode::Turn(7),
-        };
-        let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"turn\":7"));
-        let back: ControlRequest = serde_json::from_str(&line).unwrap();
-        assert_eq!(req, back);
+    fn build_broadcast_requires_text() {
+        let a = PanelId::new();
+        let err = ControlRequest::from_call("broadcast", &json!({"panels": [a.to_string()]}))
+            .unwrap_err();
+        assert!(err.contains("missing string argument `text`"));
     }
 
     #[test]
-    fn spawn_role_defaults_are_optional() {
-        // A minimal `spawn_role` request with only `role` parses (serde
-        // defaults fill worktree/model/agent_cli/prompt).
-        let req: ControlRequest =
-            serde_json::from_str(r#"{"op":"spawn_role","role":"backend"}"#).unwrap();
+    fn build_broadcast_rejects_bad_panel_id() {
+        let err = ControlRequest::from_call(
+            "broadcast",
+            &json!({"panels": ["not-a-ulid"], "text": "hi"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid panel id"));
+    }
+
+    #[test]
+    fn build_read_panel_request() {
+        let id = PanelId::new();
+        let req = ControlRequest::from_call(
+            "read_panel",
+            &json!({"panel": id.to_string(), "mode": "since_last_turn"}),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::ReadPanel {
+                panel: id,
+                mode: ReadPanelMode::SinceLastTurn,
+            }
+        );
+    }
+
+    #[test]
+    fn build_read_panel_turn_mode() {
+        let id = PanelId::new();
+        let req = ControlRequest::from_call(
+            "read_panel",
+            &json!({"panel": id.to_string(), "mode": "turn", "turn": 3}),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::ReadPanel {
+                panel: id,
+                mode: ReadPanelMode::Turn(3),
+            }
+        );
+    }
+
+    #[test]
+    fn build_read_panel_turn_mode_requires_an_index() {
+        let id = PanelId::new();
+        let err = ControlRequest::from_call(
+            "read_panel",
+            &json!({"panel": id.to_string(), "mode": "turn"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("requires a non-negative integer argument `turn`"));
+    }
+
+    #[test]
+    fn build_read_panel_rejects_bad_mode() {
+        let id = PanelId::new();
+        let err = ControlRequest::from_call(
+            "read_panel",
+            &json!({"panel": id.to_string(), "mode": "everything"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid mode"));
+    }
+
+    #[test]
+    fn build_spawn_role_request_with_overrides() {
+        let req = ControlRequest::from_call(
+            "spawn_role",
+            &json!({"role": "backend", "worktree": true, "agent_cli": "codex"}),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::SpawnRole {
+                role: "backend".into(),
+                worktree: true,
+                model: None,
+                agent_cli: Some(AgentCli::Codex),
+                prompt: None,
+            }
+        );
+    }
+
+    /// A free-form role: an arbitrary label plus the inline `prompt` that
+    /// becomes its system prompt is decoded off the MCP tool args.
+    #[test]
+    fn build_spawn_role_request_with_inline_prompt() {
+        let req = ControlRequest::from_call(
+            "spawn_role",
+            &json!({
+                "role": "perf-profiler",
+                "model": "opus",
+                "agent_cli": "codex",
+                "prompt": "You profile hot paths and report findings."
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::SpawnRole {
+                role: "perf-profiler".into(),
+                worktree: false,
+                model: Some("opus".into()),
+                agent_cli: Some(AgentCli::Codex),
+                prompt: Some("You profile hot paths and report findings.".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn build_request_rejects_bad_panel_id() {
+        let err = ControlRequest::from_call("ctrl_c", &json!({"panel": "not-a-ulid"})).unwrap_err();
+        assert!(err.contains("invalid panel id"));
+    }
+
+    #[test]
+    fn build_restart_panel_request() {
+        let id = PanelId::new();
+        let req =
+            ControlRequest::from_call("restart_panel", &json!({"panel": id.to_string()})).unwrap();
+        assert_eq!(req, ControlRequest::RestartPanel { panel: id });
+    }
+
+    #[test]
+    fn build_list_panels_takes_no_args() {
+        let req = ControlRequest::from_call("list_panels", &json!({})).unwrap();
+        assert_eq!(req, ControlRequest::ListPanels);
+    }
+
+    #[test]
+    fn build_queue_tasks_request() {
+        let a = PanelId::new();
+        let req = ControlRequest::from_call(
+            "queue_tasks",
+            &json!({
+                "panel": a.to_string(),
+                "tasks": ["CA-SR-2", "CA-SR-3"],
+                "read_mode": "since_last_turn",
+                "fallback_secs": 90
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::QueueTasks {
+                panel: a,
+                tasks: vec!["CA-SR-2".to_string(), "CA-SR-3".to_string()],
+                read_mode: Some(ReadPanelMode::SinceLastTurn),
+                fallback_secs: Some(90),
+                selection_hints: None,
+            }
+        );
+    }
+
+    #[test]
+    fn build_queue_tasks_parses_selection_hints() {
+        let a = PanelId::new();
+        let req = ControlRequest::from_call(
+            "queue_tasks",
+            &json!({
+                "panel": a.to_string(),
+                "selection_hints": {
+                    "prefer": ["structural", "at source"],
+                    "avoid": ["broad refactor"]
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::QueueTasks {
+                panel: a,
+                tasks: vec![],
+                read_mode: None,
+                fallback_secs: None,
+                selection_hints: Some(SelectionPolicy {
+                    prefer: vec!["structural".to_string(), "at source".to_string()],
+                    avoid: vec!["broad refactor".to_string()],
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn build_queue_tasks_rejects_bad_selection_hints() {
+        let a = PanelId::new();
+        // `prefer` must be an array of strings, not a bare string.
+        let err = ControlRequest::from_call(
+            "queue_tasks",
+            &json!({"panel": a.to_string(), "selection_hints": {"prefer": "structural"}}),
+        )
+        .unwrap_err();
+        assert!(err.contains("selection_hints"), "got: {err}");
+    }
+
+    /// `tasks` and every option default when omitted: a bare panel id is a valid
+    /// call (it just re-arms/keeps the watch with caucus's defaults).
+    #[test]
+    fn build_queue_tasks_defaults_optional_fields() {
+        let a = PanelId::new();
+        let req =
+            ControlRequest::from_call("queue_tasks", &json!({"panel": a.to_string()})).unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::QueueTasks {
+                panel: a,
+                tasks: vec![],
+                read_mode: None,
+                fallback_secs: None,
+                selection_hints: None,
+            }
+        );
+    }
+
+    #[test]
+    fn build_queue_tasks_requires_a_panel() {
+        let err = ControlRequest::from_call("queue_tasks", &json!({})).unwrap_err();
+        assert!(
+            err.contains("missing string argument `panel`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_queue_tasks_rejects_non_string_tasks() {
+        let a = PanelId::new();
+        let err = ControlRequest::from_call(
+            "queue_tasks",
+            &json!({"panel": a.to_string(), "tasks": "not-an-array"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("`tasks` must be an array of task strings"),
+            "got: {err}"
+        );
+        let err = ControlRequest::from_call(
+            "queue_tasks",
+            &json!({"panel": a.to_string(), "tasks": [1, 2]}),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("`tasks` entries must be strings"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_collect_workers_takes_no_args() {
+        let req = ControlRequest::from_call("collect_workers", &json!({})).unwrap();
+        assert_eq!(req, ControlRequest::CollectWorkers);
+    }
+
+    #[test]
+    fn build_stop_watching_request() {
+        let a = PanelId::new();
+        let req =
+            ControlRequest::from_call("stop_watching", &json!({"panel": a.to_string()})).unwrap();
+        assert_eq!(req, ControlRequest::StopWatching { panel: a });
+    }
+
+    #[test]
+    fn build_stop_watching_rejects_bad_panel_id() {
+        let err = ControlRequest::from_call("stop_watching", &json!({"panel": "not-a-ulid"}))
+            .unwrap_err();
+        assert!(err.contains("invalid panel id"), "got: {err}");
+    }
+
+    #[test]
+    fn build_wait_request() {
+        let a = PanelId::new();
+        let req = ControlRequest::from_call("wait", &json!({"panel": a.to_string()})).unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::Wait {
+                panel: a,
+                timeout_secs: None,
+            }
+        );
+        let req =
+            ControlRequest::from_call("wait", &json!({"panel": a.to_string(), "timeout_secs": 45}))
+                .unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::Wait {
+                panel: a,
+                timeout_secs: Some(45),
+            }
+        );
+        let err =
+            ControlRequest::from_call("wait", &json!({"panel": a.to_string(), "timeout_secs": -1}))
+                .unwrap_err();
+        assert!(err.contains("timeout_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn build_read_menu_request() {
+        let a = PanelId::new();
+        let req = ControlRequest::from_call("read_menu", &json!({"panel": a.to_string()})).unwrap();
+        assert_eq!(req, ControlRequest::ReadMenu { panel: a });
+    }
+
+    #[test]
+    fn build_select_option_request() {
+        let a = PanelId::new();
+        let req = ControlRequest::from_call(
+            "select_option",
+            &json!({"panel": a.to_string(), "index": 2}),
+        )
+        .unwrap();
+        assert_eq!(req, ControlRequest::SelectOption { panel: a, index: 2 });
+    }
+
+    #[test]
+    fn build_select_option_requires_index() {
+        let a = PanelId::new();
+        let err = ControlRequest::from_call("select_option", &json!({"panel": a.to_string()}))
+            .unwrap_err();
+        assert!(err.contains("missing integer argument `index`"));
+    }
+
+    #[test]
+    fn build_spawn_role_defaults_are_optional() {
+        let req = ControlRequest::from_call("spawn_role", &json!({"role": "backend"})).unwrap();
         assert_eq!(
             req,
             ControlRequest::SpawnRole {
@@ -348,58 +953,87 @@ mod tests {
     }
 
     #[test]
-    fn spawn_role_carries_an_inline_prompt() {
-        // A free-form role: an arbitrary label plus the inline `prompt` that
-        // becomes its system prompt.
-        let req: ControlRequest = serde_json::from_str(
-            r#"{"op":"spawn_role","role":"perf-profiler","prompt":"You profile hot paths."}"#,
-        )
-        .unwrap();
+    fn from_call_reads_null_params_as_no_arguments() {
         assert_eq!(
-            req,
-            ControlRequest::SpawnRole {
-                role: "perf-profiler".into(),
-                worktree: false,
-                model: None,
-                agent_cli: None,
-                prompt: Some("You profile hot paths.".into()),
-            }
+            ControlRequest::from_call("list_panels", &Value::Null).unwrap(),
+            ControlRequest::ListPanels
+        );
+        let err = ControlRequest::from_call("ctrl_c", &Value::Null).unwrap_err();
+        assert!(
+            err.contains("missing string argument `panel`"),
+            "got: {err}"
         );
     }
 
     #[test]
-    fn queue_tasks_round_trips() {
-        let req = ControlRequest::QueueTasks {
-            panel: PanelId::new(),
-            tasks: vec!["CA-SR-2".to_string(), "CA-SR-3".to_string()],
-            read_mode: Some(ReadPanelMode::SinceLastTurn),
-            fallback_secs: Some(120),
-            selection_hints: Some(SelectionPolicy {
-                prefer: vec!["structural".to_string()],
-                avoid: vec!["broad refactor".to_string()],
-            }),
-        };
-        let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"op\":\"queue_tasks\""));
-        let back: ControlRequest = serde_json::from_str(&line).unwrap();
-        assert_eq!(req, back);
+    fn from_call_rejects_non_object_params() {
+        let err = ControlRequest::from_call("list_panels", &json!(["x"])).unwrap_err();
+        assert!(err.contains("`params` must be an object"), "got: {err}");
     }
 
     #[test]
-    fn queue_tasks_optional_fields_default() {
-        // `tasks` defaults to empty and the three option fields to None.
-        let id = PanelId::new();
-        let req: ControlRequest =
-            serde_json::from_str(&format!(r#"{{"op":"queue_tasks","panel":"{id}"}}"#)).unwrap();
+    fn from_call_rejects_an_unknown_method() {
+        let err = ControlRequest::from_call("drop_tables", &json!({})).unwrap_err();
+        assert!(err.contains("unknown method `drop_tables`"), "got: {err}");
+    }
+
+    #[test]
+    fn call_params_default_to_null() {
+        let call: ControlCall =
+            serde_json::from_str(r#"{"id":"1","method":"list_panels"}"#).unwrap();
+        assert_eq!(call.params, Value::Null);
+        assert!(serde_json::from_str::<ControlCall>(r#"{"method":"list_panels"}"#).is_err());
+    }
+
+    #[test]
+    fn reply_wire_shape() {
+        let ok = ControlReply::response(Some("7".into()), ControlResponse::Ok);
         assert_eq!(
-            req,
-            ControlRequest::QueueTasks {
-                panel: id,
-                tasks: vec![],
-                read_mode: None,
-                fallback_secs: None,
-                selection_hints: None,
-            }
+            serde_json::to_value(&ok).unwrap(),
+            json!({"id": "7", "result": {"type": "ok"}})
+        );
+        let failed = ControlReply::response(Some("7".into()), ControlResponse::error("boom"));
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap(),
+            json!({"id": "7", "error": {"code": "failed", "message": "boom"}})
+        );
+        let invalid = ControlReply::error(None, ErrorCode::InvalidRequest, "not json");
+        assert_eq!(
+            serde_json::to_value(&invalid).unwrap(),
+            json!({"id": null, "error": {"code": "invalid_request", "message": "not json"}})
+        );
+    }
+
+    #[test]
+    fn reply_round_trips_into_its_result() {
+        for response in [
+            ControlResponse::Ok,
+            ControlResponse::Panel {
+                text: "hello".into(),
+            },
+            ControlResponse::Spawned {
+                panel: PanelId::new(),
+            },
+            ControlResponse::Panels { panels: vec![] },
+        ] {
+            let line =
+                serde_json::to_string(&ControlReply::response(Some("1".into()), response.clone()))
+                    .unwrap();
+            let back: ControlReply = serde_json::from_str(&line).unwrap();
+            assert_eq!(back.into_result(), Ok(response));
+        }
+        let line = serde_json::to_string(&ControlReply::response(
+            None,
+            ControlResponse::error("no such panel"),
+        ))
+        .unwrap();
+        let back: ControlReply = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            back.into_result(),
+            Err(ReplyError {
+                code: ErrorCode::Failed,
+                message: "no such panel".into(),
+            })
         );
     }
 
@@ -419,73 +1053,5 @@ mod tests {
             serde_json::from_str::<SelectionPolicy>(&line).unwrap(),
             full
         );
-    }
-
-    #[test]
-    fn restart_panel_round_trips() {
-        let req = ControlRequest::RestartPanel {
-            panel: PanelId::new(),
-        };
-        let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"op\":\"restart_panel\""));
-        let back: ControlRequest = serde_json::from_str(&line).unwrap();
-        assert_eq!(req, back);
-    }
-
-    #[test]
-    fn collect_workers_and_stop_watching_round_trip() {
-        for req in [
-            ControlRequest::CollectWorkers,
-            ControlRequest::StopWatching {
-                panel: PanelId::new(),
-            },
-        ] {
-            let line = serde_json::to_string(&req).unwrap();
-            let back: ControlRequest = serde_json::from_str(&line).unwrap();
-            assert_eq!(req, back);
-        }
-    }
-
-    #[test]
-    fn read_menu_round_trips() {
-        let req = ControlRequest::ReadMenu {
-            panel: PanelId::new(),
-        };
-        let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"op\":\"read_menu\""));
-        let back: ControlRequest = serde_json::from_str(&line).unwrap();
-        assert_eq!(req, back);
-    }
-
-    #[test]
-    fn select_option_carries_index() {
-        let req = ControlRequest::SelectOption {
-            panel: PanelId::new(),
-            index: 3,
-        };
-        let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"op\":\"select_option\""));
-        assert!(line.contains("\"index\":3"));
-        let back: ControlRequest = serde_json::from_str(&line).unwrap();
-        assert_eq!(req, back);
-    }
-
-    #[test]
-    fn response_variants_round_trip() {
-        for resp in [
-            ControlResponse::Ok,
-            ControlResponse::Panel {
-                text: "hello".into(),
-            },
-            ControlResponse::Spawned {
-                panel: PanelId::new(),
-            },
-            ControlResponse::Panels { panels: vec![] },
-            ControlResponse::error("boom"),
-        ] {
-            let line = serde_json::to_string(&resp).unwrap();
-            let back: ControlResponse = serde_json::from_str(&line).unwrap();
-            assert_eq!(resp, back);
-        }
     }
 }

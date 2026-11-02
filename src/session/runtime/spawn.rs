@@ -602,7 +602,7 @@ impl Multiplexer {
             role: role.to_string(),
             branch: Some(format!(
                 "caucus/{}/{}-{}",
-                session_suffix(&self.session),
+                session_suffix(self.session.id),
                 stem,
                 next
             )),
@@ -611,7 +611,7 @@ impl Multiplexer {
             // per-role spawn counter.
             name_override: Some(format!(
                 "{}-{}-{}",
-                session_suffix(&self.session),
+                session_suffix(self.session.id),
                 stem,
                 next,
             )),

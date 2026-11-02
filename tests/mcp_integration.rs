@@ -4,9 +4,10 @@
 //!
 //! * the `caucus mcp-serve` binary answering a real JSON-RPC `tools/list`
 //!   request over stdio (the success criterion);
-//! * the control socket end-to-end — a [`ControlRequest`] written to a live
+//! * the control socket end-to-end — a call written to a live
 //!   [`Multiplexer`]'s control socket executes against real panels and the
-//!   [`ControlResponse`] makes it back.
+//!   [`ControlResponse`] makes it back, from both the async client and
+//!   `caucus ctl`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -165,7 +166,7 @@ async fn control_socket_executes_against_multiplexer() {
 
     // Client task: send `list_panels` over the control socket.
     let client = tokio::spawn(async move {
-        caucus::mcp::control_client::roundtrip(&sock, &ControlRequest::ListPanels)
+        caucus::mcp::control_client::call(&sock, "t1", "list_panels", &serde_json::json!({}))
             .await
             .unwrap()
     });
@@ -190,9 +191,81 @@ async fn control_socket_executes_against_multiplexer() {
 
     let response = response.expect("control round-trip completed");
     match response {
-        ControlResponse::Panels { panels } => assert!(panels.is_empty()),
+        Ok(ControlResponse::Panels { panels }) => assert!(panels.is_empty()),
         other => panic!("expected Panels, got {other:?}"),
     }
+
+    mux.shutdown();
+}
+
+/// Run `caucus ctl <args>` while the multiplexer drains its control socket;
+/// returns the exit code and stdout.
+async fn run_ctl(
+    mux: &mut Multiplexer,
+    control: &mut caucus::mcp::control_server::ControlServer,
+    args: &[&str],
+    session_env: Option<String>,
+) -> (i32, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_caucus"));
+    cmd.arg("ctl")
+        .args(args)
+        .env_remove("CAUCUS_SESSION_ID")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(session) = session_env {
+        cmd.env("CAUCUS_SESSION_ID", session);
+    }
+    let mut child = cmd.spawn().expect("spawn caucus ctl");
+    for _ in 0..1000 {
+        mux.drain_control(control);
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut out = String::new();
+            std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+            return (status.code().unwrap(), out);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = child.kill();
+    panic!("caucus ctl {args:?} did not finish");
+}
+
+/// `caucus ctl` reaches the multiplexer through `drain_control`, the path the
+/// main worker's tool calls take: by `--sock` or by the session id in
+/// `CAUCUS_SESSION_ID`, with an error reply exiting 2.
+#[tokio::test]
+async fn ctl_calls_the_multiplexer_over_the_control_socket() {
+    let tmp = TempDir::new().unwrap();
+    let (mut mux, mut control) = build_mux(&tmp);
+    let sock = control.sock_path().display().to_string();
+
+    let (code, out) = run_ctl(
+        &mut mux,
+        &mut control,
+        &["--sock", &sock, "--id", "a1", "list_panels"],
+        None,
+    )
+    .await;
+    assert_eq!(code, 0, "stdout: {out}");
+    let reply: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+    assert_eq!(
+        reply,
+        serde_json::json!({"id": "a1", "result": {"type": "panels", "panels": []}})
+    );
+
+    let session = mux.session.id.to_string();
+    let missing = caucus::session::PanelId::new().to_string();
+    let params = serde_json::json!({"panel": missing, "mode": "screen"}).to_string();
+    let (code, out) = run_ctl(
+        &mut mux,
+        &mut control,
+        &["read_panel", &params],
+        Some(session),
+    )
+    .await;
+    assert_eq!(code, 2, "stdout: {out}");
+    let reply: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+    assert_eq!(reply["id"], "ctl");
+    assert_eq!(reply["error"]["code"], "failed");
 
     mux.shutdown();
 }

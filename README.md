@@ -189,7 +189,7 @@ menu's "type something" option, then `send_keys`), unblocking the worker.
 
 `caucus` with no subcommand launches the multiplexer TUI. The subcommands
 are for bootstrap, inspection, and resume — live control is exposed to the
-main worker over MCP, not the CLI.
+main worker over MCP, and `caucus ctl` makes the same calls from a shell.
 
 ```
 caucus                              # launch the multiplexer TUI in the current git repo
@@ -206,6 +206,12 @@ caucus role list                    # list known roles
 caucus role show <name>             # show one role's full spec
 caucus sessions [--format json]     # list resumable sessions, newest first
 caucus resume <session_id>          # relaunch the TUI restoring a persisted session
+caucus ctl list_panels              # call an MCP tool on a running session; the
+                                    # session comes from --session or
+                                    # CAUCUS_SESSION_ID, or pass --sock
+caucus ctl read_panel '{"panel":"<id>","mode":"screen"}'
+                                    # params are the tool's arguments as JSON;
+                                    # each reply is printed as one JSON line
 ```
 
 (`caucus signal post` and `caucus mcp-serve` also exist but are internal —

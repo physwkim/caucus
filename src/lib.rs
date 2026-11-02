@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod cli;
 pub mod config;
+pub mod ctl;
 pub mod doctor;
 pub mod gc;
 pub mod hook;

@@ -232,7 +232,7 @@ mod tests {
     /// queued for the next turn.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_control_answers_at_most_the_limit_per_turn() {
-        use crate::mcp::control_client::roundtrip;
+        use crate::mcp::control_client::call;
         let tmp = TempDir::new().unwrap();
         let session = Session::new("test", tmp.path().to_path_buf());
         let config = Config::load(tmp.path()).unwrap();
@@ -243,7 +243,9 @@ mod tests {
         let clients: Vec<_> = (0..count)
             .map(|_| {
                 let sock = sock.clone();
-                tokio::spawn(async move { roundtrip(&sock, &ControlRequest::ListPanels).await })
+                tokio::spawn(async move {
+                    call(&sock, "t", "list_panels", &serde_json::Value::Null).await
+                })
             })
             .collect();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -261,7 +263,7 @@ mod tests {
         for client in clients {
             assert!(matches!(
                 client.await.unwrap().unwrap(),
-                ControlResponse::Panels { .. }
+                Ok(ControlResponse::Panels { .. })
             ));
         }
     }

@@ -363,8 +363,7 @@ mod tests {
     /// connection.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_socket_wait_is_held_until_the_panel_settles() {
-        use crate::mcp::control_client::roundtrip;
-        use crate::mcp::protocol::ControlRequest;
+        use crate::mcp::control_client::call;
         let tmp = TempDir::new().unwrap();
         let session = Session::new("test", tmp.path().to_path_buf());
         let config = Config::load(tmp.path()).unwrap();
@@ -372,11 +371,8 @@ mod tests {
             Multiplexer::new(session, config, area(), 'a', LaunchMode::Fresh).unwrap();
         let id = push_panel(&mut mux, PanelState::Working);
         let sock = control.sock_path().to_path_buf();
-        let request = ControlRequest::Wait {
-            panel: id,
-            timeout_secs: None,
-        };
-        let client = tokio::spawn(async move { roundtrip(&sock, &request).await });
+        let params = serde_json::json!({"panel": id.to_string()});
+        let client = tokio::spawn(async move { call(&sock, "t", "wait", &params).await });
         let deadline = Instant::now() + Duration::from_secs(30);
         while control.jobs().is_empty() {
             assert!(Instant::now() < deadline, "wait never queued");
@@ -389,7 +385,10 @@ mod tests {
 
         set_state(&mut mux, id, PanelState::Idle);
         mux.poll_waits();
-        assert_eq!(summary_state(client.await.unwrap().unwrap()), "idle");
+        assert_eq!(
+            summary_state(client.await.unwrap().unwrap().unwrap()),
+            "idle"
+        );
         mux.shutdown();
     }
 

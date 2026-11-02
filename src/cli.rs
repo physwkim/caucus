@@ -1,8 +1,9 @@
 //! Non-TUI subcommand dispatch (`docs/design.md` §10).
 //!
 //! `caucus` with no subcommand launches the multiplexer TUI. The subcommands
-//! here are for bootstrap and hooks only — live control (`send_keys`,
-//! `spawn_role`, ...) is exposed to the main worker over MCP, not the CLI.
+//! here are for bootstrap, hooks and inspection. Live control (`send_keys`,
+//! `spawn_role`, ...) is exposed to the main worker over MCP; `caucus ctl`
+//! makes the same calls from a shell.
 //!
 //! Exit codes follow `docs/design.md` §10.1:
 //! `0` ok · `2` user error · `3` environment error · `4` bad caucus state ·
@@ -119,6 +120,25 @@ pub enum Command {
         /// Path to the main caucus process's control socket.
         #[arg(long)]
         control_sock: PathBuf,
+    },
+    /// Make one control-socket call against a running session and print the
+    /// reply lines — the main worker's MCP tools (`list_panels`,
+    /// `read_panel`, `send_keys`, …) from a shell. Exits 2 on an error reply,
+    /// 3 when the socket cannot be reached.
+    Ctl {
+        /// Control socket path; overrides `--session`.
+        #[arg(long)]
+        sock: Option<PathBuf>,
+        /// Session whose control socket to call (`CAUCUS_SESSION_ID`).
+        #[arg(long, env = "CAUCUS_SESSION_ID")]
+        session: Option<String>,
+        /// Request id echoed on every reply line.
+        #[arg(long, default_value = "ctl")]
+        id: String,
+        /// The MCP tool name to call.
+        method: String,
+        /// The tool's arguments, as a JSON object.
+        params: Option<String>,
     },
     /// List resumable sessions persisted under `.caucus/sessions/`.
     Sessions {
@@ -322,6 +342,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Some(Command::Signal(cmd)) => run_signal(cmd),
         Some(Command::Role(cmd)) => run_role(cmd),
         Some(Command::McpServe { control_sock }) => run_mcp_serve(&control_sock),
+        Some(Command::Ctl {
+            sock,
+            session,
+            id,
+            method,
+            params,
+        }) => run_ctl(sock, session, id, method, params),
         Some(Command::Sessions { format }) => run_sessions(format),
         Some(Command::Resume { session_id }) => run_resume(&session_id, prefix),
         Some(Command::Gc { older_than, prune }) => run_gc(older_than, prune),
@@ -336,6 +363,52 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
 fn run_mcp_serve(control_sock: &std::path::Path) -> Result<ExitCode> {
     crate::mcp::serve::run(control_sock).context("run caucus mcp-serve")?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `caucus ctl [--sock P | --session ID] [--id ID] <method> [params]`.
+fn run_ctl(
+    sock: Option<PathBuf>,
+    session: Option<String>,
+    id: String,
+    method: String,
+    params: Option<String>,
+) -> Result<ExitCode> {
+    let sock = match (sock, session) {
+        (Some(sock), _) => sock,
+        (None, Some(session)) => match SessionId::from_str(&session) {
+            Ok(session) => crate::session::runtime::control_socket_path(session),
+            Err(err) => {
+                eprintln!("caucus ctl: invalid --session id '{session}': {err}");
+                return Ok(ExitCode::from(EXIT_USER_ERROR));
+            }
+        },
+        (None, None) => {
+            eprintln!("caucus ctl: pass --sock or --session (or set CAUCUS_SESSION_ID)");
+            return Ok(ExitCode::from(EXIT_USER_ERROR));
+        }
+    };
+    let params = match params.as_deref().map(serde_json::from_str) {
+        None => serde_json::Value::Null,
+        Some(Ok(params)) => params,
+        Some(Err(err)) => {
+            eprintln!("caucus ctl: params is not JSON: {err}");
+            return Ok(ExitCode::from(EXIT_USER_ERROR));
+        }
+    };
+    let stream = match std::os::unix::net::UnixStream::connect(&sock) {
+        Ok(stream) => stream,
+        Err(err) => {
+            eprintln!("caucus ctl: connect to {}: {err}", sock.display());
+            return Ok(ExitCode::from(EXIT_ENV_ERROR));
+        }
+    };
+    let call = crate::mcp::protocol::ControlCall { id, method, params };
+    let ok = crate::ctl::exchange(stream, &call, &mut std::io::stdout().lock())?;
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_USER_ERROR)
+    })
 }
 
 /// The git repository caucus operates on — the current working directory.
@@ -891,6 +964,34 @@ mod tests {
                 assert_eq!(control_sock, PathBuf::from("/tmp/caucus-ctl.sock"));
             }
             other => panic!("expected McpServe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctl_parses_method_and_params() {
+        let cli = Cli::try_parse_from([
+            "caucus",
+            "ctl",
+            "--sock",
+            "/tmp/c.sock",
+            "read_panel",
+            r#"{"panel":"x","mode":"screen"}"#,
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Ctl {
+                sock,
+                id,
+                method,
+                params,
+                ..
+            }) => {
+                assert_eq!(sock, Some(PathBuf::from("/tmp/c.sock")));
+                assert_eq!(id, "ctl");
+                assert_eq!(method, "read_panel");
+                assert_eq!(params.as_deref(), Some(r#"{"panel":"x","mode":"screen"}"#));
+            }
+            other => panic!("expected Ctl, got {other:?}"),
         }
     }
 

@@ -1255,7 +1255,8 @@ caucus/
 └── src/
     ├── main.rs              (진입점: `caucus` = TUI 기동 / 비-TUI 서브커맨드 분기)
     ├── lib.rs               (라이브러리 노출, 테스트용)
-    ├── cli.rs               (init/doctor/signal/role/sessions/resume/mcp-serve 비-TUI 서브커맨드 dispatch)
+    ├── cli.rs               (init/doctor/signal/role/ctl/sessions/resume/mcp-serve 비-TUI 서브커맨드 dispatch)
+    ├── ctl.rs               (`caucus ctl`: 제어 소켓 콜 1회, reply 줄을 stdout에 그대로 출력)
     ├── config/              (글로벌+프로젝트 config 병합, roles.toml 파싱)
     ├── session/
     │   ├── state.rs         (Session 상태머신, transition() 단일 owner)
@@ -1394,10 +1395,11 @@ escape(`ESC ] 52 ; c ; <base64> BEL`)를 호스트 터미널에 써서 이뤄지
 
 ## 10. CLI surface
 
-caucus는 이제 장기 실행 TUI다. 라이브 제어(`send_keys` / `spawn_role` …)는 CLI가
-아니라 **MCP 서버**로 main worker에 노출된다(§0 #4). CLI는 기동·부트스트랩·hook·
-세션 inspect/resume용으로 축소됐다 — 옛 `session` / `round` / `execute` / `agent` /
-`watch` 서브커맨드군은 전부 폐기.
+caucus는 이제 장기 실행 TUI다. 라이브 제어(`send_keys` / `spawn_role` …)는 **MCP
+서버**로 main worker에 노출된다(§0 #4). 같은 툴을 셸·QA 스크립트에서 부르는 통로는
+`caucus ctl` 하나다(§10.3). CLI는 기동·부트스트랩·hook·세션 inspect/resume용으로
+축소됐다 — 옛 `session` / `round` / `execute` / `agent` / `watch` 서브커맨드군은 전부
+폐기.
 
 ```
 caucus                              # 풀스크린 멀티플렉서 TUI 기동 (현 git repo 기준).
@@ -1429,6 +1431,10 @@ caucus signal note [--kind progress|artifact|question] <body>
 
 caucus mcp-serve --control-sock <p> # main worker용 stdio MCP 서버
                                     # (main worker의 Claude Code가 spawn, 내부용)
+caucus ctl [--sock <p> | --session <id>] [--id <id>] <method> [<params-json>]
+                                    # 실행 중인 세션의 제어 소켓에 콜 1회 (§10.3).
+                                    # --session 기본값은 CAUCUS_SESSION_ID, --sock이
+                                    # 우선. reply 줄을 stdout에 그대로 출력
 ```
 
 TUI 안에서 사용자는 main worker 패널과 대화하고, main worker가 MCP 툴로 sub-agent
@@ -1436,11 +1442,11 @@ TUI 안에서 사용자는 main worker 패널과 대화하고, main worker가 MC
 
 ### 10.1 exit code 규약
 
-비-TUI 서브커맨드(`init` / `doctor` / `signal` / `role` / `sessions` / `gc`)에 적용:
+비-TUI 서브커맨드(`init` / `doctor` / `signal` / `role` / `ctl` / `sessions` / `gc`)에 적용:
 
 - `0` — 성공
-- `2` — 사용자 오류 (잘못된 인자 등)
-- `3` — 환경 오류 (git 없음, claude CLI 없음 등)
+- `2` — 사용자 오류 (잘못된 인자 등; `ctl`은 에러 reply도 여기)
+- `3` — 환경 오류 (git 없음, claude CLI 없음, `ctl`의 제어 소켓 연결 실패 등)
 - `4` — caucus 상태 비정상 (manifest 손상 등) — `caucus doctor` 권유
 - `1` — 예상 못한 실패 (panic 등). bug로 간주.
 
@@ -1448,6 +1454,28 @@ TUI 안에서 사용자는 main worker 패널과 대화하고, main worker가 MC
 
 비-TUI 서브커맨드는 정형 데이터를 stdout(JSON, `--format json` 시), 사람 읽기
 메시지를 stderr(텍스트)로 분리한다. TUI 모드에는 해당 없음 — 화면이 곧 출력이다.
+
+### 10.3 제어 소켓 프로토콜
+
+제어 소켓(`$TMPDIR/caucus-<session 끝 10자>-ctl.sock`)은 연결당 콜 하나, reply 한
+줄의 줄 단위 JSON이다. `mcp-serve`·`caucus ctl`·임의 스크립트가 같은 형식을 쓴다.
+
+```
+→ {"id":"a1","method":"read_panel","params":{"panel":"<id>","mode":"screen"}}
+← {"id":"a1","result":{"type":"panel","text":"..."}}
+← {"id":"a1","error":{"code":"failed","message":"no such panel: ..."}}
+```
+
+- `method`는 MCP 툴 이름, `params`는 그 툴의 인자 그대로다(없거나 `null`이면 인자
+  없음). 디코딩은 메인 프로세스 한 곳(`ControlRequest::from_call`)에서만 하므로 MCP
+  툴과 다른 클라이언트의 스키마가 갈라지지 않는다. 실행은 MCP 콜과 같은
+  `drain_control` → `execute_control` 경로다.
+- `id`는 필수 문자열이고 reply에 그대로 돌아온다. 콜로 읽히지 않는 줄이면 `id`를
+  최대한 건져서, 못 건지면 `null`로 답한다.
+- `result.type`: `ok` / `panel`(`text`) / `spawned`(`panel`) / `panels`(`panels`).
+- `error.code`: `invalid_request`(JSON 아님·한도 초과·`id` 없음·모르는 method·잘못된
+  params — 아무것도 실행 안 됨), `failed`(실행했고 실패), `unavailable`(멀티플렉서
+  종료 중이라 답 없음).
 
 ---
 

@@ -22,7 +22,7 @@ use crate::input::FocusRouter;
 use crate::mcp::control_server::ControlServer;
 use crate::panel::lifecycle::Panel;
 use crate::render::{Layout, LayoutMode, LayoutTree, Rect};
-use crate::session::id::PanelId;
+use crate::session::id::{PanelId, SessionId};
 use crate::session::lock::{SessionLock, SessionLockError};
 use crate::session::state::Session;
 use crate::signal::server::SignalServer;
@@ -394,7 +394,7 @@ impl Multiplexer {
         let signal_server = SignalServer::bind(&sock_path)
             .with_context(|| format!("bind turn-signal socket {}", sock_path.display()))?;
 
-        let control_sock_path = control_socket_path(&session);
+        let control_sock_path = control_socket_path(session.id);
         let control_server = ControlServer::bind(&control_sock_path)
             .with_context(|| format!("bind control socket {}", control_sock_path.display()))?;
 
@@ -569,19 +569,20 @@ impl Multiplexer {
 /// injected into every agent as `CAUCUS_SOCK`, so its exact location is an
 /// internal detail — only the env var is contract.
 fn socket_path(session: &Session) -> PathBuf {
-    std::env::temp_dir().join(format!("caucus-{}.sock", session_suffix(session)))
+    std::env::temp_dir().join(format!("caucus-{}.sock", session_suffix(session.id)))
 }
 
-/// Choose the MCP control socket path for `session` — distinct from the
-/// turn-signal socket, same SUN_LEN-safe temp-dir scheme.
-fn control_socket_path(session: &Session) -> PathBuf {
-    std::env::temp_dir().join(format!("caucus-{}-ctl.sock", session_suffix(session)))
+/// The control socket path of session `id` — distinct from the turn-signal
+/// socket, same SUN_LEN-safe temp-dir scheme. `caucus ctl --session` derives
+/// it the same way.
+pub fn control_socket_path(id: SessionId) -> PathBuf {
+    std::env::temp_dir().join(format!("caucus-{}-ctl.sock", session_suffix(id)))
 }
 
 /// Short, collision-safe session suffix (last 10 ULID chars) — keeps socket
 /// paths well under the OS `SUN_LEN` cap.
-fn session_suffix(session: &Session) -> String {
-    let id = session.id.to_string();
+fn session_suffix(id: SessionId) -> String {
+    let id = id.to_string();
     id.chars()
         .rev()
         .take(10)

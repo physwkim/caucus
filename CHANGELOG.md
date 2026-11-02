@@ -21,6 +21,15 @@ versions.
   the main panel. caucus now registers a 3660 s tool timeout with Claude Code
   (`.mcp.json` `timeout`) and codex (`tool_timeout_sec`) so neither client
   abandons a held call.
+- **`caucus ctl` calls an MCP tool on a running session from a shell.**
+  `caucus ctl list_panels` sends one call to the session's control socket
+  (`--session`, defaulting to `CAUCUS_SESSION_ID`, or `--sock`) and prints
+  the reply as a JSON line; it exits 2 on an error reply and 3 when the
+  socket cannot be reached. The socket now speaks
+  `{"id","method","params"}` with `{"id","result"}` / `{"id","error":{"code",
+  "message"}}` replies, where `method` and `params` are the MCP tool name and
+  arguments, decoded only by the main process. A `caucus mcp-serve` from an
+  older build cannot talk to a session started by this one.
 
 ### Changed
 

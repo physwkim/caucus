@@ -12,9 +12,9 @@ use tempfile::TempDir;
 use super::test_support::area;
 use super::*;
 use crate::bench_support::{PANEL_COUNTS, Summary, cat_panel, paint_screen};
-use crate::mcp::ReadPanelMode;
-use crate::mcp::control_client::roundtrip;
-use crate::mcp::protocol::ControlRequest;
+use serde_json::{Value, json};
+
+use crate::mcp::control_client::call;
 use crate::role::spec::AgentCli;
 
 const BURSTS: [usize; 3] = [64, 512, 4096];
@@ -48,20 +48,21 @@ fn build(tmp: &TempDir, n: usize) -> (Multiplexer, ControlServer) {
     (mux, control)
 }
 
-/// Queue `burst` copies of `request` through the socket, then drain them the
+/// Queue `burst` copies of the `method` call through the socket, then drain them the
 /// way successive loop turns would and return the longest single turn.
 async fn drain_once(
     mux: &mut Multiplexer,
     control: &mut ControlServer,
     sock: &Path,
-    request: &ControlRequest,
+    method: &'static str,
+    params: &Value,
     burst: usize,
 ) -> Duration {
     let clients: Vec<_> = (0..burst)
         .map(|_| {
             let sock = sock.to_path_buf();
-            let request = request.clone();
-            tokio::spawn(async move { roundtrip(&sock, &request).await })
+            let params = params.clone();
+            tokio::spawn(async move { call(&sock, "profile", method, &params).await })
         })
         .collect();
     let deadline = Instant::now() + QUEUE_TIMEOUT;
@@ -76,7 +77,7 @@ async fn drain_once(
         stall = stall.max(start.elapsed());
     }
     for client in clients {
-        client.await.unwrap().unwrap();
+        client.await.unwrap().unwrap().unwrap();
     }
     stall
 }
@@ -94,20 +95,20 @@ async fn control_profile() {
         let (mut mux, mut control) = build(&tmp, n);
         let sock = control.sock_path().to_path_buf();
         let requests = [
-            ("list_panels", ControlRequest::ListPanels),
+            ("list_panels", "list_panels", json!({})),
             (
                 "read_screen",
-                ControlRequest::ReadPanel {
-                    panel: mux.panels[0].id,
-                    mode: ReadPanelMode::Screen,
-                },
+                "read_panel",
+                json!({"panel": mux.panels[0].id.to_string(), "mode": "screen"}),
             ),
         ];
-        for (name, request) in &requests {
+        for (name, method, params) in &requests {
             for burst in BURSTS {
                 let mut samples = Vec::with_capacity(SAMPLES);
                 for _ in 0..SAMPLES {
-                    samples.push(drain_once(&mut mux, &mut control, &sock, request, burst).await);
+                    samples.push(
+                        drain_once(&mut mux, &mut control, &sock, method, params, burst).await,
+                    );
                 }
                 let s = Summary::of(&mut samples);
                 println!(
