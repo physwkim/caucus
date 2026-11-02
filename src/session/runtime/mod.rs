@@ -199,17 +199,12 @@ pub struct Multiplexer {
     /// between turns — the boundary re-opens a capture turn and keeps the panel
     /// `Working`, so the watch cannot latch until the last queued prompt ends.
     outstanding_prompts: HashMap<PanelId, u32>,
-    /// Per-panel grid-quiescence probe for lost-turn reconciliation
-    /// ([`Multiplexer::poll_lost_turns`]). Value is the grid `generation` last
-    /// seen for the panel and the instant that generation was first observed —
-    /// i.e. how long the panel's screen has been unchanged. Only panels
-    /// currently `Working` carry an entry; it resets when the grid changes and
-    /// is dropped when the panel leaves `Working` (a real boundary) or is
-    /// detached. A panel `Working` but silent past
-    /// [`LOST_TURN_RECONCILE_QUIESCENCE`] has no turn actually running —
-    /// a hookless local command (`/model`, `/help`, …) or a dropped Stop hook
-    /// left the turn open — and is reconciled back to `Idle`.
-    lost_turn_probe: HashMap<PanelId, (u64, Instant)>,
+    /// Per-panel evidence for lost-turn reconciliation
+    /// ([`Multiplexer::poll_lost_turns`], [`input::LostTurnProbe`]). Only
+    /// panels currently `Working` carry an entry; it is dropped when the panel
+    /// leaves `Working` (a real boundary), sits on a blocked prompt, or is
+    /// detached.
+    lost_turn_probe: HashMap<PanelId, input::LostTurnProbe>,
     /// `question` notes posted by panel agents (`caucus signal note --kind
     /// question`), waiting to be announced to the main worker. FIFO, drained
     /// one per tick by [`Multiplexer::poll_question_notices`] under the same
@@ -248,15 +243,16 @@ pub struct Multiplexer {
     /// shutdown); the branch persists and is what `caucus resume` re-attaches
     /// a worktree on. Populated at spawn, dropped on kill.
     worktree_branches: HashMap<PanelId, String>,
-    /// Cached blocking-prompt scan per panel, keyed by panel id, valued by the
-    /// grid `generation` it was computed against plus the detected
-    /// [`rounds::BlockedPrompt`] (or `None`).
-    /// [`Multiplexer::poll_round_blocked_panels`] runs every tick while a round
-    /// is pending; without this it would re-materialise each round panel's full
-    /// viewport and re-run the grid scanners on every iteration even when the
-    /// grid did not change. The cache recomputes only when a panel's grid
-    /// generation advances; an entry is pruned when its panel is killed.
-    blocked_scan_cache: HashMap<PanelId, (u64, Option<rounds::BlockedPrompt>)>,
+    /// Cached screen scan per panel, keyed by panel id, valued by the grid
+    /// `generation` it was computed against plus the [`rounds::ScreenScan`]
+    /// (blocked prompt and turn activity).
+    /// [`Multiplexer::poll_round_blocked_panels`] and
+    /// [`Multiplexer::poll_lost_turns`] run every tick; without this they
+    /// would re-materialise each panel's full viewport and re-run the grid
+    /// scanners on every iteration even when the grid did not change. The
+    /// cache recomputes only when a panel's grid generation advances; an entry
+    /// is pruned when its panel is killed.
+    screen_scan_cache: HashMap<PanelId, (u64, rounds::ScreenScan)>,
     /// The branch tip each panel's lane was last checked against for superseded
     /// commits ([`Multiplexer::record_commit_supersessions`]). A commit's
     /// reachability from a branch can only change when the branch ref moves, so
@@ -442,7 +438,7 @@ impl Multiplexer {
                 show_transcript: false,
                 scroll: None,
                 worktree_branches: HashMap::new(),
-                blocked_scan_cache: HashMap::new(),
+                screen_scan_cache: HashMap::new(),
                 checked_branch_tips: HashMap::new(),
                 resume_round_notice: None,
                 last_liveness_probe: None,

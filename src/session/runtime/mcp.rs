@@ -870,7 +870,7 @@ mod tests {
     /// generation cache, as the per-tick passes do. The cat grid holds no
     /// prompt, so only a cache read sees the seeded menu.
     #[tokio::test]
-    async fn list_panels_and_read_menu_read_the_blocked_scan_cache() {
+    async fn list_panels_and_read_menu_read_the_screen_scan_cache() {
         use crate::agent::manifest::AgentManifest;
         use crate::panel::lifecycle::PanelState;
         use crate::term::{Menu, MenuOption};
@@ -895,9 +895,15 @@ mod tests {
             }],
             cursor: 0,
         };
-        mux.blocked_scan_cache.insert(
+        mux.screen_scan_cache.insert(
             id,
-            (generation, Some(rounds::BlockedPrompt::Selection(menu))),
+            (
+                generation,
+                rounds::ScreenScan {
+                    blocked: Some(rounds::BlockedPrompt::Selection(menu)),
+                    activity: crate::term::ScreenActivity::Unknown,
+                },
+            ),
         );
 
         let panels = McpToolSurface::list_panels(&mut mux);

@@ -14,6 +14,16 @@ versions.
   time, with the turn count and total busy time; the idle input wait is not
   counted. Unset, it costs one branch per pass.
 
+### Changed
+
+- **A turn whose Stop hook never arrived ends in ~1 s, not 20 s.** caucus now
+  reads each working panel's screen with rules ported from herdr's Claude
+  Code and codex detection: once a live-turn indicator has been seen, an idle
+  prompt held for 1 s ends the turn. Live, a dropped Claude Stop or codex
+  `notify` was reconciled 1.0–1.1 s after the agent finished, in 6 of 6 runs.
+  A panel never seen working still waits out the 20 s quiescence window, and
+  one stopped at a blocked prompt is still never reconciled.
+
 ### Performance
 
 - **Lost-turn recovery reads the cached prompt scan.** Every loop tick

@@ -7,6 +7,7 @@ use crate::panel::lifecycle::{self, PanelState};
 use crate::signal::{
     AgentNote, CompactTrigger, LifecycleKind, LifecycleSignal, NoteKind, TurnSignal,
 };
+use crate::term::ScreenActivity;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -28,6 +29,70 @@ const LIVENESS_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 /// (`/model`, `/help`, …) or a dropped Stop hook — stays silent this long. The
 /// wait is the price of never reconciling a turn that is still running.
 const LOST_TURN_RECONCILE_QUIESCENCE: Duration = Duration::from_secs(20);
+
+/// How long a `Working` panel that visibly ran its turn must then show its
+/// idle prompt, continuously, before [`Multiplexer::poll_lost_turns`]
+/// reconciles it. Claude Code runs the Stop hook before it repaints the idle
+/// prompt (the hook lands 50–65 ms ahead of that frame on 2.1.316), so a
+/// delivered Stop always wins; the hold only rides out a transient frame
+/// between two live indicators.
+const SCREEN_IDLE_RECONCILE_HOLD: Duration = Duration::from_secs(1);
+
+/// What a `Working` panel's screen has shown during its current `Working`
+/// phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenTrack {
+    /// No live-turn indicator yet: an idle prompt may be the one the submitted
+    /// prompt has not left, or a hookless local command that never runs a
+    /// turn. Only grid quiescence can reconcile it.
+    Unconfirmed,
+    /// A live-turn indicator was seen: the turn really ran.
+    Live,
+    /// After [`ScreenTrack::Live`], the idle prompt has shown continuously
+    /// since this instant.
+    IdleSince(Instant),
+}
+
+/// Lost-turn evidence for one `Working` panel
+/// ([`Multiplexer::poll_lost_turns`]): the grid-quiescence clock plus what the
+/// screen has shown since the panel went `Working`.
+#[derive(Debug, Clone)]
+pub(super) struct LostTurnProbe {
+    /// Grid generation last seen, and when it was first seen.
+    generation: u64,
+    since: Instant,
+    screen: ScreenTrack,
+}
+
+impl LostTurnProbe {
+    fn new(generation: u64, now: Instant) -> Self {
+        Self {
+            generation,
+            since: now,
+            screen: ScreenTrack::Unconfirmed,
+        }
+    }
+
+    /// Fold one tick's observation in. Returns `true` once the turn is lost:
+    /// the grid has been unchanged past [`LOST_TURN_RECONCILE_QUIESCENCE`], or
+    /// a turn that visibly ran has shown its idle prompt for
+    /// [`SCREEN_IDLE_RECONCILE_HOLD`].
+    fn observe(&mut self, generation: u64, activity: ScreenActivity, now: Instant) -> bool {
+        if generation != self.generation {
+            self.generation = generation;
+            self.since = now;
+        }
+        self.screen = match (self.screen, activity) {
+            (_, ScreenActivity::Working) => ScreenTrack::Live,
+            (ScreenTrack::Live, ScreenActivity::Idle) => ScreenTrack::IdleSince(now),
+            (ScreenTrack::IdleSince(_), ScreenActivity::Unknown) => ScreenTrack::Live,
+            (track, _) => track,
+        };
+        now.duration_since(self.since) >= LOST_TURN_RECONCILE_QUIESCENCE
+            || matches!(self.screen, ScreenTrack::IdleSince(idle)
+                if now.duration_since(idle) >= SCREEN_IDLE_RECONCILE_HOLD)
+    }
+}
 
 impl Multiplexer {
     /// Apply a key event via the focus router. Returns `true` while caucus
@@ -533,14 +598,18 @@ impl Multiplexer {
     /// `main_deliverable`, stranding every finished worker with nothing able to
     /// push it. A dropped Stop hook has the same shape.
     ///
-    /// The only evidence caucus has that no turn is really running is the PTY:
-    /// a working agent repaints (see [`LOST_TURN_RECONCILE_QUIESCENCE`]), an
-    /// agent idle at a static prompt emits nothing. So a `Working` panel whose
-    /// grid has been unchanged that long, and which is **not** sitting on a
-    /// blocked prompt (that is [`Multiplexer::poll_round_blocked_panels`]'s
-    /// job — a live chooser is a static grid too, but a genuine attention
-    /// state), is reconciled. One uniform rule closes the whole hookless-command
-    /// family and dropped Stops at once, for main and workers alike.
+    /// The evidence that no turn is really running is the PTY. The screen
+    /// shows it directly: a turn that rendered a live indicator and then
+    /// holds its idle prompt for [`SCREEN_IDLE_RECONCILE_HOLD`] has ended
+    /// ([`LostTurnProbe`]). Without that evidence (no live indicator yet, or
+    /// a layout the detector does not know) only silence remains: a working
+    /// agent repaints (see [`LOST_TURN_RECONCILE_QUIESCENCE`]), an agent idle
+    /// at a static prompt emits nothing. A panel **sitting on a blocked
+    /// prompt** is never reconciled — that is
+    /// [`Multiplexer::poll_round_blocked_panels`]'s job, a live chooser is a
+    /// static grid too, but a genuine attention state. The rules close the
+    /// whole hookless-command family and dropped Stops at once, for main and
+    /// workers alike.
     pub fn poll_lost_turns(&mut self) {
         let now = Instant::now();
         let working: Vec<(PanelId, u64)> = self
@@ -551,24 +620,21 @@ impl Multiplexer {
             .collect();
         let mut due: Vec<PanelId> = Vec::new();
         for (id, generation) in working {
-            // A live selection / [y/n] prompt is a static grid, but it is a real
-            // attention state owned elsewhere — never reconcile it away. This runs
-            // every tick, so only through the generation cache.
-            if self.panel_blocked_cached(id, generation).is_some() {
+            // This runs every tick, so only through the generation cache.
+            let Some(scan) = self.panel_screen_cached(id, generation) else {
+                continue;
+            };
+            if scan.blocked.is_some() {
                 self.lost_turn_probe.remove(&id);
                 continue;
             }
-            match self.lost_turn_probe.get(&id) {
-                Some((seen, since)) if *seen == generation => {
-                    if now.duration_since(*since) >= LOST_TURN_RECONCILE_QUIESCENCE {
-                        due.push(id);
-                    }
-                }
-                // First sight, or the grid changed since last tick: (re)start the
-                // clock. A changing grid is a live turn — the window never elapses.
-                _ => {
-                    self.lost_turn_probe.insert(id, (generation, now));
-                }
+            let activity = scan.activity;
+            let probe = self
+                .lost_turn_probe
+                .entry(id)
+                .or_insert_with(|| LostTurnProbe::new(generation, now));
+            if probe.observe(generation, activity, now) {
+                due.push(id);
             }
         }
         // Drop probes for panels that left `Working` between ticks (a real
@@ -1425,18 +1491,22 @@ mod tests {
         mux.shutdown();
     }
 
+    impl LostTurnProbe {
+        /// Backdate the quiescence clock past its window, as if the grid had
+        /// been unchanged since before now.
+        pub(crate) fn age_out_quiescence(&mut self) {
+            self.since = Instant::now() - LOST_TURN_RECONCILE_QUIESCENCE - Duration::from_secs(1);
+        }
+    }
+
     /// Backdate a panel's lost-turn probe so its quiescence window has already
     /// elapsed, as if the grid had been unchanged since before now. Requires an
     /// entry to already exist (one `poll_lost_turns` seeds it).
     fn age_out_lost_turn_probe(mux: &mut Multiplexer, id: PanelId) {
-        let (generation, _) = mux.lost_turn_probe[&id];
-        mux.lost_turn_probe.insert(
-            id,
-            (
-                generation,
-                Instant::now() - LOST_TURN_RECONCILE_QUIESCENCE - Duration::from_secs(1),
-            ),
-        );
+        mux.lost_turn_probe
+            .get_mut(&id)
+            .unwrap()
+            .age_out_quiescence();
     }
 
     /// The core recovery: a panel wedged `Working` with no Stop coming — a
@@ -1543,7 +1613,7 @@ mod tests {
             PanelState::Working,
             "a grid change restarts the window — a working agent is never reconciled"
         );
-        let (_, since) = mux.lost_turn_probe[&id];
+        let since = mux.lost_turn_probe[&id].since;
         assert!(
             Instant::now().duration_since(since) < LOST_TURN_RECONCILE_QUIESCENCE,
             "the clock was reset to now, not left aged out"
@@ -1568,18 +1638,16 @@ mod tests {
 
         mux.poll_lost_turns();
         // Even fully aged out, a blocked panel is skipped (and its probe dropped).
-        mux.lost_turn_probe.insert(
-            id,
-            (
-                mux.panels
-                    .iter()
-                    .find(|p| p.id == id)
-                    .unwrap()
-                    .grid()
-                    .generation(),
-                Instant::now() - LOST_TURN_RECONCILE_QUIESCENCE - Duration::from_secs(1),
-            ),
-        );
+        let generation = mux
+            .panels
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .grid()
+            .generation();
+        let mut probe = LostTurnProbe::new(generation, Instant::now());
+        probe.age_out_quiescence();
+        mux.lost_turn_probe.insert(id, probe);
         mux.poll_lost_turns();
         assert_eq!(
             panel_state(&mux, id),
@@ -1597,8 +1665,8 @@ mod tests {
     /// answer from the generation cache, not re-scan an unchanged viewport. The
     /// cat grid holds no prompt, so only a cache read sees the seeded one.
     #[tokio::test]
-    async fn poll_lost_turns_reads_the_blocked_scan_cache() {
-        use super::super::rounds::BlockedPrompt;
+    async fn poll_lost_turns_reads_the_screen_scan_cache() {
+        use super::super::rounds::{BlockedPrompt, ScreenScan};
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let id = push_cat_panel(&mut mux, PanelState::Working);
@@ -1610,14 +1678,148 @@ mod tests {
             .grid()
             .generation();
         let prompt = BlockedPrompt::Permission("Continue? [y/N]".into());
-        mux.blocked_scan_cache
-            .insert(id, (generation, Some(prompt)));
+        mux.screen_scan_cache.insert(
+            id,
+            (
+                generation,
+                ScreenScan {
+                    blocked: Some(prompt),
+                    activity: ScreenActivity::Unknown,
+                },
+            ),
+        );
 
         mux.poll_lost_turns();
         assert!(
             !mux.lost_turn_probe.contains_key(&id),
             "the cached prompt marks the panel blocked, so no probe is armed"
         );
+        mux.shutdown();
+    }
+
+    /// The screen rule's boundaries, one per transition: an idle prompt
+    /// reconciles only after a live indicator was seen and only once it has
+    /// held for [`SCREEN_IDLE_RECONCILE_HOLD`]; a live indicator or an
+    /// unknown frame restarts the hold.
+    #[test]
+    fn lost_turn_probe_screen_boundaries() {
+        use ScreenActivity::{Idle, Unknown, Working};
+        let t0 = Instant::now();
+        let hold = SCREEN_IDLE_RECONCILE_HOLD;
+        let tick = Duration::from_millis(10);
+
+        // Idle before any live indicator: only quiescence could reconcile.
+        let mut p = LostTurnProbe::new(0, t0);
+        assert!(!p.observe(1, Idle, t0));
+        assert!(!p.observe(1, Idle, t0 + hold * 5));
+        assert_eq!(p.screen, ScreenTrack::Unconfirmed);
+
+        // Live, then idle: not before the hold, yes at it.
+        let mut p = LostTurnProbe::new(0, t0);
+        assert!(!p.observe(1, Working, t0));
+        assert!(!p.observe(2, Idle, t0 + tick));
+        assert!(!p.observe(3, Idle, t0 + tick + hold - tick));
+        assert!(p.observe(3, Idle, t0 + tick + hold));
+
+        // A live indicator during the hold restarts it.
+        let mut p = LostTurnProbe::new(0, t0);
+        p.observe(1, Working, t0);
+        p.observe(2, Idle, t0 + tick);
+        p.observe(3, Working, t0 + hold / 2);
+        assert!(!p.observe(4, Idle, t0 + hold + tick));
+        assert!(p.observe(4, Idle, t0 + hold + tick + hold));
+
+        // An unknown frame breaks continuity but keeps the live evidence.
+        let mut p = LostTurnProbe::new(0, t0);
+        p.observe(1, Working, t0);
+        p.observe(2, Idle, t0 + tick);
+        p.observe(3, Unknown, t0 + hold / 2);
+        assert_eq!(p.screen, ScreenTrack::Live);
+        assert!(!p.observe(4, Idle, t0 + hold + tick));
+        assert!(p.observe(4, Idle, t0 + hold + tick + hold));
+    }
+
+    /// Quiescence still reconciles whatever the screen showed: a live
+    /// indicator frozen on a static grid is a hung repaint, not a turn.
+    #[test]
+    fn lost_turn_probe_quiescence_applies_in_every_track() {
+        let t0 = Instant::now();
+        let late = t0 + LOST_TURN_RECONCILE_QUIESCENCE;
+        for activity in [
+            ScreenActivity::Working,
+            ScreenActivity::Idle,
+            ScreenActivity::Unknown,
+        ] {
+            let mut p = LostTurnProbe::new(7, t0);
+            assert!(!p.observe(7, activity, t0), "{activity:?}");
+            assert!(p.observe(7, activity, late), "{activity:?}");
+        }
+        let mut p = LostTurnProbe::new(7, t0);
+        assert!(
+            !p.observe(8, ScreenActivity::Unknown, late),
+            "a new generation restarts the clock"
+        );
+    }
+
+    fn paint(mux: &mut Multiplexer, id: PanelId, screen: &str) {
+        let grid = &mut mux.panels.iter_mut().find(|p| p.id == id).unwrap().grid;
+        grid.advance(b"\x1b[2J\x1b[H");
+        grid.advance(screen.replace('\n', "\r\n").as_bytes());
+    }
+
+    const CLAUDE_WORKING: &str =
+        "✢ Thinking…\n──────────\n❯ \n──────────\n  ⏵⏵ bypass permissions on · esc to interrupt";
+    const CLAUDE_IDLE: &str =
+        "● hi\n✻ Worked for 1s\n──────────\n❯ \n──────────\n  ⏵⏵ bypass permissions on";
+
+    /// End to end through the grid and the panel's CLI: a Claude panel whose
+    /// Stop never arrives is reconciled once its screen has shown the turn
+    /// run and then held the idle prompt — without waiting out quiescence.
+    #[tokio::test]
+    async fn poll_lost_turns_reconciles_when_the_screen_shows_the_turn_ended() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+
+        paint(&mut mux, id, CLAUDE_WORKING);
+        mux.poll_lost_turns();
+        assert_eq!(mux.lost_turn_probe[&id].screen, ScreenTrack::Live);
+
+        paint(&mut mux, id, CLAUDE_IDLE);
+        mux.poll_lost_turns();
+        assert!(matches!(
+            mux.lost_turn_probe[&id].screen,
+            ScreenTrack::IdleSince(_)
+        ));
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "the hold has not elapsed"
+        );
+
+        mux.lost_turn_probe.get_mut(&id).unwrap().screen = ScreenTrack::IdleSince(
+            Instant::now() - SCREEN_IDLE_RECONCILE_HOLD - Duration::from_millis(1),
+        );
+        mux.poll_lost_turns();
+        assert_eq!(panel_state(&mux, id), PanelState::Idle);
+        mux.shutdown();
+    }
+
+    /// An idle prompt with no live indicator seen this phase is left to the
+    /// quiescence window: Enter may not have landed yet, or a hookless local
+    /// command ran no turn.
+    #[tokio::test]
+    async fn poll_lost_turns_does_not_trust_an_idle_screen_never_seen_working() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+
+        paint(&mut mux, id, CLAUDE_IDLE);
+        mux.poll_lost_turns();
+        mux.lost_turn_probe.get_mut(&id).unwrap().since = Instant::now();
+        mux.poll_lost_turns();
+        assert_eq!(mux.lost_turn_probe[&id].screen, ScreenTrack::Unconfirmed);
+        assert_eq!(panel_state(&mux, id), PanelState::Working);
         mux.shutdown();
     }
 

@@ -11,8 +11,10 @@ use tempfile::TempDir;
 
 use super::Multiplexer;
 use super::test_support::mux;
+use crate::agent::AgentManifest;
 use crate::bench_support::{PANEL_COUNTS, Summary, cat_panel, paint_screen, spin};
 use crate::panel::PanelState;
+use crate::role::spec::AgentCli;
 
 const WARMUP_TICKS: usize = 50;
 const TICKS: usize = 500;
@@ -58,15 +60,31 @@ impl Activity {
 }
 
 /// A working main panel plus `n - 1` working workers, each watched, tiled
-/// into the test area with a full screen of text.
+/// into the test area with a full screen of text. CLIs alternate so both
+/// screen-activity scanners run.
 fn build(tmp: &TempDir, n: usize) -> Multiplexer {
     let mut mux = mux(tmp);
     for i in 0..n {
-        let mut panel = cat_panel(if i == 0 { "main" } else { "worker" });
+        let role = if i == 0 { "main" } else { "worker" };
+        let mut panel = cat_panel(role);
         panel.state = PanelState::Working;
         if i == 0 {
             mux.main_panel_id = Some(panel.id);
         }
+        let cli = if i % 2 == 0 {
+            AgentCli::Claude
+        } else {
+            AgentCli::Codex
+        };
+        let manifest = AgentManifest::new(
+            mux.session.id,
+            panel.id,
+            role,
+            format!("{role}-{i}"),
+            cli,
+            None,
+        );
+        mux.manifests.insert(panel.id, manifest);
         mux.panels.push(panel);
     }
     mux.rebuild_layout_tree();

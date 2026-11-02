@@ -476,7 +476,7 @@ impl Multiplexer {
             agent_id: panel.agent_id,
         };
         self.manifests.remove(&panel_id);
-        self.blocked_scan_cache.remove(&panel_id);
+        self.screen_scan_cache.remove(&panel_id);
         self.checked_branch_tips.remove(&panel_id);
         self.local_commands_without_turn.remove(&panel_id);
         self.outstanding_prompts.remove(&panel_id);

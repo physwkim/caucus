@@ -4,6 +4,7 @@ use crate::agent::manifest::TurnMark;
 use crate::mcp::protocol::{ControlResponse, SelectionPolicy};
 use crate::mcp::{McpToolSurface, ReadPanelMode};
 use crate::panel::lifecycle::{Panel, PanelState};
+use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -165,7 +166,7 @@ fn push_round_panel_footer(out: &mut String, c: &RoundPanelContribution) {
 }
 
 /// What a round panel is visibly waiting on, detected from its rendered grid
-/// ([`Multiplexer::panel_blocked_prompt`]) — a mid-turn attention state the
+/// ([`Multiplexer::scan_panel_screen`]) — a mid-turn attention state the
 /// coarse panel state cannot express, because none of these fire a `Stop` hook.
 /// The panel therefore stays coarse `Working` and its round never settles; the
 /// per-tick round watch ([`Multiplexer::poll_round_blocked_panels`]) pushes a
@@ -189,6 +190,15 @@ pub(crate) enum BlockedPrompt {
     /// A raw `[y/n]`-style yes/no prompt from a tool/shell the agent ran —
     /// answered with `send_keys`. Carries the prompt line for the notice.
     Permission(String),
+}
+
+/// One read of a panel's rendered screen, cached per grid generation by
+/// [`Multiplexer::panel_screen_cached`]: the prompt it is blocked on, if any,
+/// and whether the agent's turn is visibly running.
+#[derive(Debug, Clone)]
+pub(crate) struct ScreenScan {
+    pub(crate) blocked: Option<BlockedPrompt>,
+    pub(crate) activity: crate::term::ScreenActivity,
 }
 
 impl BlockedPrompt {
@@ -1981,47 +1991,62 @@ impl Multiplexer {
         }
     }
 
-    /// Scan a panel's visible grid for whatever it is stuck waiting on
-    /// ([`BlockedPrompt`]): a numbered selection menu first (the richer,
-    /// higher-confidence match), then a raw `[y/n]` yes/no prompt. `None` when
-    /// neither is confidently detected. Private so every scan goes through
-    /// [`Multiplexer::panel_blocked_cached`].
-    fn panel_blocked_prompt(panel: &Panel) -> Option<BlockedPrompt> {
+    /// Read a panel's visible grid once for both screen facts: whatever it is
+    /// stuck waiting on ([`BlockedPrompt`] — a numbered selection menu first,
+    /// the richer match, then a raw `[y/n]` prompt) and the turn activity its
+    /// CLI renders ([`crate::term::ScreenActivity`]; `Unknown` without a
+    /// known CLI). Private so every scan goes through
+    /// [`Multiplexer::panel_screen_cached`].
+    fn scan_panel_screen(panel: &Panel, cli: Option<AgentCli>) -> ScreenScan {
         let (_, rows) = panel.grid().size();
         let lines: Vec<String> = (0..rows)
             .map(|r| panel.grid().row_text(r).trim_end().to_string())
             .collect();
-        if let Some(menu) = crate::term::scan_menu(&lines) {
-            return Some(BlockedPrompt::Selection(menu));
-        }
-        crate::term::scan_yes_no_prompt(&lines).map(BlockedPrompt::Permission)
+        let blocked = match crate::term::scan_menu(&lines) {
+            Some(menu) => Some(BlockedPrompt::Selection(menu)),
+            None => crate::term::scan_yes_no_prompt(&lines).map(BlockedPrompt::Permission),
+        };
+        let title = panel.grid().title();
+        let activity = match cli {
+            Some(AgentCli::Claude) => crate::term::claude_activity(&lines, title),
+            Some(AgentCli::Codex) => crate::term::codex_activity(&lines, title),
+            None => crate::term::ScreenActivity::Unknown,
+        };
+        ScreenScan { blocked, activity }
     }
 
-    /// [`Multiplexer::panel_blocked_prompt`] gated by the panel's grid
+    /// [`Multiplexer::scan_panel_screen`] gated by the panel's grid
     /// `generation`. If the panel's grid has not changed since the last scan
     /// (cached generation matches), the cached result is returned without
     /// re-materialising the viewport or re-running the scanners; otherwise it
     /// re-scans and refreshes the cache. This is what keeps the per-tick
-    /// blocked-panel poll from re-scanning every idle round panel. Returns
-    /// `None` for an unknown id.
+    /// blocked-panel and lost-turn polls from re-scanning every unchanged
+    /// panel. Returns `None` for an unknown id.
+    pub(super) fn panel_screen_cached(
+        &mut self,
+        id: PanelId,
+        generation: u64,
+    ) -> Option<&ScreenScan> {
+        let fresh = self
+            .screen_scan_cache
+            .get(&id)
+            .is_some_and(|(cached_gen, _)| *cached_gen == generation);
+        if !fresh {
+            let panel = self.panels.iter().find(|p| p.id == id)?;
+            let cli = self.manifests.get(&id).map(|m| m.agent_cli);
+            let scan = Self::scan_panel_screen(panel, cli);
+            self.screen_scan_cache.insert(id, (generation, scan));
+        }
+        self.screen_scan_cache.get(&id).map(|(_, scan)| scan)
+    }
+
+    /// The blocked prompt from [`Multiplexer::panel_screen_cached`].
     pub(super) fn panel_blocked_cached(
         &mut self,
         id: PanelId,
         generation: u64,
     ) -> Option<BlockedPrompt> {
-        if let Some((cached_gen, cached)) = self.blocked_scan_cache.get(&id)
-            && *cached_gen == generation
-        {
-            return cached.clone();
-        }
-        let prompt = self
-            .panels
-            .iter()
-            .find(|p| p.id == id)
-            .and_then(Self::panel_blocked_prompt);
-        self.blocked_scan_cache
-            .insert(id, (generation, prompt.clone()));
-        prompt
+        self.panel_screen_cached(id, generation)?.blocked.clone()
     }
 
     /// Overlay a live grid-detected blocking prompt ([`BlockedPrompt`]) onto the
@@ -2463,7 +2488,6 @@ mod tests {
     /// tick.
     #[tokio::test]
     async fn a_wedged_main_is_reconciled_so_settled_workers_deliver() {
-        use std::time::{Duration, Instant};
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
@@ -2491,11 +2515,10 @@ mod tests {
 
         // The quiescence window elapses on the silent main.
         mux.poll_lost_turns();
-        let (generation, _) = mux.lost_turn_probe[&main];
-        mux.lost_turn_probe.insert(
-            main,
-            (generation, Instant::now() - Duration::from_secs(3600)),
-        );
+        mux.lost_turn_probe
+            .get_mut(&main)
+            .unwrap()
+            .age_out_quiescence();
         mux.poll_lost_turns();
         assert_eq!(
             mux.panels().iter().find(|p| p.id == main).unwrap().state(),
@@ -4943,11 +4966,11 @@ mod tests {
         assert_ne!(menu, perm, "a menu and a yes/no prompt must not collide");
     }
 
-    /// `panel_blocked_prompt` glues the grid rows to the scanners: a `[y/n]`
+    /// `scan_panel_screen` glues the grid rows to the scanners: a `[y/n]`
     /// prompt rendered into a live panel's grid is detected as a `Permission`
     /// blocker (the grid → `row_text` → `scan_yes_no_prompt` path end to end).
     #[tokio::test]
-    async fn panel_blocked_prompt_detects_a_live_yes_no_prompt() {
+    async fn scan_panel_screen_detects_a_live_yes_no_prompt() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let pid = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
@@ -4958,7 +4981,7 @@ mod tests {
             .grid
             .advance(b"Building project...\r\nContinue? [y/N]");
 
-        match Multiplexer::panel_blocked_prompt(panel) {
+        match Multiplexer::scan_panel_screen(panel, None).blocked {
             Some(BlockedPrompt::Permission(line)) => assert!(
                 line.contains("[y/N]"),
                 "the detected prompt line must be the y/n line: {line:?}"
@@ -5577,8 +5600,16 @@ Enter to select - up/down to navigate - Esc to cancel";
             .generation();
 
         let sentinel = BlockedPrompt::Permission("Continue? [y/N]".into());
-        mux.blocked_scan_cache
-            .insert(pid, (generation, Some(sentinel.clone())));
+        mux.screen_scan_cache.insert(
+            pid,
+            (
+                generation,
+                ScreenScan {
+                    blocked: Some(sentinel.clone()),
+                    activity: crate::term::ScreenActivity::Unknown,
+                },
+            ),
+        );
 
         // Same generation → cache hit → the sentinel, no re-scan.
         assert_eq!(
@@ -5591,7 +5622,7 @@ Enter to select - up/down to navigate - Esc to cancel";
         // cache is refreshed to the new generation.
         assert!(mux.panel_blocked_cached(pid, generation + 1).is_none());
         assert_eq!(
-            mux.blocked_scan_cache.get(&pid).map(|(g, _)| *g),
+            mux.screen_scan_cache.get(&pid).map(|(g, _)| *g),
             Some(generation + 1),
             "the cache must track the latest generation it scanned"
         );
@@ -5599,19 +5630,28 @@ Enter to select - up/down to navigate - Esc to cancel";
         mux.shutdown();
     }
 
-    /// A killed panel's blocked-scan cache entry is pruned, so the cache cannot
+    /// A killed panel's screen-scan cache entry is pruned, so the cache cannot
     /// grow with dead-panel ids over a long session.
     #[tokio::test]
-    async fn kill_panel_prunes_the_blocked_scan_cache() {
+    async fn kill_panel_prunes_the_screen_scan_cache() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let pid = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
-        mux.blocked_scan_cache.insert(pid, (0, None));
+        mux.screen_scan_cache.insert(
+            pid,
+            (
+                0,
+                ScreenScan {
+                    blocked: None,
+                    activity: crate::term::ScreenActivity::Unknown,
+                },
+            ),
+        );
 
         mux.kill_panel(pid).unwrap();
         assert!(
-            !mux.blocked_scan_cache.contains_key(&pid),
-            "killing a panel must drop its blocked-scan cache entry"
+            !mux.screen_scan_cache.contains_key(&pid),
+            "killing a panel must drop its screen-scan cache entry"
         );
 
         mux.shutdown();
