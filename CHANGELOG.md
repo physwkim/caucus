@@ -33,6 +33,11 @@ versions.
   against the grid generation. The loop time one `list_panels` request takes
   drops from ~30–55 µs to ~2–3 µs over one panel, and from ~70–155 µs to
   ~35–70 µs over 50.
+- **A burst of MCP tool calls no longer freezes the screen.** caucus answered
+  every queued control request in one loop turn, so 4096 queued
+  `list_panels` calls held input and drawing for 0.18–0.41 s; it now answers
+  at most 64 per turn and leaves the rest for the next one, and the longest
+  turn stays under 15 ms at any burst size.
 
 ## [0.11.0] — 2026-10-15
 

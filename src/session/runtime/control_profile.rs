@@ -1,8 +1,8 @@
-//! Loop stall from a burst of control-socket requests. `drain_control` runs
-//! every queued job inside one loop turn, so no input is read and no frame is
-//! drawn until the whole burst is answered. A sample sends `burst` real
-//! socket requests, waits until all of them sit in the job channel, then
-//! times the single `drain_control` call a loop turn would make.
+//! Loop stall from a burst of control-socket requests. No input is read and
+//! no frame is drawn while one `drain_control` call runs. A sample sends
+//! `burst` real socket requests, waits until all of them sit in the job
+//! channel, then calls `drain_control` once per loop turn until the channel
+//! is empty and keeps the longest single call.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -48,8 +48,8 @@ fn build(tmp: &TempDir, n: usize) -> (Multiplexer, ControlServer) {
     (mux, control)
 }
 
-/// Queue `burst` copies of `request` through the socket, then time the one
-/// drain that answers them all.
+/// Queue `burst` copies of `request` through the socket, then drain them the
+/// way successive loop turns would and return the longest single turn.
 async fn drain_once(
     mux: &mut Multiplexer,
     control: &mut ControlServer,
@@ -69,9 +69,12 @@ async fn drain_once(
         assert!(Instant::now() < deadline, "the burst never fully queued");
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    let start = Instant::now();
-    mux.drain_control(control);
-    let stall = start.elapsed();
+    let mut stall = Duration::ZERO;
+    while !control.jobs().is_empty() {
+        let start = Instant::now();
+        mux.drain_control(control);
+        stall = stall.max(start.elapsed());
+    }
     for client in clients {
         client.await.unwrap().unwrap();
     }
@@ -81,10 +84,10 @@ async fn drain_once(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "profile: cargo test --release --lib control_profile -- --ignored --nocapture --test-threads=1"]
 async fn control_profile() {
-    println!("control_profile: median of {SAMPLES} bursts, one drain_control each");
+    println!("control_profile: longest drain_control turn, median of {SAMPLES} bursts");
     println!(
-        "{:<12} {:>6} {:>6} {:>10} {:>10} {:>9}",
-        "request", "panels", "burst", "stall_ms", "max_ms", "us/job"
+        "{:<12} {:>6} {:>6} {:>10} {:>10}",
+        "request", "panels", "burst", "stall_ms", "max_ms"
     );
     for n in PANEL_COUNTS {
         let tmp = TempDir::new().unwrap();
@@ -108,13 +111,12 @@ async fn control_profile() {
                 }
                 let s = Summary::of(&mut samples);
                 println!(
-                    "{:<12} {:>6} {:>6} {:>10.2} {:>10.2} {:>9.1}",
+                    "{:<12} {:>6} {:>6} {:>10.2} {:>10.2}",
                     name,
                     n,
                     burst,
                     s.median.as_secs_f64() * 1e3,
-                    s.max.as_secs_f64() * 1e3,
-                    s.median.as_secs_f64() * 1e6 / burst as f64
+                    s.max.as_secs_f64() * 1e3
                 );
             }
         }

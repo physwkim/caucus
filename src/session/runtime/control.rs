@@ -4,6 +4,11 @@ use crate::mcp::protocol::{ControlRequest, ControlResponse};
 use crate::mcp::{McpToolSurface, PanelSummary};
 use crate::session::id::PanelId;
 
+/// Most control jobs one [`Multiplexer::drain_control`] call executes. A
+/// burst larger than this is answered over several loop turns, so input,
+/// the PTY pump and the frame keep running while it drains.
+pub(super) const CONTROL_DRAIN_LIMIT: usize = 64;
+
 impl Multiplexer {
     /// Execute one queued [`ControlRequest`] against the live panels and
     /// produce its [`ControlResponse`] (`docs/design.md` §0 #4).
@@ -94,10 +99,11 @@ impl Multiplexer {
         }
     }
 
-    /// Drain every queued control job from `server`, execute it, and answer
-    /// each through its oneshot reply. Called once per event-loop tick — the
-    /// single point at which main worker MCP tool calls touch live panels, on
-    /// the same thread that pumps PTYs (Invariant I-5).
+    /// Execute up to [`CONTROL_DRAIN_LIMIT`] queued control jobs from
+    /// `server` in arrival order and answer each through its oneshot reply;
+    /// the rest wait for the next loop turn. Called once per event-loop tick
+    /// — the single point at which main worker MCP tool calls touch live
+    /// panels, on the same thread that pumps PTYs (Invariant I-5).
     ///
     /// Most requests are answered immediately via
     /// [`Multiplexer::execute_control`]. The one exception is
@@ -108,8 +114,10 @@ impl Multiplexer {
     /// non-blocking in a different way: it acks now and the round is delivered
     /// later by the caucus→main push in [`Multiplexer::poll_worker_watches`].
     pub fn drain_control(&mut self, server: &mut ControlServer) {
-        while let Ok(job) = server.jobs().try_recv() {
-            let ControlJob { request, reply } = job;
+        for _ in 0..CONTROL_DRAIN_LIMIT {
+            let Ok(ControlJob { request, reply }) = server.jobs().try_recv() else {
+                break;
+            };
             match request {
                 // Defer the worktree create off the event loop; the reply is
                 // moved into the pending entry and answered on completion.
@@ -205,6 +213,45 @@ mod tests {
                 matches!(resp, ControlResponse::Error { .. }),
                 "expected an error response for an unknown panel"
             );
+        }
+    }
+
+    /// A burst over [`CONTROL_DRAIN_LIMIT`] is answered in loop-turn-sized
+    /// batches: each drain answers at most the limit and leaves the rest
+    /// queued for the next turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_control_answers_at_most_the_limit_per_turn() {
+        use crate::mcp::control_client::roundtrip;
+        let tmp = TempDir::new().unwrap();
+        let session = Session::new("test", tmp.path().to_path_buf());
+        let config = Config::load(tmp.path()).unwrap();
+        let (mut mux, _signal, mut control) =
+            Multiplexer::new(session, config, area(), 'a', LaunchMode::Fresh).unwrap();
+        let sock = control.sock_path().to_path_buf();
+        let count = CONTROL_DRAIN_LIMIT * 2 + 1;
+        let clients: Vec<_> = (0..count)
+            .map(|_| {
+                let sock = sock.clone();
+                tokio::spawn(async move { roundtrip(&sock, &ControlRequest::ListPanels).await })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while control.jobs().len() < count {
+            assert!(std::time::Instant::now() < deadline, "burst never queued");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        let mut left = count;
+        while left > 0 {
+            mux.drain_control(&mut control);
+            left -= CONTROL_DRAIN_LIMIT.min(left);
+            assert_eq!(control.jobs().len(), left);
+        }
+        for client in clients {
+            assert!(matches!(
+                client.await.unwrap().unwrap(),
+                ControlResponse::Panels { .. }
+            ));
         }
     }
 
