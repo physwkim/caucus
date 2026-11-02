@@ -71,6 +71,25 @@ const CLAUDE_PROMPT_BOX_MENU: [&str; 5] = [
     "↑/↓ to navigate",
 ];
 
+/// Whether a Claude Code chooser (the folder-trust dialog, a menu in the
+/// prompt box) holds the input, so typed text and Enter would answer it: a
+/// chooser footer at the screen's foot with the `❯` cursor row above it.
+pub fn claude_dialog(lines: &[String]) -> bool {
+    let rows = trimmed_rows(lines);
+    let foot = bottom_non_empty(rows, 3);
+    let Some(footer) = foot.iter().rposition(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("enter to confirm")
+            || CLAUDE_PROMPT_BOX_MENU.iter().any(|n| lower.contains(n))
+    }) else {
+        return false;
+    };
+    let above = &rows[..rows.len() - foot.len() + footer];
+    bottom_non_empty(above, 12)
+        .iter()
+        .any(|line| line.trim_start().starts_with('❯'))
+}
+
 /// Classify a Claude Code screen. `lines` are the grid rows, trailing
 /// whitespace trimmed.
 pub fn claude_activity(lines: &[String], title: Option<&str>) -> ScreenActivity {
@@ -186,6 +205,13 @@ pub fn codex_title_thread(title: &str) -> Option<&str> {
         .find_iter(title)
         .last()
         .map(|m| m.as_str())
+}
+
+/// Whether a codex startup dialog (directory trust, update chooser) holds the
+/// input, so typed text and Enter would answer it.
+pub fn codex_dialog(lines: &[String]) -> bool {
+    let rows = trimmed_rows(lines);
+    codex_trust_dialog(rows) || codex_update_dialog(rows)
 }
 
 /// Classify a codex screen. `lines` are the grid rows, trailing whitespace
@@ -410,6 +436,29 @@ mod tests {
         );
     }
 
+    /// Claude Code 2.1.316's folder-trust dialog, captured live: "No, exit" is
+    /// the default, so a pushed line plus Enter quits the agent.
+    #[test]
+    fn claude_trust_dialog_and_prompt_box_menu_are_dialogs() {
+        let trust = rows(&format!(
+            "{RULE}\n Accessing workspace:\n /repo\n\n Quick safety check: Is this a project you created or one you trust?\n\n Security guide\n\n ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel\n\n\n"
+        ));
+        assert!(claude_dialog(&trust));
+        let menu = rows(&format!(
+            "question\n{RULE}\n❯ 1. Yes\n  2. No\nEnter to select · Esc to cancel\n{RULE}\n"
+        ));
+        assert!(claude_dialog(&menu));
+    }
+
+    #[test]
+    fn claude_idle_prompt_is_not_a_dialog() {
+        let idle = claude_screen(
+            "❯ [caucus] panel finished\n● Esc to cancel stops the dialog.",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        );
+        assert!(!claude_dialog(&idle));
+    }
+
     #[test]
     fn claude_menu_in_the_prompt_box_is_not_idle() {
         let screen = rows(&format!(
@@ -528,6 +577,19 @@ mod tests {
         LazyLock::force(&CODEX_UPDATE_PICKER);
         LazyLock::force(&CODEX_SPARKLE_PROMPT);
         LazyLock::force(&CODEX_TITLE_THREAD);
+    }
+
+    #[test]
+    fn codex_trust_and_update_choosers_are_dialogs() {
+        let trust = rows(
+            "> You are in /repo\n\n  Do you trust the contents of this directory?\n\n› 1. Yes, continue\n  2. No, quit\n",
+        );
+        assert!(codex_dialog(&trust));
+        let update = rows(
+            "  Update available · 0.162.0 -> 0.163.0\n\n› 1. Update now\n  2. Skip\n\n  enter continue · esc skip\n",
+        );
+        assert!(codex_dialog(&update));
+        assert!(!codex_dialog(&codex_screen("• done")));
     }
 
     #[test]

@@ -1131,6 +1131,7 @@ mod tests {
                 rounds::ScreenScan {
                     blocked: Some(rounds::BlockedPrompt::Selection(menu)),
                     activity: crate::term::ScreenActivity::Unknown,
+                    dialog: false,
                 },
             ),
         );

@@ -269,6 +269,7 @@ mod tests {
                         0,
                     ))),
                     activity: crate::term::ScreenActivity::Unknown,
+                    dialog: false,
                 },
             ),
         );

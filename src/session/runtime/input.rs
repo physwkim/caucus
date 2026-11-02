@@ -1880,6 +1880,7 @@ mod tests {
                 ScreenScan {
                     blocked: Some(prompt),
                     activity: ScreenActivity::Unknown,
+                    dialog: false,
                 },
             ),
         );

@@ -207,11 +207,13 @@ pub(crate) enum BlockedPrompt {
 
 /// One read of a panel's rendered screen, cached per grid generation by
 /// [`Multiplexer::panel_screen_cached`]: the prompt it is blocked on, if any,
-/// and whether the agent's turn is visibly running.
+/// whether the agent's turn is visibly running, and whether a CLI dialog
+/// holds the input (typed text and Enter would answer it).
 #[derive(Debug, Clone)]
 pub(crate) struct ScreenScan {
     pub(crate) blocked: Option<BlockedPrompt>,
     pub(crate) activity: crate::term::ScreenActivity,
+    pub(crate) dialog: bool,
 }
 
 impl BlockedPrompt {
@@ -1334,21 +1336,34 @@ impl Multiplexer {
     }
 
     /// Whether a caucus→main push may land *this tick*: the main panel exists,
-    /// is coarse `Idle`, and has no un-submitted human keystroke within
-    /// `COMPOSE_GRACE` (so the user is not mid-compose). The single gate shared
-    /// by both push paths — round completion
-    /// ([`Multiplexer::poll_worker_watches`]) and selection prompts
-    /// ([`Multiplexer::poll_round_blocked_panels`]). Each push flips the main
-    /// panel to `Working`, closing the gate for the rest of the tick, so at most
-    /// one push of either kind lands per tick.
-    fn main_deliverable(&self) -> bool {
-        let main_idle = self.main_panel_id.is_some_and(|id| {
-            self.panels
-                .iter()
-                .find(|p| p.id == id)
-                .is_some_and(|p| p.state() == PanelState::Idle)
-        });
-        main_idle && self.main_compose_quiet()
+    /// is coarse `Idle`, has no un-submitted human keystroke within
+    /// `COMPOSE_GRACE` (so the user is not mid-compose), and its screen shows
+    /// no prompt or dialog that would take the pushed text and Enter as its
+    /// answer. The single gate shared by every push path — round completion
+    /// ([`Multiplexer::poll_worker_watches`]), selection prompts
+    /// ([`Multiplexer::poll_round_blocked_panels`]), notices and nudges. Each
+    /// push flips the main panel to `Working`, closing the gate for the rest
+    /// of the tick, so at most one push of any kind lands per tick.
+    ///
+    /// The screen check is not redundant with `Idle`: a panel leaves
+    /// `Spawning` once its CLI enables bracketed paste, which Claude Code's
+    /// folder-trust dialog already does, and "No, exit" is its default.
+    fn main_deliverable(&mut self) -> bool {
+        let Some(id) = self.main_panel_id else {
+            return false;
+        };
+        let Some(generation) = self
+            .panels
+            .iter()
+            .find(|p| p.id == id && p.state() == PanelState::Idle)
+            .map(|p| p.grid().generation())
+        else {
+            return false;
+        };
+        self.main_compose_quiet()
+            && self
+                .panel_screen_cached(id, generation)
+                .is_some_and(|scan| scan.blocked.is_none() && !scan.dialog)
     }
 
     /// Whether no un-submitted human keystroke is holding the main panel
@@ -2121,12 +2136,22 @@ impl Multiplexer {
             None => crate::term::scan_yes_no_prompt(&lines).map(BlockedPrompt::Permission),
         };
         let title = panel.grid().title();
-        let activity = match cli {
-            Some(AgentCli::Claude) => crate::term::claude_activity(&lines, title),
-            Some(AgentCli::Codex) => crate::term::codex_activity(&lines, title),
-            None => crate::term::ScreenActivity::Unknown,
+        let (activity, dialog) = match cli {
+            Some(AgentCli::Claude) => (
+                crate::term::claude_activity(&lines, title),
+                crate::term::claude_dialog(&lines),
+            ),
+            Some(AgentCli::Codex) => (
+                crate::term::codex_activity(&lines, title),
+                crate::term::codex_dialog(&lines),
+            ),
+            None => (crate::term::ScreenActivity::Unknown, false),
         };
-        ScreenScan { blocked, activity }
+        ScreenScan {
+            blocked,
+            activity,
+            dialog,
+        }
     }
 
     /// [`Multiplexer::scan_panel_screen`] gated by the panel's grid
@@ -4541,6 +4566,47 @@ mod tests {
         mux.shutdown();
     }
 
+    /// Claude Code's folder-trust dialog enables bracketed paste, so main is
+    /// `Idle` on it, and its default is "No, exit": a push there quits main.
+    /// Every push waits until main's screen shows its prompt again.
+    #[tokio::test]
+    async fn no_push_lands_on_a_main_showing_a_dialog() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let mf = AgentManifest::new(mux.session.id, main, "main", "main", AgentCli::Claude, None);
+        mux.manifests.insert(main, mf);
+        let draw = |mux: &mut Multiplexer, screen: &str| {
+            let panel = mux.panels.iter_mut().find(|p| p.id == main).unwrap();
+            panel
+                .grid
+                .advance(format!("\x1b[2J\x1b[H{}", screen.replace('\n', "\r\n")).as_bytes());
+        };
+        draw(
+            &mut mux,
+            "Quick safety check: Is this a project you trust?\n\n❯ No, exit\n  Yes, I trust this folder\n\nEnter to confirm · Esc to cancel",
+        );
+        push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle
+        );
+        assert!(mux.main_stranded_last_nudge.is_none());
+
+        draw(&mut mux, "● ok\n────────\n❯ \n────────\n  ? for shortcuts");
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working
+        );
+        mux.shutdown();
+    }
+
     /// A queued question notice is injected into an idle main — which flips
     /// it `Working` (the injected turn), closing the deliverability gate: at
     /// most one notice lands per tick, the rest stay queued.
@@ -5879,6 +5945,7 @@ Enter to select - up/down to navigate - Esc to cancel";
                 ScreenScan {
                     blocked: Some(sentinel.clone()),
                     activity: crate::term::ScreenActivity::Unknown,
+                    dialog: false,
                 },
             ),
         );
@@ -5916,6 +5983,7 @@ Enter to select - up/down to navigate - Esc to cancel";
                 ScreenScan {
                     blocked: None,
                     activity: crate::term::ScreenActivity::Unknown,
+                    dialog: false,
                 },
             ),
         );
