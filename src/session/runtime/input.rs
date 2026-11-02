@@ -38,13 +38,29 @@ const LOST_TURN_RECONCILE_QUIESCENCE: Duration = Duration::from_secs(20);
 /// between two live indicators.
 const SCREEN_IDLE_RECONCILE_HOLD: Duration = Duration::from_secs(1);
 
+/// How long after a prompt's submit reaches the PTY its panel may still show
+/// the idle prompt, with no live-turn indicator or blocked prompt in between,
+/// before [`Multiplexer::poll_lost_turns`] declares the prompt stalled. Both
+/// CLIs paint their live indicator within a frame of accepting a prompt, so
+/// this is herdr's `agent_prompt_stalled` window, not a model-latency budget.
+const PROMPT_EFFECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// What a `Working` panel's screen has shown during its current `Working`
 /// phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenTrack {
-    /// No live-turn indicator yet: an idle prompt may be the one the submitted
-    /// prompt has not left, or a hookless local command that never runs a
-    /// turn. Only grid quiescence can reconcile it.
+    /// A prompt opened this phase and its submitting `\r` is still held back
+    /// ([`Multiplexer::poll_pending_submits`]): the agent has not been asked
+    /// to start anything yet.
+    AwaitingSubmit,
+    /// The prompt's submit reached the PTY at this instant and nothing has
+    /// shown since. An idle prompt [`PROMPT_EFFECT_TIMEOUT`] later means the
+    /// prompt stalled.
+    AwaitingEffect(Instant),
+    /// No live-turn indicator yet, and the phase did not start at a submit
+    /// caucus timed (a turn resumed past a blocked prompt): an idle prompt may
+    /// be a hookless local command that never runs a turn. Only grid
+    /// quiescence can reconcile it.
     Unconfirmed,
     /// A live-turn indicator was seen: the turn really ran.
     Live,
@@ -64,20 +80,36 @@ pub(super) struct LostTurnProbe {
     screen: ScreenTrack,
 }
 
+/// Why [`Multiplexer::poll_lost_turns`] closes a `Working` panel no turn
+/// signal ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LostTurn {
+    /// The turn ran, or may have, and its Stop never came.
+    Unsignalled,
+    /// The submitted prompt never started a turn.
+    Stalled,
+}
+
 impl LostTurnProbe {
-    fn new(generation: u64, now: Instant) -> Self {
+    fn new(generation: u64, now: Instant, screen: ScreenTrack) -> Self {
         Self {
             generation,
             since: now,
-            screen: ScreenTrack::Unconfirmed,
+            screen,
         }
     }
 
-    /// Fold one tick's observation in. Returns `true` once the turn is lost:
-    /// the grid has been unchanged past [`LOST_TURN_RECONCILE_QUIESCENCE`], or
-    /// a turn that visibly ran has shown its idle prompt for
-    /// [`SCREEN_IDLE_RECONCILE_HOLD`].
-    fn observe(&mut self, generation: u64, activity: ScreenActivity, now: Instant) -> bool {
+    /// Fold one tick's observation in. Returns the loss once the turn is
+    /// lost: a submit followed by [`PROMPT_EFFECT_TIMEOUT`] of no live
+    /// indicator ending on the idle prompt stalled; otherwise the grid has
+    /// been unchanged past [`LOST_TURN_RECONCILE_QUIESCENCE`], or a turn that
+    /// visibly ran has shown its idle prompt for [`SCREEN_IDLE_RECONCILE_HOLD`].
+    fn observe(
+        &mut self,
+        generation: u64,
+        activity: ScreenActivity,
+        now: Instant,
+    ) -> Option<LostTurn> {
         if generation != self.generation {
             self.generation = generation;
             self.since = now;
@@ -88,9 +120,16 @@ impl LostTurnProbe {
             (ScreenTrack::IdleSince(_), ScreenActivity::Unknown) => ScreenTrack::Live,
             (track, _) => track,
         };
-        now.duration_since(self.since) >= LOST_TURN_RECONCILE_QUIESCENCE
+        if matches!(self.screen, ScreenTrack::AwaitingEffect(submit)
+            if activity == ScreenActivity::Idle
+                && now.duration_since(submit) >= PROMPT_EFFECT_TIMEOUT)
+        {
+            return Some(LostTurn::Stalled);
+        }
+        (now.duration_since(self.since) >= LOST_TURN_RECONCILE_QUIESCENCE
             || matches!(self.screen, ScreenTrack::IdleSince(idle)
-                if now.duration_since(idle) >= SCREEN_IDLE_RECONCILE_HOLD)
+                if now.duration_since(idle) >= SCREEN_IDLE_RECONCILE_HOLD))
+        .then_some(LostTurn::Unsignalled)
     }
 }
 
@@ -618,7 +657,7 @@ impl Multiplexer {
             .filter(|p| p.state() == PanelState::Working)
             .map(|p| (p.id, p.grid().generation()))
             .collect();
-        let mut due: Vec<PanelId> = Vec::new();
+        let mut due: Vec<(PanelId, LostTurn)> = Vec::new();
         for (id, generation) in working {
             // This runs every tick, so only through the generation cache.
             let Some(scan) = self.panel_screen_cached(id, generation) else {
@@ -632,9 +671,9 @@ impl Multiplexer {
             let probe = self
                 .lost_turn_probe
                 .entry(id)
-                .or_insert_with(|| LostTurnProbe::new(generation, now));
-            if probe.observe(generation, activity, now) {
-                due.push(id);
+                .or_insert_with(|| LostTurnProbe::new(generation, now, ScreenTrack::Unconfirmed));
+            if let Some(loss) = probe.observe(generation, activity, now) {
+                due.push((id, loss));
             }
         }
         // Drop probes for panels that left `Working` between ticks (a real
@@ -644,8 +683,18 @@ impl Multiplexer {
                 .iter()
                 .any(|p| p.id == *id && p.state() == PanelState::Working)
         });
-        for id in due {
-            self.reconcile_lost_turn(id);
+        for (id, loss) in due {
+            self.reconcile_lost_turn(id, loss);
+        }
+    }
+
+    /// The deferred submitting `\r` of `panel`'s prompt reached the PTY
+    /// ([`Multiplexer::poll_pending_submits`]): start its prompt-effect clock.
+    pub(super) fn note_submit_written(&mut self, panel: PanelId) {
+        if let Some(probe) = self.lost_turn_probe.get_mut(&panel)
+            && probe.screen == ScreenTrack::AwaitingSubmit
+        {
+            probe.screen = ScreenTrack::AwaitingEffect(Instant::now());
         }
     }
 
@@ -656,8 +705,9 @@ impl Multiplexer {
     /// produce a Stop; a genuinely-queued later prompt is treated as a fresh
     /// turn), flip `Working -> Idle`, and record `TurnReconciled` so
     /// `derived_state` follows in lockstep (Invariant I-2) without the timeline
-    /// claiming a turn completed.
-    fn reconcile_lost_turn(&mut self, panel_id: PanelId) {
+    /// claiming a turn completed. A stalled prompt records `PromptStalled`
+    /// instead, which the watch delivery reports as such.
+    fn reconcile_lost_turn(&mut self, panel_id: PanelId, loss: LostTurn) {
         self.lost_turn_probe.remove(&panel_id);
         self.outstanding_prompts.remove(&panel_id);
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
@@ -668,12 +718,25 @@ impl Multiplexer {
         }
         panel.end_turn();
         let _ = lifecycle::transition(panel, PanelState::Idle);
-        warn!(
-            panel = %panel_id,
-            "reconciled a lost turn signal: panel idle at a static prompt, no Stop hook fired"
-        );
+        let record = match loss {
+            LostTurn::Unsignalled => {
+                warn!(
+                    panel = %panel_id,
+                    "reconciled a lost turn signal: panel idle at a static prompt, no Stop hook fired"
+                );
+                manifest::record_turn_reconciled
+            }
+            LostTurn::Stalled => {
+                warn!(
+                    panel = %panel_id,
+                    timeout_ms = PROMPT_EFFECT_TIMEOUT.as_millis() as u64,
+                    "prompt stalled: no working or blocked state observed after the submit"
+                );
+                manifest::record_prompt_stalled
+            }
+        };
         if let Some(manifest) = self.manifests.get_mut(&panel_id)
-            && let Err(err) = manifest::record_turn_reconciled(manifest, &self.session.root_dir)
+            && let Err(err) = record(manifest, &self.session.root_dir)
         {
             warn!(panel = %panel_id, error = %err, "lost-turn reconcile manifest write failed");
         }
@@ -878,11 +941,20 @@ impl Multiplexer {
             return;
         };
         panel.begin_turn();
-        match panel.state() {
-            PanelState::Spawning | PanelState::Idle => {
-                let _ = lifecycle::transition(panel, PanelState::Working);
-            }
-            _ => {}
+        let opened = matches!(panel.state(), PanelState::Spawning | PanelState::Idle);
+        if opened {
+            let _ = lifecycle::transition(panel, PanelState::Working);
+            // The phase starts at this submit, so its effect is timed: from
+            // now when the `\r` went inline, from the deferred write otherwise.
+            let generation = panel.grid().generation();
+            let now = Instant::now();
+            let screen = if self.submit_pending(panel_id) {
+                ScreenTrack::AwaitingSubmit
+            } else {
+                ScreenTrack::AwaitingEffect(now)
+            };
+            self.lost_turn_probe
+                .insert(panel_id, LostTurnProbe::new(generation, now, screen));
         }
         // This is the only `Idle -> Working` path, so it is where a delivered
         // prompt becomes a fact — the timeline's `PromptDelivered` is written
@@ -1499,6 +1571,26 @@ mod tests {
         }
     }
 
+    impl Multiplexer {
+        /// `panel`'s prompt-effect phase: `Some(false)` while its submit is
+        /// held back, `Some(true)` once the effect clock runs, `None` outside
+        /// either.
+        pub(crate) fn prompt_effect_armed(&self, panel: PanelId) -> Option<bool> {
+            match self.lost_turn_probe.get(&panel)?.screen {
+                ScreenTrack::AwaitingSubmit => Some(false),
+                ScreenTrack::AwaitingEffect(_) => Some(true),
+                _ => None,
+            }
+        }
+
+        /// Backdate `panel`'s running prompt-effect clock past its window.
+        pub(crate) fn age_out_prompt_effect(&mut self, panel: PanelId) {
+            let probe = self.lost_turn_probe.get_mut(&panel).unwrap();
+            assert!(matches!(probe.screen, ScreenTrack::AwaitingEffect(_)));
+            probe.screen = ScreenTrack::AwaitingEffect(Instant::now() - PROMPT_EFFECT_TIMEOUT);
+        }
+    }
+
     /// Backdate a panel's lost-turn probe so its quiescence window has already
     /// elapsed, as if the grid had been unchanged since before now. Requires an
     /// entry to already exist (one `poll_lost_turns` seeds it).
@@ -1645,7 +1737,7 @@ mod tests {
             .unwrap()
             .grid()
             .generation();
-        let mut probe = LostTurnProbe::new(generation, Instant::now());
+        let mut probe = LostTurnProbe::new(generation, Instant::now(), ScreenTrack::Unconfirmed);
         probe.age_out_quiescence();
         mux.lost_turn_probe.insert(id, probe);
         mux.poll_lost_turns();
@@ -1709,34 +1801,43 @@ mod tests {
         let tick = Duration::from_millis(10);
 
         // Idle before any live indicator: only quiescence could reconcile.
-        let mut p = LostTurnProbe::new(0, t0);
-        assert!(!p.observe(1, Idle, t0));
-        assert!(!p.observe(1, Idle, t0 + hold * 5));
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::Unconfirmed);
+        assert_eq!(p.observe(1, Idle, t0), None);
+        assert_eq!(p.observe(1, Idle, t0 + hold * 5), None);
         assert_eq!(p.screen, ScreenTrack::Unconfirmed);
 
         // Live, then idle: not before the hold, yes at it.
-        let mut p = LostTurnProbe::new(0, t0);
-        assert!(!p.observe(1, Working, t0));
-        assert!(!p.observe(2, Idle, t0 + tick));
-        assert!(!p.observe(3, Idle, t0 + tick + hold - tick));
-        assert!(p.observe(3, Idle, t0 + tick + hold));
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::Unconfirmed);
+        assert_eq!(p.observe(1, Working, t0), None);
+        assert_eq!(p.observe(2, Idle, t0 + tick), None);
+        assert_eq!(p.observe(3, Idle, t0 + tick + hold - tick), None);
+        assert_eq!(
+            p.observe(3, Idle, t0 + tick + hold),
+            Some(LostTurn::Unsignalled)
+        );
 
         // A live indicator during the hold restarts it.
-        let mut p = LostTurnProbe::new(0, t0);
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::Unconfirmed);
         p.observe(1, Working, t0);
         p.observe(2, Idle, t0 + tick);
         p.observe(3, Working, t0 + hold / 2);
-        assert!(!p.observe(4, Idle, t0 + hold + tick));
-        assert!(p.observe(4, Idle, t0 + hold + tick + hold));
+        assert_eq!(p.observe(4, Idle, t0 + hold + tick), None);
+        assert_eq!(
+            p.observe(4, Idle, t0 + hold + tick + hold),
+            Some(LostTurn::Unsignalled)
+        );
 
         // An unknown frame breaks continuity but keeps the live evidence.
-        let mut p = LostTurnProbe::new(0, t0);
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::Unconfirmed);
         p.observe(1, Working, t0);
         p.observe(2, Idle, t0 + tick);
         p.observe(3, Unknown, t0 + hold / 2);
         assert_eq!(p.screen, ScreenTrack::Live);
-        assert!(!p.observe(4, Idle, t0 + hold + tick));
-        assert!(p.observe(4, Idle, t0 + hold + tick + hold));
+        assert_eq!(p.observe(4, Idle, t0 + hold + tick), None);
+        assert_eq!(
+            p.observe(4, Idle, t0 + hold + tick + hold),
+            Some(LostTurn::Unsignalled)
+        );
     }
 
     /// Quiescence still reconciles whatever the screen showed: a live
@@ -1750,13 +1851,17 @@ mod tests {
             ScreenActivity::Idle,
             ScreenActivity::Unknown,
         ] {
-            let mut p = LostTurnProbe::new(7, t0);
-            assert!(!p.observe(7, activity, t0), "{activity:?}");
-            assert!(p.observe(7, activity, late), "{activity:?}");
+            let mut p = LostTurnProbe::new(7, t0, ScreenTrack::Unconfirmed);
+            assert_eq!(p.observe(7, activity, t0), None, "{activity:?}");
+            assert_eq!(
+                p.observe(7, activity, late),
+                Some(LostTurn::Unsignalled),
+                "{activity:?}"
+            );
         }
-        let mut p = LostTurnProbe::new(7, t0);
+        let mut p = LostTurnProbe::new(7, t0, ScreenTrack::Unconfirmed);
         assert!(
-            !p.observe(8, ScreenActivity::Unknown, late),
+            p.observe(8, ScreenActivity::Unknown, late).is_none(),
             "a new generation restarts the clock"
         );
     }
@@ -1805,9 +1910,9 @@ mod tests {
         mux.shutdown();
     }
 
-    /// An idle prompt with no live indicator seen this phase is left to the
-    /// quiescence window: Enter may not have landed yet, or a hookless local
-    /// command ran no turn.
+    /// Within [`PROMPT_EFFECT_TIMEOUT`] of the submit, an idle prompt never
+    /// seen working is left alone: the agent may not have painted its first
+    /// live frame yet.
     #[tokio::test]
     async fn poll_lost_turns_does_not_trust_an_idle_screen_never_seen_working() {
         let tmp = TempDir::new().unwrap();
@@ -1818,9 +1923,74 @@ mod tests {
         mux.poll_lost_turns();
         mux.lost_turn_probe.get_mut(&id).unwrap().since = Instant::now();
         mux.poll_lost_turns();
-        assert_eq!(mux.lost_turn_probe[&id].screen, ScreenTrack::Unconfirmed);
+        assert_eq!(mux.prompt_effect_armed(id), Some(true));
         assert_eq!(panel_state(&mux, id), PanelState::Working);
         mux.shutdown();
+    }
+
+    /// Past [`PROMPT_EFFECT_TIMEOUT`], that idle prompt is a stalled prompt:
+    /// the panel settles and the timeline records `PromptStalled`, not a
+    /// reconciled turn, so the watch can say the prompt never ran.
+    #[tokio::test]
+    async fn poll_lost_turns_closes_a_stalled_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+
+        paint(&mut mux, id, CLAUDE_IDLE);
+        mux.age_out_prompt_effect(id);
+        mux.poll_lost_turns();
+
+        assert_eq!(panel_state(&mux, id), PanelState::Idle);
+        assert!(!mux.lost_turn_probe.contains_key(&id));
+        assert!(!mux.outstanding_prompts.contains_key(&id));
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        let kinds: Vec<_> = on_disk.lane_events().iter().map(|e| &e.kind).collect();
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, LaneEventKind::PromptStalled)),
+            "{kinds:?}"
+        );
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| matches!(k, LaneEventKind::TurnReconciled)),
+            "{kinds:?}"
+        );
+        mux.shutdown();
+    }
+
+    /// The prompt-effect rule's boundaries, one per transition: an idle
+    /// prompt stalls at [`PROMPT_EFFECT_TIMEOUT`] after the submit, not before;
+    /// a live indicator or no idle evidence (an unknown frame) never stalls;
+    /// and a held-back submit is not timed at all.
+    #[test]
+    fn lost_turn_probe_prompt_effect_boundaries() {
+        use ScreenActivity::{Idle, Unknown, Working};
+        let t0 = Instant::now();
+        let window = PROMPT_EFFECT_TIMEOUT;
+        let tick = Duration::from_millis(10);
+        let effect = ScreenTrack::AwaitingEffect(t0);
+
+        let mut p = LostTurnProbe::new(0, t0, effect);
+        assert_eq!(p.observe(0, Idle, t0 + window - tick), None);
+        assert_eq!(p.observe(0, Idle, t0 + window), Some(LostTurn::Stalled));
+
+        // A live frame is the effect: from then on the screen-idle hold rules.
+        let mut p = LostTurnProbe::new(0, t0, effect);
+        assert_eq!(p.observe(1, Working, t0 + tick), None);
+        assert_eq!(p.observe(2, Idle, t0 + window), None);
+        assert!(matches!(p.screen, ScreenTrack::IdleSince(_)));
+
+        // No idle evidence, no stall: the clock waits for an idle frame.
+        let mut p = LostTurnProbe::new(0, t0, effect);
+        assert_eq!(p.observe(1, Unknown, t0 + window * 2), None);
+        assert_eq!(p.observe(2, Idle, t0 + window * 2), Some(LostTurn::Stalled));
+
+        // A submit still held back is never timed.
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::AwaitingSubmit);
+        assert_eq!(p.observe(0, Idle, t0 + window * 2), None);
     }
 
     /// An `Idle` panel carries no phantom turn: `poll_lost_turns` never touches

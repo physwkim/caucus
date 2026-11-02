@@ -482,13 +482,20 @@ impl Multiplexer {
                 still_pending.push(s);
                 continue;
             }
-            if let Some(p) = self.panels.iter_mut().find(|p| p.id == s.panel)
-                && let Err(e) = p.write_input(b"\r")
-            {
-                warn!(panel = %s.panel, error = %e, "deferred submit write failed");
+            let Some(p) = self.panels.iter_mut().find(|p| p.id == s.panel) else {
+                continue;
+            };
+            match p.write_input(b"\r") {
+                Ok(()) => self.note_submit_written(s.panel),
+                Err(e) => warn!(panel = %s.panel, error = %e, "deferred submit write failed"),
             }
         }
         self.pending_submits = still_pending;
+    }
+
+    /// Whether `panel` has a submitting `\r` still held back.
+    pub(crate) fn submit_pending(&self, panel: PanelId) -> bool {
+        self.pending_submits.iter().any(|s| s.panel == panel)
     }
 
     /// Render a panel's turn at absolute `index` for the `turn` read mode.
@@ -703,6 +710,30 @@ mod tests {
             "the due submit is flushed/dropped, the not-yet-due one stays"
         );
         assert_eq!(mux.pending_submits[0].panel, pending_panel);
+    }
+
+    /// A prompt's effect clock starts when its deferred `\r` reaches the
+    /// PTY, not when the paste was typed.
+    #[tokio::test]
+    async fn a_deferred_submit_starts_the_prompt_effect_clock() {
+        use crate::panel::lifecycle::PanelState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Idle);
+        mux.pending_submits.push(PendingSubmit {
+            panel: id,
+            due: Instant::now() + Duration::from_secs(60),
+        });
+        mux.note_prompt_delivered(id);
+        assert_eq!(mux.prompt_effect_armed(id), Some(false));
+
+        mux.poll_pending_submits();
+        assert_eq!(mux.prompt_effect_armed(id), Some(false), "not yet due");
+
+        mux.pending_submits[0].due = Instant::now() - Duration::from_millis(1);
+        mux.poll_pending_submits();
+        assert_eq!(mux.prompt_effect_armed(id), Some(true));
+        mux.shutdown();
     }
 
     /// `menu_nav_bytes` emits the right count + direction of arrow keys, then

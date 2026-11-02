@@ -137,6 +137,18 @@ fn push_round_panel_footer(out: &mut String, c: &RoundPanelContribution) {
                 ));
             }
         }
+        PanelOutcome::Stalled {
+            pending_backlog, ..
+        } => {
+            out.push_str(
+                "⚠ the last prompt never started a turn and may still sit unsubmitted in the panel's input: send_keys with empty text and enter=true submits it, or clear the input before sending a new prompt.\n",
+            );
+            if *pending_backlog > 0 {
+                out.push_str(&format!(
+                    "⏳ {pending_backlog} queued task(s) were not run: the prompt stalled.\n"
+                ));
+            }
+        }
         PanelOutcome::Running {
             note,
             finished,
@@ -351,7 +363,7 @@ pub(super) struct WorkerWatch {
     /// would otherwise make [`Multiplexer::worker_contribution`] skip the
     /// finished panel's read and deliver it as "still working, no output
     /// captured".
-    settled: Option<PanelState>,
+    settled: Option<Settled>,
     /// Follow-up task queue. A watched panel that goes idle with a non-empty
     /// queue is fed its next task (popped front) by
     /// [`Multiplexer::poll_worker_watches`], flipping it back to `Working` — so a
@@ -403,6 +415,17 @@ pub(super) struct WorkerWatch {
     auto_answers: Vec<AutoAnswerRecord>,
 }
 
+/// What a watch latched when its panel settled ([`WorkerWatch::settled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// The panel ended its turn and settled in this state (`Idle` or
+    /// `Exited`).
+    In(PanelState),
+    /// The watched turn's prompt stalled (`PromptStalled`): the panel is
+    /// `Idle`, and the prompt may still sit unsubmitted in its input.
+    Stalled,
+}
+
 /// One round panel's contribution, collected once and rendered into both the
 /// full per-panel report ([`Multiplexer::assemble_watch_report`]) and the
 /// injected summary ([`Multiplexer::render_watch_summary`]) — so the two always
@@ -437,6 +460,12 @@ enum PanelOutcome {
     Running {
         note: Option<String>,
         finished: usize,
+        pending_backlog: usize,
+    },
+    /// Latched on a stalled prompt ([`Settled::Stalled`]): the turns of this
+    /// assignment that finished before it, and the queued tasks it held back.
+    Stalled {
+        bodies: Vec<String>,
         pending_backlog: usize,
     },
 }
@@ -677,6 +706,7 @@ impl Multiplexer {
         let backlog = w.backlog.len();
         let (role, state) = match self.panels.iter().find(|p| p.id == w.panel) {
             None => ("(gone)", "gone"),
+            Some(p) if w.settled == Some(Settled::Stalled) => (p.role.as_str(), "prompt stalled"),
             Some(p) if w.settled.is_some() => (p.role.as_str(), "settled"),
             // Not latched: either mid-turn, or idle with queued work left (the
             // owner poll feeds it its next task).
@@ -1166,6 +1196,17 @@ impl Multiplexer {
         if matches!(state, PanelState::Working | PanelState::Spawning) {
             return false;
         }
+        // A stalled prompt may still sit in the panel's input, so feeding the
+        // next task would submit both as one prompt: settle and let main decide.
+        if state == PanelState::Idle
+            && self
+                .manifests
+                .get(&w.panel)
+                .is_some_and(|m| m.prompt_stalled_since(w.turn_start))
+        {
+            w.settled = Some(Settled::Stalled);
+            return true;
+        }
         // `state` is `Idle` or `Exited` here, so this is exhaustive: an idle
         // panel with work left and time on the clock gets fed; everything else
         // settles. The queue's front is cloned, not popped — it is consumed only
@@ -1177,7 +1218,7 @@ impl Multiplexer {
 
         match feed {
             None => {
-                w.settled = Some(state);
+                w.settled = Some(Settled::In(state));
                 w.captured.extend(done);
                 true
             }
@@ -1719,9 +1760,16 @@ impl Multiplexer {
         let panel = self.panels.iter().find(|p| p.id == w.panel)?;
         let pending_backlog = w.backlog.len();
         let (state, outcome) = match w.settled {
-            Some(state) => (
+            Some(Settled::In(state)) => (
                 state,
                 PanelOutcome::Finished {
+                    bodies: w.captured.clone(),
+                    pending_backlog,
+                },
+            ),
+            Some(Settled::Stalled) => (
+                PanelState::Idle,
+                PanelOutcome::Stalled {
                     bodies: w.captured.clone(),
                     pending_backlog,
                 },
@@ -1761,7 +1809,7 @@ impl Multiplexer {
         // One output stays header-less, identical to the pre-backlog report;
         // two or more get `### task N` headers.
         let bodies: &[String] = match &c.outcome {
-            PanelOutcome::Finished { bodies, .. } => bodies,
+            PanelOutcome::Finished { bodies, .. } | PanelOutcome::Stalled { bodies, .. } => bodies,
             PanelOutcome::Running { .. } => &[],
         };
         let total = bodies.len();
@@ -1796,7 +1844,12 @@ impl Multiplexer {
         // Teaser: the panel's latest output, trimmed to the teaser budget — the
         // full text is in the report file. A running turn has none, and the
         // footer says so.
-        if let PanelOutcome::Finished { bodies, .. } = &c.outcome {
+        if let PanelOutcome::Stalled { bodies, .. } = &c.outcome {
+            out.push_str(&format!(
+                " · {} earlier output(s), in the full report\n",
+                bodies.len()
+            ));
+        } else if let PanelOutcome::Finished { bodies, .. } = &c.outcome {
             out.push_str(&format!(" · {} output(s)\n", bodies.len()));
             let latest = bodies.last().map(|b| b.trim()).unwrap_or("");
             if latest.is_empty() {
@@ -1822,6 +1875,8 @@ impl Multiplexer {
                 PanelOutcome::Finished { .. } => "finished",
                 PanelOutcome::Running { .. } =>
                     "forced out by the fallback deadline (turn still running, no result yet)",
+                PanelOutcome::Stalled { .. } =>
+                    "prompt stalled (no working or blocked state within 5 s of the submit)",
             }
         )
     }
@@ -2128,7 +2183,7 @@ mod tests {
         // A watch handed a captured body is one the owner poll would have
         // latched; mirror that so report-rendering tests see the same shape the
         // live path builds.
-        let settled = (!captured.is_empty()).then_some(PanelState::Idle);
+        let settled = (!captured.is_empty()).then_some(Settled::In(PanelState::Idle));
         WorkerWatch {
             panel,
             settled,
@@ -2400,7 +2455,7 @@ mod tests {
         mux.poll_worker_watches();
         assert_eq!(
             mux.watches[watch_of(&mux, worker)].settled,
-            Some(PanelState::Idle),
+            Some(Settled::In(PanelState::Idle)),
             "the queued prompt's own Stop settles the watch",
         );
         let panel = mux.panels.iter().find(|p| p.id == worker).unwrap();
@@ -3664,7 +3719,7 @@ mod tests {
         );
         assert_eq!(
             r.settled,
-            Some(PanelState::Idle),
+            Some(Settled::In(PanelState::Idle)),
             "the settle latch rides the re-keyed watch"
         );
         assert!(
@@ -4087,6 +4142,40 @@ mod tests {
             "the finished body comes once, with the final result: {report}",
         );
 
+        mux.shutdown();
+    }
+
+    /// A fed worker whose prompt stalls settles as stalled with the rest of
+    /// its queue unfed, and the report says the prompt never ran.
+    #[tokio::test]
+    async fn a_stalled_prompt_settles_the_watch_without_feeding_the_backlog() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (_main, sub) = worker_with_manifest(&mut mux);
+
+        let tasks = vec!["first".to_string(), "second".to_string()];
+        mux.queue_tasks(sub, tasks, None, Some(3600), None);
+        // Hold the push so the latched watch can be inspected.
+        mux.main_compose_since = Some(Instant::now());
+        mux.poll_worker_watches();
+        assert_eq!(mux.watches[watch_of(&mux, sub)].backlog, ["second"]);
+
+        let grid = &mut mux.panels.iter_mut().find(|p| p.id == sub).unwrap().grid;
+        grid.advance(b"\x1b[2J\x1b[H");
+        grid.advance(
+            "● hi\r\n──────────\r\n❯ \r\n──────────\r\n  ⏵⏵ bypass permissions on".as_bytes(),
+        );
+        mux.age_out_prompt_effect(sub);
+        mux.poll_lost_turns();
+        mux.poll_worker_watches();
+
+        let w = &mux.watches[watch_of(&mux, sub)];
+        assert_eq!(w.settled, Some(Settled::Stalled));
+        assert_eq!(w.backlog, ["second"], "a stalled prompt's queue is not fed");
+        let c = mux.worker_contribution(w).unwrap();
+        let report = mux.assemble_watch_report(w, &c);
+        assert!(report.contains("prompt stalled"), "{report}");
+        assert!(report.contains("1 queued task(s) were not run"), "{report}");
         mux.shutdown();
     }
 

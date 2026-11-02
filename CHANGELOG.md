@@ -21,8 +21,16 @@ versions.
   Code and codex detection: once a live-turn indicator has been seen, an idle
   prompt held for 1 s ends the turn. Live, a dropped Claude Stop or codex
   `notify` was reconciled 1.0–1.1 s after the agent finished, in 6 of 6 runs.
-  A panel never seen working still waits out the 20 s quiescence window, and
-  one stopped at a blocked prompt is still never reconciled.
+  A panel never seen working falls to the prompt-stall check below or the
+  20 s quiescence window, and one stopped at a blocked prompt is still never
+  reconciled.
+- **A prompt that never starts a turn is closed after 5 s.** When a panel
+  prompted from idle still shows its idle prompt 5 s after the submit reached
+  it, with no working or blocked screen in between, caucus ends the turn as
+  `prompt_stalled` (herdr's prompt-effect rule and timeout) instead of waiting
+  20 s. The watch report says the prompt may still sit unsubmitted in the
+  panel's input, and a stalled worker's queued tasks are not fed, since the
+  next paste would join the stuck one.
 
 ### Performance
 

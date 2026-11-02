@@ -168,7 +168,8 @@ impl AgentManifest {
     }
 
     /// Whether a turn ended at or after `mark` — a turn signal, a finished
-    /// local command, or a reconciled wedge: the three ways a turn closes.
+    /// local command, a reconciled wedge, or a stalled prompt: the four ways a
+    /// turn closes.
     pub fn turn_ended_since(&self, mark: TurnMark) -> bool {
         self.events_since(mark).iter().any(|e| {
             matches!(
@@ -176,8 +177,17 @@ impl AgentManifest {
                 LaneEventKind::TurnCompleted
                     | LaneEventKind::LocalCommandCompleted { .. }
                     | LaneEventKind::TurnReconciled
+                    | LaneEventKind::PromptStalled
             )
         })
+    }
+
+    /// Whether a prompt submitted at or after `mark` stalled
+    /// ([`record_prompt_stalled`]).
+    pub fn prompt_stalled_since(&self, mark: TurnMark) -> bool {
+        self.events_since(mark)
+            .iter()
+            .any(|e| matches!(e.kind, LaneEventKind::PromptStalled))
     }
 
     /// The final message of a turn that **ended at or after `mark`**, or
@@ -419,9 +429,35 @@ pub(crate) fn record_turn_reconciled(
     manifest: &mut AgentManifest,
     session_root: &Path,
 ) -> Result<(), ManifestError> {
-    manifest
-        .lane_events
-        .push(LaneEvent::now(LaneEventKind::TurnReconciled));
+    settle_unsignalled(
+        manifest,
+        session_root,
+        LaneEvent::now(LaneEventKind::TurnReconciled),
+    )
+}
+
+/// Sibling of [`record_turn_reconciled`] for a prompt that never started a
+/// turn: appends `PromptStalled` instead, so the watch delivery reports the
+/// stall rather than a finished turn.
+pub(crate) fn record_prompt_stalled(
+    manifest: &mut AgentManifest,
+    session_root: &Path,
+) -> Result<(), ManifestError> {
+    settle_unsignalled(
+        manifest,
+        session_root,
+        LaneEvent::now(LaneEventKind::PromptStalled),
+    )
+}
+
+/// Close a turn no signal ended: append `event`, clear any stale blocker, and
+/// settle `derived_state`.
+fn settle_unsignalled(
+    manifest: &mut AgentManifest,
+    session_root: &Path,
+    event: LaneEvent,
+) -> Result<(), ManifestError> {
+    manifest.lane_events.push(event);
     manifest.current_blocker = None;
     manifest.derived_state = super::derive_state::derive_agent_state(
         manifest.status.as_str(),
@@ -598,6 +634,7 @@ fn event_label(kind: &LaneEventKind) -> String {
             format!("local_command_completed ({command})")
         }
         LaneEventKind::TurnReconciled => "turn_reconciled".into(),
+        LaneEventKind::PromptStalled => "prompt_stalled".into(),
         LaneEventKind::Blocked { blocker } => {
             format!("blocked ({:?}: {})", blocker.failure_class, blocker.detail)
         }
