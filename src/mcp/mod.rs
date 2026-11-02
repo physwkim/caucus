@@ -26,7 +26,7 @@
 //! `rmcp` (1.7.0) resolves cleanly but its server surface is macro-driven and
 //! its transport runs an internal loop that resists deterministic unit
 //! testing. The MCP slice caucus needs is small — `initialize` / `tools/list`
-//! / `tools/call`, fourteen tools — so [`jsonrpc`] implements exactly that, with
+//! / `tools/call`, fifteen tools — so [`jsonrpc`] implements exactly that, with
 //! a pure dispatch core. See that module's header for the rationale.
 
 pub mod control_client;
