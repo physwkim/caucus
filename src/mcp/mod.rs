@@ -445,12 +445,13 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                     "fallback_secs": {
                         "type": "integer",
                         "description": "Safety-net seconds: a worker still \
-                                        mid-turn after this is reported to you \
-                                        anyway as an interim notice (no result \
-                                        yet, its last note, tasks still queued); \
-                                        it stays watched with its queue intact \
-                                        and the window restarts (default 600, \
-                                        max 3600). Set from now."
+                                        mid-turn whose screen has not changed \
+                                        for this long is reported to you as \
+                                        possibly stuck (no result yet, its last \
+                                        note, tasks still queued), once until \
+                                        its screen changes again; it stays \
+                                        watched with its queue intact (default \
+                                        600, max 3600). Set from now."
                     },
                     "selection_hints": {
                         "type": "object",
@@ -486,11 +487,11 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
             description: "Collect every worker that is ready RIGHT NOW. Takes no \
                           arguments — caucus watches every panel you have handed \
                           work to, so this covers all of them. Returns the report \
-                          of each worker that has finished (or passed its \
-                          fallback deadline) and has not reached you yet; the \
-                          ones still running are reported as a status line \
-                          instead (working / draining backlog / settled, backlog \
-                          remaining, seconds left on the fallback deadline) and \
+                          of each worker that has finished (or whose screen has \
+                          been silent for its fallback window) and has not \
+                          reached you yet; the ones still running are reported \
+                          as a status line instead (working / draining backlog / \
+                          settled, backlog remaining, stall alarm countdown) and \
                           stay watched, so call again later to collect them. \
                           There is no barrier — this hands you the early \
                           finishers while the slow workers are still going. This \

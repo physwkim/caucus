@@ -58,6 +58,12 @@ versions.
   answered one call at a time, so parallel calls queued behind the slowest;
   each call now runs on its own task and is answered as it finishes. A call
   the client cancels is dropped and not answered.
+- **A worker still running no longer reports in every fallback window.**
+  `fallback_secs` (and `round_fallback_secs`) now count screen silence: a
+  watched panel mid-turn is reported only when its screen has not changed
+  for that long, as "may be stuck", and once per silence until the screen
+  changes again. In a 7-day main session the old repeating "forced out"
+  notice made up 43.5% of main's API calls.
 
 ### Performance
 

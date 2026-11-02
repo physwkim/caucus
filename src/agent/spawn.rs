@@ -31,8 +31,8 @@ pub struct CaucusMcp {
 ///
 /// codex has no equivalent of claude's `Stop` hook (the turn-signal mechanism
 /// in `docs/design.md` §7), so without this a codex panel never reports its
-/// turn as done: caucus would keep it `Working` forever and a registered round
-/// would settle only at its fallback deadline. codex *does* invoke a `notify`
+/// turn as done: caucus would keep it `Working` forever and its watch would
+/// report it only through the stall alarm. codex *does* invoke a `notify`
 /// program on `agent-turn-complete`, passing the event JSON as a trailing
 /// argument (verified empirically — `-c notify=[...]` is honoured in the
 /// interactive TUI mode caucus drives over a PTY). caucus registers

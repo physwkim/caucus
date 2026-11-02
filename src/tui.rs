@@ -839,7 +839,7 @@ async fn event_loop(
         prof.lap("poll_round_blocked_panels");
 
         // 6. Round delivery — if a registered round's panels have now settled
-        //    (or its fallback deadline passed), assemble their results and
+        //    (or its stall alarm is due), assemble their results and
         //    inject them into the main worker's panel (the caucus→main push).
         mux.poll_worker_watches();
         prof.lap("poll_worker_watches");

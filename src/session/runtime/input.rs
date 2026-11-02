@@ -392,8 +392,8 @@ impl Multiplexer {
         // contribution and deliver a still-working agent's "done" to main.
         // Treat it like a mid-turn note: nothing transitions, nothing is
         // recorded, the reply sender drops (allow) and the agent proceeds. The
-        // background task wakes the session and its real Stop lands later; the
-        // round's fallback deadline bounds the wait either way.
+        // background task wakes the session and its real Stop lands later; a
+        // panel left silent meanwhile still raises the watch's stall alarm.
         if let Some(in_flight) = signal.background_tasks_in_flight()
             && in_flight > 0
         {

@@ -14,7 +14,7 @@
 | 2 | 실행 모델 = **caucus 자체 멀티플렉서**. 장기 실행 풀스크린 TUI 프로세스. agent는 caucus가 관리하는 **패널별 PTY**에서 도는 `claude` / `codex` CLI 프로세스. tmux / zellij 의존 없음 — 둘은 분석 레퍼런스(kodex 적재)일 뿐. |
 | 3 | VT 레이어 = **공개 크레이트** (경로 B-i): `vte`(escape-sequence 파서) + `portable-pty`(PTY 관리) + `ratatui`(패널 레이아웃·렌더). caucus가 직접 짜는 것은 grid `vte::Perform` 구현(~2-4k LOC) 하나뿐이며 zellij `zellij-server/src/panes/grid.rs`를 라인 단위 레퍼런스로 쓴다. zellij 크레이트 통째 vendor는 기각 — grid가 `output`/`tab`/`ui`/`route`/`screen`/`thread_bus` + `zellij-utils` ~140k LOC와 결합되어 깨끗한 추출 불가. |
 | 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버**의 15개 툴(`send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `queue_tasks` / `collect_workers` / `stop_watching` / `read_menu` / `select_option` / `wait`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. main 백엔드 CLI는 `--agent-cli claude\|codex`로 선택한다(기본 `claude`). codex를 고르면 caucus MCP 서버를 `-c mcp_servers.caucus.command/args/tool_timeout_sec`로 등록한다 — codex에는 `--mcp-config`가 없고 `[mcp_servers.<name>]` config로만 MCP를 받기 때문(claude는 `--mcp-config`를 쓴다). 어느 백엔드든 동일한 15개 툴로 sub-agent를 지휘한다. |
-| 5 | 턴 완료 신호 = Claude `Stop` hook이 **caucus 실행 프로세스의 소켓에 post**한다. 파일 sentinel(`*.sentinel.json`) + 폴링 watcher는 폐기. codex에는 Stop hook이 없으므로 codex 패널마다 `-c notify=[caucus, "signal", "codex-notify", …]`를 주입한다 — codex는 `agent-turn-complete`에 그 program을 호출하며 이벤트 JSON을 마지막 argv로 붙인다(실측 검증). `caucus signal codex-notify`가 그 JSON을 파싱해 claude Stop hook과 **동일한 `TurnSignal{Stop}`을 같은 소켓에 post**하므로, 두 백엔드가 단일 턴-완료 소유자(`handle_signal`)로 수렴한다. 이게 없으면 codex 패널은 영원히 `Working`으로 남아 그 워커의 배달이 fallback 마감에만 발화한다. |
+| 5 | 턴 완료 신호 = Claude `Stop` hook이 **caucus 실행 프로세스의 소켓에 post**한다. 파일 sentinel(`*.sentinel.json`) + 폴링 watcher는 폐기. codex에는 Stop hook이 없으므로 codex 패널마다 `-c notify=[caucus, "signal", "codex-notify", …]`를 주입한다 — codex는 `agent-turn-complete`에 그 program을 호출하며 이벤트 JSON을 마지막 argv로 붙인다(실측 검증). `caucus signal codex-notify`가 그 JSON을 파싱해 claude Stop hook과 **동일한 `TurnSignal{Stop}`을 같은 소켓에 post**하므로, 두 백엔드가 단일 턴-완료 소유자(`handle_signal`)로 수렴한다. 이게 없으면 codex 패널은 영원히 `Working`으로 남아 그 워커는 정체 경보로만 main에 알려진다. |
 | 6 | "라운드" 개념은 **폐지** — 파일 안건 broadcast + `response-*.md` 수집도, 여러 패널을 한 묶음으로 기다리는 배리어도 없다. main이 패널에 라이브로 키를 입력하면 caucus가 그 워커를 감시하고, §5의 턴 완료 신호로 **워커 하나씩** 결과를 되돌린다. |
 | 7 | Role 정의: `~/.caucus/roles.toml` (전역) + `<repo>/.caucus/roles.toml` (프로젝트 오버라이드, 우선). |
 | 8 | 실행 단계 worktree per role 유지. Agent manifest 위치: `<repo>/.caucus/sessions/<session_id>/agents/<agent_id>.{md,json}`. `.gitignore`에 `.caucus/` 추가 권장. |
@@ -189,9 +189,11 @@ push한다. 라운드라는 묶음도, 파일 안건도, `response-*.md` 수집�
    수 없다(I-10). 전체 보고서를 통째로 PTY에 붙여 넣지 않는 이유: 패널 결과가 수백
    KB까지 가고, 그 크기의 단일 bracketed paste는 백엔드의 paste 처리 병리를
    건드린다. main worker는 teaser로 부족하면 보고서 파일을 Read한다. main worker가
-   idle이고 사용자가 입력 중이 아닐 때 전달된다. 안전망: fallback_secs가 지나도
-   턴이 안 끝난 패널은 중간 통지(결과 없음, 이번 턴의 마지막 note, 남은 큐 수)로
-   알리고, watch와 백로그는 그대로 둔 채 창을 다시 연다.
+   idle이고 사용자가 입력 중이 아닐 때 전달된다. 안전망: 턴이 안 끝난 패널의
+   화면(grid generation)이 fallback_secs 동안 한 번도 바뀌지 않으면 "멈춘 것
+   같다"는 중간 통지(결과 없음, 이번 턴의 마지막 note, 남은 큐 수)를 보낸다.
+   화면이 계속 바뀌는 패널은 끝날 때까지 통지가 없고, 같은 침묵에는 한 번만
+   알리며 화면이 다시 바뀌면 창이 새로 시작된다. watch와 백로그는 그대로 둔다.
 
 5. main worker가 주입된 패널 결과를 받고 그 워커에 대해 판단:
      - 그 워커에 후속 작업 → 곧바로 send_keys. 프롬프트를 주는 순간 watch가
@@ -222,7 +224,7 @@ watch의 단일 owner `poll_worker_watch`가 매 tick 이 판정을 하며,
 막 끝난 턴의 출력을 `read_mode`로 캡처해 latch한다(**Invariant I-9**) — 전달
 보고서가 마지막 턴만이 아니라 모든 task 산출물을 담도록, 그리고 배달 시점에
 패널을 다시 읽지 않도록. 전달 시에는 캡처분이 `### task N` 섹션으로 main에
-주입된다(단일 task면 헤더 없이 기존과 동일). fallback 중간 통지는 본문이 없다 —
+주입된다(단일 task면 헤더 없이 기존과 동일). 정체 경보 중간 통지는 본문이 없다 —
 끝낸 task들의 본문은 최종 배달에 한 번만 실리고, 모든 읽기는 watch의 `turn_start`
 마크 이후로만 하므로 이전 턴의 메시지가 이번 턴의 결과로 나갈 수 없다.
 
@@ -234,7 +236,7 @@ interaction 한다(**Invariant I-10**). 다만 push는 main 패널이 idle일 �
 착지하므로(즉 main이 턴을 끝낸 뒤에만), 턴 안에서 기다리는 main은 영원히 못 받는다.
 그래서 `collect_workers`가 **pull 경로**로 존재한다: 인자 없이 준비된 워커를 모두
 스트림으로 반환하고(그 watch들을 소진), 남은 워커는 상태 텍스트(working / draining
-backlog / settled, 남은 백로그 수, fallback 데드라인까지 남은 초)로 보고하며 계속
+backlog / settled, 남은 백로그 수, 정체 경보까지 남은 무변화 초)로 보고하며 계속
 감시한다. 감시를 끊고 싶으면 `stop_watching(panel=<worker>)` — caucus가 그 워커의
 백로그 급여와 결과 전달을 멈춘다; 패널은 건드리지 않아 진행 중 작업은 계속 돌고,
 다음 프롬프트가 watch를 다시 무장시킨다.
@@ -253,7 +255,8 @@ main은 settle하는 쪽이 아니라 결과를 *받는* 쪽이다.
 
 **선택 프롬프트 엣지**: 감시 중인 sub-agent가 턴을 끝내지 않고 대화형
 선택 메뉴에서 멈추면 turn signal이 안 와 그 워커가 settle하지
-못한다 — 그대로 두면 fallback_secs까지 멈춰 있다. 모델 주도 메뉴는 spawn에서
+못한다 — 그대로 두면 화면이 fallback_secs 동안 멈춰 정체 경보가 날 때까지 아무
+소식이 없다. 모델 주도 메뉴는 spawn에서
 원천 차단한다: 모든 sub-agent는 claude 백엔드에 `--disallowedTools
 AskUserQuestion`이 걸리고, 양 백엔드의 시스템 프롬프트에 질문 계약
 (`role::prompt::SUBAGENT_QUESTION_CONTRACT` — 질문을 텍스트로 쓰고 턴을 끝내면
@@ -410,7 +413,7 @@ role의 system prompt가 되어 template을 대체한다(없으면 spec의 templ
 ```toml
 [settings]
 scrollback_lines        = 10000  # 패널별 스크롤백 깊이(행)
-round_fallback_secs     = 600    # 워커 감시 안전망 데드라인 기본값([1, 3600]로 clamp)
+round_fallback_secs     = 600    # 워커 정체 경보까지의 화면 무변화 창 기본값([1, 3600]로 clamp)
 capture_turn_limit      = 64     # 패널당 메모리에 유지하는 닫힌 턴 수
 capture_open_turn_bytes = 4194304 # 열린(진행 중) 턴 하나의 메모리 바이트 상한
 mouse                   = false  # 마우스 캡처: 기본 off면 터미널 네이티브 드래그-선택/복사 유지,
@@ -802,8 +805,8 @@ caucus의 watch settle 게이트는 **패널 상태**다(§9 `poll_worker_watch`
 > 이를 mid-turn note처럼 취급한다 — 상태 전이 없음, 매니페스트 기록 없음, reply
 > sender는 drop(=allow)되어 에이전트는 그대로 진행한다.
 
-백그라운드 작업이 세션을 깨우면 진짜 Stop이 나중에 도착한다. 그 사이 watch는
-자신의 `fallback_deadline`이 상한을 준다.
+백그라운드 작업이 세션을 깨우면 진짜 Stop이 나중에 도착한다. 그 사이 화면이
+멈춘 패널은 watch의 정체 경보(`stall`)가 main에 알린다.
 
 필드가 **없는** 경우(그 필드 이전의 Claude Code, 또는 대응물이 없는 codex
 notify)는 "in-flight 없음"이 아니라 "알 수 없음"이며, 종전과 동일하게 턴을
@@ -1681,13 +1684,15 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
   latch해 main에 배달한다(실제 발생한 오탐). 마커가 없는 패널은 사람이 직접 친 경우로,
   분류가 불가능해 턴이 열려 있고 Stop 훅도 오지 않으므로 이 훅이 유일한 owner다.
 - **Enforcement**: `WorkerWatch.settled` / `.captured`는 private 필드이고 `poll_worker_watch`만
-  쓴다. `watch_ready`는 latch(`settled`)와 fallback 기한만 읽고 `self.panels`의 상태로 재판정하지
-  않는다(gone 판정 제외). `local_commands_without_turn`은 분류 지점(`send_keys`)에서만 삽입되고
+  쓴다. `watch_ready`는 latch(`settled`)와 정체 경보 시계(`stall`)만 읽고 `self.panels`의 상태로
+  재판정하지 않는다(gone 판정 제외). `stall`은 `poll_worker_watch`(패널 grid generation이 바뀌면
+  재무장), `after_handoff`(경보를 넘기면 `Alarmed`), `queue_tasks`의 `fallback_secs`(창 재설정)만
+  쓴다 — 그래서 화면이 움직이는 패널은 경보가 없고, 한 번의 침묵에는 경보가 한 번뿐이다. `local_commands_without_turn`은 분류 지점(`send_keys`)에서만 삽입되고
   `close_local_command`에서만 소비된다. `outstanding_prompts`의 증가는
   `note_prompt_outstanding`, 감소는 `consume_outstanding_prompt` 단 하나씩이며, 두 맵 모두
   `detach_panel`에서 패널과 함께 사라진다.
 - **Tests**: latch 후 패널을 다시 `Working`으로 깨워도 watch가 미정착으로 돌아가지 않고 기여가
-  남는지; latch 후 도착한 `Stop` 훅이 리포트의 `last_message`를 덮지 못하는지; fallback이 와도 backlog가
+  남는지; latch 후 도착한 `Stop` 훅이 리포트의 `last_message`를 덮지 못하는지; 정체 경보가 와도 backlog가
   유지되고 다음 idle에 급여되는지. 미결 카운트의 경계마다 한 케이스씩 — 잔량
   `> 0`(첫 Stop은 정착시키지 않고 capture turn을 다시 연다)과 `== 0`(큐 프롬프트 자신의 Stop이
   정착시킨다); 손으로 친 `/compact`의 close가 자기 프롬프트를 소비해 카운트가 0으로 돌아오는지.
@@ -1697,9 +1702,9 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
   그 워커의 기여만 따로 main에 전달되고, 다른 워커의 watch는 그대로 살아 있다. 조기 완료 워커가
   최후미 워커를 기다리지 않으므로 N명의 워커는 main과 N회 interaction 한다.
 - **구조적 정확히-한-번**: 배달 원장(`delivered` 집합) 자체가 없다. **정착한 워커의 배달 = watch
-  제거**(`after_handoff`; fallback 중간 통지는 watch를 남기고 창만 다시 연다)이므로
+  제거**(`after_handoff`; 정체 경보 중간 통지는 watch를 남기고, 화면이 다시 바뀔 때까지 경보를 끈다)이므로
   이미 배달된 워커는 물어볼 watch가 존재하지 않는다 — 중복 배달이 표현 불가능하다.
-  `watch_ready`(정착했거나 fallback due)가 배달 대상을 고르고, `render_watch_delivery`가 그
+  `watch_ready`(정착했거나 정체 경보 due)가 배달 대상을 고르고, `render_watch_delivery`가 그
   워커 한 명의 assemble + spill(`rounds/<panel>-<n>.md`) + summary의 유일한 지점이다.
 - **MUST**: 세 배달 경로 모두 배달과 watch 제거를 같은 지점에서 한다 — **push** =
   `poll_worker_watches()` (메인 패널이 idle일 때 준비된 워커를 tick당 하나씩 타이핑해 넣고, 확인된

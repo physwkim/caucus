@@ -132,9 +132,10 @@ pub enum ControlRequest {
     ///
     /// `read_mode` selects what the worker's result is read as, captured the
     /// instant it settles (default `last_message`). `fallback_secs` is the
-    /// safety net: a worker still mid-turn after it is reported anyway, as an
-    /// interim notice (no result yet, its last note, the tasks still queued),
-    /// and stays watched with its queue intact. `selection_hints` lets caucus auto-answer that
+    /// safety net: a worker still mid-turn whose screen has not changed for
+    /// that long is reported as possibly stuck (no result yet, its last note,
+    /// the tasks still queued), once per silence, and stays watched with its
+    /// queue intact. `selection_hints` lets caucus auto-answer that
     /// worker's selection menus without interrupting the main worker — see
     /// [`SelectionPolicy`]; absent (default `None`) escalates every menu.
     ///
@@ -151,11 +152,11 @@ pub enum ControlRequest {
     /// **pull** half of delivery.
     ///
     /// Each worker that has settled is answered with its own report and its
-    /// watch is spent; one past its fallback deadline is answered with an
+    /// watch is spent; one whose stall alarm is due is answered with an
     /// interim notice and stays watched; the workers still running are
     /// reported as a status line instead — settled vs working vs draining
-    /// backlog, the backlog remaining, and the seconds left until the fallback
-    /// deadline — and stay watched. There is no barrier: the early
+    /// backlog, the backlog remaining, and the seconds of screen silence left
+    /// before a stall alarm — and stay watched. There is no barrier: the early
     /// finishers come back while the slow ones are still working. Each status is
     /// read from the settle latch, so a worker that finished and was later
     /// re-woken still reads `settled`.
@@ -166,7 +167,7 @@ pub enum ControlRequest {
     /// *idle* — i.e. after the main worker ends its turn. A main worker that
     /// stays in its turn polling is `Working` throughout, so the push can never
     /// land: main waits for its workers and the workers wait for main to stop
-    /// waiting. The fallback deadline does not break that livelock — it makes a
+    /// waiting. The stall alarm does not break that livelock — it makes a
     /// worker *due*, not *deliverable*. Handing the report to the poller does.
     ///
     /// Answered with a [`ControlResponse::Panel`] (text). A worker is delivered

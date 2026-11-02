@@ -7,7 +7,7 @@
 //! constants the code used when these values were hardcoded. The resolved
 //! [`Settings`] is copied onto [`crate::config::Config`] and read by the owners
 //! of the values that used to be constants: `Grid` scrollback depth,
-//! `OutputCapture` caps, and the round fallback deadline.
+//! `OutputCapture` caps, and the watch fallback (stall-alarm) window.
 
 use std::path::{Path, PathBuf};
 
@@ -16,11 +16,12 @@ use thiserror::Error;
 
 use crate::render::LayoutMode;
 
-/// Default watch safety-net deadline (seconds). A watched worker is delivered
-/// when it settles, or force-delivered when this deadline passes — whichever
-/// comes first, per worker (`docs/design.md` §4).
+/// Default watch safety-net window (seconds). A watched worker is delivered
+/// when it settles; one still mid-turn whose screen has not changed for this
+/// long is reported to main as possibly stuck, once per silence
+/// (`docs/design.md` §4).
 pub(crate) const ROUND_FALLBACK_DEFAULT_SECS: u64 = 600;
-/// Hard cap on the watch fallback deadline — bounds a misconfigured
+/// Hard cap on the watch fallback window — bounds a misconfigured
 /// `round_fallback_secs` setting and any per-`queue_tasks` override alike.
 pub(crate) const ROUND_FALLBACK_MAX_SECS: u64 = 3600;
 
@@ -39,8 +40,8 @@ pub(crate) const SCROLLBACK_MAX_LINES: usize = 1_000_000;
 pub struct Settings {
     /// Per-panel terminal scrollback depth, in rows.
     pub scrollback_lines: usize,
-    /// Default round fallback deadline, in seconds (resolved into
-    /// `[1, ROUND_FALLBACK_MAX_SECS]`).
+    /// Default watch screen-silence window before a stall alarm, in seconds
+    /// (resolved into `[1, ROUND_FALLBACK_MAX_SECS]`).
     pub round_fallback_secs: u64,
     /// Closed turns kept in memory per panel before older turns spill to the
     /// panel log.

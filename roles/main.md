@@ -121,7 +121,8 @@ directly in this panel; you are the agent that gets the job done.
   menu's "type something" / "let me write" entry, then `send_keys` your
   reply into that panel.
 - Answer promptly: until the chooser is resolved the panel stays
-  `working`, and its watch only reports at the fallback deadline.
+  `working`, and its watch reports it only once its screen has sat
+  unchanged for the fallback window.
 - To stop the recurring direction/approach menus interrupting you at all,
   pre-authorize them per worker:
   `queue_tasks(panel=<worker>, selection_hints={prefer:["structural","at
