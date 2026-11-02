@@ -9,4 +9,4 @@ pub mod screen_activity;
 pub use capture::{OutputCapture, TurnSegment};
 pub use grid::{Cell, Grid};
 pub use prompt_scan::{Menu, MenuOption, scan_menu, scan_yes_no_prompt};
-pub use screen_activity::{ScreenActivity, claude_activity, codex_activity};
+pub use screen_activity::{ScreenActivity, claude_activity, codex_activity, codex_title_thread};

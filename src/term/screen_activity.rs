@@ -173,6 +173,21 @@ static CODEX_UPDATE_PICKER: LazyLock<[Regex; 2]> = LazyLock::new(|| {
 static CODEX_SPARKLE_PROMPT: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?m)^›[⠁⠂⠄⠈⠐⠠⡀⢀][^\n]*(?:\n(?:[^•■✗✓\n][^\n]*)?)*\z"));
 
+/// The `thread-id` title item `codex_args` enables. codex cuts each item to
+/// 32 columns, so a UUID shows as its first 29 characters and `...`.
+static CODEX_TITLE_THREAD: LazyLock<Regex> =
+    LazyLock::new(|| re(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1,12}"));
+
+/// The thread id (possibly a truncated prefix) a codex title shows. The last
+/// match wins: `thread-id` is the last title item, and a thread or project
+/// name before it may itself contain a UUID.
+pub fn codex_title_thread(title: &str) -> Option<&str> {
+    CODEX_TITLE_THREAD
+        .find_iter(title)
+        .last()
+        .map(|m| m.as_str())
+}
+
 /// Classify a codex screen. `lines` are the grid rows, trailing whitespace
 /// trimmed; `title` is the OSC window title codex keeps current.
 pub fn codex_activity(lines: &[String], title: Option<&str>) -> ScreenActivity {
@@ -512,6 +527,22 @@ mod tests {
         LazyLock::force(&CODEX_UPDATE_LEGACY);
         LazyLock::force(&CODEX_UPDATE_PICKER);
         LazyLock::force(&CODEX_SPARKLE_PROMPT);
+        LazyLock::force(&CODEX_TITLE_THREAD);
+    }
+
+    #[test]
+    fn codex_title_thread_reads_the_last_visible_thread_id() {
+        assert_eq!(
+            codex_title_thread("⠙ Run sleep | repo | 01a19adc-cb89-7c71-bc0f-3af55..."),
+            Some("01a19adc-cb89-7c71-bc0f-3af55")
+        );
+        assert_eq!(
+            codex_title_thread(
+                "[ ! ] Action Required | 0aaaaaaa-1111-2222-3333-444444444444 | 01a19adc-cb89-7c71-bc0f-3af55..."
+            ),
+            Some("01a19adc-cb89-7c71-bc0f-3af55")
+        );
+        assert_eq!(codex_title_thread("⠙ Run sleep | repo"), None);
     }
 
     #[test]

@@ -107,6 +107,14 @@ impl TurnSignal {
             .and_then(Value::as_array)
             .map(Vec::len)
     }
+
+    /// The codex thread whose turn ended (`thread-id` on the notify JSON).
+    /// `None` for Claude Code payloads, which have no such field.
+    pub fn codex_thread_id(&self) -> Option<&str> {
+        self.raw_hook_payload
+            .get("thread-id")
+            .and_then(Value::as_str)
+    }
 }
 
 /// What a mid-turn [`AgentNote`] carries. Serialised lowercase:
