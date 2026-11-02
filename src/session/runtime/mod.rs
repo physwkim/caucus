@@ -110,11 +110,13 @@ pub struct Multiplexer {
     /// `wait` calls whose panel was still busy when drained; answered by
     /// [`Multiplexer::poll_waits`].
     pending_waits: Vec<wait::PendingWait>,
-    /// Submitting Enters held back from bracketed pastes until the agent has
-    /// ingested the paste. A bracketed-paste agent (Claude Code) that commits a
-    /// large paste to a `[Pasted text #N]` placeholder swallows a `\r` arriving
-    /// in the *same* PTY burst, so the submit is delivered as a discrete
-    /// keypress on a later tick ([`Multiplexer::poll_pending_submits`]).
+    /// Input owed to panels, written by [`Multiplexer::poll_pending_submits`]:
+    /// everything sent to an agent that has not yet enabled bracketed paste,
+    /// and submitting Enters held back from bracketed pastes until the agent
+    /// has ingested the paste. A bracketed-paste agent (Claude Code) that
+    /// commits a large paste to a `[Pasted text #N]` placeholder swallows a
+    /// `\r` arriving in the *same* PTY burst, so the submit is delivered as a
+    /// discrete keypress on a later tick.
     pending_submits: Vec<PendingSubmit>,
     /// The panel awaiting a close confirmation (`Ctrl-A x`), or `None`. While
     /// `Some`, the close-confirm prompt is drawn and the focus router captures

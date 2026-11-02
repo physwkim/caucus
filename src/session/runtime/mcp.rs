@@ -404,14 +404,31 @@ pub(crate) fn classify_local_slash_command(text: &str) -> Option<LocalCommandKin
     }
 }
 
-/// A submitting Enter held back from a bracketed paste, waiting to be delivered
-/// as a discrete keypress (see [`Multiplexer::pending_submits`]).
+/// Input caucus has committed to a panel but not yet written in full (see
+/// [`Multiplexer::pending_submits`]). At most one per panel.
 pub(crate) struct PendingSubmit {
-    /// Panel the held-back `\r` is destined for.
+    /// Panel the held input is destined for.
     panel: PanelId,
-    /// Earliest instant the `\r` may be written — `now + submit_delay_for(len)`
-    /// at enqueue time (the hold scales with the paste size).
-    due: Instant,
+    /// What is still owed.
+    stage: SubmitStage,
+}
+
+enum SubmitStage {
+    /// The agent has not enabled bracketed paste since it spawned, so its
+    /// input loop is not running: a `\r` written now reaches the tty first
+    /// and arrives as a newline, not a submit. Every delivery is held, in
+    /// order, and framed by [`plan_delivery`] once the mode is on.
+    Booting(Vec<HeldText>),
+    /// A bracketed paste was written; its submitting `\r` may be written at
+    /// this instant — `now + submit_delay_for(len)` at enqueue time (the hold
+    /// scales with the paste size).
+    Enter(Instant),
+}
+
+/// One `deliver_text` call held for a booting panel.
+struct HeldText {
+    text: String,
+    enter: bool,
 }
 
 /// How `send_keys` should deliver `text` to a panel's PTY, framed for the
@@ -484,13 +501,42 @@ impl Multiplexer {
     /// both must frame multi-line input as one bracketed paste rather than let
     /// each embedded newline submit. The caller owns turn bookkeeping
     /// (`note_prompt_delivered`) — this only writes the bytes and schedules the
-    /// deferred submit when one is needed.
+    /// deferred submit when one is needed. Input for a panel still booting is
+    /// held instead ([`SubmitStage::Booting`]).
     pub(crate) fn deliver_text(
         &mut self,
         panel: PanelId,
         text: &str,
         enter: bool,
     ) -> Result<(), McpError> {
+        let p = self
+            .panels
+            .iter()
+            .find(|p| p.id == panel)
+            .ok_or(McpError::NoSuchPanel(panel))?;
+        let booting = p.state() == PanelState::Spawning && !p.grid().bracketed_paste();
+        let held = HeldText {
+            text: text.to_owned(),
+            enter,
+        };
+        let slot = self.pending_submits.iter_mut().find(|s| s.panel == panel);
+        match slot.map(|s| &mut s.stage) {
+            // Behind input already held, even once a prompt has moved the
+            // panel past `Spawning`.
+            Some(SubmitStage::Booting(queue)) => queue.push(held),
+            Some(stage) if booting => *stage = SubmitStage::Booting(vec![held]),
+            None if booting => self.pending_submits.push(PendingSubmit {
+                panel,
+                stage: SubmitStage::Booting(vec![held]),
+            }),
+            _ => return self.write_delivery(panel, text, enter),
+        }
+        Ok(())
+    }
+
+    /// Write `text` framed for `panel`'s current input mode, deferring a
+    /// bracketed paste's `\r`.
+    fn write_delivery(&mut self, panel: PanelId, text: &str, enter: bool) -> Result<(), McpError> {
         let p = self
             .panels
             .iter_mut()
@@ -515,39 +561,66 @@ impl Multiplexer {
     /// the paste size. Replaces any pending submit already queued for the same
     /// panel (the latest paste wins) so a panel never accrues stale Enters.
     fn enqueue_submit(&mut self, panel: PanelId, paste_len: usize) {
-        let due = Instant::now() + submit_delay_for(paste_len);
+        let stage = SubmitStage::Enter(Instant::now() + submit_delay_for(paste_len));
         match self.pending_submits.iter_mut().find(|s| s.panel == panel) {
-            Some(s) => s.due = due,
-            None => self.pending_submits.push(PendingSubmit { panel, due }),
+            Some(s) => s.stage = stage,
+            None => self.pending_submits.push(PendingSubmit { panel, stage }),
         }
     }
 
-    /// Flush every deferred submit whose delay has elapsed: write the held-back
-    /// `\r` as a discrete keypress to its panel. Called once per event-loop
-    /// tick. A submit whose panel has been killed is dropped (the panel can no
-    /// longer accept input).
+    /// Write what each panel is owed: a booting panel's held input once its
+    /// agent has enabled bracketed paste, and a deferred `\r` once its delay
+    /// has elapsed. Called once per event-loop tick, after `pump_all` has
+    /// parsed this tick's output. Input for a killed or exited panel is
+    /// dropped (nothing can read it).
     pub(crate) fn poll_pending_submits(&mut self) {
         let now = Instant::now();
         let mut still_pending = Vec::with_capacity(self.pending_submits.len());
-        for s in std::mem::take(&mut self.pending_submits) {
-            if s.due > now {
-                still_pending.push(s);
+        for PendingSubmit { panel, stage } in std::mem::take(&mut self.pending_submits) {
+            if let SubmitStage::Enter(due) = stage
+                && due > now
+            {
+                still_pending.push(PendingSubmit { panel, stage });
                 continue;
             }
-            let Some(p) = self.panels.iter_mut().find(|p| p.id == s.panel) else {
+            let Some(p) = self.panels.iter_mut().find(|p| p.id == panel) else {
                 continue;
             };
-            match p.write_input(b"\r") {
-                Ok(()) => self.note_submit_written(s.panel),
-                Err(e) => warn!(panel = %s.panel, error = %e, "deferred submit write failed"),
+            match stage {
+                SubmitStage::Booting(_) if p.state() == PanelState::Exited => {}
+                SubmitStage::Booting(queue) if p.grid().bracketed_paste() => {
+                    for HeldText { text, enter } in queue {
+                        match self.write_delivery(panel, &text, enter) {
+                            // A bare Enter has no paste to wait behind and
+                            // went inline: its submit reached the PTY now.
+                            Ok(()) if enter && !self.submit_pending(panel) => {
+                                self.note_submit_written(panel)
+                            }
+                            Ok(()) => {}
+                            Err(e) => warn!(panel = %panel, error = %e, "held input write failed"),
+                        }
+                    }
+                }
+                SubmitStage::Enter(_) => match p.write_input(b"\r") {
+                    Ok(()) => self.note_submit_written(panel),
+                    Err(e) => warn!(panel = %panel, error = %e, "deferred submit write failed"),
+                },
+                stage => still_pending.push(PendingSubmit { panel, stage }),
             }
         }
-        self.pending_submits = still_pending;
+        // Flushing held input above may have queued fresh Enters.
+        self.pending_submits.extend(still_pending);
     }
 
     /// Whether `panel` has a submitting `\r` still held back.
     pub(crate) fn submit_pending(&self, panel: PanelId) -> bool {
-        self.pending_submits.iter().any(|s| s.panel == panel)
+        self.pending_submits.iter().any(|s| {
+            s.panel == panel
+                && match &s.stage {
+                    SubmitStage::Booting(queue) => queue.iter().any(|h| h.enter),
+                    SubmitStage::Enter(_) => true,
+                }
+        })
     }
 
     /// Render a panel's turn at absolute `index` for the `turn` read mode.
@@ -632,6 +705,22 @@ mod tests {
     use crate::session::runtime::test_support::*;
     use tempfile::TempDir;
 
+    impl PendingSubmit {
+        fn enter_at(panel: PanelId, due: Instant) -> Self {
+            Self {
+                panel,
+                stage: SubmitStage::Enter(due),
+            }
+        }
+
+        fn due(&self) -> Option<Instant> {
+            match self.stage {
+                SubmitStage::Enter(due) => Some(due),
+                SubmitStage::Booting(_) => None,
+            }
+        }
+    }
+
     /// Bracketed + submit: the paste carries the text with NO trailing `\r`
     /// (the submit is held back, never inline with the paste), and
     /// `defer_submit` is set so `send_keys` queues the discrete Enter.
@@ -699,13 +788,13 @@ mod tests {
         let panel = PanelId::new();
 
         mux.enqueue_submit(panel, 0);
-        let first_due = mux.pending_submits[0].due;
+        let first_due = mux.pending_submits[0].due();
         assert_eq!(mux.pending_submits.len(), 1);
 
         mux.enqueue_submit(panel, 0);
         assert_eq!(mux.pending_submits.len(), 1, "same panel must not stack");
         assert!(
-            mux.pending_submits[0].due >= first_due,
+            mux.pending_submits[0].due() >= first_due,
             "re-enqueue pushes the deadline out, it does not add a second submit"
         );
     }
@@ -745,14 +834,14 @@ mod tests {
         let mut mux = mux(&tmp);
         let due_panel = PanelId::new();
         let pending_panel = PanelId::new();
-        mux.pending_submits.push(PendingSubmit {
-            panel: due_panel,
-            due: Instant::now() - Duration::from_millis(1),
-        });
-        mux.pending_submits.push(PendingSubmit {
-            panel: pending_panel,
-            due: Instant::now() + Duration::from_secs(60),
-        });
+        mux.pending_submits.push(PendingSubmit::enter_at(
+            due_panel,
+            Instant::now() - Duration::from_millis(1),
+        ));
+        mux.pending_submits.push(PendingSubmit::enter_at(
+            pending_panel,
+            Instant::now() + Duration::from_secs(60),
+        ));
 
         mux.poll_pending_submits();
 
@@ -772,19 +861,76 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let id = push_cat_panel(&mut mux, PanelState::Idle);
-        mux.pending_submits.push(PendingSubmit {
-            panel: id,
-            due: Instant::now() + Duration::from_secs(60),
-        });
+        mux.pending_submits.push(PendingSubmit::enter_at(
+            id,
+            Instant::now() + Duration::from_secs(60),
+        ));
         mux.note_prompt_delivered(id);
         assert_eq!(mux.prompt_effect_armed(id), Some(false));
 
         mux.poll_pending_submits();
         assert_eq!(mux.prompt_effect_armed(id), Some(false), "not yet due");
 
-        mux.pending_submits[0].due = Instant::now() - Duration::from_millis(1);
+        mux.pending_submits[0] =
+            PendingSubmit::enter_at(id, Instant::now() - Duration::from_millis(1));
         mux.poll_pending_submits();
         assert_eq!(mux.prompt_effect_armed(id), Some(true));
+        mux.shutdown();
+    }
+
+    /// Input to an agent that has not enabled bracketed paste since it spawned
+    /// is held, in order, so its Enter is not written into the tty before the
+    /// agent's input loop runs. Once the mode is on it is pasted and its Enter
+    /// is owed as a discrete keypress, as for any live panel.
+    #[tokio::test]
+    async fn input_to_a_booting_panel_waits_for_bracketed_paste() {
+        use crate::panel::lifecycle::PanelState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Spawning);
+        let pump_until =
+            |mux: &mut Multiplexer, wait: Duration, done: &dyn Fn(&Multiplexer) -> bool| {
+                let deadline = Instant::now() + wait;
+                while !done(mux) && Instant::now() < deadline {
+                    mux.pump_all();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+        let screen = |mux: &Multiplexer| {
+            let grid = mux.panels.iter().find(|p| p.id == id).unwrap().grid();
+            (0..grid.size().1)
+                .map(|row| grid.row_text(row))
+                .collect::<String>()
+        };
+        let bracketed = |mux: &Multiplexer| {
+            let p = mux.panels.iter().find(|p| p.id == id).unwrap();
+            p.grid().bracketed_paste()
+        };
+
+        McpToolSurface::send_keys(&mut mux, id, "first", true).unwrap();
+        McpToolSurface::send_keys(&mut mux, id, "second", true).unwrap();
+        assert_eq!(mux.prompt_effect_armed(id), Some(false), "Enter still owed");
+        pump_until(&mut mux, Duration::from_millis(300), &|_| false);
+        mux.poll_pending_submits();
+        pump_until(&mut mux, Duration::from_millis(100), &|_| false);
+        assert!(!screen(&mux).contains("first"), "{}", screen(&mux));
+
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == id)
+            .unwrap()
+            .write_input(b"\x1b[?2004h\n")
+            .unwrap();
+        pump_until(&mut mux, Duration::from_secs(5), &bracketed);
+        mux.poll_pending_submits();
+        assert!(mux.submit_pending(id), "the paste's Enter is deferred");
+        assert_eq!(mux.prompt_effect_armed(id), Some(false));
+        pump_until(&mut mux, Duration::from_secs(5), &|mux| {
+            screen(mux).contains("second")
+        });
+        let screen = screen(&mux);
+        let (first, second) = (screen.find("first"), screen.find("second"));
+        assert!(first.is_some() && first < second, "{screen}");
         mux.shutdown();
     }
 

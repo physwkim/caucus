@@ -802,6 +802,8 @@ async fn event_loop(
         //     out of the paste burst (the agent swallows a `\r` while it commits
         //     a `[Pasted text #N]` placeholder) and written here as a discrete
         //     keypress once its delay has elapsed, a tick after the paste landed.
+        //     Input sent to a booting agent is pasted here once the pump above
+        //     has seen it enable bracketed paste.
         mux.poll_pending_submits();
         prof.lap("poll_pending_submits");
 
