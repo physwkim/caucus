@@ -1458,7 +1458,8 @@ TUI 안에서 사용자는 main worker 패널과 대화하고, main worker가 MC
 ### 10.3 제어 소켓 프로토콜
 
 제어 소켓(`$TMPDIR/caucus-<session 끝 10자>-ctl.sock`)은 연결당 콜 하나, reply 한
-줄의 줄 단위 JSON이다. `mcp-serve`·`caucus ctl`·임의 스크립트가 같은 형식을 쓴다.
+줄의 줄 단위 JSON이다(`subscribe_events`만 reply 뒤에 이벤트 줄이 이어진다).
+`mcp-serve`·`caucus ctl`·임의 스크립트가 같은 형식을 쓴다.
 
 ```
 → {"id":"a1","method":"read_panel","params":{"panel":"<id>","mode":"screen"}}
@@ -1472,10 +1473,35 @@ TUI 안에서 사용자는 main worker 패널과 대화하고, main worker가 MC
   `drain_control` → `execute_control` 경로다.
 - `id`는 필수 문자열이고 reply에 그대로 돌아온다. 콜로 읽히지 않는 줄이면 `id`를
   최대한 건져서, 못 건지면 `null`로 답한다.
-- `result.type`: `ok` / `panel`(`text`) / `spawned`(`panel`) / `panels`(`panels`).
+- `result.type`: `ok` / `panel`(`text`) / `spawned`(`panel`) / `panels`(`panels`) /
+  `subscribed`(`seq`, `panels`).
 - `error.code`: `invalid_request`(JSON 아님·한도 초과·`id` 없음·모르는 method·잘못된
   params — 아무것도 실행 안 됨), `failed`(실행했고 실패), `unavailable`(멀티플렉서
-  종료 중이라 답 없음).
+  종료 중이라 답 없음), `events_lost`(아래 구독이 링보다 뒤처짐).
+
+`subscribe_events`(params 없음)만 연결을 유지한다. MCP 툴이 아니라 제어 소켓에서만
+부를 수 있다. reply의 `panels`는 `list_panels` 행, `seq`는 그 행이 반영한 마지막
+이벤트 번호이고, 이후 `seq`가 그보다 큰 이벤트가 한 줄씩 온다.
+
+```
+→ {"id":"s1","method":"subscribe_events"}
+← {"id":"s1","result":{"type":"subscribed","seq":4,"panels":[...]}}
+← {"id":"s1","event":{"type":"panel_updated","seq":5,"panel":{...}}}
+← {"id":"s1","event":{"type":"panel_removed","seq":6,"panel_id":"<id>"}}
+← {"id":"s1","error":{"code":"events_lost","message":"..."}}
+```
+
+- 이벤트는 행 단위 최신값이다. 새로 생겼거나 바뀐 행은 행 전체를 담은
+  `panel_updated`, 사라진 행은 `panel_removed`. snapshot에 `seq` 순으로 적용하면
+  현재 행이 되고, `seq`는 빈틈 없이 1씩 는다.
+- 멀티플렉서는 구독자가 있을 때만 매 루프 턴 끝(`publish_panel_events`)에
+  `list_panels` 행을 직전 행과 비교해 발행한다. 구독 콜은 큐에 넣기 전에 broadcast를
+  구독하고 snapshot 직전에 한 번 발행하므로, snapshot과 첫 이벤트 사이에 빠지는
+  이벤트가 없다. snapshot `seq` 이하 이벤트는 서버가 버린다.
+- broadcast 링은 이벤트 512개(`EVENT_RING`)다. 그보다 뒤처진 구독자는 따라잡을 수
+  없으므로 `events_lost` 에러 한 줄을 받고 연결이 닫힌다. 클라이언트는 다시 구독해
+  새 snapshot에서 시작한다.
+- 클라이언트가 연결을 닫거나 write 쪽을 닫으면(half-close 포함) 구독이 끝난다.
 
 ---
 

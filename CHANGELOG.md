@@ -30,6 +30,12 @@ versions.
   "message"}}` replies, where `method` and `params` are the MCP tool name and
   arguments, decoded only by the main process. A `caucus mcp-serve` from an
   older build cannot talk to a session started by this one.
+- **`caucus ctl subscribe_events` streams panel changes.** The reply is the
+  `list_panels` rows with the `seq` they reflect; after it comes one line per
+  later change, `panel_updated` with the whole new or changed row or
+  `panel_removed`, numbered without gaps. A client more than 512 events
+  behind gets an `events_lost` error and is disconnected, and subscribes
+  again for a fresh snapshot. With no subscriber, nothing is computed.
 
 ### Changed
 

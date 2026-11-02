@@ -6,7 +6,7 @@
 //! the framing below; the main process executes each call against the live
 //! [`crate::session::Multiplexer`].
 //!
-//! Newline-delimited JSON, one call and one reply per connection:
+//! Newline-delimited JSON, one call per connection:
 //!
 //! - call ([`ControlCall`]): `{"id": "<string>", "method": "<tool>",
 //!   "params": {...}}`. `method` is an MCP tool name and `params` that tool's
@@ -14,6 +14,11 @@
 //!   decodes them.
 //! - reply ([`ControlReply`]): `{"id": ..., "result": {"type": ..., ...}}` or
 //!   `{"id": ..., "error": {"code": ..., "message": ...}}`.
+//!
+//! `subscribe_events` is the one method that keeps the connection open: its
+//! `subscribed` result is followed by one [`ControlEvent`] line per panel
+//! event ([`super::events`]) until the client closes the connection or falls
+//! behind, which ends the stream with an [`ErrorCode::EventsLost`] error.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,6 +26,7 @@ use serde_json::{Value, json};
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
 
+use super::events::PanelEvent;
 use super::{PanelSummary, ReadPanelMode};
 
 /// Main-supplied hints for auto-answering a watched worker's selection menu
@@ -186,6 +192,10 @@ pub enum ControlRequest {
         panel: PanelId,
         timeout_secs: Option<u64>,
     },
+    /// Open a [`super::events`] subscription. Answered with
+    /// [`ControlResponse::Subscribed`], the snapshot the events that follow
+    /// apply to. Not an MCP tool: only the control socket can stream.
+    SubscribeEvents,
 }
 
 impl ControlRequest {
@@ -407,6 +417,7 @@ impl ControlRequest {
                     timeout_secs,
                 })
             }
+            "subscribe_events" => Ok(Self::SubscribeEvents),
             other => Err(format!("unknown method `{other}`")),
         }
     }
@@ -434,6 +445,9 @@ pub enum ControlResponse {
     Spawned { panel: PanelId },
     /// `list_panels` succeeded.
     Panels { panels: Vec<PanelSummary> },
+    /// `subscribe_events` succeeded: `panels` are the rows as of event `seq`;
+    /// the stream continues at `seq + 1`.
+    Subscribed { seq: u64, panels: Vec<PanelSummary> },
     /// The tool call failed; `message` is human-readable. Never a `result`:
     /// [`ControlReply::response`] sends it as an error.
     #[serde(skip)]
@@ -483,6 +497,18 @@ pub enum ErrorCode {
     Failed,
     /// The multiplexer is shutting down and did not answer.
     Unavailable,
+    /// A `subscribe_events` subscriber fell more than
+    /// [`super::events::EVENT_RING`] events behind. The stream ends; subscribe
+    /// again for a fresh snapshot.
+    EventsLost,
+}
+
+/// One streamed `subscribe_events` line: `{"id": ..., "event": {"type": ...,
+/// "seq": ..., ...}}`, `id` being the subscribing call's.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControlEvent {
+    pub id: String,
+    pub event: PanelEvent,
 }
 
 impl ControlReply {
@@ -738,6 +764,35 @@ mod tests {
         let req =
             ControlRequest::from_call("restart_panel", &json!({"panel": id.to_string()})).unwrap();
         assert_eq!(req, ControlRequest::RestartPanel { panel: id });
+    }
+
+    #[test]
+    fn build_subscribe_events_takes_no_args() {
+        for params in [Value::Null, json!({})] {
+            let req = ControlRequest::from_call("subscribe_events", &params).unwrap();
+            assert_eq!(req, ControlRequest::SubscribeEvents);
+        }
+    }
+
+    #[test]
+    fn event_line_wire_shape() {
+        let panel = PanelId::new();
+        let line = ControlEvent {
+            id: "s".into(),
+            event: PanelEvent::PanelRemoved {
+                seq: 4,
+                panel_id: panel,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&line).unwrap(),
+            json!({"id": "s", "event": {"type": "panel_removed", "seq": 4, "panel_id": panel.to_string()}})
+        );
+        let lost = ControlReply::error(Some("s".into()), ErrorCode::EventsLost, "behind");
+        assert_eq!(
+            serde_json::to_value(&lost).unwrap(),
+            json!({"id": "s", "error": {"code": "events_lost", "message": "behind"}})
+        );
     }
 
     #[test]
@@ -1015,6 +1070,10 @@ mod tests {
                 panel: PanelId::new(),
             },
             ControlResponse::Panels { panels: vec![] },
+            ControlResponse::Subscribed {
+                seq: 3,
+                panels: vec![crate::mcp::events::test_row(PanelId::new(), "idle")],
+            },
         ] {
             let line =
                 serde_json::to_string(&ControlReply::response(Some("1".into()), response.clone()))

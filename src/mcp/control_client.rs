@@ -8,9 +8,8 @@
 //!
 //! [`ControlClient`] implements [`crate::mcp::jsonrpc::ToolHandler`] so the
 //! hand-rolled [`crate::mcp::jsonrpc::McpDispatch`] can drive it directly.
-//! Each call is a fresh connect / write-line / read-line / close — the
-//! control-socket protocol is strictly one call, one reply per connection
-//! (`protocol` module doc).
+//! Each call is a fresh connect / write-line / read-line / close — every MCP
+//! tool is one call, one reply per connection (`protocol` module doc).
 
 use std::path::{Path, PathBuf};
 
@@ -90,6 +89,10 @@ fn render_response(resp: ControlResponse) -> ToolOutcome {
             Ok(text) => ToolOutcome::Ok(text),
             Err(err) => ToolOutcome::Err(format!("serialise panel list: {err}")),
         },
+        // mcp-serve lists no `subscribe_events` tool, so this is not reached.
+        ControlResponse::Subscribed { .. } => {
+            ToolOutcome::Err("subscribe_events streams; it is not an MCP tool".to_string())
+        }
         ControlResponse::Error { message } => ToolOutcome::Err(message),
     }
 }
@@ -124,7 +127,11 @@ mod tests {
     async fn a_failed_call_is_a_tool_error() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("control.sock");
-        let mut server = crate::mcp::control_server::ControlServer::bind(&sock).unwrap();
+        let mut server = crate::mcp::control_server::ControlServer::bind(
+            &sock,
+            crate::mcp::events::EventFeed::new().subscriber(),
+        )
+        .unwrap();
         let client = ControlClient::new(&sock);
         let panel = PanelId::new();
         let call = tokio::spawn(async move {

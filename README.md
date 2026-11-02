@@ -212,6 +212,8 @@ caucus ctl list_panels              # call an MCP tool on a running session; the
 caucus ctl read_panel '{"panel":"<id>","mode":"screen"}'
                                     # params are the tool's arguments as JSON;
                                     # each reply is printed as one JSON line
+caucus ctl subscribe_events         # print the list_panels rows, then one JSON
+                                    # line per row change until interrupted
 ```
 
 (`caucus signal post` and `caucus mcp-serve` also exist but are internal —

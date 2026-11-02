@@ -101,7 +101,29 @@ impl Multiplexer {
                 panel,
                 timeout_secs,
             } => self.wait_now(panel, timeout_secs),
+            ControlRequest::SubscribeEvents => {
+                // Publish first: the snapshot must be the rows as of its
+                // seq, and they go stale while no one is subscribed.
+                self.refresh_event_feed();
+                let (seq, panels) = self.events.snapshot();
+                ControlResponse::Subscribed { seq, panels }
+            }
         }
+    }
+
+    /// Publish what changed in the `list_panels` rows since the last call to
+    /// `subscribe_events` clients. Called once per event-loop tick, after
+    /// every step that can change a row. With no subscriber connected it
+    /// returns at once: the rows are not even read.
+    pub fn publish_panel_events(&mut self) {
+        if self.events.has_subscribers() {
+            self.refresh_event_feed();
+        }
+    }
+
+    fn refresh_event_feed(&mut self) {
+        let rows = self.list_panels();
+        self.events.publish(rows);
     }
 
     /// Execute up to [`CONTROL_DRAIN_LIMIT`] queued control jobs from
@@ -326,6 +348,54 @@ mod tests {
             );
         }
 
+        mux.shutdown();
+    }
+
+    /// `subscribe_events` answers with the current rows at the feed's seq;
+    /// each tick then publishes one event per changed row and nothing for an
+    /// unchanged one. With no subscriber the tick publishes nothing.
+    #[tokio::test]
+    async fn subscribe_then_ticks_publish_row_changes() {
+        use crate::mcp::events::PanelEvent;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let panel = crate::bench_support::cat_panel("worker");
+        let id = panel.id;
+        mux.panels.push(panel);
+        mux.rebuild_layout_tree();
+
+        mux.publish_panel_events();
+        assert_eq!(mux.events.snapshot().0, 0, "no subscriber, no publish");
+
+        let mut rx = mux.events.subscriber().subscribe();
+        let ControlResponse::Subscribed { seq, panels } =
+            mux.execute_control(ControlRequest::SubscribeEvents)
+        else {
+            panic!("expected Subscribed");
+        };
+        assert_eq!(seq, 1);
+        assert_eq!(panels, mux.list_panels());
+        assert_eq!(rx.try_recv().unwrap().seq(), 1);
+
+        mux.publish_panel_events();
+        assert!(rx.try_recv().is_err(), "an unchanged row publishes nothing");
+
+        mux.panels[0].state = PanelState::Working;
+        mux.publish_panel_events();
+        match rx.try_recv().unwrap() {
+            PanelEvent::PanelUpdated { seq: 2, panel } => assert_eq!(panel.state, "working"),
+            other => panic!("expected the working row at seq 2, got {other:?}"),
+        }
+
+        mux.kill_panel(id).unwrap();
+        mux.publish_panel_events();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            PanelEvent::PanelRemoved {
+                seq: 3,
+                panel_id: id
+            }
+        );
         mux.shutdown();
     }
 }

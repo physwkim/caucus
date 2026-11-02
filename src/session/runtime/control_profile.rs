@@ -3,6 +3,8 @@
 //! `burst` real socket requests, waits until all of them sit in the job
 //! channel, then calls `drain_control` once per loop turn until the channel
 //! is empty and keeps the longest single call.
+//!
+//! `events_profile` times the per-tick `publish_panel_events` step.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -11,7 +13,7 @@ use tempfile::TempDir;
 
 use super::test_support::area;
 use super::*;
-use crate::bench_support::{PANEL_COUNTS, Summary, cat_panel, paint_screen};
+use crate::bench_support::{PANEL_COUNTS, Summary, cat_panel, paint_screen, spin};
 use serde_json::{Value, json};
 
 use crate::mcp::control_client::call;
@@ -120,6 +122,55 @@ async fn control_profile() {
                     s.max.as_secs_f64() * 1e3
                 );
             }
+        }
+        mux.shutdown();
+    }
+}
+
+const EVENT_TICKS: usize = 2000;
+
+/// One `publish_panel_events` call per tick for [`EVENT_TICKS`] ticks.
+/// `spinning` advances every panel's spinner first, outside the timing, so
+/// each row's screen scan reruns — every panel printing at once.
+fn publish_ticks(mux: &mut Multiplexer, spinning: bool) -> Summary {
+    let mut samples = Vec::with_capacity(EVENT_TICKS);
+    for step in 0..EVENT_TICKS {
+        if spinning {
+            for panel in mux.panels.iter_mut() {
+                spin(&mut panel.grid, step);
+            }
+        }
+        let start = Instant::now();
+        mux.publish_panel_events();
+        samples.push(start.elapsed());
+    }
+    Summary::of(&mut samples)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "profile: cargo test --release --lib events_profile -- --ignored --nocapture --test-threads=1"]
+async fn events_profile() {
+    println!("events_profile: publish_panel_events per tick, {EVENT_TICKS} ticks");
+    println!(
+        "{:<22} {:>6} {:>10} {:>10} {:>10}",
+        "case", "panels", "median_us", "p95_us", "max_us"
+    );
+    for n in PANEL_COUNTS {
+        let tmp = TempDir::new().unwrap();
+        let (mut mux, _control) = build(&tmp, n);
+        let mut cases = vec![("no subscriber", publish_ticks(&mut mux, true))];
+        let _subscriber = mux.events.subscriber().subscribe();
+        cases.push(("subscribed, unchanged", publish_ticks(&mut mux, false)));
+        cases.push(("subscribed, spinning", publish_ticks(&mut mux, true)));
+        for (name, s) in cases {
+            println!(
+                "{:<22} {:>6} {:>10.1} {:>10.1} {:>10.1}",
+                name,
+                n,
+                s.median.as_secs_f64() * 1e6,
+                s.p95.as_secs_f64() * 1e6,
+                s.max.as_secs_f64() * 1e6
+            );
         }
         mux.shutdown();
     }

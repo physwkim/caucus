@@ -22,6 +22,9 @@
 //!    event loop, which executes it against live panels (Invariant I-5's
 //!    single-owner discipline) and answers through the job's oneshot.
 //!
+//! The control socket also streams panel changes to `subscribe_events`
+//! clients ([`events`]); that method is not an MCP tool.
+//!
 //! ## MCP transport: hand-rolled, not `rmcp`
 //!
 //! `rmcp` (1.7.0) resolves cleanly but its server surface is macro-driven and
@@ -32,6 +35,7 @@
 
 pub mod control_client;
 pub mod control_server;
+pub mod events;
 pub mod jsonrpc;
 pub mod protocol;
 pub mod serve;

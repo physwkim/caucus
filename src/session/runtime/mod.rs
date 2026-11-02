@@ -20,6 +20,7 @@ use crate::agent::manifest::AgentManifest;
 use crate::config::Config;
 use crate::input::FocusRouter;
 use crate::mcp::control_server::ControlServer;
+use crate::mcp::events::EventFeed;
 use crate::panel::lifecycle::Panel;
 use crate::render::{Layout, LayoutMode, LayoutTree, Rect};
 use crate::session::id::{PanelId, SessionId};
@@ -307,6 +308,9 @@ pub struct Multiplexer {
     /// ours cannot become ours later — panels caucus spawns are matched by the
     /// exact-id rule before this cache is consulted.
     unbound_unclaimed: HashSet<String>,
+    /// The `subscribe_events` feed: the `list_panels` rows last published and
+    /// their `seq` ([`Multiplexer::publish_panel_events`]).
+    events: EventFeed,
 }
 
 /// Whether [`Multiplexer::new`] is opening a brand-new session or reopening a
@@ -394,8 +398,9 @@ impl Multiplexer {
         let signal_server = SignalServer::bind(&sock_path)
             .with_context(|| format!("bind turn-signal socket {}", sock_path.display()))?;
 
+        let events = EventFeed::new();
         let control_sock_path = control_socket_path(session.id);
-        let control_server = ControlServer::bind(&control_sock_path)
+        let control_server = ControlServer::bind(&control_sock_path, events.subscriber())
             .with_context(|| format!("bind control socket {}", control_sock_path.display()))?;
 
         let (cleanup, _consumer) = CleanupQueue::spawn();
@@ -450,6 +455,7 @@ impl Multiplexer {
                 view_epoch: 0,
                 pending_clipboard: None,
                 unbound_unclaimed: HashSet::new(),
+                events,
             },
             signal_server,
             control_server,

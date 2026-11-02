@@ -865,6 +865,12 @@ async fn event_loop(
         mux.poll_stranded_main();
         prof.lap("poll_stranded_main");
 
+        // 7b. Event stream — publish this tick's `list_panels` row changes to
+        //     `subscribe_events` clients. Last, so it sees every change the
+        //     steps above made. Free while no client is subscribed.
+        mux.publish_panel_events();
+        prof.lap("publish_panel_events");
+
         if mux.should_quit() {
             break;
         }
