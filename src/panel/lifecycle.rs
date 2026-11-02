@@ -43,7 +43,8 @@ fn dump_pty_enabled() -> bool {
 /// of that detection with nothing to write it.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PanelState {
-    /// PTY allocated, agent process starting.
+    /// PTY allocated, agent CLI booting: its input loop is not live until it
+    /// enables bracketed paste.
     Spawning,
     /// Agent is processing a turn.
     Working,

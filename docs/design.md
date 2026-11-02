@@ -114,6 +114,11 @@ caucus는 장기 실행 프로세스다. Session = 그 프로세스가 들고 �
                  (어느 상태에서든 exited로 갈 수 있다)
 ```
 
+`spawning`은 CLI가 bracketed paste(`CSI ?2004h`)를 켜는 순간 `idle`로 끝난다 —
+그때부터 `deliver_text`의 paste + 별도 Enter가 제출된다. 첫 출력 바이트는 그
+신호가 아니다: boot 중에 쓴 입력의 tty echo일 수 있고, `?2004h` 전에 쓴 `\r`은
+유실된다(Claude Code는 첫 바이트 ~0.14 s 뒤에 `?2004h`를 낸다).
+
 coarse 상태에 `blocked`는 없다. 권한 프롬프트나 chooser에 멈춘 패널은 turn
 signal을 아예 내지 않으므로 여기서는 `working` 그대로고, caucus는 읽는 시점에
 grid를 훑어(`term::prompt_scan` → `overlay_blocked_state`) main worker가 보는
@@ -1140,8 +1145,9 @@ blocker(`derive_state::blocker_state`)와 live grid에서 스캔한
 caucus가 감지할 수단조차 없는 상태를 보고할 수 있다고 광고하는 셈이다. 새 상태는
 그것을 만들어내는 신호와 *함께* 추가한다.
 
-manifest에는 boot 단계가 없다. 패널이 coarse `spawning`인 동안(CLI가 아직 첫
-출력을 내기 전) `list_panels`·`wait`·transcript 행은 manifest 대신 coarse
+manifest에는 boot 단계가 없다. 패널이 coarse `spawning`인 동안(CLI가 아직
+bracketed paste(`CSI ?2004h`)를 켜지 않아 입력 루프가 살아 있지 않은 동안)
+`list_panels`·`wait`·transcript 행은 manifest 대신 coarse
 `spawning`을 읽는다(`PanelState::manifest_reports_state`) — 그러지 않으면 막 띄운
 패널이 `idle`로 보고된다.
 

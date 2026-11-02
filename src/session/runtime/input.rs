@@ -287,12 +287,14 @@ impl Multiplexer {
         // responsiveness path and must not be throttled.
         for panel in &mut self.panels {
             match panel.pump() {
-                Ok(n) => {
-                    // First output from a freshly-spawned agent: its CLI
-                    // process is alive and drawing its UI — it has left
-                    // `Spawning` and is now an idle agent awaiting its first
-                    // instruction.
-                    if n > 0 && panel.state() == PanelState::Spawning {
+                Ok(_) => {
+                    // A freshly-spawned agent has booted once it enables
+                    // bracketed paste (`CSI ?2004h`): its input loop is live,
+                    // so a prompt `deliver_text` frames for it now submits.
+                    // Its first output byte is no such sign — it can be the
+                    // tty's echo of input written during boot, and a `\r`
+                    // written before `?2004h` is lost.
+                    if panel.state() == PanelState::Spawning && panel.grid().bracketed_paste() {
                         let _ = lifecycle::transition(panel, PanelState::Idle);
                     }
                 }
@@ -2773,6 +2775,41 @@ mod tests {
             mux.render_signature(),
             "a turn completion must repaint the transcript"
         );
+        mux.shutdown();
+    }
+
+    /// A booting panel stays `Spawning` through plain output (here `cat`
+    /// echoing a line) and becomes `Idle` once the agent enables bracketed
+    /// paste — the point a delivered prompt's Enter is no longer lost.
+    #[tokio::test]
+    async fn a_booting_panel_is_spawning_until_it_enables_bracketed_paste() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Spawning);
+        fn panel(mux: &mut Multiplexer, id: PanelId) -> &mut lifecycle::Panel {
+            mux.panels.iter_mut().find(|p| p.id == id).unwrap()
+        }
+        let pump_until = |mux: &mut Multiplexer, done: &dyn Fn(&lifecycle::Panel) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                mux.pump_all();
+                if done(mux.panels.iter().find(|p| p.id == id).unwrap())
+                    || Instant::now() > deadline
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        panel(&mut mux, id).write_input(b"boot\n").unwrap();
+        pump_until(&mut mux, &|p| p.grid().generation() > 0);
+        assert!(panel(&mut mux, id).grid().generation() > 0, "cat echoed");
+        assert_eq!(panel(&mut mux, id).state(), PanelState::Spawning);
+
+        panel(&mut mux, id).write_input(b"\x1b[?2004h\n").unwrap();
+        pump_until(&mut mux, &|p| p.state() == PanelState::Idle);
+        assert_eq!(panel(&mut mux, id).state(), PanelState::Idle);
         mux.shutdown();
     }
 

@@ -76,6 +76,10 @@ versions.
   overlay and `wait` showed a freshly spawned panel as mid-turn until its
   first turn ended, and a `wait` on it held until its deadline. It now reads
   `spawning` while its CLI boots and `idle` after.
+- **A new panel reads `spawning` until its CLI accepts input.** It used to
+  turn `idle` at its first output byte, ~0.14 s before Claude Code's input
+  is live, so a prompt sent on that `idle` lost its Enter and sat unsent. It
+  now turns `idle` when the CLI enables bracketed paste.
 
 ## [0.11.0] — 2026-10-15
 
