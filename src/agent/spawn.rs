@@ -383,8 +383,8 @@ fn claude_args(
     args
 }
 
-/// `codex` argv: `--no-daemon` and `-c check_for_update_on_startup=false` (no
-/// startup chooser), `--model` (omitted when unset — codex rejects claude model
+/// `codex` argv: `-c features.daemon_auto_start=false` and
+/// `-c check_for_update_on_startup=false` (no startup chooser), `--model` (omitted when unset — codex rejects claude model
 /// ids), the role's system prompt as `-c instructions=<text>` (codex's base
 /// instructions config override — it has no `--append-system-prompt` flag),
 /// the caucus MCP server as `-c mcp_servers.caucus.*` for the main worker panel
@@ -409,10 +409,13 @@ fn codex_args(
     // an Enter caucus sends there picks the highlighted option: "Update now"
     // (runs the installer) or "Cancel" (codex exits when the shared background
     // server's feature settings differ). The panel process must also own its
-    // agent, so codex runs in-process rather than on that shared server.
-    // Verified on codex 0.162; a codex without the daemon rejects --no-daemon.
+    // agent; the per-launch `-c` overrides below already keep codex off that
+    // shared server, and turning off its auto-start drops the warning about it.
+    // Not `--no-daemon`: codex before 0.156 rejects the flag, but ignores an
+    // unknown feature key. Verified on codex 0.162.
     let mut args: Vec<OsString> = vec![
-        "--no-daemon".into(),
+        "-c".into(),
+        "features.daemon_auto_start=false".into(),
         "-c".into(),
         "check_for_update_on_startup=false".into(),
     ];
@@ -1070,8 +1073,9 @@ mod tests {
     }
 
     /// Every codex panel, main or sub-agent, starts past both startup
-    /// choosers: on its own process, not the shared background server, and
-    /// without the update check.
+    /// choosers: with the shared background server's auto-start off, and
+    /// without the update check. `--no-daemon` stays out: codex before 0.156
+    /// rejects it.
     #[test]
     fn codex_argv_skips_the_startup_choosers() {
         for caucus_mcp in [
@@ -1091,7 +1095,12 @@ mod tests {
                 ..SpawnRequest::default()
             };
             let args = args_of(&build_command(&req, PanelId::new()));
-            assert!(args.contains(&"--no-daemon".to_string()), "{args:?}");
+            assert!(!args.contains(&"--no-daemon".to_string()), "{args:?}");
+            assert!(
+                args.windows(2)
+                    .any(|w| w == ["-c", "features.daemon_auto_start=false"]),
+                "{args:?}"
+            );
             assert!(
                 args.windows(2)
                     .any(|w| w == ["-c", "check_for_update_on_startup=false"]),
