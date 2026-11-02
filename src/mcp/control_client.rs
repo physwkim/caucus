@@ -273,6 +273,19 @@ fn build_request(name: &str, args: &Value) -> std::result::Result<ControlRequest
                 index,
             })
         }
+        "wait" => {
+            let timeout_secs =
+                match args.get("timeout_secs") {
+                    Some(v) => Some(v.as_u64().ok_or_else(|| {
+                        "`timeout_secs` must be a non-negative integer".to_string()
+                    })?),
+                    None => None,
+                };
+            Ok(ControlRequest::Wait {
+                panel: panel(args)?,
+                timeout_secs,
+            })
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -660,6 +673,31 @@ mod tests {
     fn build_stop_watching_rejects_bad_panel_id() {
         let err = build_request("stop_watching", &json!({"panel": "not-a-ulid"})).unwrap_err();
         assert!(err.contains("invalid panel id"), "got: {err}");
+    }
+
+    #[test]
+    fn build_wait_request() {
+        let a = PanelId::new();
+        let req = build_request("wait", &json!({"panel": a.to_string()})).unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::Wait {
+                panel: a,
+                timeout_secs: None,
+            }
+        );
+        let req =
+            build_request("wait", &json!({"panel": a.to_string(), "timeout_secs": 45})).unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::Wait {
+                panel: a,
+                timeout_secs: Some(45),
+            }
+        );
+        let err = build_request("wait", &json!({"panel": a.to_string(), "timeout_secs": -1}))
+            .unwrap_err();
+        assert!(err.contains("timeout_secs"), "got: {err}");
     }
 
     #[test]

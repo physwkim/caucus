@@ -8,11 +8,12 @@
 //! live panels and answers through the job's oneshot reply channel; this
 //! module writes the [`ControlResponse`] back on the connection.
 //!
-//! Most requests are answered on the tick they are drained. The one exception
-//! is `spawn_role(worktree=true)`, whose `git worktree add` is run off the
-//! event loop (`session::runtime::spawn_async`): its oneshot is held and
-//! answered a few ticks later when the worktree is ready. The accept task
-//! simply awaits the oneshot, so the wait is transparent to this module.
+//! Most requests are answered on the tick they are drained. Two are not:
+//! `spawn_role(worktree=true)`, whose `git worktree add` is run off the event
+//! loop (`session::runtime::spawn_async`), and `wait` on a busy panel
+//! (`session::runtime::wait`). Their oneshot is held and answered on a later
+//! tick. The accept task simply awaits the oneshot, so the delay is
+//! transparent to this module.
 //!
 //! Why route through the event loop rather than touch panels here: the
 //! `Multiplexer` is `!Send` single-owner state (it owns PTYs, grids). Control

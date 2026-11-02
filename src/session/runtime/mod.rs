@@ -38,6 +38,7 @@ mod scroll;
 mod spawn;
 mod spawn_async;
 mod unbound;
+mod wait;
 
 use self::mcp::PendingSubmit;
 use self::rounds::{QuestionNotice, WorkerWatch};
@@ -105,6 +106,9 @@ pub struct Multiplexer {
     /// a worker thread. Finished off the event loop so a slow worktree create
     /// never freezes the TUI; completed by [`Multiplexer::poll_pending_spawns`].
     pending_spawns: Vec<spawn_async::PendingSpawn>,
+    /// `wait` calls whose panel was still busy when drained; answered by
+    /// [`Multiplexer::poll_waits`].
+    pending_waits: Vec<wait::PendingWait>,
     /// Submitting Enters held back from bracketed pastes until the agent has
     /// ingested the paste. A bracketed-paste agent (Claude Code) that commits a
     /// large paste to a `[Pasted text #N]` placeholder swallows a `\r` arriving
@@ -421,6 +425,7 @@ impl Multiplexer {
                 watches: Vec::new(),
                 watched_in_flight: HashSet::new(),
                 pending_spawns: Vec::new(),
+                pending_waits: Vec::new(),
                 pending_submits: Vec::new(),
                 pending_close: None,
                 main_panel_id: None,

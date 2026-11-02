@@ -96,6 +96,11 @@ impl Multiplexer {
                     Err(err) => ControlResponse::error(err),
                 }
             }
+            // This path cannot hold a reply; `drain_control` parks a wait.
+            ControlRequest::Wait {
+                panel,
+                timeout_secs,
+            } => self.wait_now(panel, timeout_secs),
         }
     }
 
@@ -106,11 +111,13 @@ impl Multiplexer {
     /// panels, on the same thread that pumps PTYs (Invariant I-5).
     ///
     /// Most requests are answered immediately via
-    /// [`Multiplexer::execute_control`]. The one exception is
+    /// [`Multiplexer::execute_control`]. Two are deferred.
     /// `spawn_role(worktree=true)`: its `git worktree add` is slow enough to
     /// freeze the single-threaded loop, so it is deferred off-thread
     /// (`Multiplexer::begin_spawn_role_worktree`) and its reply is sent later
-    /// from `Multiplexer::poll_pending_spawns`. `register_round` is
+    /// from `Multiplexer::poll_pending_spawns`. `wait` on a busy panel is
+    /// parked (`Multiplexer::begin_wait`) and answered from
+    /// `Multiplexer::poll_waits`. `register_round` is
     /// non-blocking in a different way: it acks now and the round is delivered
     /// later by the caucus→main push in [`Multiplexer::poll_worker_watches`].
     pub fn drain_control(&mut self, server: &mut ControlServer) {
@@ -130,6 +137,10 @@ impl Multiplexer {
                 } => {
                     self.begin_spawn_role_worktree(role, model, agent_cli, prompt, reply);
                 }
+                ControlRequest::Wait {
+                    panel,
+                    timeout_secs,
+                } => self.begin_wait(panel, timeout_secs, reply),
                 other => {
                     let response = self.execute_control(other);
                     // A dropped reply channel means the control-socket

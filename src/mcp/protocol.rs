@@ -174,7 +174,25 @@ pub enum ControlRequest {
     /// Pick option `index` (the displayed 1-based number) in a panel's
     /// selection menu: caucus navigates the chooser there and presses Enter.
     SelectOption { panel: PanelId, index: usize },
+    /// Hold the reply until `panel` stops working: its `list_panels` state
+    /// leaves `working` / `spawning`. `timeout_secs` defaults to
+    /// [`DEFAULT_WAIT_SECS`] and may not exceed [`MAX_WAIT_SECS`]. Answered
+    /// with the panel's summary ([`ControlResponse::Panels`]), or an error on
+    /// timeout, for an unknown or vanished panel, or for the main panel.
+    Wait {
+        panel: PanelId,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
 }
+
+/// [`ControlRequest::Wait`]'s timeout when the caller names none.
+pub const DEFAULT_WAIT_SECS: u64 = 600;
+
+/// The longest [`ControlRequest::Wait`] caucus accepts. The MCP clients'
+/// per-call timeouts are set above it (`crate::mcp::serve::TOOL_TIMEOUT_SECS`)
+/// so the client never abandons a wait caucus is still holding.
+pub const MAX_WAIT_SECS: u64 = 3600;
 
 /// One control-socket response — the result of executing a [`ControlRequest`]
 /// against the live multiplexer.
@@ -217,6 +235,29 @@ mod tests {
         assert!(line.contains("\"op\":\"send_keys\""));
         let back: ControlRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn wait_round_trips_and_defaults_its_timeout() {
+        let req = ControlRequest::Wait {
+            panel: PanelId::new(),
+            timeout_secs: Some(30),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"op\":\"wait\""));
+        let back: ControlRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(req, back);
+
+        let id = PanelId::new();
+        let req: ControlRequest =
+            serde_json::from_str(&format!(r#"{{"op":"wait","panel":"{id}"}}"#)).unwrap();
+        assert_eq!(
+            req,
+            ControlRequest::Wait {
+                panel: id,
+                timeout_secs: None,
+            }
+        );
     }
 
     #[test]

@@ -18,9 +18,9 @@ use super::manifest::AgentManifest;
 /// the sub-agent panels through this server's tools (`spawn_role`, `list_panels`,
 /// ...). claude registers it via the written `.mcp.json` (`mcp_config_path`,
 /// `--mcp-config`); codex has no such flag, so its argv injects
-/// `-c mcp_servers.caucus.{command,args}` built from this. `None` for every
-/// non-main panel — a sub-agent is not an orchestrator and must not receive the
-/// caucus tool surface.
+/// `-c mcp_servers.caucus.{command,args,tool_timeout_sec}` built from this.
+/// `None` for every non-main panel — a sub-agent is not an orchestrator and
+/// must not receive the caucus tool surface.
 #[derive(Debug, Clone)]
 pub struct CaucusMcp {
     pub caucus_bin: PathBuf,
@@ -433,6 +433,15 @@ fn codex_args(
         server_args.push(mcp.control_sock.as_os_str());
         server_args.push("\"]");
         args.push(server_args);
+
+        args.push("-c".into());
+        args.push(
+            format!(
+                "mcp_servers.caucus.tool_timeout_sec={}",
+                crate::mcp::serve::TOOL_TIMEOUT_SECS
+            )
+            .into(),
+        );
     }
     // Turn-completion signalling: codex invokes this `notify` program on
     // `agent-turn-complete` with the event JSON appended as a final argument.
@@ -947,6 +956,14 @@ mod tests {
                     == "mcp_servers.caucus.args=[\"mcp-serve\", \"--control-sock\", \
                         \"/repo/.caucus/sessions/S1/control.sock\"]"),
             "codex must register the caucus server args: {args:?}"
+        );
+        let timeout = format!(
+            "mcp_servers.caucus.tool_timeout_sec={}",
+            crate::mcp::serve::TOOL_TIMEOUT_SECS
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "-c" && w[1] == timeout),
+            "codex must raise the caucus tool timeout above the longest wait: {args:?}"
         );
         // No claude-only MCP flag leaks onto a codex invocation.
         assert!(!args.contains(&"--mcp-config".to_string()));

@@ -7,8 +7,9 @@
 //! request-building stays on the event loop, the slow `git worktree add` runs on
 //! a worker thread, and the MCP tool call's reply is sent *later* — from
 //! [`Multiplexer::poll_pending_spawns`], once the worktree exists and the panel
-//! has launched. This is the one deferred-reply path in the control protocol
-//! (`docs/design.md` §0 #4); every other request still answers synchronously.
+//! has launched. Besides `wait` (`session::runtime::wait`), this is the one
+//! deferred-reply path in the control protocol (`docs/design.md` §0 #4);
+//! every other request still answers synchronously.
 
 use super::*;
 use crate::mcp::McpError;

@@ -13,6 +13,14 @@ versions.
   second, `.caucus/caucus.log` gets each loop pass's call count, mean and max
   time, with the turn count and total busy time; the idle input wait is not
   counted. Unset, it costs one branch per pass.
+- **A `wait` MCP tool — the surface is now fifteen.** `wait(panel,
+  timeout_secs)` holds the main worker's call until that panel's
+  `list_panels` state leaves `working`/`spawning`, then returns its entry; a
+  panel fed its next queued task is not reported between tasks. It errors on
+  timeout (default 600 s, max 3600 s), on a killed or restarted panel, and on
+  the main panel. caucus now registers a 3660 s tool timeout with Claude Code
+  (`.mcp.json` `timeout`) and codex (`tool_timeout_sec`) so neither client
+  abandons a held call.
 
 ### Changed
 

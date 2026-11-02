@@ -2,10 +2,10 @@
 //! (`docs/design.md` §0 #4, §9).
 //!
 //! The main worker (a Claude Code agent in one panel) drives every sub-agent
-//! panel through fourteen MCP tools: `send_keys`, `send_key`, `broadcast`,
+//! panel through fifteen MCP tools: `send_keys`, `send_key`, `broadcast`,
 //! `ctrl_c`, `read_panel`, `spawn_role`, `kill_panel`, `restart_panel`,
 //! `list_panels`, `queue_tasks`, `collect_workers`, `stop_watching`,
-//! `read_menu`, `select_option`.
+//! `read_menu`, `select_option`, `wait`.
 //!
 //! ## Architecture
 //!
@@ -547,6 +547,33 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                 "required": ["panel", "index"]
             }),
         },
+        ToolDef {
+            name: "wait",
+            description: "Block until one panel stops working — its list_panels \
+                          state leaves 'working' / 'spawning' (idle, exited, or \
+                          stopped on a prompt) — and return its list_panels \
+                          entry. Use it only when your next step inside this turn \
+                          needs that panel's result; otherwise end your turn and \
+                          let caucus push the result to you. A watched worker \
+                          is still delivered afterwards: call collect_workers to \
+                          take its report now. Errors on timeout, if the panel \
+                          is killed or restarted while you wait, and for your own \
+                          panel.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "panel": panel_prop(),
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": protocol::MAX_WAIT_SECS,
+                        "default": protocol::DEFAULT_WAIT_SECS,
+                        "description": "Give up after this many seconds."
+                    }
+                },
+                "required": ["panel"]
+            }),
+        },
     ]
 }
 
@@ -582,6 +609,7 @@ mod tests {
                 "stop_watching",
                 "read_menu",
                 "select_option",
+                "wait",
             ]
         );
     }

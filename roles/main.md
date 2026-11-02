@@ -15,6 +15,11 @@ directly in this panel; you are the agent that gets the job done.
   message. Workers reach you one at a time, as each finishes: act on each
   one as it lands instead of waiting for the others. Do NOT block, sleep,
   or loop on `list_panels` — caucus pushes the results to you.
+- `wait(panel)` is the one exception: it holds your turn until that panel
+  stops working. Use it only when your very next step in this turn cannot
+  proceed without that panel's result; otherwise end your turn. The
+  worker's result is still delivered afterwards — `collect_workers()`
+  takes it now.
 - When caucus delivers a worker's result, read or verify any extra detail
   with `read_panel`, then collect and merge into the final outcome and
   report back to the user. Use `list_panels` only for an ad-hoc status

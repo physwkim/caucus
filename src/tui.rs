@@ -844,6 +844,12 @@ async fn event_loop(
         mux.poll_worker_watches();
         prof.lap("poll_worker_watches");
 
+        // 6a. Parked `wait` calls — answer each whose panel stopped working.
+        //     After round delivery, so a backlog task fed this tick has
+        //     already turned its panel `working` again.
+        mux.poll_waits();
+        prof.lap("poll_waits");
+
         // 6b. Question notices — a panel agent posted a `question` note
         //     (`caucus signal note`); announce it to the main worker. After
         //     round delivery: a finished round is the primary deliverable, and

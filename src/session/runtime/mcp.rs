@@ -1,9 +1,71 @@
 use super::*;
+use crate::agent::derive_state::DerivedState;
 use crate::mcp::{McpError, McpToolSurface, PanelSummary, ReadPanelMode};
+use crate::panel::lifecycle::PanelState;
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+/// A panel's state as `list_panels` reports it: the manifest's derived state
+/// with a live grid prompt overlaid, or the coarse panel state before the
+/// panel has a manifest. `wait` holds on this same value, so it returns on
+/// exactly the state `list_panels` shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportedState {
+    Derived(DerivedState),
+    Coarse(PanelState),
+}
+
+impl ReportedState {
+    /// A live grid-detected prompt (selection menu or `[y/n]`) overlays the
+    /// derived state: no Stop hook fires while one is open, so the
+    /// signal-derived state alone would read `working`.
+    fn of(
+        manifest: Option<&AgentManifest>,
+        coarse: PanelState,
+        blocked: Option<&rounds::BlockedPrompt>,
+    ) -> Self {
+        match manifest {
+            Some(m) => Self::Derived(Multiplexer::overlay_blocked_state(
+                m.derived_state(),
+                blocked,
+            )),
+            None => Self::Coarse(coarse),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Derived(state) => state.as_str(),
+            Self::Coarse(state) => state.label(),
+        }
+    }
+
+    /// Mid-turn: neither settled nor stopped on something that needs the
+    /// main worker.
+    pub(crate) fn is_busy(self) -> bool {
+        matches!(
+            self,
+            Self::Derived(DerivedState::Working)
+                | Self::Coarse(PanelState::Spawning | PanelState::Working)
+        )
+    }
+}
+
+impl Multiplexer {
+    /// The [`ReportedState`] of `panel`, or `None` if it does not exist.
+    pub(crate) fn reported_state(&mut self, panel: PanelId) -> Option<ReportedState> {
+        let p = self.panels.iter().find(|p| p.id == panel)?;
+        let (generation, coarse) = (p.grid().generation(), p.state());
+        let blocked = self.panel_blocked_cached(panel, generation);
+        Some(ReportedState::of(
+            self.manifests.get(&panel),
+            coarse,
+            blocked.as_ref(),
+        ))
+    }
+}
 
 /// The main worker's MCP tool surface, backed by the live panel registry
 /// (`docs/design.md` §0 #4). Every method runs on the multiplexer's own
@@ -168,23 +230,12 @@ impl McpToolSurface for Multiplexer {
             .zip(blocked)
             .map(|(p, blocked)| {
                 let manifest = self.manifests.get(&p.id);
-                // Prefer the manifest's derived_state (turn-signal fed); fall
-                // back to the coarse panel-state label before the first turn.
-                // A live grid-detected prompt (selection menu or `[y/n]`)
-                // overlays its blocked state — no Stop hook fires while one is
-                // open, so the signal-derived state alone would read `working`.
-                let (state, agent_cli) = match manifest {
-                    Some(m) => {
-                        let st = Self::overlay_blocked_state(m.derived_state(), blocked.as_ref());
-                        (st.as_str().to_string(), m.agent_cli)
-                    }
-                    None => (p.state_label().to_string(), AgentCli::Claude),
-                };
+                let state = ReportedState::of(manifest, p.state(), blocked.as_ref());
                 PanelSummary {
                     panel_id: p.id,
                     role: p.role.clone(),
-                    state,
-                    agent_cli,
+                    state: state.as_str().to_string(),
+                    agent_cli: manifest.map_or(AgentCli::Claude, |m| m.agent_cli),
                     // The manifest holds the live worktree path and the model
                     // override; the branch lives in `worktree_branches` (it
                     // outlives the path, which is removed on shutdown).

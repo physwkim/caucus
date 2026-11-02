@@ -58,7 +58,7 @@ and renders the panels (`ratatui`). tmux and zellij are *not* dependencies —
 they are studied as references for the grid and layout design.
 
 **The main worker drives sub-agents over MCP.** caucus runs an MCP server.
-The main worker gets fourteen caucus tools (see [MCP tools](#mcp-tools) below)
+The main worker gets fifteen caucus tools (see [MCP tools](#mcp-tools) below)
 so a single instruction from you turns into the main worker decomposing the
 task, spawning sub-agent panels, and feeding each one its sub-task as real
 keystrokes.
@@ -152,7 +152,7 @@ pages the pager, exactly as the key does.
 
 ## MCP tools
 
-caucus exposes fourteen tools to the main worker over MCP. The main worker
+caucus exposes fifteen tools to the main worker over MCP. The main worker
 calls them to spawn, drive, observe, and reap sub-agent panels:
 
 | Tool              | What it does                                                              |
@@ -171,6 +171,7 @@ calls them to spawn, drive, observe, and reap sub-agent panels:
 | `stop_watching`   | Stop reporting one worker and drop its queued tasks; the panel itself is untouched, and the next prompt re-arms the watch. |
 | `read_menu`       | Read a panel's interactive selection menu (question + numbered options).  |
 | `select_option`   | Answer a panel's selection menu by picking an option number.              |
+| `wait`            | Hold the main worker's turn until one panel stops working, then return its `list_panels` entry. For a result the next step in this turn needs; otherwise end the turn and let caucus push it. |
 
 `read_panel` takes a `mode`: `screen` (the visible grid), `scrollback` (the
 full scrollback buffer), `since_last_turn` (everything since the last
