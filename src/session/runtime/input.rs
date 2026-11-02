@@ -110,14 +110,18 @@ impl LostTurnProbe {
         activity: ScreenActivity,
         now: Instant,
     ) -> Option<LostTurn> {
-        if generation != self.generation {
+        // A screen showing another thread says nothing about this turn, not
+        // even by holding still.
+        if generation != self.generation || activity == ScreenActivity::OtherThread {
             self.generation = generation;
             self.since = now;
         }
         self.screen = match (self.screen, activity) {
             (_, ScreenActivity::Working) => ScreenTrack::Live,
             (ScreenTrack::Live, ScreenActivity::Idle) => ScreenTrack::IdleSince(now),
-            (ScreenTrack::IdleSince(_), ScreenActivity::Unknown) => ScreenTrack::Live,
+            (ScreenTrack::IdleSince(_), ScreenActivity::Unknown | ScreenActivity::OtherThread) => {
+                ScreenTrack::Live
+            }
             (track, _) => track,
         };
         if matches!(self.screen, ScreenTrack::AwaitingEffect(submit)
@@ -1840,6 +1844,41 @@ mod tests {
         assert_eq!(
             p.observe(4, Idle, t0 + hold + tick + hold),
             Some(LostTurn::Unsignalled)
+        );
+    }
+
+    /// A codex sub-agent view is another thread's screen: neither its idle
+    /// prompt nor its stillness reconciles the panel, however long it stays
+    /// up, and it breaks an idle hold like an unknown frame. Back on the
+    /// panel's own screen the rules resume, a stalled submit included.
+    #[test]
+    fn lost_turn_probe_holds_while_another_thread_is_shown() {
+        use ScreenActivity::{Idle, OtherThread, Working};
+        let t0 = Instant::now();
+        let hold = SCREEN_IDLE_RECONCILE_HOLD;
+        let quiet = LOST_TURN_RECONCILE_QUIESCENCE;
+        let tick = Duration::from_millis(10);
+
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::Unconfirmed);
+        p.observe(1, Working, t0);
+        p.observe(2, Idle, t0 + tick);
+        assert_eq!(p.observe(3, OtherThread, t0 + tick * 2), None);
+        assert_eq!(p.screen, ScreenTrack::Live);
+        assert_eq!(p.observe(3, OtherThread, t0 + quiet * 3), None);
+        assert_eq!(p.observe(4, Idle, t0 + quiet * 3 + tick), None);
+        assert_eq!(
+            p.observe(4, Idle, t0 + quiet * 3 + tick + hold),
+            Some(LostTurn::Unsignalled)
+        );
+
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::AwaitingEffect(t0));
+        assert_eq!(
+            p.observe(1, OtherThread, t0 + PROMPT_EFFECT_TIMEOUT * 2),
+            None
+        );
+        assert_eq!(
+            p.observe(2, Idle, t0 + PROMPT_EFFECT_TIMEOUT * 2 + tick),
+            Some(LostTurn::Stalled)
         );
     }
 

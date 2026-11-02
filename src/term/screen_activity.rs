@@ -22,6 +22,10 @@ pub enum ScreenActivity {
     Idle,
     /// Neither: a dialog, a viewer, a blocker, or an unrecognised layout.
     Unknown,
+    /// The screen is another conversation's: codex showing a sub-agent the
+    /// human opened. Its status, title and stillness are that thread's, so
+    /// none of it is evidence about the panel's own turn.
+    OtherThread,
 }
 
 fn re(pattern: &str) -> Regex {
@@ -202,6 +206,14 @@ pub fn codex_dialog(lines: &[String]) -> bool {
 /// Classify a codex screen. `lines` are the grid rows, trailing whitespace
 /// trimmed; `title` is the OSC window title codex keeps current.
 pub fn codex_activity(lines: &[String], title: Option<&str>) -> ScreenActivity {
+    let rows = trimmed_rows(lines);
+    let last_prompt = rows.iter().rposition(|line| codex_prompt_line(line));
+    let current_prompt =
+        last_prompt.filter(|&i| !rows[i + 1..].iter().any(|l| codex_block_line(l)));
+    // The title follows the viewed thread too, so this precedes it.
+    if current_prompt.is_some_and(|i| rows[i].starts_with(CODEX_SUBAGENT_VIEW)) {
+        return ScreenActivity::OtherThread;
+    }
     let title = title.unwrap_or("");
     if title.contains("Action Required") {
         return ScreenActivity::Unknown;
@@ -209,10 +221,6 @@ pub fn codex_activity(lines: &[String], title: Option<&str>) -> ScreenActivity {
     if CODEX_TITLE_SPINNER.is_match(title) {
         return ScreenActivity::Working;
     }
-    let rows = trimmed_rows(lines);
-    let last_prompt = rows.iter().rposition(|line| codex_prompt_line(line));
-    let current_prompt =
-        last_prompt.filter(|&i| !rows[i + 1..].iter().any(|l| codex_block_line(l)));
     let after_last_prompt = last_prompt.map_or(rows, |i| &rows[i + 1..]);
     let after_lower = after_last_prompt.join("\n").to_lowercase();
     if codex_transcript_viewer(&after_lower)
@@ -238,6 +246,11 @@ pub fn codex_activity(lines: &[String], title: Option<&str>) -> ScreenActivity {
     }
     ScreenActivity::Unknown
 }
+
+/// The composer placeholder codex shows, with input disabled, while a
+/// sub-agent's thread is open (`ChatComposer::set_parent_owned_thread`).
+/// Matched as a prefix: a narrow panel clips the rest.
+const CODEX_SUBAGENT_VIEW: &str = "› Viewing sub-agent — ";
 
 fn codex_prompt_line(line: &str) -> bool {
     line == "›" || line.starts_with("› ")
@@ -561,6 +574,31 @@ mod tests {
         LazyLock::force(&CODEX_UPDATE_LEGACY);
         LazyLock::force(&CODEX_UPDATE_PICKER);
         LazyLock::force(&CODEX_SPARKLE_PROMPT);
+    }
+
+    /// Captured from codex 0.162 with `/subagents` on a running sub-agent,
+    /// then on a finished one: neither is the panel's turn.
+    #[test]
+    fn a_codex_subagent_view_is_another_thread() {
+        let running = rows(
+            "  $ /bin/bash -lc 'sleep 35; echo $((19*21))'\n\n◦ Working (1s • esc to interrupt)\n\n› Viewing sub-agent — direct input is disabled\n\n  GPT-6-Astra high · /tmp/repo\n  ? for shortcuts\n",
+        );
+        assert_eq!(
+            codex_activity(&running, Some("⠙ calculate_view | repo")),
+            ScreenActivity::OtherThread
+        );
+        let finished = rows(
+            "• 399\n\n  Worked for 43s • 3:49 PM\n\n› Viewing sub-agent — direct input is disabled\n\n  GPT-6-Astra high · /tmp/repo\n  ? for shortcuts\n",
+        );
+        assert_eq!(
+            codex_activity(&finished, Some("calculate_view | repo")),
+            ScreenActivity::OtherThread
+        );
+        let typed = codex_screen("› Viewing sub-agent — what does it mean\n• It means…");
+        assert_eq!(
+            codex_activity(&typed, Some("task | work")),
+            ScreenActivity::Idle
+        );
     }
 
     #[test]
