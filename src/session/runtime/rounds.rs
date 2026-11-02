@@ -1386,14 +1386,15 @@ impl Multiplexer {
     /// panel caucus hands a prompt is watched from that instant
     /// (`Multiplexer::arm_worker_watch`), so a worker main gave work to always
     /// has a path back. What remains reachable is a panel that reached
-    /// `Working`/`Spawning` **without caucus delivering it a prompt** — spawned
-    /// and left un-tasked while main ended its turn, or an agent CLI that opened
-    /// a turn on its own (a leftover background shell finishing). Nothing owes
-    /// main that panel's result, so without this main sits idle indefinitely.
+    /// `Working` **without caucus delivering it a prompt** — an agent CLI that
+    /// opened a turn on its own (a leftover background shell finishing).
+    /// Nothing owes main that panel's result, so without this main sits idle
+    /// indefinitely. A `Spawning` panel is not busy: it runs nothing caucus
+    /// did not hand it, and a task sent while it boots turns it `Working`.
     ///
     /// Stranded ⟺ main exists and is `Idle`, `watches` is empty (a
     /// pending round *is* a wake path), and ≥1 non-main panel is
-    /// `Working`/`Spawning`. Fires only while stranded, the shared
+    /// `Working`. Fires only while stranded, the shared
     /// deliverability gate is open (`Multiplexer::main_deliverable`), and at
     /// least `STRANDED_NUDGE_COOLDOWN` has passed since the last nudge. The
     /// `main_stranded_last_nudge` latch is cleared the instant main is no longer
@@ -1407,10 +1408,7 @@ impl Multiplexer {
         let working: Vec<PanelId> = if self.watches.is_empty() {
             self.panels
                 .iter()
-                .filter(|p| {
-                    p.id != main_id
-                        && matches!(p.state(), PanelState::Working | PanelState::Spawning)
-                })
+                .filter(|p| p.id != main_id && p.state() == PanelState::Working)
                 .map(|p| p.id)
                 .collect()
         } else {
@@ -1448,8 +1446,8 @@ impl Multiplexer {
         notice.push_str(
             "caucus watches every panel it delivers a prompt to and re-prompts \
              you the moment that panel finishes — but these were never given a \
-             task through caucus (spawned and left un-tasked, or the agent \
-             started a turn on its own). Send them their task with send_keys or \
+             task through caucus (the agent started a turn on its own). Send \
+             them their task with send_keys or \
              broadcast and end your turn; you will be woken per panel as each \
              finishes. Use read_panel or kill_panel if they should not be \
              running at all.",
@@ -4599,6 +4597,34 @@ mod tests {
         assert!(mux.main_stranded_last_nudge.is_none());
 
         draw(&mut mux, "● ok\n────────\n❯ \n────────\n  ? for shortcuts");
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working
+        );
+        mux.shutdown();
+    }
+
+    /// A booting sub-panel is not busy: resume respawns every panel, and a
+    /// main that boots first must not be told its subs run work it never
+    /// handed out. The same panel counts once it is `Working`.
+    #[tokio::test]
+    async fn a_spawning_sub_does_not_strand_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Spawning);
+
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle
+        );
+        assert!(mux.main_stranded_last_nudge.is_none());
+
+        let panel = mux.panels.iter_mut().find(|p| p.id == sub).unwrap();
+        crate::panel::lifecycle::transition(panel, PanelState::Working).unwrap();
         mux.poll_stranded_main();
         assert_eq!(
             mux.panels().iter().find(|p| p.id == main).unwrap().state(),
