@@ -405,29 +405,6 @@ impl Multiplexer {
             return;
         }
 
-        // codex runs `notify` for every thread it drives, including the
-        // ephemeral one that writes the title mid-turn and any subagents. Only
-        // the thread the panel's title shows is the panel's turn; anything else
-        // is dropped like the pause above. A title with no thread id (older
-        // codex, no thread yet) cannot tell them apart, so the signal counts.
-        if let Some(thread) = signal.codex_thread_id()
-            && let Some(shown) = self
-                .panels
-                .iter()
-                .find(|p| p.id == signal.panel_id)
-                .and_then(|p| p.grid().title())
-                .and_then(crate::term::codex_title_thread)
-            && !thread.starts_with(shown)
-        {
-            debug!(
-                panel = %signal.panel_id,
-                thread,
-                shown,
-                "codex side-thread completion; not a turn boundary"
-            );
-            return;
-        }
-
         // This boundary belongs to the prompt whose turn just ended. Consume it,
         // and learn whether caucus delivered a further prompt while that turn
         // was open — the CLI queued it, so the agent runs it next and this is
@@ -1360,84 +1337,6 @@ mod tests {
             serde_json::json!({ "session_id": "conv-1" }),
         ));
 
-        assert_eq!(panel_state(&mux, id), PanelState::Idle);
-        mux.shutdown();
-    }
-
-    /// A codex panel whose title shows `title` and whose prompt is in flight.
-    fn working_codex_panel(
-        mux: &mut Multiplexer,
-        title: &str,
-    ) -> (PanelId, crate::session::id::AgentId) {
-        let (id, agent_id) = working_panel_with_manifest(mux);
-        if let Some(mf) = mux.manifests.get_mut(&id) {
-            mf.agent_cli = crate::role::spec::AgentCli::Codex;
-        }
-        let panel = mux.panels.iter_mut().find(|p| p.id == id).unwrap();
-        panel.grid.advance(format!("\x1b]0;{title}\x07").as_bytes());
-        (id, agent_id)
-    }
-
-    fn codex_stop(mux: &Multiplexer, id: PanelId, thread: &str, message: &str) -> TurnSignal {
-        TurnSignal::now(
-            mux.session.id,
-            id,
-            crate::signal::TurnKind::Stop,
-            Some(message.into()),
-            serde_json::json!({ "type": "agent-turn-complete", "thread-id": thread }),
-        )
-    }
-
-    /// codex runs `notify` for every thread, including the ephemeral one that
-    /// writes the title while the real turn is still running. Its completion
-    /// must leave the panel's turn open and its last message untouched; the
-    /// completion from the thread the title shows ends the turn.
-    #[tokio::test]
-    async fn a_codex_side_thread_completion_is_not_a_turn_boundary() {
-        let tmp = TempDir::new().unwrap();
-        let mut mux = mux(&tmp);
-        let (id, agent_id) = working_codex_panel(
-            &mut mux,
-            "⠙ Run sleep | repo | 01a19adc-cb89-7c71-bc0f-3af55...",
-        );
-
-        mux.handle_signal(codex_stop(
-            &mux,
-            id,
-            "01a19adc-e169-7272-8cbf-b5e8b69d0165",
-            r#"{"title":"Run sleep"}"#,
-        ));
-        assert_eq!(panel_state(&mux, id), PanelState::Working);
-        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
-        assert_eq!(on_disk.last_message(), None);
-
-        mux.handle_signal(codex_stop(
-            &mux,
-            id,
-            "01a19adc-cb89-7c71-bc0f-3af552d5a202",
-            "done",
-        ));
-        assert_eq!(panel_state(&mux, id), PanelState::Idle);
-        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
-        assert_eq!(on_disk.last_message(), Some("done"));
-        mux.shutdown();
-    }
-
-    /// A title with no thread id (a codex predating the `thread-id` title
-    /// item, or no thread yet) gives nothing to compare: every completion
-    /// ends the turn, as before.
-    #[tokio::test]
-    async fn a_codex_completion_without_a_title_thread_ends_the_turn() {
-        let tmp = TempDir::new().unwrap();
-        let mut mux = mux(&tmp);
-        let (id, _) = working_codex_panel(&mut mux, "⠙ Run sleep | repo");
-
-        mux.handle_signal(codex_stop(
-            &mux,
-            id,
-            "01a19adc-e169-7272-8cbf-b5e8b69d0165",
-            "done",
-        ));
         assert_eq!(panel_state(&mux, id), PanelState::Idle);
         mux.shutdown();
     }

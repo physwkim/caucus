@@ -260,17 +260,29 @@ pub(crate) fn run_note(
 /// event type, or an absent/unparseable payload, is a silent no-op (it does
 /// not even open the socket): codex fires `notify` for more than turn
 /// completion, and only completion means the agent is idle again.
+///
+/// So is a completion from a thread that is not the panel's conversation by
+/// codex's record under `codex_home` (a subagent, the title thread; see
+/// `codex_home::is_top_level_thread`). A payload with no `thread-id`, or no
+/// `codex_home`, cannot be classified and counts.
 pub(crate) fn run_codex_notify(
     sock_path: &Path,
     session_id: SessionId,
     panel_id: PanelId,
     payload: Option<&str>,
+    codex_home: Option<&Path>,
 ) -> Result<()> {
     let raw: serde_json::Value = payload
         .and_then(|p| serde_json::from_str(p.trim()).ok())
         .unwrap_or(serde_json::Value::Null);
 
     if raw.get("type").and_then(serde_json::Value::as_str) != Some("agent-turn-complete") {
+        return Ok(());
+    }
+    if let Some(thread) = raw.get("thread-id").and_then(serde_json::Value::as_str)
+        && let Some(home) = codex_home
+        && !crate::agent::codex_home::is_top_level_thread(home, thread)
+    {
         return Ok(());
     }
 
@@ -406,6 +418,7 @@ mod tests {
             SessionId::new(),
             PanelId::new(),
             Some(r#"{"type":"agent-turn-failed"}"#),
+            None,
         );
         assert!(res.is_ok(), "non-completion notify must be a silent no-op");
     }
@@ -420,6 +433,7 @@ mod tests {
                 SessionId::new(),
                 PanelId::new(),
                 None,
+                None,
             )
             .is_ok()
         );
@@ -429,6 +443,7 @@ mod tests {
                 SessionId::new(),
                 PanelId::new(),
                 Some("not json"),
+                None,
             )
             .is_ok()
         );
@@ -452,7 +467,7 @@ mod tests {
 
         let sock_for_client = sock.clone();
         tokio::task::spawn_blocking(move || {
-            run_codex_notify(&sock_for_client, session_id, panel_id, Some(payload)).unwrap();
+            run_codex_notify(&sock_for_client, session_id, panel_id, Some(payload), None).unwrap();
         })
         .await
         .unwrap();
@@ -466,6 +481,70 @@ mod tests {
         assert_eq!(sig.panel_id, panel_id);
         assert_eq!(sig.kind, TurnKind::Stop);
         assert_eq!(sig.last_message.as_deref(), Some("3 findings, all fixed"));
+    }
+
+    /// A completion from a thread codex records as a subagent, or from the
+    /// unrecorded title thread, is not the panel's turn: a no-op that never
+    /// opens the socket. One from the panel's own thread posts.
+    #[tokio::test]
+    async fn codex_notify_posts_only_the_panels_own_thread() {
+        use crate::agent::codex_home::tests::write_rollout;
+        use crate::signal::server::SignalServer;
+
+        let main = "01a19afa-c6fd-77f2-8aed-354a60dafed7";
+        let sub = "01a19afb-0471-7dd2-811a-ba579d7520b5";
+        let home = tempfile::tempdir().unwrap();
+        write_rollout(
+            home.path(),
+            "2026/11/02",
+            main,
+            serde_json::json!({ "id": main, "source": "cli" }),
+        );
+        write_rollout(
+            home.path(),
+            "2026/11/02",
+            sub,
+            serde_json::json!({ "id": sub, "parent_thread_id": main, "source": { "subagent": {} } }),
+        );
+        let payload = |thread: &str| {
+            serde_json::json!({ "type": "agent-turn-complete", "thread-id": thread, "last-assistant-message": "391" })
+                .to_string()
+        };
+        for side in [sub, "01a19afa-e139-7dc0-b6a3-2c27b3bc476b"] {
+            run_codex_notify(
+                Path::new("/nonexistent/caucus.sock"),
+                SessionId::new(),
+                PanelId::new(),
+                Some(&payload(side)),
+                Some(home.path()),
+            )
+            .expect("a side-thread completion must not open the socket");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("caucus.sock");
+        let mut server = SignalServer::bind(&sock).unwrap();
+        let panel_id = PanelId::new();
+        let home_path = home.path().to_path_buf();
+        let own = payload(main);
+        tokio::task::spawn_blocking(move || {
+            run_codex_notify(
+                &sock,
+                SessionId::new(),
+                panel_id,
+                Some(&own),
+                Some(&home_path),
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+        let (event, _) = server.signals().recv().await.expect("signal received");
+        let crate::signal::SignalEvent::Turn(sig) = event else {
+            panic!("expected a turn signal");
+        };
+        assert_eq!(sig.panel_id, panel_id);
+        assert_eq!(sig.last_message.as_deref(), Some("391"));
     }
 
     /// `run_note` connects, posts, and the server's channel yields the note —

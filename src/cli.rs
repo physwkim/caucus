@@ -601,7 +601,13 @@ fn run_signal(cmd: SignalCommand) -> Result<ExitCode> {
                 .with_context(|| format!("invalid --session id '{session}'"))?;
             let panel_id = PanelId::from_str(&panel)
                 .with_context(|| format!("invalid --panel id '{panel}'"))?;
-            crate::signal::post::run_codex_notify(&sock, session_id, panel_id, payload.as_deref())?;
+            crate::signal::post::run_codex_notify(
+                &sock,
+                session_id,
+                panel_id,
+                payload.as_deref(),
+                crate::agent::codex_home::dir().as_deref(),
+            )?;
             Ok(ExitCode::SUCCESS)
         }
     }

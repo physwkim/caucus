@@ -16,14 +16,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, Table, value};
 
-/// codex's config file: `$CODEX_HOME/config.toml` when `CODEX_HOME` is set
-/// (mirroring codex itself), otherwise `~/.codex/config.toml`. `None` when
-/// neither `CODEX_HOME` nor `HOME` is set — there is then no config to edit.
+/// codex's config file, `config.toml` in `codex_home::dir`. `None`
+/// when neither `CODEX_HOME` nor `HOME` is set — there is then no config to
+/// edit.
 fn config_path() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("CODEX_HOME") {
-        return Some(PathBuf::from(home).join("config.toml"));
-    }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex").join("config.toml"))
+    super::codex_home::dir().map(|home| home.join("config.toml"))
 }
 
 /// Mark `dir` trusted in codex's config so a codex panel launched there skips

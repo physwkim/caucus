@@ -475,15 +475,6 @@ fn codex_args(
         v.push(n.panel_id.to_string());
         v.push("\"]");
         args.push(v);
-        // codex also notifies for side threads (the title generator,
-        // subagents); the panel's own thread id in the title is how
-        // `handle_signal_with_reply` tells them apart. The default items stay
-        // first so the title spinner and idle reads are unchanged.
-        args.push("-c".into());
-        args.push(
-            "tui.terminal_title=[\"activity\",\"thread-name\",\"project-name\",\"thread-id\"]"
-                .into(),
-        );
     }
     if skip_permissions {
         args.push("--dangerously-bypass-approvals-and-sandbox".into());
@@ -1047,11 +1038,6 @@ mod tests {
             notify.contains(&format!("\"--panel\",\"{panel}\"")),
             "notify must carry this panel's id: {notify}"
         );
-        // The title must name the panel's thread so side-thread notifies can
-        // be told apart, after the default items the screen reads rely on.
-        assert!(args.windows(2).any(|w| w[0] == "-c"
-            && w[1]
-                == r#"tui.terminal_title=["activity","thread-name","project-name","thread-id"]"#));
     }
 
     /// With no signal socket wired (the default/unit-test `SpawnRequest`), codex
@@ -1069,7 +1055,6 @@ mod tests {
         };
         let args = args_of(&build_command(&req, PanelId::new()));
         assert!(!args.iter().any(|a| a.starts_with("notify=[")));
-        assert!(!args.iter().any(|a| a.starts_with("tui.terminal_title=")));
     }
 
     /// Every codex panel, main or sub-agent, starts past both startup
