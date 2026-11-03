@@ -106,6 +106,35 @@ versions.
   turn `idle` at its first output byte, ~0.14 s before Claude Code's input
   is live, so a prompt sent on that `idle` lost its Enter and sat unsent. It
   now turns `idle` when the CLI enables bracketed paste.
+- **Input sent to a panel that is still booting waits for it.** `send_keys`
+  to a `spawning` panel wrote its Enter before the CLI enabled bracketed
+  paste, so the prompt sat unsent; caucus now holds that input in order and
+  pastes it once the CLI accepts input.
+- **A codex panel starts at its prompt.** codex 0.162 can open on an update
+  chooser or a background-server chooser, where caucus's first Enter picked
+  "Update now" or "Cancel" and the panel never reached its prompt. codex
+  panels now launch with `check_for_update_on_startup=false` and
+  `features.daemon_auto_start=false`, which codex before 0.156 ignores.
+- **Nothing is typed into the main worker while it shows a dialog.** Claude
+  Code's folder-trust dialog reads as idle, so a push to main sent then
+  picked the dialog's default, "No, exit", and main quit. Worker results and
+  nudges now wait until main's screen shows no dialog or blocked prompt.
+- **A worker that is still booting is not reported as unassigned work.** The
+  stranded-main check counted `spawning` panels as busy, so main was told
+  about a worker that was only starting, e.g. on resume when a worker boots
+  slower than main.
+- **A codex panel's turn ends only on its own completion.** codex runs its
+  `notify` program for every thread it drives, including its sub-agents and
+  the hidden thread that writes the conversation title mid-turn, so either
+  could end the panel's turn early. caucus now reads codex's rollout record
+  for the thread: a sub-agent's names its parent and the title thread has
+  none, and both are ignored. Without a `$CODEX_HOME/sessions` directory,
+  every completion still counts.
+- **Viewing a codex sub-agent no longer ends the panel's turn.** While
+  `/subagents` shows a sub-agent, codex's screen is that thread's, so once it
+  finished caucus read the panel as idle with its own turn still running.
+  caucus now takes no idle evidence from that view and resumes when the
+  panel's own conversation is back on screen.
 
 ## [0.11.0] — 2026-10-15
 
