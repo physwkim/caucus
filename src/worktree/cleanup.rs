@@ -10,10 +10,10 @@
 //! whose work could not be salvaged is left on disk instead.
 //!
 //! Two functions force-remove, and both enforce it:
-//! [`salvage_before_removal`] here (the disposal queue — `kill_panel`,
-//! shutdown, spawn-failure) and [`super::manager::reconcile_stale`] (the
+//! `salvage_before_removal` here (the disposal queue — `kill_panel`,
+//! shutdown, spawn-failure) and `super::manager::reconcile_stale` (the
 //! crash/resume re-attach). Both salvage through
-//! [`super::manager::salvage_uncommitted_work`], committing a dirty tree onto
+//! `super::manager::salvage_uncommitted_work`, committing a dirty tree onto
 //! its own branch first. The branch outlives the worktree on every path that
 //! keeps it, so the commit is recoverable; the spawn-failure path deletes the
 //! branch and so has nothing to preserve.

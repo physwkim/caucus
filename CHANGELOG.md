@@ -5,6 +5,305 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [0.12.0] — 2026-11-04
+
+caucus wakes the main worker less. Every main turn re-reads main's whole
+conversation from the prompt cache, and in a 7-day session 43.5% of main's
+API calls were caucus reporting a worker that was still running; a running
+worker now reports only when its screen falls silent, and workers that
+finish together arrive in one message. A turn whose completion signal is
+lost ends about 1 s after the agent finishes instead of 20 s, codex panels
+start and finish reliably, and `caucus ctl` drives a session from a shell.
+The control socket's format changed, so restart running sessions after
+upgrading; no hook reinstall is needed.
+
+### Added
+
+- **`CAUCUS_PROF=1` logs where the event loop spends its time.** Once a
+  second, `.caucus/caucus.log` gets each loop pass's call count, mean and max
+  time, with the turn count and total busy time; the idle input wait is not
+  counted. Unset, it costs one branch per pass.
+- **A `wait` MCP tool — the surface is now fifteen.** `wait(panel,
+  timeout_secs)` holds the main worker's call until that panel's
+  `list_panels` state leaves `working`/`spawning`, then returns its entry; a
+  panel fed its next queued task is not reported between tasks. It errors on
+  timeout (default 600 s, max 3600 s), on a killed or restarted panel, and on
+  the main panel. caucus now registers a 3660 s tool timeout with Claude Code
+  (`.mcp.json` `timeout`) and codex (`tool_timeout_sec`) so neither client
+  abandons a held call.
+- **`caucus ctl` calls an MCP tool on a running session from a shell.**
+  `caucus ctl list_panels` sends one call to the session's control socket
+  (`--session`, defaulting to `CAUCUS_SESSION_ID`, or `--sock`) and prints
+  the reply as a JSON line; it exits 2 on an error reply and 3 when the
+  socket cannot be reached. The socket now speaks
+  `{"id","method","params"}` with `{"id","result"}` / `{"id","error":{"code",
+  "message"}}` replies, where `method` and `params` are the MCP tool name and
+  arguments, decoded only by the main process. A `caucus mcp-serve` from an
+  older build cannot talk to a session started by this one.
+- **`caucus ctl subscribe_events` streams panel changes.** The reply is the
+  `list_panels` rows with the `seq` they reflect; after it comes one line per
+  later change, `panel_updated` with the whole new or changed row or
+  `panel_removed`, numbered without gaps. A client more than 512 events
+  behind gets an `events_lost` error and is disconnected, and subscribes
+  again for a fresh snapshot. With no subscriber, nothing is computed.
+
+### Changed
+
+- **A turn whose Stop hook never arrived ends in ~1 s, not 20 s.** caucus now
+  reads each working panel's screen with rules ported from herdr's Claude
+  Code and codex detection: once a live-turn indicator has been seen, an idle
+  prompt held for 1 s ends the turn. Live, a dropped Claude Stop or codex
+  `notify` was reconciled 1.0–1.1 s after the agent finished, in 6 of 6 runs.
+  A panel never seen working falls to the prompt-stall check below or the
+  20 s quiescence window, and one stopped at a blocked prompt is still never
+  reconciled.
+- **A prompt that never starts a turn is closed after 5 s.** When a panel
+  prompted from idle still shows its idle prompt 5 s after the submit reached
+  it, with no working or blocked screen in between, caucus ends the turn as
+  `prompt_stalled` (herdr's prompt-effect rule and timeout) instead of waiting
+  20 s. The watch report says the prompt may still sit unsubmitted in the
+  panel's input, and a stalled worker's queued tasks are not fed, since the
+  next paste would join the stuck one.
+- **The main worker's caucus tool calls run concurrently.** `mcp-serve`
+  answered one call at a time, so parallel calls queued behind the slowest;
+  each call now runs on its own task and is answered as it finishes. A call
+  the client cancels is dropped and not answered.
+- **A worker still running no longer reports in every fallback window.**
+  `fallback_secs` (and `round_fallback_secs`) now count screen silence: a
+  watched panel mid-turn is reported only when its screen has not changed
+  for that long, as "may be stuck", and once per silence until the screen
+  changes again. In a 7-day main session the old repeating "forced out"
+  notice made up 43.5% of main's API calls.
+- **Workers that finish while the main worker is busy arrive in one
+  message.** The push delivered one worker per main turn, so each further
+  ready worker cost another turn that re-read main's whole context; every
+  worker ready when main goes idle now rides one push, as the Stop
+  hook-reply already did.
+
+### Performance
+
+- **Lost-turn recovery reads the cached prompt scan.** Every loop tick
+  (~250 Hz) re-rendered each `Working` panel's viewport to text to look for a
+  blocked prompt; it now shares the per-panel scan the blocked-panel announcer
+  already caches against the grid generation, so an unchanged screen is not
+  rescanned. A quiet one-panel tick drops from ~10 µs to under 0.5 µs; with 50
+  active panels, from ~39 µs to ~29 µs.
+- **Output from panels hidden behind a zoom no longer repaints the screen.**
+  Any panel's output used to redraw the whole frame on the next 16 ms tick,
+  visible or not; now only panels on screen do, and the transcript overlay
+  still refreshes when a turn completes. With 49 busy workers behind a zoomed
+  panel, caucus drops from ~54 frames/s to 1 and from ~28% to ~15% CPU.
+- **`list_panels`, `read_menu` and `select_option` reuse the cached prompt
+  scan.** Each call re-rendered panel screens to text to look for a blocked
+  prompt; they now read the per-panel scan the event loop already caches
+  against the grid generation. The loop time one `list_panels` request takes
+  drops from ~30–55 µs to ~2–3 µs over one panel, and from ~70–155 µs to
+  ~35–70 µs over 50.
+- **A burst of MCP tool calls no longer freezes the screen.** caucus answered
+  every queued control request in one loop turn, so 4096 queued
+  `list_panels` calls held input and drawing for 0.18–0.41 s; it now answers
+  at most 64 per turn and leaves the rest for the next one, and the longest
+  turn stays under 15 ms at any burst size.
+
+### Fixed
+
+- **A panel that has not been prompted yet reads `idle`, not `working`.** A
+  new panel's record started as `working`, so `list_panels`, the transcript
+  overlay and `wait` showed a freshly spawned panel as mid-turn until its
+  first turn ended, and a `wait` on it held until its deadline. It now reads
+  `spawning` while its CLI boots and `idle` after.
+- **A new panel reads `spawning` until its CLI accepts input.** It used to
+  turn `idle` at its first output byte, ~0.14 s before Claude Code's input
+  is live, so a prompt sent on that `idle` lost its Enter and sat unsent. It
+  now turns `idle` when the CLI enables bracketed paste.
+- **Input sent to a panel that is still booting waits for it.** `send_keys`
+  to a `spawning` panel wrote its Enter before the CLI enabled bracketed
+  paste, so the prompt sat unsent; caucus now holds that input in order and
+  pastes it once the CLI accepts input.
+- **A codex panel starts at its prompt.** codex 0.162 can open on an update
+  chooser or a background-server chooser, where caucus's first Enter picked
+  "Update now" or "Cancel" and the panel never reached its prompt. codex
+  panels now launch with `check_for_update_on_startup=false` and
+  `features.daemon_auto_start=false`, which codex before 0.156 ignores.
+- **Nothing is typed into the main worker while it shows a dialog.** Claude
+  Code's folder-trust dialog reads as idle, so a push to main sent then
+  picked the dialog's default, "No, exit", and main quit. Worker results and
+  nudges now wait until main's screen shows no dialog or blocked prompt.
+- **A worker that is still booting is not reported as unassigned work.** The
+  stranded-main check counted `spawning` panels as busy, so main was told
+  about a worker that was only starting, e.g. on resume when a worker boots
+  slower than main.
+- **A codex panel's turn ends only on its own completion.** codex runs its
+  `notify` program for every thread it drives, including its sub-agents and
+  the hidden thread that writes the conversation title mid-turn, so either
+  could end the panel's turn early. caucus now reads codex's rollout record
+  for the thread: a sub-agent's names its parent and the title thread has
+  none, and both are ignored. Without a `$CODEX_HOME/sessions` directory,
+  every completion still counts.
+- **Viewing a codex sub-agent no longer ends the panel's turn.** While
+  `/subagents` shows a sub-agent, codex's screen is that thread's, so once it
+  finished caucus read the panel as idle with its own turn still running.
+  caucus now takes no idle evidence from that view and resumes when the
+  panel's own conversation is back on screen.
+
+## [0.11.0] — 2026-10-15
+
+Never tagged or published to crates.io; its changes first ship in 0.12.0.
+
+caucus no longer works in rounds. A main worker used to register a round over
+the panels it had briefed and hear back once, when the last of them settled;
+now every panel caucus hands a prompt to is watched on its own, its result is
+pushed to main the moment it finishes, and the watch re-arms when main sends
+the next task — instruct → finish → instruct is a loop with no registration
+step. The MCP surface changes with it (breaking, below), and a set of fixes
+closes the ways a panel could sit wedged `Working` or report the wrong turn's
+output as a task's answer. No hook reinstall or config change is needed.
+
+### Changed
+
+- **BREAKING (MCP surface): `register_round` / `round_status` / `cancel_round`
+  are replaced by `queue_tasks` / `collect_workers` / `stop_watching`.** The
+  runtime had already stopped working in rounds, but the tools main reads still
+  taught the concept — and main follows its tool names, which is what made it
+  keep waiting for a round that no longer existed. The new surface is per
+  worker, with no round id anywhere:
+  - `queue_tasks(panel, tasks?, read_mode?, fallback_secs?, selection_hints?)`
+    — queue follow-up tasks on one worker and tune its watch. It configures the
+    watch caucus already armed rather than creating one, so a panel still has
+    exactly one watch. It is no longer needed to *hear back* from a worker at
+    all: `send_keys` is enough.
+  - `collect_workers()` — the in-turn pull, now argument-free: it hands back
+    every ready worker and reports the ones still running. This is the livelock
+    escape hatch (the push can only land while main is idle), so it survives the
+    redesign; it no longer needs an id, and covers workers main never registered.
+  - `stop_watching(panel)` — stop being woken by one worker and stop feeding it
+    backlog. The panel is untouched, and the next prompt re-arms the watch.
+
+  `RoundId` is deleted along with the `round` handle on the watch, so a watch is
+  now identified by its panel and nothing else. `broadcast` no longer tells main
+  to follow up with a registration, and `docs/review-loop.md` drops the
+  `register_round` step from every pass.
+
+- **Results reach the main worker one worker at a time; the all-settled
+  barrier is gone.** A round that ran across several panels delivered only once every
+  panel had settled — the main worker sat idle behind the single slowest
+  sub-agent. Each worker's result is now delivered the instant that worker
+  settles (latched by Invariant I-9), so the main worker starts on the early
+  finishers while the slow ones are still working, and is woken once per
+  worker rather than once total. Every path — the keystroke push, the
+  `collect_workers` pull, and the Stop hook-reply — delivers each worker
+  exactly once. Design §8 flow, §7.6, Invariant I-10.
+
+- **Every worker caucus hands a prompt to is watched, and the watch re-arms
+  after each delivery.** A round retired when it was delivered, so once main
+  sent a worker its next task nothing was watching that worker until main
+  registered another round — and a worker main simply talked to, without
+  registering anything, was never reported at all. Now the watch is armed at
+  the moment caucus delivers the prompt (in the single `Idle -> Working`
+  owner, so `send_keys`, `broadcast`, a backlog feed and a human typing into
+  the panel all arm exactly once), spent on delivery, and re-armed by the
+  next prompt. The stranded-main nudge survives but only covers panels
+  working on something caucus never handed them. Design §8 flow.
+
+- **The round object is gone: caucus watches one worker at a time.** The
+  `PendingRound` (a panel list plus four per-panel maps plus a `delivered`
+  ledger) collapsed into a per-panel `WorkerWatch` — one panel, one settle
+  latch, one backlog queue, one captured list. Exactly-once delivery
+  (Invariant I-10) is now structural rather than book-kept: **delivering a
+  worker removes its watch**, so a spent watch cannot be asked again — the
+  `delivered` set and the `round_fully_delivered` / `retire_gone_round_panels`
+  retirement logic it needed are deleted, not re-implemented. Spilled reports
+  move from `rounds/<round-id>-<panel-id>.md` to `rounds/<panel-id>-<n>.md`,
+  so a worker re-prompted across a session no longer overwrites its previous
+  assignment's report. The resume snapshot (`pending-rounds.json`) flattens
+  to one record per watched worker; a snapshot written by an older caucus is
+  unreadable and is treated as "nothing in flight" (the same best-effort path
+  a corrupt file already took). Design §8, §7.6, Invariants I-9/I-10.
+
+### Fixed
+
+- **A local slash command sent to a worker panel no longer registers as a task
+  and reports a bogus result to main.** The classifier knew only `/compact` and
+  `/clear`, so `/model` (and every other client-local builtin) fell through to
+  the prompt path: it opened a capture turn, flipped the panel `Working`, **armed
+  a worker watch**, and counted an outstanding prompt. Since nothing closes a
+  hookless command, the panel wedged — and once reconciliation returned it to
+  `Idle`, that phantom watch settled and delivered the command's own screen to
+  main as the worker's finished task. Local commands are now classified in two
+  kinds: hook-closed (`/compact`, `/clear`) still record the marker
+  `close_local_command` needs, while hookless ones (`/model`, `/status`,
+  `/cost`, …) open no turn, arm no watch, count nothing, and record no marker
+  (nothing would ever consume it, and a stale one would suppress a later
+  hand-typed `/compact` close). The hookless list is deliberately conservative:
+  omitting a command degrades to reconciliation, whereas wrongly listing one
+  that runs a real turn would lose the work entirely.
+- **A panel wedged `Working` by a hookless local slash command (`/model`,
+  `/help`, `/status`, …) — or a dropped Stop hook — is now recovered.** Only
+  `/compact` and `/clear` fire a lifecycle hook caucus can close a turn on;
+  every other local builtin fires none, and a directly-typed command cannot be
+  classified at submit time. caucus opened a capture turn for it and flipped the
+  panel `Working`, and nothing ever closed it: a watched worker could never
+  settle, and a wedged **main** panel — which carries no watch — never became
+  deliverable, so every finished worker was stranded with nothing able to push
+  it (the `/model` report: "workers all finish but no completion signal
+  arrives"). A new per-tick pass (`poll_lost_turns`) reconciles a panel that has
+  sat `Working` with an unchanging grid, and no blocked prompt, past a
+  quiescence window (20s) — the PTY signature of an agent idle at its prompt,
+  since a working agent repaints its status line continuously. Reconciliation
+  closes the phantom turn, clears its outstanding-prompt count, flips the panel
+  to `Idle`, and records a distinct `TurnReconciled` timeline event (not a
+  fabricated `TurnCompleted`), covering main and workers with one uniform rule.
+- **A worker prompted twice in a row no longer reports the first task's output
+  as the second task's answer — and no longer goes dark on the second.** A
+  prompt submitted while the panel's turn was already open is queued by the
+  agent CLI, not started, and caucus held no record of it: `begin_turn` no-ops
+  on an open turn and the panel was already watched. The *first* turn's Stop
+  therefore passed for the queued prompt's boundary — the panel went `Idle`, its
+  watch latched the first task's output and delivered it to main as the second
+  task's answer, and the delivery spent the watch, so the second task's real
+  result was never reported at all. caucus now counts outstanding prompts per
+  panel (incremented only where a prompt is submitted, decremented only at a
+  real turn boundary): while any remain the boundary keeps the panel `Working`
+  and re-opens a capture turn, so the watch settles on the last queued prompt's
+  own Stop and every task's output is captured in its own turn.
+- **A `/compact` completing no longer settles a prompt that arrived while it
+  was still running.** caucus classifies a `/compact` it submits itself and
+  deliberately opens no capture turn for it, but `close_local_command` decided
+  from the panel's *live* state — so when the next brief landed mid-compaction
+  (queued inside the CLI, not started), the compaction's `PostCompact` ended
+  that brief's turn and flipped the panel `Idle`. The watch settled and
+  delivered the worker's **previous** report as the brief's answer: a false
+  positive main acted on. The classification is now recorded
+  (`local_commands_without_turn`) and consumed by the close, so a local command
+  can only ever close a turn it opened; a hand-typed `/compact` (unclassifiable,
+  and with no Stop hook to follow) still closes its own turn as before.
+- **A worker that paused on a selection menu, was answered, and then finished
+  is now reported to main.** A panel blocked on a prompt (selection menu,
+  `[y/N]`) has an open turn that the agent is waiting inside; answering
+  resumes that same turn, so exactly one Stop still follows. But
+  `select_option` — and the auto-answer from `selection_hints`, and a `[y/N]`
+  answered with `send_keys` — routed through `note_prompt_delivered`, which
+  counted the answer as another prompt: the resumed turn's single Stop
+  decremented the count from two to one, read as "a queued prompt is still
+  pending", and pinned the panel `Working`, so its watch never settled and the
+  finished worker was never delivered. The single owner now applies one rule:
+  a submission into a panel that is `Working` *and* showing a blocked prompt
+  is an answer that resumes the open turn and is not counted; a submission
+  into a running, unblocked turn is genuinely queued by the CLI, brings its
+  own Stop, and still is.
+- **A watch armed on an idle panel no longer delivers that panel's previous
+  output as its first task.** `queue_tasks` on an idle panel captured the
+  panel's old `last_message` as task 1, and every fallback notice re-delivered
+  it under the forced-out header as if it were new. The watch now marks the
+  panel's timeline when it arms and at each backlog feed, and reads nothing
+  older than that mark; a turn that has not ended has no body to deliver.
+- **A fallback notice no longer spends the watch.** The fallback deadline
+  stopped feeding the worker's backlog and its delivery removed the watch, so
+  a panel that was still alive lost its queued tasks and its eventual result.
+  A forced-out watch now keeps its backlog and finished turns and restarts its
+  fallback window; only a settled delivery spends the watch, and backlog is
+  discarded only on kill, exit, or `stop_watching`.
+
 ## [0.10.3] — 2026-07-23
 
 Two ways a panel's real state and caucus's belief about it could diverge,

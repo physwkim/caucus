@@ -1,16 +1,18 @@
 use super::*;
 use crate::agent::derive_state::DerivedState;
+use crate::agent::manifest::TurnMark;
 use crate::mcp::protocol::{ControlResponse, SelectionPolicy};
 use crate::mcp::{McpToolSurface, ReadPanelMode};
 use crate::panel::lifecycle::{Panel, PanelState};
-use crate::session::id::{PanelId, RoundId};
-use std::collections::{HashMap, VecDeque};
+use crate::role::spec::AgentCli;
+use crate::session::id::PanelId;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 // The round fallback default + hard cap live in `config::settings` (the default
 // is the `round_fallback_secs` tunable; the cap bounds it and per-call
-// overrides). Imported here so register_round reads the single source of truth.
+// overrides). Imported here so the watch defaults read the single source of truth.
 use crate::config::settings::ROUND_FALLBACK_MAX_SECS;
 
 /// How long caucus holds an injected round after the user's last un-submitted
@@ -38,25 +40,24 @@ const STRANDED_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
 /// with a warning — the newest question is the one still worth answering.
 pub(super) const QUESTION_NOTICE_CAP: usize = 32;
 
-/// Per-captured-turn byte budget in the **on-disk** round report
-/// ([`Multiplexer::assemble_round_report`]). A turn body over this is head/tail
+/// Per-captured-turn byte budget in the **on-disk** panel report
+/// ([`Multiplexer::assemble_watch_report`]). A turn body over this is head/tail
 /// truncated in the report and its full text spilled to
 /// `<session_root>/round-spills/`. Without it a `scrollback` read (up to 10k
-/// rows × the panel width per panel) concatenated across a multi-panel round
-/// would inflate even the spilled report file without bound. (The report is no
-/// longer injected into the main PTY — finding 24: the main worker is handed
-/// the teaser-bounded [`Multiplexer::render_round_summary`] that points at the
-/// report file. This bound keeps the file itself readable.) Split evenly
-/// between the head and tail kept around the elision.
+/// rows × the panel width) would inflate even the spilled report file without
+/// bound. (The report is no longer injected into the main PTY — the main worker
+/// is handed the teaser-bounded [`Multiplexer::render_watch_summary`] that
+/// points at the report file. This bound keeps the file itself readable.) Split
+/// evenly between the head and tail kept around the elision.
 const MAX_ROUND_BODY_BYTES: usize = 16 * 1024;
 
-/// Per-panel teaser budget in the *injected* round-delivery summary
-/// ([`Multiplexer::render_round_summary`]). The full assembled report is
-/// spilled to `<session_root>/rounds/<round_id>.md` and the main worker is
-/// handed only a compact summary that points at it — so the bracketed paste
-/// caucus injects into the main PTY stays small (per-panel teaser, not the
-/// whole report). Each panel contributes at most this many bytes of its latest
-/// output as a teaser; the rest is in the report file.
+/// Per-panel teaser budget in the *injected* panel-delivery summary
+/// ([`Multiplexer::render_watch_summary`]). The full report is spilled to
+/// `<session_root>/rounds/<round_id>-<panel>.md` and the main worker is handed
+/// only a compact summary that points at it — so the bracketed paste caucus
+/// injects into the main PTY stays small (a teaser, not the whole report). The
+/// panel contributes at most this many bytes of its latest output as a teaser;
+/// the rest is in the report file.
 const ROUND_SUMMARY_TEASER_BYTES: usize = 1024;
 
 /// Largest char-boundary byte index `<= idx` in `s` (stable stand-in for the
@@ -98,64 +99,92 @@ fn summary_teaser(body: &str, budget: usize) -> String {
     )
 }
 
-/// The shared opening line of both the full round report and the injected
-/// summary — panel count plus a fallback note when the deadline forced
-/// delivery before every panel settled.
-fn round_header(panel_count: usize, all_settled: bool) -> String {
-    format!(
-        "[caucus] Round complete — {panel_count} panel(s){}.\n",
-        if all_settled {
-            ""
-        } else {
-            " (fallback deadline reached; some panels did not finish)"
-        }
-    )
-}
-
-/// Append the "caucus auto-answered" audit block shared by the full report and
-/// the injected summary: one line per selection menu caucus resolved for this
-/// round under the main worker's pre-authorized [`SelectionPolicy`], so the
-/// delivered message shows which direction forks were taken on its behalf —
-/// without the main worker ever having been interrupted. Nothing is emitted
-/// when the round auto-answered no menu.
-fn push_auto_answers(out: &mut String, round: &PendingRound) {
-    if round.auto_answers.is_empty() {
+/// Append the "caucus auto-answered" audit lines for one watched worker — the
+/// forks caucus resolved for it under the pre-authorized
+/// [`SelectionPolicy`], so the streamed delivery shows which direction caucus
+/// took on the worker's behalf without ever interrupting the main worker.
+/// Streamed delivery hands the main worker one panel at a time, so it shows only
+/// *that* panel's auto-answers; nothing is emitted when caucus auto-answered
+/// none of its menus.
+fn push_panel_auto_answers(out: &mut String, w: &WorkerWatch) {
+    if w.auto_answers.is_empty() {
         return;
     }
     out.push_str(&format!(
-        "caucus auto-answered {} selection menu(s) per your hints (you were not interrupted):\n",
-        round.auto_answers.len()
+        "caucus auto-answered {} selection menu(s) on this panel per your hints (you were not interrupted):\n",
+        w.auto_answers.len()
     ));
-    for a in &round.auto_answers {
+    for a in &w.auto_answers {
         out.push_str(&format!(
-            "  panel {} (role: {}) → option {} \"{}\"\n",
-            a.panel, a.role, a.number, a.label
+            "  → option {} \"{}\" (role: {})\n",
+            a.number, a.label, a.role
         ));
     }
 }
 
 /// Append the per-panel trailing markers shared by the full report and the
-/// summary: a "still working" note for a panel the fallback deadline caught
-/// mid-turn, and a count of backlog tasks that never ran.
+/// summary: for a panel whose stall alarm fired mid-turn, that its turn
+/// has no result yet, the last note it posted *during* that turn, and what is
+/// still queued behind it; for an exited panel, the tasks it never ran.
 fn push_round_panel_footer(out: &mut String, c: &RoundPanelContribution) {
-    if !c.settled {
-        out.push_str("⏳ still working — did not finish within the fallback window.\n");
-    }
-    if c.pending_backlog > 0 {
-        out.push_str(&format!(
-            "⏳ {} queued backlog task(s) were not run before the fallback window closed.\n",
-            c.pending_backlog
-        ));
+    match &c.outcome {
+        PanelOutcome::Finished {
+            pending_backlog, ..
+        } => {
+            if *pending_backlog > 0 {
+                out.push_str(&format!(
+                    "⏳ {pending_backlog} queued task(s) were not run: the panel exited.\n"
+                ));
+            }
+        }
+        PanelOutcome::Stalled {
+            pending_backlog, ..
+        } => {
+            out.push_str(
+                "⚠ the last prompt never started a turn and may still sit unsubmitted in the panel's input: send_keys with empty text and enter=true submits it, or clear the input before sending a new prompt.\n",
+            );
+            if *pending_backlog > 0 {
+                out.push_str(&format!(
+                    "⏳ {pending_backlog} queued task(s) were not run: the prompt stalled.\n"
+                ));
+            }
+        }
+        PanelOutcome::Running {
+            note,
+            finished,
+            pending_backlog,
+            ..
+        } => {
+            match note {
+                Some(note) => out.push_str(&format!(
+                    "⏳ turn still running, no result yet; last note: {note}\n"
+                )),
+                None => out.push_str(
+                    "⏳ turn still running, no result yet; no note posted during this turn.\n",
+                ),
+            }
+            if *finished > 0 {
+                out.push_str(&format!(
+                    "⏳ {finished} earlier task(s) finished; their output comes with the final result.\n"
+                ));
+            }
+            if *pending_backlog > 0 {
+                out.push_str(&format!("⏳ {pending_backlog} task(s) still queued.\n"));
+            }
+            out.push_str(
+                "caucus is still watching this panel: its result is delivered when it finishes, and no further stall alarm comes until its screen changes. read_panel shows what it is sitting on.\n",
+            );
+        }
     }
 }
 
 /// What a round panel is visibly waiting on, detected from its rendered grid
-/// ([`Multiplexer::panel_blocked_prompt`]) — a mid-turn attention state the
+/// ([`Multiplexer::scan_panel_screen`]) — a mid-turn attention state the
 /// coarse panel state cannot express, because none of these fire a `Stop` hook.
 /// The panel therefore stays coarse `Working` and its round never settles; the
 /// per-tick round watch ([`Multiplexer::poll_round_blocked_panels`]) pushes a
 /// deduped interim notice for each so the main worker can act before the
-/// fallback deadline rather than the round silently stalling.
+/// stall alarm rather than the round silently stalling.
 /// One queued `question` note awaiting announcement to the main worker
 /// (`Multiplexer::pending_question_notices` →
 /// [`Multiplexer::poll_question_notices`]). The role is captured at enqueue —
@@ -174,6 +203,17 @@ pub(crate) enum BlockedPrompt {
     /// A raw `[y/n]`-style yes/no prompt from a tool/shell the agent ran —
     /// answered with `send_keys`. Carries the prompt line for the notice.
     Permission(String),
+}
+
+/// One read of a panel's rendered screen, cached per grid generation by
+/// [`Multiplexer::panel_screen_cached`]: the prompt it is blocked on, if any,
+/// whether the agent's turn is visibly running, and whether a CLI dialog
+/// holds the input (typed text and Enter would answer it).
+#[derive(Debug, Clone)]
+pub(crate) struct ScreenScan {
+    pub(crate) blocked: Option<BlockedPrompt>,
+    pub(crate) activity: crate::term::ScreenActivity,
+    pub(crate) dialog: bool,
 }
 
 impl BlockedPrompt {
@@ -221,12 +261,12 @@ struct AutoAnswer {
     label: String,
 }
 
-/// One selection menu caucus auto-answered for a round, recorded on its
-/// [`PendingRound`] so the delivered report/summary names the direction forks
+/// One selection menu caucus auto-answered for a worker, recorded on its
+/// [`WorkerWatch`] so the delivered report/summary names the direction forks
 /// caucus resolved under the main worker's pre-authorized hints — the
-/// transparency complement to never interrupting the main worker.
+/// transparency complement to never interrupting the main worker. A watch is
+/// per-panel, so which panel it belongs to is the watch itself.
 struct AutoAnswerRecord {
-    panel: PanelId,
     role: String,
     number: usize,
     label: String,
@@ -279,323 +319,514 @@ fn label_contains_kw(label: &str, keyword: &str) -> bool {
 }
 
 /// A round caucus is watching on the main worker's behalf
-/// ([`Multiplexer::poll_pending_rounds`]).
+/// ([`Multiplexer::poll_worker_watches`]).
 ///
 /// Unlike a control request (each answered immediately), a round carries no
 /// reply channel — `register_round` already acked at registration. Instead
-/// the event loop watches it each tick and, once every panel has settled (or
-/// `fallback_deadline` passes), assembles the panels' results, spills the full
-/// report to `<session_root>/rounds/<id>.md`, and *injects* a compact summary
-/// pointing at that file into the main worker's panel as a fresh turn. This is
-/// the caucus→main push that the pull-only MCP transport cannot do.
-pub(super) struct PendingRound {
-    /// Stable identity handed back at registration ([`ControlResponse::RoundRegistered`]),
-    /// the handle the main worker uses to poll ([`Multiplexer::round_status`]) or
-    /// cancel ([`Multiplexer::cancel_round`]) this round. Live-only: not persisted,
-    /// since a round never survives a restart (the sub-agent processes start
-    /// fresh — see [`Multiplexer::ingest_resumed_rounds`]).
-    id: RoundId,
-    /// Panel ids in the round. Ids that no longer exist count as settled
-    /// (see [`Multiplexer::round_settled`]).
-    panels: Vec<PanelId>,
-    /// The round's **settle latch** (Invariant I-9): a panel is inserted here
-    /// by [`Multiplexer::poll_round_panels`] — the round's single owner — at
-    /// the first tick it settles for this round (it left `Working`/`Spawning`
-    /// with an empty backlog, or is terminal), and its finished turn is
-    /// captured into `captured` in the same step. The value is the
-    /// [`PanelState`] it settled *in*, which is what the delivered report
-    /// renders.
+/// the event loop watches it each tick and, as **each** panel settles (or when
+/// its screen has been silent for the fallback window), spills that one
+/// panel's result to
+/// `<session_root>/rounds/<id>-<panel>.md` and *injects* a compact summary
+/// pointing at it into the main worker's panel as a fresh turn. This is the
+/// caucus→main push that the pull-only MCP transport cannot do.
+///
+/// Delivery is **streamed per worker**, not barriered: nothing waits for the
+/// slowest worker before waking main. Each worker is handed to main the tick it
+/// settles, and delivering it *removes* its watch — which is what makes
+/// exactly-once (Invariant I-10) hold by construction rather than by ledger.
+pub(super) struct WorkerWatch {
+    /// The one panel this watch owns, and the whole of its identity — there is
+    /// no round, no group, and no handle. caucus arms one
+    /// ([`Multiplexer::arm_worker_watch`]) the instant it hands this panel a
+    /// prompt, and delivery spends it.
     ///
-    /// Presence is the latch: once a panel is here, neither its later state nor
-    /// its later output can change the round's dueness or its contribution.
-    /// This is what makes the barrier hold. A round's delivery is gated on the
+    /// Every prompted sub-panel is watched, so **a worker can never run without a
+    /// path back to main**: main sends a task and is told when that task is done,
+    /// with no registration step, and the watch re-arms on the next prompt so the
+    /// instruct → finish → instruct loop continues indefinitely. Before this, a
+    /// round was retired on delivery and the worker went dark until main
+    /// registered another one — which is what made a round feel like a barrier
+    /// even after per-panel streaming landed.
+    ///
+    /// One panel has at most one watch, which is what makes exactly-once
+    /// delivery (Invariant I-10) hold without a ledger.
+    panel: PanelId,
+    /// The panel's **settle latch** (Invariant I-9): set by
+    /// [`Multiplexer::poll_worker_watches`] — this watch's single owner — at the
+    /// first tick the panel settles (it left `Working`/`Spawning` with an empty
+    /// backlog, or is terminal), and its finished turn is captured into
+    /// `captured` in the same step. The value is the [`PanelState`] it settled
+    /// *in*, which is what the delivered report renders.
+    ///
+    /// Being `Some` is the latch: once set, neither the panel's later state nor
+    /// its later output can change its contribution. Delivery is gated on the
     /// *main* panel being idle ([`Multiplexer::main_deliverable`]), so an
-    /// arbitrary amount of time can pass between a panel settling and the round
-    /// landing — and any path that re-opens a settled panel's turn in that
-    /// window (an MCP `send_keys`, an auto-answered menu, a human Enter typed
-    /// into the panel) would otherwise un-settle the round and, worse, make
-    /// [`Multiplexer::round_panel_contribution`] skip the finished panel's read
-    /// and deliver it as "still working, no output captured".
-    settled: HashMap<PanelId, PanelState>,
-    /// Per-panel follow-up task queue. A round panel that goes idle with a
-    /// non-empty queue is fed its next task (popped front) by
-    /// [`Multiplexer::feed_round_backlog`], flipping it back to `Working` — so
-    /// an early finisher keeps working its backlog instead of idling until the
-    /// barrier. A panel settles for the round only once it is idle *and* its
-    /// queue is empty; a panel with no entry here settles on its first idle.
-    backlog: HashMap<PanelId, VecDeque<String>>,
-    /// Per-panel output of every *finished* turn, in order, each read in
-    /// `read_mode` by [`Multiplexer::poll_round_panels`] at the instant the
+    /// arbitrary amount of time can pass between settling and delivery — and any
+    /// path that re-opens a settled panel's turn in that window (an MCP
+    /// `send_keys`, an auto-answered menu, a human Enter typed into the panel)
+    /// would otherwise make [`Multiplexer::worker_contribution`] skip the
+    /// finished panel's read and deliver it as "still working, no output
+    /// captured".
+    settled: Option<Settled>,
+    /// Follow-up task queue. A watched panel that goes idle with a non-empty
+    /// queue is fed its next task (popped front) by
+    /// [`Multiplexer::poll_worker_watches`], flipping it back to `Working` — so a
+    /// pre-planned pipeline costs main one delivery instead of one per task. The
+    /// panel settles only once it is idle *and* this queue is empty; a watch with
+    /// an empty queue settles on the first idle.
+    backlog: VecDeque<String>,
+    /// Output of every *finished* turn of this assignment, in order, each read in
+    /// `read_mode` by [`Multiplexer::poll_worker_watches`] at the instant the
     /// panel went idle on it — a backlog turn just before its successor is fed,
     /// and the last turn as the panel is latched into `settled`.
     ///
-    /// This is the round's whole record of a panel: the delivered report renders
-    /// these bodies and never re-reads the panel
-    /// ([`Multiplexer::round_panel_contribution`]). Reading at settle-time
-    /// rather than at delivery-time is load-bearing in both directions — a
-    /// `since_last_turn` read must happen before the next task reopens the turn,
-    /// and a `last_message` read must happen before a *later* turn the agent
-    /// starts on its own (a leftover background shell finishing wakes the CLI
-    /// into a fresh turn caucus never prompted) overwrites the manifest's
-    /// `last_message` with a stray "nothing new came out of it" line.
-    captured: HashMap<PanelId, Vec<String>>,
-    /// How each panel's result is read for the delivered report.
+    /// This is the watch's whole record of the panel: the delivered report
+    /// renders these bodies and never re-reads the panel
+    /// ([`Multiplexer::worker_contribution`]). Reading at settle-time rather than
+    /// at delivery-time is load-bearing in both directions — a `since_last_turn`
+    /// read must happen before the next task reopens the turn, and a
+    /// `last_message` read must happen before a *later* turn the agent starts on
+    /// its own (a leftover background shell finishing wakes the CLI into a fresh
+    /// turn caucus never prompted) overwrites the manifest's `last_message` with
+    /// a stray "nothing new came out of it" line.
+    captured: Vec<String>,
+    /// Where the turn this watch is waiting on began on the panel's manifest
+    /// timeline: taken when the watch is armed and again as each backlog task
+    /// is fed. A body, `last_message` or note is reported only if it was
+    /// recorded since this mark, so no turn is ever handed an earlier turn's
+    /// output ([`Multiplexer::read_watched_turn`]).
+    turn_start: TurnMark,
+    /// How this panel's result is read for the delivered report.
     pub(super) read_mode: ReadPanelMode,
-    /// Wall-clock instant past which the round is delivered regardless of
-    /// state — the safety net, marking still-`working` panels unfinished.
-    fallback_deadline: Instant,
-    /// Optional main-supplied keyword hints for auto-answering this round's
-    /// selection menus ([`SelectionPolicy`]). When a round panel stops on a
-    /// chooser, [`Multiplexer::poll_round_blocked_panels`] resolves it against
-    /// these; a unique keyword match is auto-selected (and noted in the
-    /// delivered report), anything else is escalated to the main worker as
-    /// before. `None` keeps every menu an escalation.
+    /// The safety net for a panel still mid-turn: when its screen has not
+    /// changed for `fallback_budget`, main is told it may be stuck
+    /// ([`PanelOutcome::Running`]). A panel whose screen keeps moving is never
+    /// reported before it finishes, and a silent one is reported once per
+    /// silence. The alarm never touches the backlog or spends the watch.
+    stall: StallClock,
+    /// The panel grid generation `stall` last saw; any other value is a screen
+    /// change, which re-arms it ([`Multiplexer::poll_worker_watch`]).
+    seen_generation: u64,
+    /// The screen-silence window behind `stall`.
+    fallback_budget: Duration,
+    /// Optional main-supplied keyword hints for auto-answering this panel's
+    /// selection menus ([`SelectionPolicy`]). When the panel stops on a chooser,
+    /// [`Multiplexer::poll_round_blocked_panels`] resolves it against these; a
+    /// unique keyword match is auto-selected (and noted in the delivered report),
+    /// anything else is escalated to the main worker as before. `None` keeps
+    /// every menu an escalation.
     selection_hints: Option<SelectionPolicy>,
-    /// Selection menus caucus auto-answered for this round under
-    /// `selection_hints`, in answer order. Rendered into the delivered
-    /// report/summary ([`push_auto_answers`]) so the main worker sees which
-    /// forks were resolved on its behalf, without ever being interrupted.
+    /// Selection menus caucus auto-answered for this panel under
+    /// `selection_hints`, in answer order. Rendered into the streamed delivery
+    /// ([`push_panel_auto_answers`]) so the main worker sees which forks were
+    /// resolved on its behalf, without ever being interrupted.
     auto_answers: Vec<AutoAnswerRecord>,
 }
 
+impl WorkerWatch {
+    /// Start a fresh silence window from now.
+    fn rearm_stall(&mut self) {
+        self.stall = StallClock::Armed(Instant::now() + self.fallback_budget);
+    }
+
+    /// Whether the panel's screen has been silent for the whole window and
+    /// main has not been told about this silence yet.
+    fn stall_due(&self, now: Instant) -> bool {
+        matches!(self.stall, StallClock::Armed(deadline) if now >= deadline)
+    }
+}
+
+/// A watch's stall alarm ([`WorkerWatch::stall`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallClock {
+    /// Fires at this instant unless the panel's screen changes first.
+    Armed(Instant),
+    /// Main was told about the current silence; the next screen change
+    /// re-arms the clock.
+    Alarmed,
+}
+
+/// What a watch latched when its panel settled ([`WorkerWatch::settled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// The panel ended its turn and settled in this state (`Idle` or
+    /// `Exited`).
+    In(PanelState),
+    /// The watched turn's prompt stalled (`PromptStalled`): the panel is
+    /// `Idle`, and the prompt may still sit unsubmitted in its input.
+    Stalled,
+}
+
 /// One round panel's contribution, collected once and rendered into both the
-/// full report ([`Multiplexer::assemble_round_report`]) and the injected
-/// summary ([`Multiplexer::render_round_summary`]) — so the two always show the
-/// *same* captured text (the per-panel `read_panel` happens exactly once, in
-/// [`Multiplexer::round_panel_contribution`]).
+/// full per-panel report ([`Multiplexer::assemble_watch_report`]) and the
+/// injected summary ([`Multiplexer::render_watch_summary`]) — so the two always
+/// show the *same* captured text (the per-panel `read_panel` happens exactly
+/// once, in [`Multiplexer::worker_contribution`]).
 struct RoundPanelContribution {
     /// The panel's role label.
     role: String,
     /// The state the panel **settled in** for this round, or its live state if
-    /// it never settled (only reachable on a fallback delivery, where it is
+    /// it never settled (only reachable on a stall alarm, where it is
     /// `Working`/`Spawning`).
     state: PanelState,
-    /// Whether the panel latched for this round (Invariant I-9). `false` only on
-    /// a fallback delivery that caught the panel mid-turn.
-    settled: bool,
-    /// Every finished-turn body, in order, as captured by
-    /// [`Multiplexer::poll_round_panels`] at the instant each turn ended. A
-    /// panel caught mid-turn by the fallback contributes whatever it had already
-    /// finished (empty if it never finished a turn).
-    bodies: Vec<String>,
-    /// Queued backlog tasks not yet run (non-zero only on a fallback delivery).
-    pending_backlog: usize,
+    outcome: PanelOutcome,
+}
+
+/// Whether the delivered panel finished, and what it has to show for it. The
+/// variant picks the delivery header ([`Multiplexer::panel_delivery_header`]).
+enum PanelOutcome {
+    /// Latched (Invariant I-9): every finished-turn body, in order, as
+    /// captured by [`Multiplexer::poll_worker_watch`] at the instant each turn
+    /// ended.
+    Finished {
+        bodies: Vec<String>,
+        /// Queued tasks that never ran (non-zero only for an `Exited` panel).
+        pending_backlog: usize,
+    },
+    /// A stall alarm mid-turn ([`WorkerWatch::stall`]): an interim notice, not
+    /// the panel's result. It carries no body at all — the running turn has
+    /// none yet, and the turns of this assignment that did end (`finished`
+    /// of them) are delivered with the final result, once — only the note the
+    /// running turn posted since it began.
+    Running {
+        /// The silence window the screen stayed unchanged for, at least.
+        silent_secs: u64,
+        note: Option<String>,
+        finished: usize,
+        pending_backlog: usize,
+    },
+    /// Latched on a stalled prompt ([`Settled::Stalled`]): the turns of this
+    /// assignment that finished before it, and the queued tasks it held back.
+    Stalled {
+        bodies: Vec<String>,
+        pending_backlog: usize,
+    },
 }
 
 impl Multiplexer {
-    /// Register a round on `panels`: stash a [`PendingRound`] for the event
-    /// loop to deliver and ack immediately with the panels' current snapshot.
-    /// `fallback_secs` is clamped to `[1, ROUND_FALLBACK_MAX_SECS]`, defaulting
-    /// to the `[settings]` `round_fallback_secs` tunable
-    /// (`self.config.settings`); `read_mode` defaults to `LastMessage`.
+    /// Queue follow-up tasks on one worker and set how caucus watches it.
     ///
-    /// Unlike the removed blocking wait, this never special-cases an
-    /// already-settled round — delivery is decided uniformly by
-    /// [`Multiplexer::poll_pending_rounds`] (which also gates on the main panel
-    /// being idle), so the registration path has exactly one shape.
+    /// caucus already watches every panel it hands a prompt to
+    /// ([`Multiplexer::arm_worker_watch`]), so this does not make a worker
+    /// visible — it configures the watch that already exists, arming one if the
+    /// panel has not been prompted yet (the queued tasks are then fed on its
+    /// first idle). There is exactly one watch per panel either way, which is
+    /// what keeps delivery exactly-once without a ledger.
     ///
-    /// `backlog` is an optional per-panel task queue: a panel listed here is
-    /// fed its next task on each idle (keeping an early finisher busy) and
-    /// settles only once its queue drains; a panel absent from `backlog`
-    /// settles on its first idle, the original one-task behaviour. Entries for
-    /// panels not in `panels` and empty queues are dropped at registration, so
-    /// `backlog` only ever holds work that can actually be fed.
-    pub(crate) fn register_round(
+    /// `tasks` are *appended* to the queue: the panel is fed the next one each
+    /// time it goes idle (keeping an early finisher busy) and settles only once
+    /// it is idle *and* the queue is empty. An empty `tasks` sets the options
+    /// alone. `fallback_secs` is clamped to `[1, ROUND_FALLBACK_MAX_SECS]` and
+    /// restarts the silence window from now; each option left `None` leaves the
+    /// watch's current value alone.
+    ///
+    /// The main panel is not a worker and cannot be queued.
+    pub(crate) fn queue_tasks(
         &mut self,
-        panels: Vec<PanelId>,
+        panel: PanelId,
+        tasks: Vec<String>,
         read_mode: Option<ReadPanelMode>,
         fallback_secs: Option<u64>,
-        backlog: Option<HashMap<PanelId, Vec<String>>>,
         selection_hints: Option<SelectionPolicy>,
     ) -> ControlResponse {
-        let budget = fallback_secs
-            .unwrap_or(self.config.settings.round_fallback_secs)
-            .clamp(1, ROUND_FALLBACK_MAX_SECS);
-        let backlog = backlog
-            .unwrap_or_default()
-            .into_iter()
-            // Only queue work for panels actually in the round, and drop empty
-            // queues so the feed/settle check never sees a vacuous entry.
-            .filter(|(id, tasks)| panels.contains(id) && !tasks.is_empty())
-            .map(|(id, tasks)| (id, VecDeque::from(tasks)))
-            .collect();
-        let round_id = RoundId::new();
-        // Snapshot the panels for the ack before moving `panels` into the round.
-        let panels_snapshot = self.panel_summaries(&panels);
-        self.pending_rounds.push(PendingRound {
-            id: round_id,
-            panels,
-            settled: HashMap::new(),
-            backlog,
-            captured: HashMap::new(),
-            read_mode: read_mode.unwrap_or(ReadPanelMode::LastMessage),
-            fallback_deadline: Instant::now() + Duration::from_secs(budget),
-            selection_hints,
-            auto_answers: Vec::new(),
-        });
-        // Durably shadow the new round so a quit/crash before delivery surfaces
-        // it on resume instead of losing it silently.
-        self.persist_pending_rounds();
-        ControlResponse::RoundRegistered {
-            round_id,
-            panels: panels_snapshot,
+        if Some(panel) == self.main_panel_id {
+            return ControlResponse::error(
+                "the main panel is the delivery target, not a worker: it cannot be queued",
+            );
+        }
+        if !self.panels.iter().any(|p| p.id == panel) {
+            return ControlResponse::error(format!("unknown panel {panel}"));
+        }
+        // Arm the watch if this panel has not been prompted yet, so the options
+        // and the queue always land on a live watch.
+        self.arm_worker_watch(panel);
+        let Some(w) = self.watches.iter_mut().find(|w| w.panel == panel) else {
+            return ControlResponse::error(
+                "caucus has no main panel to deliver to, so it cannot watch a worker",
+            );
+        };
+        w.backlog.extend(tasks);
+        if let Some(mode) = read_mode {
+            w.read_mode = mode;
+        }
+        if let Some(secs) = fallback_secs {
+            w.fallback_budget = Duration::from_secs(secs.clamp(1, ROUND_FALLBACK_MAX_SECS));
+            w.rearm_stall();
+        }
+        if selection_hints.is_some() {
+            w.selection_hints = selection_hints;
+        }
+        let text = self.render_watch_status(
+            self.watches
+                .iter()
+                .find(|w| w.panel == panel)
+                .expect("just configured above"),
+        );
+        // Durably shadow the watch so a quit/crash before delivery surfaces it on
+        // resume instead of losing the queued work silently.
+        self.persist_watches();
+        ControlResponse::Panel {
+            text: format!("Watching worker {panel}:\n{text}"),
         }
     }
 
-    /// Check on a registered round by id — and, once it is **complete**, hand
-    /// its assembled report straight back to the caller. This is the *pull* half
-    /// of round delivery (Invariant I-10).
+    /// Arm a standing watch on a sub-panel caucus has just handed a prompt to,
+    /// so its result finds its way back to the main worker without the main
+    /// worker having registered anything.
     ///
-    /// A complete round (every panel latched, or the fallback deadline passed)
-    /// is delivered right here: it is removed from `pending_rounds`, completed
-    /// through [`Multiplexer::complete_round`] — the same owner the push half
-    /// uses — and its summary returned as the response. Otherwise the round is
-    /// left pending and the caller gets its live status: per-panel state
-    /// (working / draining backlog / settled / gone), remaining backlog count,
-    /// and seconds left on the fallback deadline.
+    /// Called from [`Multiplexer::note_prompt_delivered`] — the single
+    /// `Idle -> Working` owner, so every path that gives a worker work (MCP
+    /// `send_keys`, `broadcast`, a backlog feed, a human typing into the panel)
+    /// arms exactly once, at the moment the work becomes a fact.
+    ///
+    /// Three cases are skipped:
+    /// - **no main panel at all** (`main_panel_id` is `None`): a watch exists to
+    ///   deliver to main, so with no delivery target there is nothing to arm.
+    ///   This also keeps a watch off a panel that is *about to become* main —
+    ///   `spawn_main_panel` claims `main_panel_id` at spawn, before any prompt,
+    ///   so main is never mistaken for a worker.
+    /// - the **main panel**: main is the delivery target, not a worker.
+    /// - a panel **already watched** — a live watch still owes main this panel's
+    ///   result. That covers both an explicit `queue_tasks` and a backlog feed
+    ///   re-prompting a panel its own watch already owns, so a panel is never
+    ///   watched twice and never delivered twice.
+    ///
+    /// A panel whose watch already *delivered* is not "already watched": delivery
+    /// removes the watch, and this fresh prompt arms a new one. That re-arm is
+    /// what makes the loop continuous — main hears about task 2 the same way it
+    /// heard about task 1, without registering anything in between.
+    pub(super) fn arm_worker_watch(&mut self, panel: PanelId) {
+        let Some(main) = self.main_panel_id else {
+            return;
+        };
+        if panel == main || self.worker_watched(panel) {
+            return;
+        }
+        let budget = Duration::from_secs(
+            self.config
+                .settings
+                .round_fallback_secs
+                .clamp(1, ROUND_FALLBACK_MAX_SECS),
+        );
+        let seen_generation = self
+            .panels
+            .iter()
+            .find(|p| p.id == panel)
+            .map(|p| p.grid().generation())
+            .unwrap_or_default();
+        self.watches.push(WorkerWatch {
+            panel,
+            settled: None,
+            backlog: VecDeque::new(),
+            captured: Vec::new(),
+            turn_start: self.panel_turn_mark(panel),
+            read_mode: ReadPanelMode::LastMessage,
+            stall: StallClock::Armed(Instant::now() + budget),
+            seen_generation,
+            fallback_budget: budget,
+            selection_hints: None,
+            auto_answers: Vec::new(),
+        });
+        self.persist_watches();
+    }
+
+    /// Whether a live watch still owes the main worker this panel's result.
+    /// A panel whose watch was delivered reads `false` — delivery removes the
+    /// watch — so the next prompt re-arms it
+    /// ([`Multiplexer::arm_worker_watch`]).
+    ///
+    /// Reads `watched_in_flight` as well as `watches`, so the answer does not
+    /// depend on whether a delivery path currently holds the watch out of the
+    /// list — see that field for the double-watch this closes.
+    fn worker_watched(&self, panel: PanelId) -> bool {
+        self.watched_in_flight.contains(&panel) || self.watches.iter().any(|w| w.panel == panel)
+    }
+
+    /// Move `watches` out for a delivery path to consume, recording the panels
+    /// they own in `watched_in_flight` so [`Multiplexer::worker_watched`] stays
+    /// true for them while they are out of the list. Paired with
+    /// [`Multiplexer::end_round_poll`].
+    fn take_watches_for_poll(&mut self) -> Vec<WorkerWatch> {
+        let watches = std::mem::take(&mut self.watches);
+        self.watched_in_flight = watches.iter().map(|w| w.panel).collect();
+        watches
+    }
+
+    /// Clear the in-flight watch set once a delivery path has put its watches
+    /// back. Paired with [`Multiplexer::take_watches_for_poll`].
+    fn end_round_poll(&mut self) {
+        self.watched_in_flight.clear();
+    }
+
+    /// Collect every watched worker that is ready right now, streamed. This is
+    /// the *pull* half of delivery (Invariant I-10, per worker).
+    ///
+    /// Every [`Multiplexer::watch_ready`] worker is delivered right here:
+    /// rendered, its watch spent ([`Multiplexer::after_handoff`]), and returned
+    /// in the response, followed by the
+    /// live status of the workers still running. Their watches stay live; a later
+    /// poll (or the push) streams them — a main worker polling in a loop hears
+    /// each worker the tick it finishes, never waiting for the slowest.
     ///
     /// The pull half exists because the *push* half
-    /// ([`Multiplexer::poll_pending_rounds`]) types the report into the main
-    /// panel, so it can only land while that panel is `Idle` — i.e. only after
-    /// the main worker ends its turn. A main worker that instead polls this from
-    /// inside its turn is `Working` for the whole poll, so the push can never
-    /// fire: main waits for the round, and the round waits for main to stop
-    /// waiting. The fallback deadline does not break that livelock — it makes a
-    /// round *due*, not *deliverable*. Handing the report to the poller does, by
-    /// construction. Completing the round here (rather than leaving it pending
-    /// for a push that would deliver it a second time) is what keeps delivery
-    /// exactly-once.
+    /// ([`Multiplexer::poll_worker_watches`]) types into the main panel, so it
+    /// can only land while that panel is `Idle` — i.e. only after the main
+    /// worker ends its turn. A main worker that instead polls this from inside
+    /// its turn is `Working` for the whole poll, so the push can never fire:
+    /// main waits for its workers, and the workers wait for main to stop waiting.
+    /// Handing ready workers to the poller breaks that livelock by construction,
+    /// and removing their watches here (so no later push re-delivers them) is
+    /// what keeps each worker exactly-once.
     ///
-    /// The round's single owner ([`Multiplexer::poll_round_panels`]) is run
-    /// first, so both the status and the completion check see the *current*
-    /// settle latch. Without it they would lag the panels by a tick — the event
-    /// loop drains control requests before it polls rounds.
-    ///
-    /// Round ids are live-only (not persisted across a restart), so a status
-    /// poll only ever resolves rounds the current caucus instance is watching. A
-    /// round already delivered — by either half — is an unknown id.
-    pub(crate) fn round_status(&mut self, round_id: RoundId) -> ControlResponse {
-        let Some(idx) = self.pending_rounds.iter().position(|r| r.id == round_id) else {
-            return ControlResponse::error(format!(
-                "no live round {round_id}: it never existed, already delivered, or was cancelled"
-            ));
+    /// The watch owner ([`Multiplexer::poll_worker_watch`]) runs first, so both
+    /// the readiness and the status see the *current* settle latch. Without it
+    /// they would lag the panels by a tick — the event loop drains control
+    /// requests before it polls watches.
+    pub(crate) fn collect_workers(&mut self) -> ControlResponse {
+        // Take the watches out so the owner poll can borrow `self`; the ones not
+        // delivered here go back. Their panels stay `worker_watched` while out
+        // (see `watched_in_flight`) — the backlog feed below re-prompts them from
+        // inside the poll.
+        let watches = self.take_watches_for_poll();
+        let now = Instant::now();
+
+        // Stream every worker that is ready now (one pull return is one
+        // continuing main turn, so batch them like the hook reply). A delivered
+        // worker's watch is dropped, so no later push re-delivers it.
+        let mut parts: Vec<String> = Vec::new();
+        let mut status: Vec<String> = Vec::new();
+        for mut w in watches {
+            self.poll_worker_watch(&mut w);
+            if self.watch_ready(&w, now) {
+                if let Some(summary) = self.render_watch_delivery(&w) {
+                    parts.push(summary);
+                }
+                self.watches.extend(Self::after_handoff(w));
+                continue;
+            }
+            status.push(self.render_watch_status(&w));
+            self.watches.push(w);
+        }
+        self.end_round_poll();
+        self.persist_watches();
+
+        let text = match (parts.is_empty(), status.is_empty()) {
+            (true, true) => {
+                "No workers are being watched — nothing is in flight for you.".to_string()
+            }
+            (false, true) => parts.join("\n\n"),
+            (true, false) => Self::watch_status_header(&status),
+            (false, false) => format!(
+                "{}\n\n{}",
+                parts.join("\n\n"),
+                Self::watch_status_header(&status)
+            ),
         };
-        // Take the round out so the owner poll can borrow `self`; it goes back
-        // at `idx` unless it completes here.
-        let mut round = self.pending_rounds.remove(idx);
-        let fallback_due = Instant::now() >= round.fallback_deadline;
-        let changed = self.poll_round_panels(&mut round, fallback_due);
-        let all_settled = self.round_settled(&round);
-
-        if all_settled || fallback_due {
-            let summary = self.complete_round(&round, all_settled);
-            // `round` is already out of `pending_rounds`, so persisting now
-            // records it as delivered — and no push can deliver it again.
-            self.persist_pending_rounds();
-            return ControlResponse::Panel { text: summary };
-        }
-
-        let text = self.render_round_status(&round);
-        self.pending_rounds.insert(idx, round);
-        if changed {
-            self.persist_pending_rounds();
-        }
         ControlResponse::Panel { text }
     }
 
-    /// Render a round's per-panel status line-by-line. Each panel's status comes
-    /// from the round's **settle latch**, not its live state: a panel that
-    /// settled and was later re-woken (a leftover background shell, an answered
-    /// menu) has already contributed to this round and stays `settled` here,
-    /// exactly as the delivered report will render it.
-    fn render_round_status(&self, round: &PendingRound) -> String {
-        let remaining = round
-            .fallback_deadline
-            .saturating_duration_since(Instant::now())
-            .as_secs();
-        let mut out = format!(
-            "Round {}: {} panel(s), {remaining}s until the fallback deadline\n",
-            round.id,
-            round.panels.len()
-        );
-        for &id in &round.panels {
-            let backlog = round.backlog.get(&id).map(VecDeque::len).unwrap_or(0);
-            let (role, status) = match self.panels.iter().find(|p| p.id == id) {
-                None => ("(gone)", "gone"),
-                Some(p) if round.settled.contains_key(&id) => (p.role.as_str(), "settled"),
-                // Not latched: either mid-turn, or idle with queued work left
-                // (the owner poll feeds it its next task).
-                Some(p) if backlog > 0 && p.state() == PanelState::Idle => {
-                    (p.role.as_str(), "draining backlog")
-                }
-                Some(p) => (p.role.as_str(), "working"),
-            };
-            out.push_str(&format!(
-                "  - {role} ({id}): {status}, {backlog} backlog task(s) remaining\n"
-            ));
+    /// Wrap the status lines of the workers still running in their header.
+    fn watch_status_header(lines: &[String]) -> String {
+        let mut out = format!("{} worker(s) still running\n", lines.len());
+        for line in lines {
+            out.push_str(line);
         }
         out
     }
 
-    /// Cancel a live registered round by id: stop watching it and drop its
-    /// pending caucus→main delivery. The panels are left exactly where they
-    /// are — work already in flight keeps running and any backlog stops being
-    /// fed; only the barrier that would inject the assembled report into the
-    /// main worker is removed. An unknown id is an error. The durable snapshot
-    /// is re-written so the cancellation survives a crash.
-    pub(crate) fn cancel_round(&mut self, round_id: RoundId) -> ControlResponse {
-        let before = self.pending_rounds.len();
-        self.pending_rounds.retain(|r| r.id != round_id);
-        if self.pending_rounds.len() == before {
+    /// Render one live watch's status line. The state comes from the watch's
+    /// latch, not the panel's live state: a panel that settled and was then
+    /// re-woken (a leftover background shell, an answered menu) still reads
+    /// `settled`, exactly as its frozen contribution will render.
+    fn render_watch_status(&self, w: &WorkerWatch) -> String {
+        let stall = match w.stall {
+            StallClock::Armed(deadline) => format!(
+                "stall alarm in {}s if its screen stays unchanged",
+                deadline.saturating_duration_since(Instant::now()).as_secs()
+            ),
+            StallClock::Alarmed => "stall alarm sent, screen unchanged since".to_string(),
+        };
+        let backlog = w.backlog.len();
+        let (role, state) = match self.panels.iter().find(|p| p.id == w.panel) {
+            None => ("(gone)", "gone"),
+            Some(p) if w.settled == Some(Settled::Stalled) => (p.role.as_str(), "prompt stalled"),
+            Some(p) if w.settled.is_some() => (p.role.as_str(), "settled"),
+            // Not latched: either mid-turn, or idle with queued work left (the
+            // owner poll feeds it its next task).
+            Some(p) if backlog > 0 && p.state() == PanelState::Idle => {
+                (p.role.as_str(), "draining backlog")
+            }
+            Some(p) => (p.role.as_str(), "working"),
+        };
+        format!(
+            "  - {role} ({}): {state}, {backlog} backlog task(s) remaining, {stall}\n",
+            w.panel
+        )
+    }
+
+    /// Stop watching one worker: drop its watch, so caucus stops feeding it any
+    /// queued backlog and never delivers its result. The panel itself is left
+    /// exactly where it is — work already in flight keeps running. A panel that
+    /// is not watched is an error. The durable snapshot is re-written so the
+    /// drop survives a crash.
+    ///
+    /// This is not permanent: the next prompt caucus delivers to that panel
+    /// re-arms a watch ([`Multiplexer::arm_worker_watch`]).
+    pub(crate) fn stop_watching(&mut self, panel: PanelId) -> ControlResponse {
+        let before = self.watches.len();
+        self.watches.retain(|w| w.panel != panel);
+        if self.watches.len() == before {
             return ControlResponse::error(format!(
-                "no live round {round_id}: it never existed, already delivered, or was already cancelled"
+                "panel {panel} is not being watched: it was never prompted, was already \
+                 delivered, or you already stopped watching it"
             ));
         }
-        self.persist_pending_rounds();
+        self.persist_watches();
         ControlResponse::Ok
     }
 
-    /// Deliver one due, deliverable round to the main worker — the caucus→main
-    /// push. Called once per event-loop tick, after signals + pump have
-    /// updated panel state.
+    /// Push every ready worker to the main worker in one message — the
+    /// caucus→main push. Called once per event-loop tick, after signals + pump
+    /// have updated panel state.
     ///
-    /// A round is *due* when all its panels have settled, or its
-    /// `fallback_deadline` has passed. It is *delivered* only while the main
-    /// panel exists, is `Idle`, and has no un-submitted human keystroke within
-    /// `COMPOSE_GRACE` — so an injected turn never collides with a line the
-    /// user is composing. At most one round is delivered per tick: the
-    /// injection flips the main panel to `Working`, so any other due round
-    /// naturally holds until the main worker is idle again.
+    /// Delivery is **per panel**, not barriered: a watch is *ready*
+    /// (`Multiplexer::watch_ready`) the tick its panel settles (or when its
+    /// stall alarm comes due while it is still working). Its frozen
+    /// contribution is *delivered* only while the main panel exists, is `Idle`,
+    /// and has no un-submitted human keystroke within `COMPOSE_GRACE` — so an
+    /// injected turn never collides with a line the user is composing. Every
+    /// watch ready in the same tick rides one push, joined like the hook
+    /// reply: each push opens a main turn that re-reads main's whole context,
+    /// so a push per worker multiplied that cost by the workers that finished
+    /// while main was busy. The push flips main to `Working`, so a worker
+    /// ready later holds until main is idle again. Main never waits for the
+    /// slowest worker before hearing from the fast ones.
     ///
-    /// A due round whose main worker is *gone* — no main panel id, the panel
-    /// no longer exists, or it has `Exited` (the agent process died on its
-    /// own; only `kill_panel` clears the id, so a self-exit leaves
-    /// `main_panel_id` pointing at an `Exited` panel) — is dropped after its
-    /// assembled report is spilled to `dropped-rounds.log`: no caucus→main
-    /// push can ever land, so re-queuing it would spin forever, and discarding
-    /// it silently would lose every sub-agent's work. A delivery that *fails*
-    /// (e.g. the main PTY writer went away mid-tick) keeps the round for a
-    /// later tick rather than dropping it.
+    /// A ready watch whose main worker is *gone* — no main panel id, the panel no
+    /// longer exists, or it has `Exited` (the agent process died on its own; only
+    /// `kill_panel` clears the id, so a self-exit leaves `main_panel_id` pointing
+    /// at an `Exited` panel) — has its contribution spilled to
+    /// `dropped-rounds.log` and its watch spent: no caucus→main push can ever
+    /// land, so re-queuing would spin forever, and discarding silently would lose
+    /// the sub-agent's work. A delivery that *fails* (e.g. the main PTY writer
+    /// went away mid-tick) keeps every watch it carried so a later tick
+    /// retries rather than dropping them.
     ///
-    /// Before the due-check, each non-expired round's backlog is fed
-    /// (`Multiplexer::feed_round_backlog`): a panel that finished early with
-    /// queued tasks is handed its next task and flips back to `Working`, so it
-    /// is not yet settled and the round is not yet due — the early finisher
-    /// keeps working its backlog instead of idling at the barrier. Once the
-    /// fallback deadline has passed, no new backlog work starts; the round
-    /// delivers the partial report.
-    pub fn poll_pending_rounds(&mut self) {
-        if self.pending_rounds.is_empty() {
+    /// [`Multiplexer::poll_worker_watches`] runs first on each watch: it latches
+    /// a panel that settled this tick (capturing its finished turn) and hands an
+    /// early finisher its next queued task — so a backlog panel keeps working
+    /// its queue and only settles once the queue drains, deadline or not.
+    pub fn poll_worker_watches(&mut self) {
+        if self.watches.is_empty() {
             return;
         }
         let now = Instant::now();
-        // Take the queue so the settle-checks below can borrow `self`.
-        let rounds = std::mem::take(&mut self.pending_rounds);
+        let watches = self.take_watches_for_poll();
 
-        // Resolve main's liveness once. Main is *gone* — no caucus→main push
-        // can ever land — when there is no main panel id, the panel no longer
-        // exists, or it has `Exited`. A due round against a gone main is
-        // spilled and dropped, never re-queued forever.
+        // Resolve main's liveness once. Main is *gone* — no caucus→main push can
+        // ever land — when there is no main panel id, the panel no longer exists,
+        // or it has `Exited`. A ready watch against a gone main is spilled and
+        // dropped, never re-queued forever.
         let main = self.main_panel_id.and_then(|id| {
             self.panels
                 .iter()
@@ -606,135 +837,170 @@ impl Multiplexer {
         let main_id = main.map(|(id, _)| id);
         let deliverable = self.main_deliverable();
 
-        let mut delivered = false;
-        // Whether the pending-round set changed this tick (a round dropped,
-        // delivered, or had backlog fed) — only then is the durable snapshot
-        // re-written, so the common idle tick does no I/O.
+        // The workers ready this tick, rendered, for the one push below.
+        let mut batch: Vec<(WorkerWatch, String)> = Vec::new();
+        // Whether the watch set changed this tick (a worker delivered, retired,
+        // or had backlog fed) — only then is the durable snapshot re-written, so
+        // the common idle tick does no I/O.
         let mut changed = false;
-        for mut round in rounds {
-            let fallback_due = now >= round.fallback_deadline;
-            // Latch every panel that has settled for this round (capturing its
-            // finished turn) and, while there is still time, hand an early
-            // finisher its next queued task. Runs on the fallback tick too —
-            // only the *feeding* stops there: a panel that settled with queued
-            // work left must still have its finished turn captured, or the
-            // partial report the deadline forces would carry nothing for it.
-            changed |= self.poll_round_panels(&mut round, fallback_due);
-            let all_settled = self.round_settled(&round);
-            let due = fallback_due || all_settled;
-
-            if !due {
-                // Sub-agents still working: keep watching, whatever main's state.
-                self.pending_rounds.push(round);
+        for mut w in watches {
+            changed |= self.poll_worker_watch(&mut w);
+            // A watch that can never deliver carries no contribution: drop it
+            // before any main-state gate, so it never lingers.
+            if self.watch_undeliverable(&w) {
+                changed = true;
+                continue;
+            }
+            if !self.watch_ready(&w, now) {
+                self.watches.push(w);
                 continue;
             }
             if main_gone {
-                // No wake path will ever exist. Spill the assembled report so
-                // the sub-agents' work is not silently lost, then drop.
-                let report = self.assemble_round_report(&round, all_settled);
-                self.record_dropped_round(&report);
+                // No wake path will ever exist. Spill the frozen contribution so
+                // the sub-agent's work is not silently lost, then drop the watch.
+                if let Some(report) = self.render_watch_delivery(&w) {
+                    self.record_dropped_round(&report);
+                }
+                self.watches.extend(Self::after_handoff(w));
                 changed = true;
                 continue;
             }
-            if deliverable && !delivered {
-                let summary = self.complete_round(&round, all_settled);
-                // `deliverable` implies a live, idle main panel exists.
-                let mid = main_id.expect("deliverable implies a main panel");
-                match McpToolSurface::send_keys(self, mid, &summary, true) {
-                    Ok(()) => {
-                        delivered = true;
-                        changed = true;
-                    }
-                    Err(err) => {
-                        // Delivery failed (e.g. the main PTY writer went away
-                        // mid-tick): keep the round so a later tick retries,
-                        // rather than discarding every sub-agent's result.
-                        warn!(error = %err, "round delivery to main panel failed; will retry");
-                        self.pending_rounds.push(round);
+            if !deliverable {
+                self.watches.push(w);
+                continue;
+            }
+            let Some(summary) = self.render_watch_delivery(&w) else {
+                changed = true;
+                continue;
+            };
+            batch.push((w, summary));
+        }
+        if !batch.is_empty() {
+            // `deliverable` implies a live, idle main panel exists.
+            let mid = main_id.expect("deliverable implies a main panel");
+            let text = batch
+                .iter()
+                .map(|(_, summary)| summary.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            match McpToolSurface::send_keys(self, mid, &text, true) {
+                // Drop the watches only on a confirmed send (mirrors the
+                // backlog feed): a failed push keeps them ready so the next
+                // tick retries, never dropping a worker's result.
+                Ok(()) => {
+                    changed = true;
+                    for (w, _) in batch {
+                        self.watches.extend(Self::after_handoff(w));
                     }
                 }
-            } else {
-                // Gate closed (main busy / mid-compose) or one already
-                // delivered this tick: keep it for a later tick.
-                self.pending_rounds.push(round);
+                Err(err) => {
+                    warn!(error = %err, workers = batch.len(), "worker delivery to main failed; will retry");
+                    self.watches.extend(batch.into_iter().map(|(w, _)| w));
+                }
             }
         }
+        self.end_round_poll();
         if changed {
-            self.persist_pending_rounds();
+            self.persist_watches();
         }
     }
 
-    /// Complete and take the first *due* pending round, returning its summary
-    /// — the hook-reply half of round delivery (`docs/design.md` §7.6),
-    /// called by [`Multiplexer::handle_signal_with_reply`] when the main
-    /// worker's own Stop hook is waiting for a directive.
+    /// Take every worker ready to deliver right now, returning one compact
+    /// summary each — the hook-reply half of delivery (`docs/design.md` §7.6),
+    /// called by [`Multiplexer::handle_signal_with_reply`] when the main worker's
+    /// own Stop hook is waiting for a directive.
     ///
-    /// The [`Multiplexer::round_status`] pull generalised from one named round
-    /// to the whole queue: each round's latch is refreshed first
-    /// ([`Multiplexer::poll_round_panels`], Invariant I-9 — the judgement must
-    /// see panels that settled this very tick), then judged by the same due
-    /// predicate as the keystroke push (`fallback_due || all_settled`, so a
-    /// partial fallback report travels this path too). The first due round is
-    /// removed, completed ([`Multiplexer::complete_round`], Invariant I-10 —
-    /// removal-before-completion is what makes delivery exactly-once across
-    /// all three paths), and the changed set is persisted before the summary
-    /// is returned. Rounds that are not due stay pending, exactly as the push
-    /// leaves them.
-    pub(super) fn take_due_round_summary(&mut self) -> Option<String> {
-        if self.pending_rounds.is_empty() {
-            return None;
+    /// The main worker's Stop hook is one *continuing* turn, so — like the
+    /// question-notice queue that rides the same reply — every ready worker is
+    /// carried at once rather than one per turn: a worker held back would wait an
+    /// entire further main turn for the push path, which is the latency this
+    /// delivery exists to remove. Each watch's latch is refreshed first
+    /// ([`Multiplexer::poll_worker_watches`], Invariant I-9 — the judgement must
+    /// see panels that settled this very tick), then every
+    /// [`Multiplexer::watch_ready`] watch is rendered and **dropped** (Invariant
+    /// I-10, per panel). The rest stay live, exactly as the push leaves them.
+    ///
+    /// The caller lands the returned texts (hook reply → keystroke fallback →
+    /// `dropped-rounds.log`), so dropping the watch as it is taken keeps each
+    /// worker exactly-once even if the reply channel then dies.
+    pub(super) fn take_ready_round_deliveries(&mut self) -> Vec<String> {
+        if self.watches.is_empty() {
+            return Vec::new();
         }
         let now = Instant::now();
         let mut changed = false;
-        let mut summary = None;
-        let rounds = std::mem::take(&mut self.pending_rounds);
-        for mut round in rounds {
-            if summary.is_some() {
-                // One directive carries one round; the rest keep their place.
-                self.pending_rounds.push(round);
+        let mut out = Vec::new();
+        let watches = self.take_watches_for_poll();
+        for mut w in watches {
+            changed |= self.poll_worker_watch(&mut w);
+            if self.watch_undeliverable(&w) {
+                changed = true;
                 continue;
             }
-            let fallback_due = now >= round.fallback_deadline;
-            changed |= self.poll_round_panels(&mut round, fallback_due);
-            let all_settled = self.round_settled(&round);
-            if fallback_due || all_settled {
-                summary = Some(self.complete_round(&round, all_settled));
-                changed = true;
-            } else {
-                self.pending_rounds.push(round);
+            if !self.watch_ready(&w, now) {
+                self.watches.push(w);
+                continue;
             }
+            if let Some(summary) = self.render_watch_delivery(&w) {
+                out.push(summary);
+            }
+            self.watches.extend(Self::after_handoff(w));
+            changed = true;
         }
+        self.end_round_poll();
         if changed {
-            self.persist_pending_rounds();
+            self.persist_watches();
         }
-        summary
+        out
     }
 
-    /// Complete a round: assemble its full per-panel report, spill it to
-    /// `<session_root>/rounds/<id>.md`, and return the compact summary that
-    /// points at it. The single owner of round completion (Invariant I-10),
-    /// shared by every delivery path — the push
-    /// ([`Multiplexer::poll_pending_rounds`], which types the summary into an
-    /// idle main panel), the pull ([`Multiplexer::round_status`], which hands
-    /// it to a main worker polling from inside its own turn), and the
-    /// hook-reply ([`Multiplexer::take_due_round_summary`], which injects it
-    /// into the main worker's continuing turn through its Stop hook).
+    /// Whether this watch is **ready to deliver** this tick: its contribution is
+    /// frozen. A watch is ready once its panel settled (latched by
+    /// [`Multiplexer::poll_worker_watches`], the normal path) or its stall
+    /// alarm is due while the panel is still working (delivered as an interim
+    /// [`PanelOutcome::Running`] notice). Asked after the owner poll, so a
+    /// screen change seen this tick withdraws an alarm not yet delivered.
     ///
-    /// The caller must already have removed the round from `pending_rounds`, so
-    /// a round is completed exactly once no matter which half reaches it first.
-    /// Never the whole report into the main PTY: a multi-panel round's results
-    /// can run to hundreds of KB, and one giant bracketed paste risks the
-    /// backend's paste-handling pathologies.
-    fn complete_round(&self, round: &PendingRound, all_settled: bool) -> String {
-        let report = self.assemble_round_report(round, all_settled);
-        let report_path = self.spill_round_report(round.id, &report);
-        self.render_round_summary(round, all_settled, report_path.as_deref())
+    /// There is no "already delivered" case to exclude: delivering a settled
+    /// watch *removes* it ([`Multiplexer::after_handoff`]), so a spent watch
+    /// cannot be asked. That is the per-panel replacement
+    /// for the old round-level barrier and its `delivered` ledger — a round no
+    /// longer waits for its slowest worker, and exactly-once holds by
+    /// construction rather than by a bookkeeping set.
+    fn watch_ready(&self, w: &WorkerWatch, now: Instant) -> bool {
+        w.settled.is_some() || w.stall_due(now)
     }
 
-    /// Append a dropped round's assembled report to the session's
-    /// `dropped-rounds.log`, so a round whose main worker is gone (exited or
-    /// never existed) is recorded rather than silently lost. Best-effort: a
-    /// write failure is logged, not propagated — the round is being dropped
+    /// What handing a ready watch's delivery to main does to the watch — the
+    /// one place every delivery path (push, pull, hook-reply, main-gone spill)
+    /// decides it. A latched watch is spent (Invariant I-10). An alarmed one
+    /// is not: its panel is still running, so the watch keeps its backlog and
+    /// finished turns, stays silent until the panel's screen changes again,
+    /// and delivers the turn's result when it ends.
+    fn after_handoff(mut w: WorkerWatch) -> Option<WorkerWatch> {
+        if w.settled.is_some() {
+            return None;
+        }
+        w.stall = StallClock::Alarmed;
+        Some(w)
+    }
+
+    /// Whether this watch can never be delivered and must simply be dropped:
+    /// - its panel is **gone** (killed): no contribution to render and no live
+    ///   worker left.
+    /// - its panel **is the main panel**: delivery types *into* main, so watching
+    ///   main would feed its own output back to it.
+    ///   [`Multiplexer::arm_worker_watch`] already refuses to arm main, but that
+    ///   reads `main_panel_id` at arm time; checking here closes the case where a
+    ///   panel *becomes* main after a watch was armed on it, without depending on
+    ///   assignment order.
+    ///
+    /// Checked by every delivery path, so an undeliverable watch is retired
+    /// uniformly instead of lingering forever.
+    fn watch_undeliverable(&self, w: &WorkerWatch) -> bool {
+        !self.panels.iter().any(|p| p.id == w.panel) || Some(w.panel) == self.main_panel_id
+    }
+
     /// either way.
     fn record_dropped_round(&self, report: &str) {
         self.append_dropped_round(
@@ -765,33 +1031,24 @@ impl Multiplexer {
         }
     }
 
-    /// Snapshot the live pending rounds into their persistable form. Panel ids
-    /// (regenerated on resume) are resolved to role labels; per-panel captured
-    /// turns and the remaining backlog count are carried so resume can both
+    /// Snapshot the live watches into their persistable form. Panel ids
+    /// (regenerated on resume) are resolved to role labels; each watch's
+    /// captured turns and remaining backlog count are carried so resume can both
     /// preserve the work and summarise it.
-    fn pending_round_records(&self) -> Vec<crate::session::round_record::PendingRoundRecord> {
-        use crate::session::round_record::{PendingRoundRecord, RoundPanelRecord};
-        self.pending_rounds
+    fn watch_records(&self) -> Vec<crate::session::round_record::WorkerWatchRecord> {
+        use crate::session::round_record::WorkerWatchRecord;
+        self.watches
             .iter()
-            .map(|r| {
-                let panels = r
+            .map(|w| WorkerWatchRecord {
+                role: self
                     .panels
                     .iter()
-                    .map(|&id| RoundPanelRecord {
-                        role: self
-                            .panels
-                            .iter()
-                            .find(|p| p.id == id)
-                            .map(|p| p.role.clone())
-                            .unwrap_or_else(|| "(gone)".to_string()),
-                        captured: r.captured.get(&id).cloned().unwrap_or_default(),
-                        pending_backlog: r.backlog.get(&id).map(VecDeque::len).unwrap_or(0),
-                    })
-                    .collect();
-                PendingRoundRecord {
-                    panels,
-                    read_mode: r.read_mode,
-                }
+                    .find(|p| p.id == w.panel)
+                    .map(|p| p.role.clone())
+                    .unwrap_or_else(|| "(gone)".to_string()),
+                captured: w.captured.clone(),
+                pending_backlog: w.backlog.len(),
+                read_mode: w.read_mode,
             })
             .collect()
     }
@@ -800,8 +1057,8 @@ impl Multiplexer {
     /// (or remove it when there are none). Single owner of pending-round
     /// persistence: called whenever the set changes (registration, delivery,
     /// drop, backlog feed). Best-effort — a write failure is logged, not fatal.
-    fn persist_pending_rounds(&self) {
-        let records = self.pending_round_records();
+    fn persist_watches(&self) {
+        let records = self.watch_records();
         if let Err(err) = crate::session::round_record::write(&self.session.root_dir, &records) {
             warn!(error = %err, "pending-rounds persistence failed");
         }
@@ -816,7 +1073,7 @@ impl Multiplexer {
     /// continued. Each dropped round's captured work is appended to
     /// `dropped-rounds.log` (preserved, not lost), and a single notice is
     /// queued for the resumed main worker — whose claude conversation reloaded
-    /// still believing its `register_round` was live — telling it the round was
+    /// still believing the work it handed out was live — telling it the work was
     /// dropped so it stops waiting and can re-issue the work.
     ///
     /// `pending-rounds.json` is cleared immediately (it is reused for *this*
@@ -846,39 +1103,31 @@ impl Multiplexer {
         }
 
         let mut notice = format!(
-            "[caucus] {} round(s) you registered before the last restart were \
-             dropped — caucus cannot deliver a round across a restart (the \
-             sub-agent processes started fresh). Re-issue the work if you still \
-             need it. Their captured output is preserved in \
+            "[caucus] {} worker(s) caucus was watching for you before the last \
+             restart were dropped — caucus cannot carry a watch across a restart \
+             (the sub-agent processes started fresh). Re-issue the work if you \
+             still need it. Their captured output is preserved in \
              dropped-rounds.log. Summary:\n",
             records.len()
         );
-        for (i, round) in records.iter().enumerate() {
+        for (i, rec) in records.iter().enumerate() {
             notice.push_str(&format!(
-                "\n## dropped round {} ({} panel(s))\n",
-                i + 1,
-                round.panels.len()
+                "  - role {}: {} captured turn(s), {} backlog task(s) un-run\n",
+                rec.role,
+                rec.captured.len(),
+                rec.pending_backlog
             ));
-            let mut spill = String::new();
-            for panel in &round.panels {
-                notice.push_str(&format!(
-                    "  - role {}: {} captured turn(s), {} backlog task(s) un-run\n",
-                    panel.role,
-                    panel.captured.len(),
-                    panel.pending_backlog
-                ));
-                spill.push_str(&format!(
-                    "\n## role {} ({} captured turn(s), {} backlog un-run)\n",
-                    panel.role,
-                    panel.captured.len(),
-                    panel.pending_backlog
-                ));
-                for (t, body) in panel.captured.iter().enumerate() {
-                    spill.push_str(&format!("\n### task {}\n{}\n", t + 1, body.trim()));
-                }
+            let mut spill = format!(
+                "\n## role {} ({} captured turn(s), {} backlog un-run)\n",
+                rec.role,
+                rec.captured.len(),
+                rec.pending_backlog
+            );
+            for (t, body) in rec.captured.iter().enumerate() {
+                spill.push_str(&format!("\n### task {}\n{}\n", t + 1, body.trim()));
             }
             self.append_dropped_round(
-                &format!("----- dropped round {} (lost to a restart) -----", i + 1),
+                &format!("----- dropped worker {} (lost to a restart) -----", i + 1),
                 &spill,
             );
         }
@@ -930,59 +1179,32 @@ impl Multiplexer {
         }
     }
 
-    /// Whether every panel in `round` has **latched** (Invariant I-9) — i.e.
-    /// [`Self::poll_round_panels`] has seen it settle for this round and
-    /// captured its finished turn. A missing panel counts as settled: there is
-    /// no live worker left to feed, even if a stale backlog entry exists for
-    /// that id.
-    ///
-    /// This reads the latch, never the panels' live state. A round is delivered
-    /// only when the *main* panel is idle, so an unbounded amount of time can
-    /// pass between the last panel settling and the round landing; judging live
-    /// state here would let anything that re-opens a settled panel's turn in
-    /// that window (an MCP `send_keys`, an auto-answered menu, a human Enter,
-    /// the CLI waking itself when a leftover background shell finishes) silently
-    /// un-settle a finished round.
-    fn round_settled(&self, round: &PendingRound) -> bool {
-        round
-            .panels
-            .iter()
-            .all(|id| round.settled.contains_key(id) || !self.panels.iter().any(|p| p.id == *id))
-    }
-
     /// Re-key a panel's live round membership after [`Multiplexer::restart_panel`]
     /// swaps its `PanelId` (a fresh PTY is a fresh id). The restarted panel is
     /// the *same* logical round member — same role, same resumed conversation,
     /// same worktree — so every pending round that referenced `old` must now
-    /// reference `new` across all four id-keyed fields (`panels`, `settled`,
-    /// `backlog`, `captured`). Without this the round resolves `old` to a missing panel
-    /// (see [`Self::round_settled`]) and silently drops the member, settling
-    /// without its contribution. `restart_panel` is the only id-changing path:
-    /// every other spawn allocates a genuinely new panel, and `kill_panel`
+    /// reference `new` across all five id-keyed fields (`panels`, `settled`,
+    /// `delivered`, `backlog`, `captured`). Without this the round resolves
+    /// `old` to a missing panel and silently drops the member — retiring it
+    /// (gone) or losing its contribution. `restart_panel` is the only id-changing
+    /// path: every other spawn allocates a genuinely new panel, and `kill_panel`
     /// detaches permanently with no replacement.
     pub(super) fn remap_round_membership(&mut self, old: PanelId, new: PanelId) {
-        for round in &mut self.pending_rounds {
-            for id in &mut round.panels {
-                if *id == old {
-                    *id = new;
-                }
-            }
-            if let Some(state) = round.settled.remove(&old) {
-                round.settled.insert(new, state);
-            }
-            if let Some(backlog) = round.backlog.remove(&old) {
-                round.backlog.insert(new, backlog);
-            }
-            if let Some(captured) = round.captured.remove(&old) {
-                round.captured.insert(new, captured);
+        let turn_start = self.panel_turn_mark(new);
+        for w in &mut self.watches {
+            if w.panel == old {
+                w.panel = new;
+                // A mark is an index into one manifest's timeline, and the
+                // restarted panel has a fresh manifest.
+                w.turn_start = turn_start;
             }
         }
     }
 
     /// The round's **single owner** (Invariants I-9, I-10): the only writer of
     /// `round.settled` and `round.captured`. Called once per round per tick from
-    /// [`Multiplexer::poll_pending_rounds`] before the due-check, and again from
-    /// [`Multiplexer::round_status`] so a poll never lags the panels by a tick.
+    /// [`Multiplexer::poll_worker_watches`] before the due-check, and again from
+    /// [`Multiplexer::collect_workers`] so a poll never lags the panels by a tick.
     ///
     /// For each panel not yet latched, in one pass:
     ///
@@ -990,11 +1212,10 @@ impl Multiplexer {
     ///   a selection menu is here for free: a chooser fires no `Stop` hook, so it
     ///   stays coarse `Working` and [`Multiplexer::poll_round_blocked_panels`]
     ///   routes it to the main worker instead.
-    /// - `Idle` with queued backlog, before the deadline — **feed**: read the
+    /// - `Idle` with queued backlog — **feed**: read the
     ///   finished turn, then send the next task, which flips the panel back to
     ///   `Working`. Not latched: the panel has more of this round's work to do.
-    /// - otherwise (an empty backlog, a terminal `Exited`, or the fallback
-    ///   deadline having closed the feeding window) — **latch**: read the
+    /// - otherwise (an empty backlog, or a terminal `Exited`) — **latch**: read the
     ///   finished turn and record the panel in `round.settled`. Its contribution
     ///   to this round is now frozen.
     ///
@@ -1003,7 +1224,7 @@ impl Multiplexer {
     /// coarse state machine has no `Blocked` — see [`PanelState`].
     ///
     /// Every read happens at the instant the panel is observed idle, never at
-    /// delivery time — see `PendingRound::captured` for why that is load-bearing
+    /// delivery time — see `WorkerWatch::captured` for why that is load-bearing
     /// for both `since_last_turn` and `last_message`. A read and the state change
     /// it belongs to are committed together: a failed send leaves the task at the
     /// front of the queue and captures nothing, so the next tick re-reads and
@@ -1011,97 +1232,138 @@ impl Multiplexer {
     ///
     /// Returns `true` if the round's persistable state changed (a panel latched
     /// or a task was fed), so the caller re-writes the durable snapshot.
-    fn poll_round_panels(&mut self, round: &mut PendingRound, fallback_due: bool) -> bool {
-        /// What the owner decided to do with one panel this tick.
-        enum Act {
-            /// Send this task, then record the finished turn.
-            Feed(String),
-            /// Record the finished turn and freeze the panel's contribution.
-            Latch(PanelState),
+    fn poll_worker_watch(&mut self, w: &mut WorkerWatch) -> bool {
+        // Latched: its contribution is frozen, whatever the panel is doing now.
+        if w.settled.is_some() {
+            return false;
         }
-        // Decide everything first (borrows only `round` + reads `self.panels`),
-        // then act (mut-borrows `self`), so the two borrows never overlap. A
-        // backlog front is cloned, not popped, here — it is consumed only on a
-        // confirmed send below.
-        let mut acts: Vec<(PanelId, String, Act)> = Vec::new();
-        for &id in &round.panels {
-            // Latched: its contribution is frozen, whatever it is doing now.
-            if round.settled.contains_key(&id) {
-                continue;
-            }
-            // Gone (killed): nothing to latch or feed. `round_settled` counts a
-            // missing panel as settled — there is no live worker left.
-            let Some(state) = self.panels.iter().find(|p| p.id == id).map(Panel::state) else {
-                continue;
-            };
-            if matches!(state, PanelState::Working | PanelState::Spawning) {
-                continue;
-            }
-            let backlog_empty = round.backlog.get(&id).is_none_or(VecDeque::is_empty);
-            // `state` is `Idle` or `Exited` here, so this is exhaustive: an idle
-            // panel with work left and time on the clock gets fed; everything
-            // else settles.
-            let act = if state == PanelState::Idle && !backlog_empty && !fallback_due {
-                // The queue's front is cloned; popped only on a confirmed send.
-                let task = round.backlog[&id]
-                    .front()
-                    .expect("backlog is non-empty")
-                    .clone();
-                Act::Feed(task)
-            } else {
-                Act::Latch(state)
-            };
-            // Read the just-finished turn *now*, while the panel is still idle.
-            let done = self
-                .read_panel(id, round.read_mode)
-                .unwrap_or_else(|e| format!("(could not read panel: {e})"));
-            acts.push((id, done, act));
+        // Gone (killed): nothing to latch or feed; the delivery path retires it.
+        let Some((state, generation)) = self
+            .panels
+            .iter()
+            .find(|p| p.id == w.panel)
+            .map(|p| (p.state(), p.grid().generation()))
+        else {
+            return false;
+        };
+        // A screen change is the panel showing life: restart the silence
+        // window, and let a later silence raise a fresh alarm.
+        if generation != w.seen_generation {
+            w.seen_generation = generation;
+            w.rearm_stall();
         }
+        if matches!(state, PanelState::Working | PanelState::Spawning) {
+            return false;
+        }
+        // A stalled prompt may still sit in the panel's input, so feeding the
+        // next task would submit both as one prompt: settle and let main decide.
+        if state == PanelState::Idle
+            && self
+                .manifests
+                .get(&w.panel)
+                .is_some_and(|m| m.prompt_stalled_since(w.turn_start))
+        {
+            w.settled = Some(Settled::Stalled);
+            return true;
+        }
+        // `state` is `Idle` or `Exited` here, so this is exhaustive: an idle
+        // panel with work left and time on the clock gets fed; everything else
+        // settles. The queue's front is cloned, not popped — it is consumed only
+        // on a confirmed send below.
+        let feed =
+            (state == PanelState::Idle && !w.backlog.is_empty()).then(|| w.backlog[0].clone());
+        // Read the just-finished turn *now*, while the panel is still idle.
+        let done = self.read_watched_turn(w);
 
-        let mut changed = false;
-        for (id, done, act) in acts {
-            match act {
-                Act::Latch(state) => {
-                    round.settled.insert(id, state);
-                    round.captured.entry(id).or_default().push(done);
-                    changed = true;
-                }
-                Act::Feed(task) => match McpToolSurface::send_keys(self, id, &task, true) {
-                    // Delivered: consume the task (still the queue's front —
-                    // single tick, nothing else mutates the queue in between)
-                    // and record the finished turn, so the report carries every
-                    // task's result and not only the last.
-                    Ok(()) => {
-                        round.backlog.get_mut(&id).and_then(VecDeque::pop_front);
-                        round.captured.entry(id).or_default().push(done);
-                        changed = true;
-                    }
-                    // Delivery failed: leave the task at the front and capture
-                    // nothing; the panel is still idle, so the next tick re-reads
-                    // and retries.
-                    Err(err) => warn!(error = %err, panel = %id, "round backlog feed failed"),
-                },
+        match feed {
+            None => {
+                w.settled = Some(Settled::In(state));
+                w.captured.extend(done);
+                true
             }
+            Some(task) => match McpToolSurface::send_keys(self, w.panel, &task, true) {
+                // Delivered: consume the task (still the queue's front — single
+                // tick, nothing else mutates the queue in between) and record the
+                // finished turn, so the report carries every task's result and
+                // not only the last.
+                Ok(()) => {
+                    w.backlog.pop_front();
+                    w.captured.extend(done);
+                    w.turn_start = self.panel_turn_mark(w.panel);
+                    true
+                }
+                // Delivery failed: leave the task at the front and capture
+                // nothing; the panel is still idle, so the next tick re-reads and
+                // retries.
+                Err(err) => {
+                    warn!(error = %err, panel = %w.panel, "worker backlog feed failed");
+                    false
+                }
+            },
         }
-        changed
+    }
+
+    /// The current end of `panel`'s manifest timeline (the start, for a panel
+    /// with no manifest).
+    fn panel_turn_mark(&self, panel: PanelId) -> TurnMark {
+        self.manifests
+            .get(&panel)
+            .map(|m| m.mark())
+            .unwrap_or_default()
+    }
+
+    /// Read the turn `w` is waiting on, which the caller has just observed
+    /// idle. `None` when no turn has ended since `w.turn_start`: the panel is
+    /// idle on a turn this watch never started (a `queue_tasks` armed on an
+    /// already-idle panel), and its output belongs to an earlier assignment.
+    /// A `last_message` read is likewise taken only from a turn signal since
+    /// the mark, so a turn closed without one (a reconciled wedge, a local
+    /// command) is not handed an earlier turn's message.
+    fn read_watched_turn(&self, w: &WorkerWatch) -> Option<String> {
+        let manifest = self.manifests.get(&w.panel);
+        if manifest.is_some_and(|m| !m.turn_ended_since(w.turn_start)) {
+            return None;
+        }
+        Some(match w.read_mode {
+            ReadPanelMode::LastMessage => manifest
+                .and_then(|m| m.last_message_since(w.turn_start))
+                .unwrap_or_default()
+                .to_string(),
+            mode => self
+                .read_panel(w.panel, mode)
+                .unwrap_or_else(|e| format!("(could not read panel: {e})")),
+        })
     }
 
     /// Whether a caucus→main push may land *this tick*: the main panel exists,
-    /// is coarse `Idle`, and has no un-submitted human keystroke within
-    /// `COMPOSE_GRACE` (so the user is not mid-compose). The single gate shared
-    /// by both push paths — round completion
-    /// ([`Multiplexer::poll_pending_rounds`]) and selection prompts
-    /// ([`Multiplexer::poll_round_blocked_panels`]). Each push flips the main
-    /// panel to `Working`, closing the gate for the rest of the tick, so at most
-    /// one push of either kind lands per tick.
-    fn main_deliverable(&self) -> bool {
-        let main_idle = self.main_panel_id.is_some_and(|id| {
-            self.panels
-                .iter()
-                .find(|p| p.id == id)
-                .is_some_and(|p| p.state() == PanelState::Idle)
-        });
-        main_idle && self.main_compose_quiet()
+    /// is coarse `Idle`, has no un-submitted human keystroke within
+    /// `COMPOSE_GRACE` (so the user is not mid-compose), and its screen shows
+    /// no prompt or dialog that would take the pushed text and Enter as its
+    /// answer. The single gate shared by every push path — round completion
+    /// ([`Multiplexer::poll_worker_watches`]), selection prompts
+    /// ([`Multiplexer::poll_round_blocked_panels`]), notices and nudges. Each
+    /// push flips the main panel to `Working`, closing the gate for the rest
+    /// of the tick, so at most one push of any kind lands per tick.
+    ///
+    /// The screen check is not redundant with `Idle`: a panel leaves
+    /// `Spawning` once its CLI enables bracketed paste, which Claude Code's
+    /// folder-trust dialog already does, and "No, exit" is its default.
+    fn main_deliverable(&mut self) -> bool {
+        let Some(id) = self.main_panel_id else {
+            return false;
+        };
+        let Some(generation) = self
+            .panels
+            .iter()
+            .find(|p| p.id == id && p.state() == PanelState::Idle)
+            .map(|p| p.grid().generation())
+        else {
+            return false;
+        };
+        self.main_compose_quiet()
+            && self
+                .panel_screen_cached(id, generation)
+                .is_some_and(|scan| scan.blocked.is_none() && !scan.dialog)
     }
 
     /// Whether no un-submitted human keystroke is holding the main panel
@@ -1117,22 +1379,22 @@ impl Multiplexer {
     }
 
     /// Nudge the main worker when it has gone idle while sub-panels still run
-    /// but **no** round is registered to ever wake it — the stranded-main
+    /// but **nothing caucus watches** will ever wake it — the stranded-main
     /// safety net. Called once per event-loop tick, after round delivery.
     ///
-    /// caucus's only caucus→main pushes ([`Multiplexer::poll_pending_rounds`],
-    /// [`Multiplexer::poll_round_blocked_panels`]) both require a registered
-    /// round. If the main worker broadcasts/spawns work and ends its turn
-    /// *without* calling `register_round`, no round exists, so nothing ever
-    /// re-prompts it: it sits idle forever while the sub-panels work. This is
-    /// the uniform guard for that gap — independent of how the work was
-    /// dispatched (broadcast, per-panel `send_keys`, or `spawn_role`) — telling
-    /// main its panels are still working and it must register a round (or act),
-    /// because caucus cannot push their results back without one.
+    /// Most of what this used to cover is now impossible by construction: every
+    /// panel caucus hands a prompt is watched from that instant
+    /// (`Multiplexer::arm_worker_watch`), so a worker main gave work to always
+    /// has a path back. What remains reachable is a panel that reached
+    /// `Working` **without caucus delivering it a prompt** — an agent CLI that
+    /// opened a turn on its own (a leftover background shell finishing).
+    /// Nothing owes main that panel's result, so without this main sits idle
+    /// indefinitely. A `Spawning` panel is not busy: it runs nothing caucus
+    /// did not hand it, and a task sent while it boots turns it `Working`.
     ///
-    /// Stranded ⟺ main exists and is `Idle`, `pending_rounds` is empty (a
+    /// Stranded ⟺ main exists and is `Idle`, `watches` is empty (a
     /// pending round *is* a wake path), and ≥1 non-main panel is
-    /// `Working`/`Spawning`. Fires only while stranded, the shared
+    /// `Working`. Fires only while stranded, the shared
     /// deliverability gate is open (`Multiplexer::main_deliverable`), and at
     /// least `STRANDED_NUDGE_COOLDOWN` has passed since the last nudge. The
     /// `main_stranded_last_nudge` latch is cleared the instant main is no longer
@@ -1141,22 +1403,19 @@ impl Multiplexer {
         let Some(main_id) = self.main_panel_id else {
             return;
         };
-        // A pending round is itself a wake path; with one queued, main is not
-        // stranded — round delivery (or its fallback) will re-prompt it.
-        let working: Vec<PanelId> = if self.pending_rounds.is_empty() {
+        // A live watch is itself a wake path; with one armed, main is not
+        // stranded — that worker's delivery (or its stall alarm) will re-prompt it.
+        let working: Vec<PanelId> = if self.watches.is_empty() {
             self.panels
                 .iter()
-                .filter(|p| {
-                    p.id != main_id
-                        && matches!(p.state(), PanelState::Working | PanelState::Spawning)
-                })
+                .filter(|p| p.id != main_id && p.state() == PanelState::Working)
                 .map(|p| p.id)
                 .collect()
         } else {
             Vec::new()
         };
         if working.is_empty() {
-            // Not stranded (round queued, or nothing else running): re-arm.
+            // Not stranded (a watch is armed, or nothing else running): re-arm.
             self.main_stranded_last_nudge = None;
             return;
         }
@@ -1172,8 +1431,8 @@ impl Multiplexer {
         }
 
         let mut notice = String::from(
-            "[caucus] You are idle with no round registered, but these panels \
-             are still working:\n",
+            "[caucus] You are idle, and these panels are busy with work caucus \
+             never handed them, so nothing will report back to you about them:\n",
         );
         for &id in &working {
             let role = self
@@ -1185,10 +1444,13 @@ impl Multiplexer {
             notice.push_str(&format!("  - {id} (role: {role})\n"));
         }
         notice.push_str(
-            "caucus can only push their results back to you through a round. \
-             Call register_round on these panel ids and end your turn; caucus \
-             re-prompts you when they settle. (Without a round there is no \
-             wake-up path — you stay idle indefinitely.)",
+            "caucus watches every panel it delivers a prompt to and re-prompts \
+             you the moment that panel finishes — but these were never given a \
+             task through caucus (the agent started a turn on its own). Send \
+             them their task with send_keys or \
+             broadcast and end your turn; you will be woken per panel as each \
+             finishes. Use read_panel or kill_panel if they should not be \
+             running at all.",
         );
         match McpToolSurface::send_keys(self, main_id, &notice, true) {
             // Arm the cooldown only on a real push. A failed delivery must not
@@ -1218,7 +1480,7 @@ impl Multiplexer {
 
     /// Announce queued `question` notes to the main worker, one per tick,
     /// under the same deliverability gate as every other caucus→main push
-    /// ([`Multiplexer::main_deliverable`]). Called once per event-loop tick,
+    /// (`Multiplexer::main_deliverable`). Called once per event-loop tick,
     /// after round delivery — a finished round is the primary deliverable.
     ///
     /// A failed injection keeps the notice queued so a later tick retries
@@ -1326,8 +1588,9 @@ impl Multiplexer {
     /// push.
     ///
     /// Neither kind fires a `Stop` hook, so the panel stays coarse `Working` and
-    /// its round never settles; without this the main worker would only learn at
-    /// the fallback deadline (default 600s). caucus pushes an interim notice so
+    /// its round never settles; without this the main worker would only learn
+    /// from the stall alarm (default 600 s of screen silence). caucus pushes an
+    /// interim notice so
     /// the main worker can answer it (`select_option` / `send_keys`) and let the
     /// round finish. Gated by `Multiplexer::main_deliverable` and deduped by
     /// prompt content signature (`Multiplexer::notified_blockers`): a panel
@@ -1338,9 +1601,9 @@ impl Multiplexer {
     /// flipping the main panel to `Working`).
     ///
     /// A selection menu the round *pre-authorized* via its
-    /// [`SelectionPolicy`](crate::mcp::protocol::SelectionPolicy) is handled
+    /// [`SelectionPolicy`] is handled
     /// first: when the hints' keywords single out exactly one option
-    /// ([`resolve_selection`]) caucus answers it itself with `select_option` and
+    /// (`resolve_selection`) caucus answers it itself with `select_option` and
     /// pushes **no** notice — the main worker is never interrupted. This drives
     /// only the sub-agent's panel, so it is *not* gated by `main_deliverable`
     /// and is deduped separately (`Multiplexer::auto_answered`) so a menu still
@@ -1353,18 +1616,14 @@ impl Multiplexer {
         let Some(main_id) = self.main_panel_id else {
             return;
         };
-        if self.pending_rounds.is_empty() {
+        if self.watches.is_empty() {
             return;
         }
 
-        // Round panels currently stuck on a prompt, with a content signature
+        // Watched panels currently stuck on a prompt, with a content signature
         // (cursor-independent for a menu) so a moving highlight never
         // re-announces.
-        let round_panels: std::collections::HashSet<PanelId> = self
-            .pending_rounds
-            .iter()
-            .flat_map(|r| r.panels.iter().copied())
-            .collect();
+        let round_panels: HashSet<PanelId> = self.watches.iter().map(|w| w.panel).collect();
         // Snapshot each non-main round panel's grid generation (immutable
         // borrow), then scan through the generation-keyed cache (mutable
         // borrow) — so an idle panel whose grid did not change is never
@@ -1390,7 +1649,7 @@ impl Multiplexer {
         let mut open: Vec<(PanelId, u64)> = Vec::new();
         let mut prompts: HashMap<PanelId, BlockedPrompt> = HashMap::new();
         let mut to_auto: Vec<AutoAnswer> = Vec::new();
-        let mut blocked_now: std::collections::HashSet<PanelId> = std::collections::HashSet::new();
+        let mut blocked_now: HashSet<PanelId> = HashSet::new();
         for (pid, generation) in scan_targets {
             let Some(prompt) = self.panel_blocked_cached(pid, generation) else {
                 continue;
@@ -1450,18 +1709,13 @@ impl Multiplexer {
                         role,
                         option = ans.number,
                         label = %ans.label,
-                        "auto-answered a round panel's selection menu per the main worker's hints"
+                        "auto-answered a watched panel's selection menu per the main worker's hints"
                     );
                     self.auto_answered.insert(ans.pid, ans.sig);
-                    // Record it on the round (the same one whose hints resolved
+                    // Record it on the watch (the same one whose hints resolved
                     // it) so the delivered report names the fork caucus took.
-                    if let Some(round) = self
-                        .pending_rounds
-                        .iter_mut()
-                        .find(|r| r.panels.contains(&ans.pid))
-                    {
-                        round.auto_answers.push(AutoAnswerRecord {
-                            panel: ans.pid,
+                    if let Some(w) = self.watches.iter_mut().find(|w| w.panel == ans.pid) {
+                        w.auto_answers.push(AutoAnswerRecord {
                             role,
                             number: ans.number,
                             label: ans.label,
@@ -1553,10 +1807,10 @@ impl Multiplexer {
     /// `&self` borrow before answering the panel. A panel in no round, or in a
     /// round with no hints, yields `None` (every menu escalates).
     fn round_policy_for(&self, pid: PanelId) -> Option<SelectionPolicy> {
-        self.pending_rounds
+        self.watches
             .iter()
-            .find(|r| r.panels.contains(&pid))
-            .and_then(|r| r.selection_hints.clone())
+            .find(|w| w.panel == pid)
+            .and_then(|w| w.selection_hints.clone())
     }
 
     /// Collect one round panel's contribution — its role, the state it settled
@@ -1565,7 +1819,7 @@ impl Multiplexer {
     /// (killed).
     ///
     /// Reads nothing from the live panel but its role: every body was captured
-    /// by [`Multiplexer::poll_round_panels`] at the instant the turn ended
+    /// by [`Multiplexer::poll_worker_watch`] at the instant the turn ended
     /// (Invariant I-9). Re-reading here would hand the round whatever the panel
     /// happens to hold at delivery time, which is a different thing — delivery
     /// waits for the *main* panel to go idle, and in that window a settled panel
@@ -1573,139 +1827,212 @@ impl Multiplexer {
     /// a fresh turn), overwriting the `last_message` this round is reporting and
     /// flipping the panel back to `Working` so the old code skipped its read
     /// entirely and delivered it as "still working, no output captured".
-    fn round_panel_contribution(
-        &self,
-        round: &PendingRound,
-        id: PanelId,
-    ) -> Option<RoundPanelContribution> {
-        let panel = self.panels.iter().find(|p| p.id == id)?;
-        let settled = round.settled.get(&id);
+    fn worker_contribution(&self, w: &WorkerWatch) -> Option<RoundPanelContribution> {
+        let panel = self.panels.iter().find(|p| p.id == w.panel)?;
+        let pending_backlog = w.backlog.len();
+        let (state, outcome) = match w.settled {
+            Some(Settled::In(state)) => (
+                state,
+                PanelOutcome::Finished {
+                    bodies: w.captured.clone(),
+                    pending_backlog,
+                },
+            ),
+            Some(Settled::Stalled) => (
+                PanelState::Idle,
+                PanelOutcome::Stalled {
+                    bodies: w.captured.clone(),
+                    pending_backlog,
+                },
+            ),
+            // No latch: a stall alarm mid-turn; the panel's live state
+            // (`Working`/`Spawning`) is what the report should say.
+            None => (
+                panel.state(),
+                PanelOutcome::Running {
+                    silent_secs: w.fallback_budget.as_secs(),
+                    note: self
+                        .manifests
+                        .get(&w.panel)
+                        .and_then(|m| m.last_note_since(w.turn_start)),
+                    finished: w.captured.len(),
+                    pending_backlog,
+                },
+            ),
+        };
         Some(RoundPanelContribution {
             role: panel.role.clone(),
-            // A panel with no latch was caught mid-turn by the fallback; its
-            // live state (`Working`/`Spawning`) is what the report should say.
-            state: settled.copied().unwrap_or_else(|| panel.state()),
-            settled: settled.is_some(),
-            bodies: round.captured.get(&id).cloned().unwrap_or_default(),
-            pending_backlog: round.backlog.get(&id).map(VecDeque::len).unwrap_or(0),
+            state,
+            outcome,
         })
     }
 
-    /// Assemble a round's **full** report: a self-describing block per panel —
-    /// role + current state, plus its result(s). A panel that ran a single task
-    /// contributes that one output read via `read_mode`; a panel that ran a
-    /// multi-task `backlog` contributes every finished turn — the outputs
-    /// captured in `captured` (each prior turn, in feed order) followed by its
-    /// final turn read live — under `### task N` headers so the main worker can
-    /// tell them apart. A panel still `working` when the fallback deadline
-    /// forced delivery contributes whatever it already finished plus an
-    /// "unfinished" marker. A panel id that no longer exists is reported as
-    /// gone. This is the report spilled to disk
-    /// ([`Multiplexer::spill_round_report`]) and the one appended to
-    /// `dropped-rounds.log` when there is no main worker to deliver to; the
-    /// main worker is handed the compact [`Multiplexer::render_round_summary`]
-    /// that points at it, never this whole block.
-    fn assemble_round_report(&self, round: &PendingRound, all_settled: bool) -> String {
-        let mut out = round_header(round.panels.len(), all_settled);
-        push_auto_answers(&mut out, round);
-        for &id in &round.panels {
-            let Some(c) = self.round_panel_contribution(round, id) else {
-                out.push_str(&format!("\n## panel {id} — gone (killed)\n"));
-                continue;
-            };
-            out.push_str(&format!(
-                "\n## panel {id} (role: {}) — {}\n",
-                c.role,
-                c.state.label()
-            ));
-            // One output stays header-less, identical to the pre-backlog
-            // report; two or more get `### task N` headers.
-            let total = c.bodies.len();
-            for (i, body) in c.bodies.iter().enumerate() {
-                if total > 1 {
-                    out.push_str(&format!("\n### task {}\n", i + 1));
-                }
-                let body = body.trim();
-                if body.is_empty() {
-                    out.push_str("(no output captured)\n");
-                } else {
-                    // Bound each turn's body so a `scrollback` read cannot
-                    // inflate even the on-disk report without limit; the full
-                    // text is spilled to `round-spills/` and pointed at.
-                    out.push_str(&self.bound_round_body(id, body));
-                    out.push('\n');
-                }
+    /// Render one panel's **full** block — role + settled state, every finished
+    /// turn (under `### task N` headers when it ran more than one), and the
+    /// trailing footer — into `out`. The shared body of the per-panel delivery
+    /// report ([`Multiplexer::assemble_watch_report`]), used both for a live
+    /// delivery and for the main-gone spill to `dropped-rounds.log`.
+    fn push_panel_report_block(&self, out: &mut String, id: PanelId, c: &RoundPanelContribution) {
+        out.push_str(&format!(
+            "\n## panel {id} (role: {}) — {}\n",
+            c.role,
+            c.state.label()
+        ));
+        // One output stays header-less, identical to the pre-backlog report;
+        // two or more get `### task N` headers.
+        let bodies: &[String] = match &c.outcome {
+            PanelOutcome::Finished { bodies, .. } | PanelOutcome::Stalled { bodies, .. } => bodies,
+            PanelOutcome::Running { .. } => &[],
+        };
+        let total = bodies.len();
+        for (i, body) in bodies.iter().enumerate() {
+            if total > 1 {
+                out.push_str(&format!("\n### task {}\n", i + 1));
             }
-            push_round_panel_footer(&mut out, &c);
+            let body = body.trim();
+            if body.is_empty() {
+                out.push_str("(no output captured)\n");
+            } else {
+                // Bound each turn's body so a `scrollback` read cannot inflate
+                // even the on-disk report without limit; the full text is
+                // spilled to `round-spills/` and pointed at.
+                out.push_str(&self.bound_round_body(id, body));
+                out.push('\n');
+            }
         }
-        out
+        push_round_panel_footer(out, c);
     }
 
-    /// Assemble the **compact** round-delivery message injected into the main
-    /// worker's panel: a one-line-per-panel summary (role, state, output count)
-    /// with a short teaser of each panel's latest output, plus a pointer to the
-    /// full report spilled to disk. This is the structural fix for "never inject
-    /// the whole unstructured report into the main PTY": a multi-panel round's
-    /// full results can run to hundreds of KB, and pasting that in one bracketed
-    /// paste risks the backend's paste-handling pathologies. The main worker
-    /// reads `report_path` when a teaser is not enough; `report_path` is `None`
-    /// only when the spill itself failed.
-    fn render_round_summary(
-        &self,
-        round: &PendingRound,
-        all_settled: bool,
-        report_path: Option<&std::path::Path>,
-    ) -> String {
-        let mut out = round_header(round.panels.len(), all_settled);
-        push_auto_answers(&mut out, round);
-        match report_path {
-            Some(path) => out.push_str(&format!(
-                "Full per-panel report: {} — read that file for each panel's complete output.\n",
-                path.display()
-            )),
-            None => out.push_str(
-                "(the full report could not be written to disk; the teasers below are all that is available)\n",
-            ),
-        }
-        for &id in &round.panels {
-            let Some(c) = self.round_panel_contribution(round, id) else {
-                out.push_str(&format!("\n## panel {id} — gone (killed)\n"));
-                continue;
-            };
+    /// Render one panel's **compact** teaser block — role + state + output
+    /// count, then its latest output trimmed to the teaser budget, then the
+    /// footer — into `out`. The shared per-panel body of the per-panel delivery
+    /// summary ([`Multiplexer::render_watch_summary`]).
+    fn push_panel_summary_block(&self, out: &mut String, id: PanelId, c: &RoundPanelContribution) {
+        out.push_str(&format!(
+            "\n## panel {id} (role: {}) — {}",
+            c.role,
+            c.state.label(),
+        ));
+        // Teaser: the panel's latest output, trimmed to the teaser budget — the
+        // full text is in the report file. A running turn has none, and the
+        // footer says so.
+        if let PanelOutcome::Stalled { bodies, .. } = &c.outcome {
             out.push_str(&format!(
-                "\n## panel {id} (role: {}) — {} · {} output(s)\n",
-                c.role,
-                c.state.label(),
-                c.bodies.len()
+                " · {} earlier output(s), in the full report\n",
+                bodies.len()
             ));
-            // Teaser: the panel's latest output (final live read, else last
-            // captured), trimmed to the teaser budget — the full text is in the
-            // report file.
-            let latest = c.bodies.last().map(|b| b.trim()).unwrap_or("");
+        } else if let PanelOutcome::Finished { bodies, .. } = &c.outcome {
+            out.push_str(&format!(" · {} output(s)\n", bodies.len()));
+            let latest = bodies.last().map(|b| b.trim()).unwrap_or("");
             if latest.is_empty() {
                 out.push_str("(no output captured)\n");
             } else {
                 out.push_str(&summary_teaser(latest, ROUND_SUMMARY_TEASER_BYTES));
                 out.push('\n');
             }
-            push_round_panel_footer(&mut out, &c);
+        } else {
+            out.push('\n');
         }
+        push_round_panel_footer(out, c);
+    }
+
+    /// The opening line of a single panel's streamed delivery: which round it
+    /// belongs to, which panel + role, and whether it settled on its own or
+    /// raised a stall alarm mid-turn. The per-panel analogue of
+    /// [`round_header`].
+    fn panel_delivery_header(id: PanelId, role: &str, outcome: &PanelOutcome) -> String {
+        let what = match outcome {
+            PanelOutcome::Finished { .. } => "finished".to_string(),
+            PanelOutcome::Running { silent_secs, .. } => format!(
+                "may be stuck: its screen has not changed for {silent_secs} s (turn still running, no result yet)"
+            ),
+            PanelOutcome::Stalled { .. } => {
+                "prompt stalled (no working or blocked state within 5 s of the submit)".to_string()
+            }
+        };
+        format!("[caucus] panel {id} (role: {role}) {what}.\n")
+    }
+
+    /// Assemble one settled worker's **full** delivery report. Spilled to
+    /// `<session_root>/rounds/<panel>-<n>.md` and pointed at by the compact
+    /// summary the main worker is handed. Any selection menus caucus
+    /// auto-answered *on this panel* are noted, so the delivered result still
+    /// shows the fork caucus took on the worker's behalf.
+    fn assemble_watch_report(&self, w: &WorkerWatch, c: &RoundPanelContribution) -> String {
+        let mut out = Self::panel_delivery_header(w.panel, &c.role, &c.outcome);
+        push_panel_auto_answers(&mut out, w);
+        self.push_panel_report_block(&mut out, w.panel, c);
         out
     }
 
-    /// Write a round's full assembled report to
-    /// `<session_root>/rounds/<round_id>.md` and return its path, so the
-    /// caucus→main delivery can inject a compact summary that points at it
-    /// rather than the whole report. The file name is the round's id (a ULID),
-    /// unique per round. Best-effort: a failure is logged and yields `None`, and
-    /// the summary then says the spill failed.
-    fn spill_round_report(&self, round_id: RoundId, report: &str) -> Option<std::path::PathBuf> {
+    /// Assemble the **compact** streamed delivery for one settled worker: the
+    /// per-panel header, its auto-answer audit, a pointer to the spilled full
+    /// report, and a teaser of its latest output. Never the whole body into the
+    /// main PTY (a `scrollback` panel can run to hundreds of KB, and one giant
+    /// bracketed paste risks the backend's paste pathologies). `report_path` is
+    /// `None` only when the spill itself failed.
+    fn render_watch_summary(
+        &self,
+        w: &WorkerWatch,
+        c: &RoundPanelContribution,
+        report_path: Option<&std::path::Path>,
+    ) -> String {
+        let mut out = Self::panel_delivery_header(w.panel, &c.role, &c.outcome);
+        push_panel_auto_answers(&mut out, w);
+        match report_path {
+            Some(path) => out.push_str(&format!(
+                "Full report: {} — read that file for this panel's complete output.\n",
+                path.display()
+            )),
+            None => out.push_str(
+                "(the full report could not be written to disk; the teaser below is all that is available)\n",
+            ),
+        }
+        self.push_panel_summary_block(&mut out, w.panel, c);
+        out
+    }
+
+    /// Render one worker's frozen contribution into the compact message streamed
+    /// to the main worker, spilling its full output to
+    /// `<session_root>/rounds/<panel>-<n>.md` and pointing at it.
+    ///
+    /// Pure render + spill — it does **not** drop the watch. Dropping it is the
+    /// caller's job, done at the handoff point so per-panel exactly-once
+    /// (Invariant I-10) holds: typed-and-confirmed for the push, returned for the
+    /// pull/hook-reply. Returns `None` for a gone panel — it has no contribution
+    /// to deliver.
+    fn render_watch_delivery(&self, w: &WorkerWatch) -> Option<String> {
+        let c = self.worker_contribution(w)?;
+        let report = self.assemble_watch_report(w, &c);
+        let path = self.spill_watch_report(w, &report);
+        Some(self.render_watch_summary(w, &c, path.as_deref()))
+    }
+
+    /// Write one worker's full delivery report to
+    /// `<session_root>/rounds/<panel>-<seq>.md` and return its path, so the
+    /// streamed delivery can inject a compact summary that points at it rather
+    /// than the whole body.
+    ///
+    /// A worker is delivered many times over a session (the watch re-arms on
+    /// every prompt), so the panel id alone would overwrite the previous
+    /// assignment's report. `seq` counts existing reports for the panel, keeping
+    /// each delivery's file distinct. Best-effort: a failure is logged and yields
+    /// `None`, and the summary then says the spill failed.
+    fn spill_watch_report(&self, w: &WorkerWatch, report: &str) -> Option<std::path::PathBuf> {
         let dir = self.session.root_dir.join("rounds");
         if let Err(err) = std::fs::create_dir_all(&dir) {
             warn!(error = %err, "round report dir create failed");
             return None;
         }
-        let path = dir.join(format!("{round_id}.md"));
+        let prefix = format!("{}-", w.panel);
+        let seq = std::fs::read_dir(&dir)
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+                    .count()
+            })
+            .unwrap_or(0);
+        let path = dir.join(format!("{}{}.md", prefix, seq + 1));
         match std::fs::write(&path, report) {
             Ok(()) => Some(path),
             Err(err) => {
@@ -1780,52 +2107,83 @@ impl Multiplexer {
         out
     }
 
-    /// Scan a panel's visible grid for an interactive selection menu
-    /// ([`crate::term::scan_menu`]). `None` unless one is confidently detected.
-    pub(crate) fn panel_menu(panel: &Panel) -> Option<crate::term::Menu> {
-        let (_, rows) = panel.grid().size();
-        let lines: Vec<String> = (0..rows)
-            .map(|r| panel.grid().row_text(r).trim_end().to_string())
-            .collect();
-        crate::term::scan_menu(&lines)
-    }
-
-    /// Scan a panel's visible grid for whatever it is stuck waiting on
-    /// ([`BlockedPrompt`]): a numbered selection menu first (the richer,
-    /// higher-confidence match), then a raw `[y/n]` yes/no prompt. `None` when
-    /// neither is confidently detected.
-    pub(crate) fn panel_blocked_prompt(panel: &Panel) -> Option<BlockedPrompt> {
-        let (_, rows) = panel.grid().size();
-        let lines: Vec<String> = (0..rows)
-            .map(|r| panel.grid().row_text(r).trim_end().to_string())
-            .collect();
-        if let Some(menu) = crate::term::scan_menu(&lines) {
-            return Some(BlockedPrompt::Selection(menu));
+    /// The selection menu on panel `id`'s screen, read through
+    /// [`Multiplexer::panel_blocked_cached`]: a visible menu is exactly a
+    /// [`BlockedPrompt::Selection`]. `None` for an unknown id.
+    pub(super) fn panel_menu(&mut self, id: PanelId) -> Option<crate::term::Menu> {
+        let generation = self.panels.iter().find(|p| p.id == id)?.grid().generation();
+        match self.panel_blocked_cached(id, generation)? {
+            BlockedPrompt::Selection(menu) => Some(menu),
+            BlockedPrompt::Permission(_) => None,
         }
-        crate::term::scan_yes_no_prompt(&lines).map(BlockedPrompt::Permission)
     }
 
-    /// [`Multiplexer::panel_blocked_prompt`] gated by the panel's grid
+    /// Read a panel's visible grid once for both screen facts: whatever it is
+    /// stuck waiting on ([`BlockedPrompt`] — a numbered selection menu first,
+    /// the richer match, then a raw `[y/n]` prompt) and the turn activity its
+    /// CLI renders ([`crate::term::ScreenActivity`]; `Unknown` without a
+    /// known CLI). Private so every scan goes through
+    /// [`Multiplexer::panel_screen_cached`].
+    fn scan_panel_screen(panel: &Panel, cli: Option<AgentCli>) -> ScreenScan {
+        let (_, rows) = panel.grid().size();
+        let lines: Vec<String> = (0..rows)
+            .map(|r| panel.grid().row_text(r).trim_end().to_string())
+            .collect();
+        let blocked = match crate::term::scan_menu(&lines) {
+            Some(menu) => Some(BlockedPrompt::Selection(menu)),
+            None => crate::term::scan_yes_no_prompt(&lines).map(BlockedPrompt::Permission),
+        };
+        let title = panel.grid().title();
+        let (activity, dialog) = match cli {
+            Some(AgentCli::Claude) => (
+                crate::term::claude_activity(&lines, title),
+                crate::term::claude_dialog(&lines),
+            ),
+            Some(AgentCli::Codex) => (
+                crate::term::codex_activity(&lines, title),
+                crate::term::codex_dialog(&lines),
+            ),
+            None => (crate::term::ScreenActivity::Unknown, false),
+        };
+        ScreenScan {
+            blocked,
+            activity,
+            dialog,
+        }
+    }
+
+    /// [`Multiplexer::scan_panel_screen`] gated by the panel's grid
     /// `generation`. If the panel's grid has not changed since the last scan
     /// (cached generation matches), the cached result is returned without
     /// re-materialising the viewport or re-running the scanners; otherwise it
     /// re-scans and refreshes the cache. This is what keeps the per-tick
-    /// blocked-panel poll from re-scanning every idle round panel. Returns
-    /// `None` for an unknown id.
-    fn panel_blocked_cached(&mut self, id: PanelId, generation: u64) -> Option<BlockedPrompt> {
-        if let Some((cached_gen, cached)) = self.blocked_scan_cache.get(&id)
-            && *cached_gen == generation
-        {
-            return cached.clone();
+    /// blocked-panel and lost-turn polls from re-scanning every unchanged
+    /// panel. Returns `None` for an unknown id.
+    pub(super) fn panel_screen_cached(
+        &mut self,
+        id: PanelId,
+        generation: u64,
+    ) -> Option<&ScreenScan> {
+        let fresh = self
+            .screen_scan_cache
+            .get(&id)
+            .is_some_and(|(cached_gen, _)| *cached_gen == generation);
+        if !fresh {
+            let panel = self.panels.iter().find(|p| p.id == id)?;
+            let cli = self.manifests.get(&id).map(|m| m.agent_cli);
+            let scan = Self::scan_panel_screen(panel, cli);
+            self.screen_scan_cache.insert(id, (generation, scan));
         }
-        let prompt = self
-            .panels
-            .iter()
-            .find(|p| p.id == id)
-            .and_then(Self::panel_blocked_prompt);
-        self.blocked_scan_cache
-            .insert(id, (generation, prompt.clone()));
-        prompt
+        self.screen_scan_cache.get(&id).map(|(_, scan)| scan)
+    }
+
+    /// The blocked prompt from [`Multiplexer::panel_screen_cached`].
+    pub(super) fn panel_blocked_cached(
+        &mut self,
+        id: PanelId,
+        generation: u64,
+    ) -> Option<BlockedPrompt> {
+        self.panel_screen_cached(id, generation)?.blocked.clone()
     }
 
     /// Overlay a live grid-detected blocking prompt ([`BlockedPrompt`]) onto the
@@ -1898,30 +2256,64 @@ mod tests {
     use crate::term::{Grid, OutputCapture};
     use tempfile::TempDir;
 
-    fn pending_round(
-        panels: Vec<PanelId>,
+    fn watch(
+        panel: PanelId,
         read_mode: ReadPanelMode,
-        captured: HashMap<PanelId, Vec<String>>,
-        backlog: HashMap<PanelId, VecDeque<String>>,
-    ) -> PendingRound {
-        // Every panel the caller handed a captured body is one the owner poll
-        // would have latched; mirror that so report-rendering tests see the
-        // same round shape the live path builds.
-        let settled = captured
-            .keys()
-            .map(|&id| (id, PanelState::Idle))
-            .collect::<HashMap<_, _>>();
-        PendingRound {
-            id: RoundId::new(),
-            panels,
+        captured: Vec<String>,
+        backlog: VecDeque<String>,
+    ) -> WorkerWatch {
+        // A watch handed a captured body is one the owner poll would have
+        // latched; mirror that so report-rendering tests see the same shape the
+        // live path builds.
+        let settled = (!captured.is_empty()).then_some(Settled::In(PanelState::Idle));
+        WorkerWatch {
+            panel,
             settled,
             backlog,
             captured,
+            turn_start: TurnMark::default(),
             read_mode,
-            fallback_deadline: Instant::now() + Duration::from_secs(600),
+            stall: StallClock::Armed(Instant::now() + Duration::from_secs(600)),
+            seen_generation: 0,
+            fallback_budget: Duration::from_secs(600),
             selection_hints: None,
             auto_answers: Vec::new(),
         }
+    }
+
+    /// Arm the watch on `panel` directly, bypassing the MCP surface.
+    ///
+    /// This is the setup most scheduler tests want: it works on a ghost panel id
+    /// (which `queue_tasks` rightly rejects) and does not need a main panel. Any
+    /// watch the setup already armed (via `note_prompt_delivered`) is replaced,
+    /// so the panel ends with exactly the watch the test asked for — never two.
+    fn arm(mux: &mut Multiplexer, panel: PanelId, fallback_secs: u64) {
+        mux.watches.retain(|w| w.panel != panel);
+        let mut w = watch(
+            panel,
+            ReadPanelMode::LastMessage,
+            Vec::new(),
+            VecDeque::new(),
+        );
+        w.settled = None;
+        w.fallback_budget = Duration::from_secs(fallback_secs);
+        w.rearm_stall();
+        mux.watches.push(w);
+        // Mirror the live arming paths, which durably shadow every change.
+        mux.persist_watches();
+    }
+
+    /// Index of the watch on `panel`.
+    ///
+    /// Tests address a watch by the panel it watches, not by position: caucus
+    /// arms an implicit watch on every prompted sub-panel
+    /// ([`Multiplexer::arm_worker_watch`]), so what sits at `watches[0]` is not
+    /// part of any contract.
+    fn watch_of(mux: &Multiplexer, panel: PanelId) -> usize {
+        mux.watches
+            .iter()
+            .position(|w| w.panel == panel)
+            .expect("a watch must be armed on the panel")
     }
 
     /// Insert a hermetic `/bin/cat` panel directly into the mux so round
@@ -1944,167 +2336,569 @@ mod tests {
         id
     }
 
-    /// `register_round` acks immediately with the round id and a panel snapshot
-    /// and stashes a `PendingRound` — it never blocks. An unknown id is omitted
-    /// from the ack (it would not appear in `list_panels` either). The acked
-    /// `round_id` matches the stashed round. `read_mode` defaults to
-    /// `last_message`.
+    /// `queue_tasks` configures the watch on a panel caucus is already watching,
+    /// appending its tasks and applying the options — it never arms a second
+    /// watch, which is what keeps delivery exactly-once without a ledger.
     #[tokio::test]
-    async fn register_round_acks_and_stashes_a_pending_round() {
+    async fn queue_tasks_configures_the_existing_watch_instead_of_adding_one() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        let ghost = PanelId::new();
+        let main = push_cat_panel(&mut mux, "main", PanelState::Working);
+        mux.main_panel_id = Some(main);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        // The prompt caucus already delivered armed the watch.
+        mux.note_prompt_delivered(sub);
+        assert_eq!(mux.watches.len(), 1);
 
-        let ack = mux.register_round(vec![ghost], None, Some(60), None, None);
-        let acked_id = match ack {
-            ControlResponse::RoundRegistered { round_id, panels } => {
-                assert!(panels.is_empty());
-                round_id
-            }
-            other => panic!("expected an immediate RoundRegistered ack, got {other:?}"),
-        };
-        assert_eq!(mux.pending_rounds.len(), 1, "round must be stashed");
-        assert_eq!(mux.pending_rounds[0].id, acked_id, "acked id must match");
-        assert_eq!(mux.pending_rounds[0].read_mode, ReadPanelMode::LastMessage);
+        let resp = mux.queue_tasks(
+            sub,
+            vec!["t1".to_string(), "t2".to_string()],
+            Some(ReadPanelMode::SinceLastTurn),
+            Some(90),
+            Some(SelectionPolicy {
+                prefer: vec!["structural".to_string()],
+                avoid: vec![],
+            }),
+        );
+        assert!(
+            matches!(resp, ControlResponse::Panel { .. }),
+            "got: {resp:?}"
+        );
+        assert_eq!(mux.watches.len(), 1, "queueing must not arm a second watch");
+
+        let w = &mux.watches[watch_of(&mux, sub)];
+        assert_eq!(
+            w.backlog.iter().cloned().collect::<Vec<_>>(),
+            vec!["t1".to_string(), "t2".to_string()],
+        );
+        assert_eq!(w.read_mode, ReadPanelMode::SinceLastTurn);
+        assert!(w.selection_hints.is_some());
+        assert!(
+            matches!(w.stall, StallClock::Armed(d) if d <= Instant::now() + Duration::from_secs(90)),
+            "fallback_secs must restart the silence window from now"
+        );
+
+        mux.shutdown();
     }
 
-    /// `round_status` reports a live round by its registered id: each panel's
-    /// state and remaining backlog. An unknown id is an error.
+    /// `queue_tasks` on a panel that has *not* been prompted arms the watch
+    /// itself, so the queued work is fed on its first idle. An unknown panel and
+    /// the main panel are both errors — main is the delivery target, not a
+    /// worker.
     #[tokio::test]
-    async fn round_status_reports_a_live_round_and_errors_on_unknown() {
+    async fn queue_tasks_arms_an_unprompted_panel_and_rejects_main_and_ghosts() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Working);
+        mux.main_panel_id = Some(main);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        assert!(mux.watches.is_empty(), "nothing prompted yet");
+        let resp = mux.queue_tasks(sub, vec!["t1".to_string()], None, None, None);
+        assert!(
+            matches!(resp, ControlResponse::Panel { .. }),
+            "got: {resp:?}"
+        );
+        assert_eq!(
+            mux.watches[watch_of(&mux, sub)]
+                .backlog
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["t1".to_string()],
+        );
+
+        assert!(
+            matches!(
+                mux.queue_tasks(main, vec![], None, None, None),
+                ControlResponse::Error { .. }
+            ),
+            "the main panel is not a worker"
+        );
+        assert!(
+            matches!(
+                mux.queue_tasks(PanelId::new(), vec![], None, None, None),
+                ControlResponse::Error { .. }
+            ),
+            "an unknown panel must be an error"
+        );
+
+        mux.shutdown();
+    }
+
+    /// `collect_workers` streams every ready worker and then reports the ones
+    /// still running. With nothing watched it says so rather than erroring —
+    /// there is no id to be unknown.
+    #[tokio::test]
+    async fn collect_workers_streams_the_ready_and_reports_the_running() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let working = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
         let idle = push_cat_panel(&mut mux, "writer", PanelState::Idle);
+        arm(&mut mux, working, 600);
+        arm(&mut mux, idle, 600);
 
-        let round_id = match mux.register_round(vec![working, idle], None, Some(600), None, None) {
-            ControlResponse::RoundRegistered { round_id, .. } => round_id,
-            other => panic!("expected RoundRegistered, got {other:?}"),
-        };
-
-        match mux.round_status(round_id) {
+        match mux.collect_workers() {
             ControlResponse::Panel { text } => {
-                assert!(text.contains("2 panel(s)"), "status: {text}");
+                // The idle worker is ready, so the pull delivers it inline...
+                assert!(
+                    text.contains(&format!("panel {idle} (role: writer) finished")),
+                    "status: {text}"
+                );
+                // ...and the still-working one is reported as running.
+                assert!(text.contains("1 worker(s) still running"), "status: {text}");
                 assert!(text.contains("reviewer"), "status: {text}");
                 assert!(text.contains("working"), "status: {text}");
-                assert!(text.contains("writer"), "status: {text}");
-                assert!(text.contains("settled"), "status: {text}");
             }
             other => panic!("expected Panel status, got {other:?}"),
         }
 
-        let ghost_round = RoundId::new();
+        // The delivered worker's watch is spent; the running one stays.
+        assert_eq!(mux.watches.len(), 1);
+        assert!(mux.watches.iter().any(|w| w.panel == working));
+
+        mux.shutdown();
+    }
+
+    /// Nothing watched is a plain answer, not an error.
+    #[tokio::test]
+    async fn collect_workers_with_nothing_watched_is_not_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        match mux.collect_workers() {
+            ControlResponse::Panel { text } => {
+                assert!(text.contains("No workers"), "got: {text}");
+            }
+            other => panic!("expected Panel status, got {other:?}"),
+        }
+        mux.shutdown();
+    }
+
+    /// A prompt delivered while the panel's turn is **already open** is queued
+    /// by the agent CLI, not started — so the running turn's `Stop` is not its
+    /// boundary.
+    ///
+    /// The regression: the second prompt opened no turn (`begin_turn` no-ops on
+    /// an open one) and armed no watch (the panel was already watched), so
+    /// caucus held no record of it. The first turn's `Stop` then flipped the
+    /// panel `Idle`, the watch latched (Invariant I-9), and main was handed the
+    /// *first* task's output as the second task's answer — after which delivery
+    /// spent the watch, so the second task's real result was never reported at
+    /// all. One case per boundary of the outstanding count: `> 0` remaining
+    /// (the first `Stop`) and `== 0` remaining (the second).
+    #[tokio::test]
+    async fn a_queued_prompt_is_not_settled_by_the_running_turns_stop() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Working);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        McpToolSurface::send_keys(&mut mux, worker, "first task", true).unwrap();
+        assert_eq!(mux.watches.len(), 1, "the first prompt arms the watch");
+
+        // The second brief lands while the first turn is running: the CLI
+        // queues it. A panel has exactly one watch, so nothing new is armed.
+        McpToolSurface::send_keys(&mut mux, worker, "second task", true).unwrap();
+        assert_eq!(mux.watches.len(), 1);
+
+        // Boundary of the *first* prompt only.
+        stop_turn(&mut mux, worker, "first done");
+        mux.poll_worker_watches();
+        assert_eq!(
+            mux.panels()
+                .iter()
+                .find(|p| p.id == worker)
+                .unwrap()
+                .state(),
+            PanelState::Working,
+            "the queued prompt is about to run: this is not a return to idle",
+        );
         assert!(
-            matches!(mux.round_status(ghost_round), ControlResponse::Error { .. }),
-            "an unknown round id must be an error"
+            mux.watches[watch_of(&mux, worker)].settled.is_none(),
+            "no latch may be taken from the first task's turn",
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "main must not have been woken with the first task's output",
+        );
+
+        // A capture turn was re-opened, so the queued prompt's output is kept
+        // rather than dropped on the floor by `OutputCapture::push`.
+        let panel = mux.panels.iter_mut().find(|p| p.id == worker).unwrap();
+        assert_eq!(
+            panel.capture.turns().len(),
+            1,
+            "only the first turn is closed"
+        );
+        panel.capture.push(b"second task output");
+
+        // Boundary of the queued prompt: now the panel really is between turns.
+        stop_turn(&mut mux, worker, "second done");
+        mux.poll_worker_watches();
+        assert_eq!(
+            mux.watches[watch_of(&mux, worker)].settled,
+            Some(Settled::In(PanelState::Idle)),
+            "the queued prompt's own Stop settles the watch",
+        );
+        let panel = mux.panels.iter().find(|p| p.id == worker).unwrap();
+        assert_eq!(panel.capture.turns().len(), 2, "both turns were captured");
+        assert_eq!(
+            panel.capture.turn_bytes(1),
+            Some(&b"second task output"[..]),
+            "the queued prompt's output landed in its own turn",
         );
 
         mux.shutdown();
     }
 
-    /// `cancel_round` drops a live round by id (leaving the panels alone) and
-    /// errors on an unknown id. After cancelling, the round no longer polls.
+    /// A prompt delivered while a **local slash command** is still running must
+    /// not be settled by that command's completion.
+    ///
+    /// The regression, seen live: main sent a worker `/compact`, then sent it
+    /// the next brief. `/compact` is classified at submit time and deliberately
+    /// opens no turn, so the panel was still `Idle` — the brief therefore looked
+    /// like an ordinary prompt, opened a capture turn, flipped the panel to
+    /// `Working`, and armed the watch. But the CLI was mid-compact, so the brief
+    /// sat in *its* input queue, unstarted. When the `PostCompact` hook landed,
+    /// `close_local_command` ended whatever turn was open and flipped the panel
+    /// back to `Idle` — closing the brief's turn, which the compact had nothing
+    /// to do with. The watch then settled and delivered the panel's *previous*
+    /// report as the brief's answer: a false positive main acted on.
     #[tokio::test]
-    async fn cancel_round_drops_a_live_round_and_errors_on_unknown() {
+    async fn a_local_command_close_does_not_settle_a_later_prompt() {
+        use crate::signal::{CompactTrigger, LifecycleKind, LifecycleSignal};
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let session_id = mux.session.id;
+        let main = push_cat_panel(&mut mux, "main", PanelState::Working);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        // Main compacts the worker. Classified at submit: no turn is opened, so
+        // the panel stays idle and nothing is watched.
+        McpToolSurface::send_keys(&mut mux, worker, "/compact", true).unwrap();
+        assert!(
+            mux.watches.is_empty(),
+            "a local slash command is not work: it must not arm a watch"
+        );
+
+        // Main immediately sends the next brief. The CLI is still compacting, so
+        // this queues there — but to caucus it is an ordinary prompt.
+        McpToolSurface::send_keys(&mut mux, worker, "audit the TLS path", true).unwrap();
+        assert_eq!(mux.watches.len(), 1, "the brief arms the watch");
+
+        // The compact finishes. This closes the *compact*, not the brief.
+        mux.handle_lifecycle(LifecycleSignal::now(
+            session_id,
+            worker,
+            LifecycleKind::PostCompact {
+                trigger: CompactTrigger::Manual,
+            },
+            serde_json::Value::Null,
+        ));
+
+        mux.poll_worker_watches();
+        assert!(
+            mux.watches.iter().any(|w| w.panel == worker),
+            "the brief has not run yet: the compact's close must not settle it",
+        );
+        assert!(
+            mux.watches[watch_of(&mux, worker)].settled.is_none(),
+            "no latch may be taken from a turn the brief never ran",
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "main must not have been woken with a false result",
+        );
+
+        mux.shutdown();
+    }
+
+    /// The reported symptom, end to end: the user runs `/model` on the **main**
+    /// panel. `/model` fires no Stop hook and no lifecycle hook, so main wedges
+    /// `Working` — and main carries no watch, so `main_deliverable` never opens.
+    /// A worker that finishes settles its watch but has nothing able to push it:
+    /// "워커들이 모두 끝나도 종료 신호를 못받음". `poll_lost_turns` reconciles the
+    /// silent main back to `Idle`, and the settled worker is delivered the same
+    /// tick.
+    #[tokio::test]
+    async fn a_wedged_main_is_reconciled_so_settled_workers_deliver() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        // The worker finishes its task — its watch settles.
+        McpToolSurface::send_keys(&mut mux, worker, "audit the TLS path", true).unwrap();
+        stop_turn(&mut mux, worker, "TLS looks good");
+
+        // Main runs `/model` (typed directly): it opens a turn and wedges
+        // `Working`, with no Stop or lifecycle hook to ever close it.
+        mux.note_prompt_delivered(main);
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+        );
+
+        // While main is wedged, the settled worker cannot be delivered.
+        mux.poll_worker_watches();
+        assert!(
+            mux.watches.iter().any(|w| w.panel == worker),
+            "no delivery while main is wedged Working",
+        );
+
+        // The quiescence window elapses on the silent main.
+        mux.poll_lost_turns();
+        mux.lost_turn_probe
+            .get_mut(&main)
+            .unwrap()
+            .age_out_quiescence();
+        mux.poll_lost_turns();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "the wedged main is reconciled back to idle",
+        );
+
+        // Now the settled worker's result is delivered and its watch retires.
+        mux.poll_worker_watches();
+        assert!(
+            mux.watches.is_empty(),
+            "the reconciled main receives the stranded worker",
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the delivery push woke main with the worker's result",
+        );
+        mux.shutdown();
+    }
+
+    /// A **hookless** local slash command sent to a worker panel is not work: it
+    /// must open no turn and — the part that made main act on a lie — arm no
+    /// watch.
+    ///
+    /// The regression: `/model` fell through the classifier (which knew only
+    /// `/compact` and `/clear`), so `note_prompt_delivered` opened a turn,
+    /// flipped the panel `Working`, armed a watch, and counted an outstanding
+    /// prompt. Nothing closes a hookless command, so the panel wedged; once
+    /// `poll_lost_turns` reconciled it to `Idle`, that phantom watch settled and
+    /// delivered the model-selector screen to main as the worker's finished
+    /// task. Observed: `watches=1 → main woken with a bogus report`.
+    #[tokio::test]
+    async fn a_hookless_local_command_is_not_work_and_arms_no_watch() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        McpToolSurface::send_keys(&mut mux, worker, "/model", true).unwrap();
+
+        assert!(
+            mux.watches.is_empty(),
+            "a client-local UI command must not be watched as a task",
+        );
+        assert_eq!(
+            mux.panels()
+                .iter()
+                .find(|p| p.id == worker)
+                .unwrap()
+                .state(),
+            PanelState::Idle,
+            "no turn is opened, so the panel never flips Working",
+        );
+        assert!(
+            !mux.outstanding_prompts.contains_key(&worker),
+            "no prompt was delivered, so nothing may be counted",
+        );
+        assert!(
+            !mux.local_commands_without_turn.contains(&worker),
+            "a hookless command has no hook to consume a marker — recording one \
+             would later suppress a legitimate hand-typed /compact close",
+        );
+
+        // Nothing to reconcile and nothing to deliver: main is left alone.
+        mux.poll_lost_turns();
+        mux.poll_worker_watches();
+        assert!(mux.watches.is_empty());
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle,
+            "main must not be woken with a report for a command that ran no task",
+        );
+        mux.shutdown();
+    }
+
+    /// The other side of the classifier: a **hook-closed** command still records
+    /// its marker, because `close_local_command` needs it to tell its own turn
+    /// from one a later prompt opened.
+    #[tokio::test]
+    async fn a_hook_closed_local_command_still_records_its_marker() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        McpToolSurface::send_keys(&mut mux, worker, "/compact", true).unwrap();
+
+        assert!(mux.watches.is_empty(), "compaction is not a task either");
+        assert!(
+            mux.local_commands_without_turn.contains(&worker),
+            "the PostCompact hook that follows needs this marker",
+        );
+        mux.shutdown();
+    }
+
+    /// Answering a blocked prompt resumes the turn already running — it is not a
+    /// second prompt, and exactly one Stop still follows.
+    ///
+    /// The regression the outstanding-prompt counter introduced: `select_option`
+    /// routes through `note_prompt_delivered`, which counted the answer as
+    /// another prompt. The resumed turn's single Stop then decremented 2 → 1,
+    /// read as "a queued prompt is still pending", and pinned the panel
+    /// `Working` — its watch never settled, so a worker that had finished was
+    /// never reported to main. Observed: `outstanding=2`, then after the Stop
+    /// `settled=None`, `watches=1`, main still `Idle`. The auto-answer path
+    /// (`poll_round_blocked_panels`) drives the same `select_option`, so it had
+    /// the same hole.
+    #[tokio::test]
+    async fn answering_a_blocked_prompt_is_not_a_second_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        McpToolSurface::send_keys(&mut mux, worker, "real task", true).unwrap();
+        assert_eq!(mux.outstanding_prompts.get(&worker), Some(&1));
+
+        // The agent pauses *inside* that turn on a selection menu.
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == worker)
+            .unwrap()
+            .grid
+            .advance(
+                "\r\n  1. alpha\r\n\u{276f} 2. beta\r\nEnter to select \u{b7} \u{2191}/\u{2193} to navigate\r\n"
+                    .as_bytes(),
+            );
+        McpToolSurface::select_option(&mut mux, worker, 1).unwrap();
+        assert_eq!(
+            mux.outstanding_prompts.get(&worker),
+            Some(&1),
+            "answering the menu resumes the open turn — it adds no prompt",
+        );
+
+        // The resumed turn ends: one Stop, and it *is* the turn's boundary.
+        stop_turn(&mut mux, worker, "task done");
+        assert_eq!(
+            mux.panels()
+                .iter()
+                .find(|p| p.id == worker)
+                .unwrap()
+                .state(),
+            PanelState::Idle,
+            "the single Stop closes the turn — the panel is not pinned Working",
+        );
+
+        // The poll latches the answered turn and delivers it — the delivery is
+        // what proves the watch settled rather than staying pinned.
+        mux.poll_worker_watches();
+        assert!(mux.watches.is_empty(), "the finished worker is delivered");
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "main is woken with the worker's result",
+        );
+        mux.shutdown();
+    }
+
+    /// The other side of the same boundary: a submission into a turn that is
+    /// running but **not** blocked really is a queued prompt — the CLI runs it
+    /// next, so it brings its own Stop and must still be counted.
+    #[tokio::test]
+    async fn a_queued_prompt_into_an_unblocked_turn_is_still_counted() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let worker = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+
+        McpToolSurface::send_keys(&mut mux, worker, "first task", true).unwrap();
+        McpToolSurface::send_keys(&mut mux, worker, "second task", true).unwrap();
+        assert_eq!(
+            mux.outstanding_prompts.get(&worker),
+            Some(&2),
+            "no blocked prompt on screen: the second submission is genuinely queued",
+        );
+        mux.shutdown();
+    }
+
+    /// `stop_watching` drops one worker's watch (leaving the panel alone) and
+    /// errors on a panel that is not watched.
+    #[tokio::test]
+    async fn stop_watching_drops_the_watch_and_errors_on_an_unwatched_panel() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let panel = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+        arm(&mut mux, panel, 600);
 
-        let round_id = match mux.register_round(vec![panel], None, Some(600), None, None) {
-            ControlResponse::RoundRegistered { round_id, .. } => round_id,
-            other => panic!("expected RoundRegistered, got {other:?}"),
-        };
-        assert_eq!(mux.pending_rounds.len(), 1);
-
-        // An unknown id is rejected and leaves the round in place.
+        // An unwatched panel is rejected and leaves the watch in place.
         assert!(
             matches!(
-                mux.cancel_round(RoundId::new()),
+                mux.stop_watching(PanelId::new()),
                 ControlResponse::Error { .. }
             ),
-            "an unknown round id must be an error"
+            "an unwatched panel must be an error"
         );
-        assert_eq!(mux.pending_rounds.len(), 1, "unknown cancel must not drop");
+        assert_eq!(mux.watches.len(), 1, "a rejected call must not drop");
 
-        // The real id drops the round; the panel itself is untouched.
-        assert!(matches!(mux.cancel_round(round_id), ControlResponse::Ok));
-        assert!(mux.pending_rounds.is_empty(), "round must be dropped");
+        // The real panel drops the watch; the panel itself is untouched.
+        assert!(matches!(mux.stop_watching(panel), ControlResponse::Ok));
+        assert!(mux.watches.is_empty(), "the watch must be dropped");
         assert!(
             mux.panels().iter().any(|p| p.id == panel),
-            "cancel must not kill the panel"
+            "stop_watching must not kill the panel"
         );
 
         mux.shutdown();
     }
 
-    /// `register_round` stashes a backlog only for panels actually in the round
-    /// and drops empty queues, so the feed/settle check never sees a vacuous
-    /// entry: a queue for a stray (non-round) panel and an empty queue are both
-    /// discarded at registration.
+    /// A panel whose id no longer exists has no contribution to stream:
+    /// `render_watch_delivery` yields `None` (the retire path marks it delivered
+    /// with no push), rather than panicking or emitting an empty block.
     #[tokio::test]
-    async fn register_round_keeps_backlog_only_for_round_panels_and_drops_empty() {
-        let tmp = TempDir::new().unwrap();
-        let mut mux = mux(&tmp);
-        let keep = PanelId::new();
-        let empty = PanelId::new();
-        let stray = PanelId::new();
-
-        mux.register_round(
-            vec![keep, empty],
-            None,
-            Some(600),
-            Some(HashMap::from([
-                (keep, vec!["t1".to_string(), "t2".to_string()]),
-                (empty, vec![]),                // in round but no work → dropped
-                (stray, vec!["x".to_string()]), // has work but not in round → dropped
-            ])),
-            None,
-        );
-
-        let backlog = &mux.pending_rounds[0].backlog;
-        assert_eq!(
-            backlog.len(),
-            1,
-            "only the in-round non-empty queue survives"
-        );
-        assert_eq!(
-            backlog
-                .get(&keep)
-                .map(|q| q.iter().cloned().collect::<Vec<_>>()),
-            Some(vec!["t1".to_string(), "t2".to_string()]),
-        );
-        assert!(!backlog.contains_key(&empty), "empty queue must be dropped");
-        assert!(!backlog.contains_key(&stray), "stray panel must be dropped");
-    }
-
-    /// `assemble_round_report` reports an id that no longer exists as gone
-    /// rather than panicking or omitting it silently.
-    #[tokio::test]
-    async fn assemble_round_report_marks_a_missing_panel_gone() {
+    async fn render_watch_delivery_skips_a_gone_panel() {
         let tmp = TempDir::new().unwrap();
         let mux = mux(&tmp);
         let ghost = PanelId::new();
 
-        let round = pending_round(
-            vec![ghost],
+        let w = watch(
+            ghost,
             ReadPanelMode::LastMessage,
-            HashMap::new(),
-            HashMap::new(),
+            Vec::new(),
+            VecDeque::new(),
         );
-        let report = mux.assemble_round_report(&round, true);
-        assert!(report.contains("Round complete"), "report: {report}");
         assert!(
-            report.contains("gone"),
-            "a missing panel must be marked gone: {report}"
+            mux.render_watch_delivery(&w).is_none(),
+            "a gone panel must render no delivery"
         );
     }
 
-    /// `assemble_round_report` marks a panel still `Working` (the fallback
-    /// case) as unfinished rather than reading a half-done turn.
+    /// `assemble_watch_report` marks a panel still `Working` (the stall-alarm
+    /// case, `settled == None`) as unfinished rather than reading a half-done
+    /// turn.
     ///
     /// Spawning a panel needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
-    async fn assemble_round_report_marks_a_working_panel_unfinished() {
+    async fn panel_report_marks_a_working_panel_unfinished() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let Ok(sub) = mux.spawn_panel("reviewer", None, None, None) else {
@@ -2117,29 +2911,31 @@ mod tests {
             PanelState::Working,
         );
 
-        let round = pending_round(
-            vec![sub],
-            ReadPanelMode::LastMessage,
-            HashMap::new(),
-            HashMap::new(),
-        );
-        let report = mux.assemble_round_report(&round, false);
+        // No latch → `PanelOutcome::Running` → "may be stuck" header + "no
+        // result yet" footer.
+        let w = watch(sub, ReadPanelMode::LastMessage, Vec::new(), VecDeque::new());
+        let c = mux.worker_contribution(&w).unwrap();
+        let report = mux.assemble_watch_report(&w, &c);
         assert!(
-            report.contains("still working"),
+            report.contains("turn still running, no result yet"),
             "a Working panel must be marked unfinished: {report}"
+        );
+        assert!(
+            report.contains("may be stuck: its screen has not changed for 600 s"),
+            "an unsettled panel's header must raise the stall alarm: {report}"
         );
 
         mux.shutdown();
     }
 
-    /// `assemble_round_report` emits a `### task N` section for every captured
+    /// `assemble_watch_report` emits a `### task N` section for every captured
     /// turn — so a multi-task backlog delivers all of its intermediate outputs,
     /// not only the last. Boundary: three captured turns (two backlog feeds plus
     /// the settle capture) → three numbered sections, each body present.
     ///
     /// Spawning a panel needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
-    async fn assemble_round_report_emits_a_section_per_captured_task() {
+    async fn panel_report_emits_a_section_per_captured_task() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
 
@@ -2151,21 +2947,14 @@ mod tests {
         // Every finished turn is in `captured` — the two backlog turns and the
         // final one, all read by the owner poll at the instant each ended. The
         // report renders these and never re-reads the panel.
-        let captured = HashMap::from([(
-            sub,
-            vec![
-                "output of task one".to_string(),
-                "output of task two".to_string(),
-                "output of task three".to_string(),
-            ],
-        )]);
-        let round = pending_round(
-            vec![sub],
-            ReadPanelMode::LastMessage,
-            captured,
-            HashMap::new(),
-        );
-        let report = mux.assemble_round_report(&round, true);
+        let captured = vec![
+            "output of task one".to_string(),
+            "output of task two".to_string(),
+            "output of task three".to_string(),
+        ];
+        let w = watch(sub, ReadPanelMode::LastMessage, captured, VecDeque::new());
+        let c = mux.worker_contribution(&w).unwrap();
+        let report = mux.assemble_watch_report(&w, &c);
 
         for (n, body) in [
             (1, "output of task one"),
@@ -2182,29 +2971,20 @@ mod tests {
         mux.shutdown();
     }
 
-    /// A single-output panel (no backlog → empty `captured`) keeps the original
+    /// A single-output panel (no backlog → one captured turn) keeps the original
     /// header-less report shape: `### task N` sections appear only when there is
     /// more than one output to disambiguate. Backward-compat boundary against
     /// the multi-task case above.
-    ///
-    /// Spawning a panel needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
-    async fn assemble_round_report_omits_task_headers_for_a_single_output() {
+    async fn panel_report_omits_task_headers_for_a_single_output() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
 
-        let Some(sub) = spawn_idle(&mut mux, "reviewer") else {
-            eprintln!("skipping: no agent CLI on PATH");
-            return;
-        };
-
-        let round = pending_round(
-            vec![sub],
-            ReadPanelMode::LastMessage,
-            HashMap::new(),
-            HashMap::new(),
-        );
-        let report = mux.assemble_round_report(&round, true);
+        let captured = vec!["the only output".to_string()];
+        let w = watch(sub, ReadPanelMode::LastMessage, captured, VecDeque::new());
+        let c = mux.worker_contribution(&w).unwrap();
+        let report = mux.assemble_watch_report(&w, &c);
         assert!(
             !report.contains("### task"),
             "a single-output panel must not get task headers: {report}"
@@ -2213,33 +2993,33 @@ mod tests {
         mux.shutdown();
     }
 
-    /// Finding 24: a round's full results are no longer injected wholesale into
-    /// the main PTY. `spill_round_report` writes the complete report to
-    /// `rounds/<round_id>.md`, and `render_round_summary` injects only a compact
-    /// summary that points at that file. A small body is teased inline so a
-    /// trivial round needs no file read. (A `Working` panel + a captured turn
-    /// stands in for a finished sub-agent turn without a live read of the
-    /// hermetic cat panel, which has no real output.)
+    /// A panel's full result is no longer injected wholesale into the main PTY.
+    /// `spill_watch_report` writes the complete per-panel report to
+    /// `rounds/<round_id>-<panel>.md`, and `render_watch_summary` injects only a
+    /// compact summary that points at that file. A small body is teased inline
+    /// so a trivial delivery needs no file read.
     #[tokio::test]
-    async fn round_summary_points_at_a_spilled_full_report() {
+    async fn panel_summary_points_at_a_spilled_full_report() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let panel = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
-        let captured = HashMap::from([(panel, vec!["the full finding body".to_string()])]);
-        let round = pending_round(
-            vec![panel],
-            ReadPanelMode::LastMessage,
-            captured,
-            HashMap::new(),
-        );
+        let captured = vec!["the full finding body".to_string()];
+        let w = watch(panel, ReadPanelMode::LastMessage, captured, VecDeque::new());
 
-        let report = mux.assemble_round_report(&round, false);
-        let path = mux
-            .spill_round_report(round.id, &report)
-            .expect("report spilled");
+        let c = mux.worker_contribution(&w).unwrap();
+        let report = mux.assemble_watch_report(&w, &c);
+        let path = mux.spill_watch_report(&w, &report).expect("report spilled");
         assert!(
             path.starts_with(mux.session.root_dir.join("rounds")),
             "report must land in rounds/: {}",
+            path.display()
+        );
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(&panel.to_string()),
+            "the per-panel report file name must carry the panel id: {}",
             path.display()
         );
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -2248,10 +3028,10 @@ mod tests {
             "the disk report must hold the full body: {on_disk}"
         );
 
-        let summary = mux.render_round_summary(&round, false, Some(path.as_path()));
+        let summary = mux.render_watch_summary(&w, &c, Some(path.as_path()));
         assert!(
-            summary.contains("Round complete"),
-            "summary header missing: {summary}"
+            summary.contains(&format!("panel {panel}")),
+            "summary header must name the panel: {summary}"
         );
         assert!(
             summary.contains(&path.display().to_string()),
@@ -2265,27 +3045,22 @@ mod tests {
         mux.shutdown();
     }
 
-    /// A body far over the teaser budget is bounded in the *injected* summary
-    /// (with an elision marker) while the spilled report file keeps it in full
-    /// — the whole point of finding 24: the main PTY gets a teaser, the file
-    /// gets the body.
+    /// A body far over the teaser budget is bounded in the *injected* per-panel
+    /// summary (with an elision marker) while the spilled report file keeps it
+    /// in full: the main PTY gets a teaser, the file gets the body.
     #[tokio::test]
-    async fn round_summary_teases_a_large_body_kept_full_in_the_report() {
+    async fn panel_summary_teases_a_large_body_kept_full_in_the_report() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let panel = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
         let big = "x".repeat(ROUND_SUMMARY_TEASER_BYTES * 4);
-        let captured = HashMap::from([(panel, vec![big.clone()])]);
-        let round = pending_round(
-            vec![panel],
-            ReadPanelMode::LastMessage,
-            captured,
-            HashMap::new(),
-        );
+        let captured = vec![big.clone()];
+        let w = watch(panel, ReadPanelMode::LastMessage, captured, VecDeque::new());
 
-        let report = mux.assemble_round_report(&round, false);
-        let path = mux.spill_round_report(round.id, &report).unwrap();
-        let summary = mux.render_round_summary(&round, false, Some(path.as_path()));
+        let c = mux.worker_contribution(&w).unwrap();
+        let report = mux.assemble_watch_report(&w, &c);
+        let path = mux.spill_watch_report(&w, &report).unwrap();
+        let summary = mux.render_watch_summary(&w, &c, Some(path.as_path()));
 
         // The injected summary is bounded — it must not inline the whole body.
         assert!(
@@ -2312,47 +3087,54 @@ mod tests {
     /// otherwise be stranded forever. (A non-existent id counts as settled, so
     /// the round is due immediately.)
     #[tokio::test]
-    async fn poll_pending_rounds_drops_a_due_round_with_no_main() {
+    async fn poll_worker_watches_drops_a_due_round_with_no_main() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         assert!(mux.main_panel_id.is_none());
 
-        mux.register_round(vec![PanelId::new()], None, Some(600), None, None);
-        assert_eq!(mux.pending_rounds.len(), 1);
+        arm(&mut mux, PanelId::new(), 600);
+        assert_eq!(mux.watches.len(), 1);
 
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert!(
-            mux.pending_rounds.is_empty(),
+            mux.watches.is_empty(),
             "a due round with no main panel must be dropped"
         );
     }
 
-    /// A due round whose main worker has *exited on its own* (process crash/
+    /// A ready panel whose main worker has *exited on its own* (process crash/
     /// OOM) must drop, not re-queue forever. `pump_all` flips the panel to
     /// `Exited` but does not clear `main_panel_id` (only `kill_panel` does), so
     /// before this fix the round saw `main_panel_id == Some(..)` yet
     /// `deliverable == false`, falling into the re-queue arm every tick. The
-    /// dropped report is spilled rather than silently lost.
+    /// settled panel's contribution is spilled rather than silently lost.
     #[tokio::test]
-    async fn poll_pending_rounds_drops_when_main_has_exited() {
+    async fn poll_worker_watches_drops_when_main_has_exited() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let main = push_cat_panel(&mut mux, "main", PanelState::Exited);
         mux.main_panel_id = Some(main);
+        // A live idle sub-panel that will latch (settle) on the first poll, so
+        // it carries a real contribution the main-gone path must preserve.
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
 
-        // A round on a non-existent id is due immediately (a missing id counts
-        // as settled).
-        mux.register_round(vec![PanelId::new()], None, Some(600), None, None);
-        assert_eq!(mux.pending_rounds.len(), 1);
+        arm(&mut mux, sub, 600);
+        assert_eq!(mux.watches.len(), 1);
 
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert!(
-            mux.pending_rounds.is_empty(),
-            "a due round against an exited main must drop, not re-queue forever"
+            mux.watches.is_empty(),
+            "a ready panel against an exited main must drop, not re-queue forever"
         );
+        let log = mux.session.root_dir.join("dropped-rounds.log");
         assert!(
-            mux.session.root_dir.join("dropped-rounds.log").exists(),
-            "the dropped round's report must be spilled to the session dir"
+            log.exists(),
+            "the settled panel's report must be spilled to the session dir"
+        );
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            body.contains(&format!("panel {sub}")),
+            "the dropped report must name the settled panel: {body}"
         );
 
         mux.shutdown();
@@ -2392,24 +3174,36 @@ mod tests {
         mux.shutdown();
     }
 
-    /// A due round is *held*, not delivered, while the main panel is alive but
+    /// A ready panel is *held*, not delivered, while the main panel is alive but
     /// busy (not `Idle`). The round stays pending for a later tick rather than
     /// landing mid-turn. (A main that is *gone* — missing/exited — is dropped,
     /// not held: that is the wedge guarded by
-    /// `poll_pending_rounds_drops_when_main_has_exited`.)
+    /// `poll_worker_watches_drops_when_main_has_exited`.)
     #[tokio::test]
-    async fn poll_pending_rounds_holds_when_main_busy() {
+    async fn poll_worker_watches_holds_when_main_busy() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let main = push_cat_panel(&mut mux, "main", PanelState::Working);
         mux.main_panel_id = Some(main);
+        // A live idle sub that latches (settles) on the poll, so it is ready to
+        // deliver — the round is held only because main is busy, not because the
+        // panel is gone.
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
 
-        mux.register_round(vec![PanelId::new()], None, Some(600), None, None);
-        mux.poll_pending_rounds();
+        arm(&mut mux, sub, 600);
+        mux.poll_worker_watches();
         assert_eq!(
-            mux.pending_rounds.len(),
+            mux.watches.len(),
             1,
-            "round must be held while the live main panel is busy"
+            "a ready panel must be held while the live main panel is busy"
+        );
+        assert!(
+            mux.watches.iter().any(|w| w.panel == sub),
+            "the held panel's watch must survive undelivered"
+        );
+        assert!(
+            mux.watches[watch_of(&mux, sub)].settled.is_some(),
+            "the held panel is latched (settled), just not yet delivered"
         );
 
         mux.shutdown();
@@ -2424,7 +3218,7 @@ mod tests {
     /// Spawning panels needs a real agent CLI; the test is skipped (not
     /// failed) when none is on PATH, matching `tests/mcp_integration.rs`.
     #[tokio::test]
-    async fn poll_pending_rounds_delivers_to_idle_main_on_settle() {
+    async fn poll_worker_watches_delivers_to_idle_main_on_settle() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let session_id = mux.session.id;
@@ -2454,12 +3248,12 @@ mod tests {
             return;
         };
         mux.note_prompt_delivered(sub);
-        mux.register_round(vec![sub], None, Some(600), None, None);
+        arm(&mut mux, sub, 600);
 
         // Sub still working -> round held.
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert_eq!(
-            mux.pending_rounds.len(),
+            mux.watches.len(),
             1,
             "round held while the sub-panel is working"
         );
@@ -2475,18 +3269,18 @@ mod tests {
 
         // A fresh un-submitted keystroke to main arms the compose hold: still held.
         mux.main_compose_since = Some(Instant::now());
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert_eq!(
-            mux.pending_rounds.len(),
+            mux.watches.len(),
             1,
             "round held while the user is mid-compose (compose grace)"
         );
 
         // Clear the compose hold: now the round delivers.
         mux.main_compose_since = None;
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert!(
-            mux.pending_rounds.is_empty(),
+            mux.watches.is_empty(),
             "round delivered once due + main idle + quiet"
         );
         assert_eq!(
@@ -2506,6 +3300,277 @@ mod tests {
         mux.shutdown();
     }
 
+    /// A worker main talks to is watched without any registration, and the
+    /// watch **re-arms** after each delivery — so `instruct → finish → instruct`
+    /// runs as a loop instead of dying after one w.
+    ///
+    /// This is what made a round still feel like a barrier even after per-panel
+    /// streaming: `register_round` retired on delivery, so the worker went dark
+    /// and main had to register again to hear about the *next* task. Here main
+    /// never registers anything at all.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn a_prompted_worker_is_watched_without_registration_and_rearms() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Some(main) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+        let Some(worker) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+
+        // Main sends the worker a task. No queue_tasks anywhere in this test.
+        mux.note_prompt_delivered(worker);
+        assert_eq!(
+            mux.watches.len(),
+            1,
+            "handing a worker a prompt watches it, with no registration",
+        );
+        assert!(
+            mux.watches[watch_of(&mux, worker)].backlog.is_empty(),
+            "caucus armed it with defaults — no queued backlog",
+        );
+
+        // Worker finishes task 1 → main is woken with its result.
+        stop_turn(&mut mux, worker, "task one done");
+        mux.poll_worker_watches();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the finished worker wakes main",
+        );
+        assert!(
+            mux.watches.is_empty(),
+            "the spent watch is retired once delivered",
+        );
+
+        // Main acts on it and sends task 2. The watch re-arms — this is the step
+        // that used to require a fresh register_round.
+        stop_turn(&mut mux, main, "ack");
+        mux.note_prompt_delivered(worker);
+        assert_eq!(
+            mux.watches.len(),
+            1,
+            "a later prompt re-arms the watch, continuing the loop",
+        );
+
+        // Worker finishes task 2 → main is woken again.
+        stop_turn(&mut mux, worker, "task two done");
+        mux.poll_worker_watches();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the second finish wakes main just like the first",
+        );
+        assert!(mux.watches.is_empty(), "second watch also retires");
+
+        // One spilled report per delivery — two turns, two reports.
+        let spills = mux
+            .session
+            .root_dir
+            .join("rounds")
+            .read_dir()
+            .expect("rounds dir exists")
+            .filter_map(|e| e.ok())
+            .count();
+        assert_eq!(spills, 2, "each delivery spills its own report");
+
+        mux.shutdown();
+    }
+
+    /// A backlog feed re-prompts a panel from *inside* `poll_worker_watches`,
+    /// which holds the round out of `watches` while it runs. The panel
+    /// must still read as watched there, or the feed's `note_prompt_delivered`
+    /// arms a second watch on a panel its own round already owns — and main is
+    /// told about that worker twice.
+    ///
+    /// Pins `watched_in_flight`: without it `worker_watched` sees an empty queue
+    /// mid-poll and arms the duplicate.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn a_backlog_feed_inside_the_poll_does_not_double_watch_the_panel() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Some(main) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+        let Some(sub) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+
+        mux.queue_tasks(sub, vec!["queued".to_string()], None, Some(3600), None);
+        assert_eq!(
+            mux.watches.len(),
+            1,
+            "queue_tasks configures the existing watch rather than adding one",
+        );
+
+        // The poll feeds the queued task, re-prompting `sub` while the watch is
+        // held out of `watches`.
+        mux.poll_worker_watches();
+        assert_eq!(
+            mux.watches.len(),
+            1,
+            "the feed must not arm a second watch on an already-watched panel",
+        );
+        assert_eq!(
+            mux.watches.iter().filter(|w| w.panel == sub).count(),
+            1,
+            "exactly one watch may owe main this panel",
+        );
+
+        mux.shutdown();
+    }
+
+    /// Streaming delivery: a multi-panel round wakes main the instant *each*
+    /// panel settles, without waiting for the slowest. The fast panel is
+    /// delivered while the slow one is still `Working`; the slow panel's watch
+    /// stays armed and lands its own delivery only once it finishes. No barrier
+    /// — panels that settle apart reach main as separate pushes.
+    ///
+    /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
+    #[tokio::test]
+    async fn poll_worker_watches_streams_each_panel_as_it_settles() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+
+        let Some(main) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
+        let Some(fast) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        let Some(slow) = spawn_idle(&mut mux, "reviewer") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+
+        // Both sub-panels open a turn (→ Working); a generous fallback so only a
+        // real settle, not the deadline, drives delivery.
+        mux.note_prompt_delivered(fast);
+        mux.note_prompt_delivered(slow);
+        assert_eq!(mux.watches.len(), 2, "both prompts armed a watch");
+
+        // Both working: nothing delivered, both watches held.
+        mux.poll_worker_watches();
+        assert_eq!(
+            mux.watches.len(),
+            2,
+            "both watches held while both panels work"
+        );
+
+        // The fast panel settles; the slow one keeps working.
+        stop_turn(&mut mux, fast, "fast finding");
+        mux.poll_worker_watches();
+
+        // Main was woken by the fast panel alone — no wait for the slow one.
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the fast panel's settle wakes main immediately",
+        );
+        assert_eq!(
+            mux.watches.len(),
+            1,
+            "the delivered fast panel's watch is spent; the slow one stays armed",
+        );
+        assert!(
+            !mux.watches.iter().any(|w| w.panel == fast),
+            "fast panel delivered",
+        );
+        assert!(
+            mux.watches.iter().any(|w| w.panel == slow),
+            "slow panel not yet delivered",
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == slow).unwrap().state(),
+            PanelState::Working,
+            "the slow panel is still working when the fast one already delivered",
+        );
+
+        // Drain main back to Idle, then the slow panel finishes.
+        stop_turn(&mut mux, main, "ack fast");
+        stop_turn(&mut mux, slow, "slow finding");
+        mux.poll_worker_watches();
+
+        // The slow panel's own delivery lands and spends its watch.
+        assert!(
+            mux.watches.is_empty(),
+            "every watch of the round is spent once its panel is delivered",
+        );
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the slow panel's delivery wakes main again",
+        );
+
+        // One spilled report per panel — two deliveries, not a single barrier dump.
+        let spills = mux
+            .session
+            .root_dir
+            .join("rounds")
+            .read_dir()
+            .expect("rounds dir exists")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with(&fast.to_string()) || name.starts_with(&slow.to_string())
+            })
+            .count();
+        assert_eq!(spills, 2, "one spilled report per streamed panel");
+
+        mux.shutdown();
+    }
+
+    /// Workers ready in the same tick reach main as one push: every watch is
+    /// spent and main is handed exactly one prompt, so main's context is
+    /// re-read once, not once per worker.
+    #[tokio::test]
+    async fn poll_worker_watches_pushes_workers_ready_together_as_one_message() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        // Idle subs latch (settle) on the poll, so both are ready this tick.
+        let first = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+        let second = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+        arm(&mut mux, first, 600);
+        arm(&mut mux, second, 600);
+
+        mux.poll_worker_watches();
+
+        assert!(
+            mux.watches.is_empty(),
+            "both ready workers are delivered in the same tick"
+        );
+        assert_eq!(
+            mux.outstanding_prompts.get(&main),
+            Some(&1),
+            "one push carried both workers"
+        );
+        assert_eq!(
+            mux.panels.iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working,
+            "the push opened one main turn"
+        );
+
+        mux.shutdown();
+    }
+
     /// A round panel with a backlog is fed its next task on idle (flipping it
     /// back to `Working`, so the round is *not* due), and settles — letting the
     /// round deliver to main — only once its queue drains. The end-to-end
@@ -2514,7 +3579,7 @@ mod tests {
     ///
     /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
-    async fn poll_pending_rounds_feeds_backlog_then_settles_when_drained() {
+    async fn poll_worker_watches_feeds_backlog_then_settles_when_drained() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let session_id = mux.session.id;
@@ -2530,33 +3595,20 @@ mod tests {
         };
 
         // One queued task for the sub; generous fallback so only the backlog,
-        // not the deadline, drives the round.
-        mux.register_round(
-            vec![sub],
-            None,
-            Some(3600),
-            Some(HashMap::from([(sub, vec!["only-task".to_string()])])),
-            None,
-        );
+        // not the deadline, drives the w.
+        mux.queue_tasks(sub, vec!["only-task".to_string()], None, Some(3600), None);
 
         // Sub is idle with a task queued: the poll feeds it (→ Working), so the
         // round is not yet due and stays pending; the queue is now empty.
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert_eq!(
             mux.panels().iter().find(|p| p.id == sub).unwrap().state(),
             PanelState::Working,
             "an idle sub with a queued task must be fed (flips to Working)",
         );
-        assert_eq!(
-            mux.pending_rounds.len(),
-            1,
-            "round held while the sub works"
-        );
+        assert_eq!(mux.watches.len(), 1, "round held while the sub works");
         assert!(
-            mux.pending_rounds[0]
-                .backlog
-                .get(&sub)
-                .is_none_or(VecDeque::is_empty),
+            mux.watches[watch_of(&mux, sub)].backlog.is_empty(),
             "the fed task must be consumed from the queue",
         );
 
@@ -2569,9 +3621,9 @@ mod tests {
             None,
             serde_json::Value::Null,
         ));
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert!(
-            mux.pending_rounds.is_empty(),
+            mux.watches.is_empty(),
             "with the queue drained the round must deliver, not re-feed",
         );
         assert_eq!(
@@ -2583,7 +3635,7 @@ mod tests {
         mux.shutdown();
     }
 
-    /// The round owner captures every finished turn into `PendingRound::captured`
+    /// The round owner captures every finished turn into `WorkerWatch::captured`
     /// — one per fed backlog task, **and** one more when the drained panel latches
     /// (Invariant I-9). The accumulation that lets the delivered report carry
     /// every task's result, tested at its boundaries: after feed 1 → 1 body,
@@ -2607,22 +3659,19 @@ mod tests {
         };
 
         // Two queued tasks; generous fallback so only the backlog drives it.
-        mux.register_round(
-            vec![sub],
+        mux.queue_tasks(
+            sub,
+            vec!["task-1".to_string(), "task-2".to_string()],
             None,
             Some(3600),
-            Some(HashMap::from([(
-                sub,
-                vec!["task-1".to_string(), "task-2".to_string()],
-            )])),
             None,
         );
 
         // First feed: idle sub with task-1 queued → captures the pre-backlog turn.
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert_eq!(
-            mux.pending_rounds[0].captured.get(&sub).map(Vec::len),
-            Some(1),
+            mux.watches[watch_of(&mux, sub)].captured.len(),
+            1,
             "the first feed must capture exactly one finished turn",
         );
 
@@ -2634,10 +3683,10 @@ mod tests {
             None,
             serde_json::Value::Null,
         ));
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert_eq!(
-            mux.pending_rounds[0].captured.get(&sub).map(Vec::len),
-            Some(2),
+            mux.watches[watch_of(&mux, sub)].captured.len(),
+            2,
             "the second feed must capture a second finished turn",
         );
 
@@ -2653,22 +3702,22 @@ mod tests {
             serde_json::Value::Null,
         ));
         mux.main_compose_since = Some(Instant::now());
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert_eq!(
-            mux.pending_rounds[0].captured.get(&sub).map(Vec::len),
-            Some(3),
+            mux.watches[watch_of(&mux, sub)].captured.len(),
+            3,
             "the queue-empty settle must capture the panel's final turn",
         );
         assert!(
-            mux.pending_rounds[0].settled.contains_key(&sub),
+            mux.watches[watch_of(&mux, sub)].settled.is_some(),
             "the drained panel must latch as settled for the round",
         );
 
         // Release the hold: the drained round now delivers to the idle main.
         mux.main_compose_since = None;
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert!(
-            mux.pending_rounds.is_empty(),
+            mux.watches.is_empty(),
             "the drained round must deliver once the compose hold clears",
         );
 
@@ -2685,22 +3734,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
-        let mut round = pending_round(
-            vec![sub],
+        let mut w = watch(
+            sub,
             ReadPanelMode::LastMessage,
-            HashMap::new(),
-            HashMap::from([(sub, VecDeque::from(["queued".to_string()]))]),
+            Vec::new(),
+            VecDeque::from(["queued".to_string()]),
         );
 
         // Idle with work queued: the owner feeds the task (flipping the panel
         // back to `Working`) rather than latching it.
-        assert!(mux.poll_round_panels(&mut round, false));
+        assert!(mux.poll_worker_watch(&mut w));
+        assert!(w.backlog.is_empty(), "the queued task must have been fed");
         assert!(
-            round.backlog[&sub].is_empty(),
-            "the queued task must have been fed"
-        );
-        assert!(
-            !mux.round_settled(&round),
+            w.settled.is_none(),
             "an idle panel with queued backlog is not settled"
         );
         assert_eq!(
@@ -2711,17 +3757,14 @@ mod tests {
 
         // The fed task finishes with the queue now empty → the owner latches it.
         mux.panels.iter_mut().find(|p| p.id == sub).unwrap().state = PanelState::Idle;
-        assert!(mux.poll_round_panels(&mut round, false));
-        assert!(
-            mux.round_settled(&round),
-            "the drained queue latches the panel"
-        );
+        assert!(mux.poll_worker_watch(&mut w));
+        assert!(w.settled.is_some(), "the drained queue latches the panel");
 
         mux.shutdown();
     }
 
     /// An `Exited` panel with queued backlog latches immediately. The panel is
-    /// terminal and `poll_round_panels` only feeds `Idle` panels, so its backlog
+    /// terminal and `poll_worker_watch` only feeds `Idle` panels, so its backlog
     /// can never drain — gating on it (like a live `Idle` panel) would wedge the
     /// round forever.
     #[tokio::test]
@@ -2729,103 +3772,166 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Exited);
-        let mut round = pending_round(
-            vec![sub],
+        let mut w = watch(
+            sub,
             ReadPanelMode::LastMessage,
-            HashMap::new(),
-            HashMap::from([(sub, VecDeque::from(["queued".to_string()]))]),
+            Vec::new(),
+            VecDeque::from(["queued".to_string()]),
         );
 
         assert!(
-            !mux.round_settled(&round),
+            w.settled.is_none(),
             "no panel is settled until the owner poll latches it"
         );
 
-        assert!(mux.poll_round_panels(&mut round, false));
+        assert!(mux.poll_worker_watch(&mut w));
         assert!(
-            mux.round_settled(&round),
+            w.settled.is_some(),
             "an exited panel with queued backlog latches — it can never drain"
         );
         assert_eq!(
-            round.backlog[&sub].len(),
+            w.backlog.len(),
             1,
             "a terminal panel is never fed its queued work",
+        );
+        let c = mux.worker_contribution(&w).unwrap();
+        let report = mux.assemble_watch_report(&w, &c);
+        assert!(
+            report.contains("1 queued task(s) were not run: the panel exited"),
+            "{report}"
         );
 
         mux.shutdown();
     }
 
-    /// Restarting a round panel swaps its `PanelId` (fresh PTY = fresh id) but
-    /// keeps it the same logical member. `remap_round_membership` must re-key
-    /// the round's `panels`, `backlog`, and `captured` from the old id to the
-    /// new one; otherwise the round resolves the old id to a missing panel and
-    /// silently drops the member without its contribution.
+    /// Restarting a watched panel swaps its `PanelId` (fresh PTY = fresh id) but
+    /// keeps it the same logical worker. `remap_round_membership` must re-key the
+    /// watch to the new id, carrying its backlog, captured turns, and settle
+    /// latch with it; otherwise the watch resolves the old id to a missing panel
+    /// and silently drops the worker without its contribution.
     #[tokio::test]
     async fn restart_remaps_round_membership_to_the_new_panel_id() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let old = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
-        let round = pending_round(
-            vec![old],
+        let w = watch(
+            old,
             ReadPanelMode::LastMessage,
-            HashMap::from([(old, vec!["earlier turn".to_string()])]),
-            HashMap::from([(old, VecDeque::from(["queued".to_string()]))]),
+            vec!["earlier turn".to_string()],
+            VecDeque::from(["queued".to_string()]),
         );
-        mux.pending_rounds.push(round);
+        mux.watches.push(w);
 
         let new = PanelId::new();
         mux.remap_round_membership(old, new);
 
-        let r = &mux.pending_rounds[0];
-        assert_eq!(r.panels, vec![new], "round member re-keyed to the new id");
-        assert!(
-            !r.backlog.contains_key(&old) && r.backlog.contains_key(&new),
-            "backlog re-keyed to the new id"
+        let r = &mux.watches[watch_of(&mux, new)];
+        assert_eq!(r.panel, new, "the watch is re-keyed to the new id");
+        assert_eq!(
+            r.backlog.iter().cloned().collect::<Vec<_>>(),
+            vec!["queued".to_string()],
+            "the backlog rides the re-keyed watch"
+        );
+        assert_eq!(
+            r.captured,
+            vec!["earlier turn".to_string()],
+            "the captured turns ride the re-keyed watch"
+        );
+        assert_eq!(
+            r.settled,
+            Some(Settled::In(PanelState::Idle)),
+            "the settle latch rides the re-keyed watch"
         );
         assert!(
-            !r.captured.contains_key(&old) && r.captured.contains_key(&new),
-            "captured turns re-keyed to the new id"
+            !mux.watches.iter().any(|w| w.panel == old),
+            "the old id must not stay watched"
         );
 
         mux.shutdown();
     }
 
-    /// Once the fallback deadline has fired, polling must deliver the partial
-    /// report instead of starting another queued backlog task. Before this
-    /// guard, an idle panel at the deadline was fed first, flipping it back to
-    /// `Working` even though the round was already due by timeout.
+    /// A stall alarm on a panel still mid-turn keeps its queued backlog: the
+    /// watch stays live and alarmed, the panel is fed on its next idle exactly
+    /// as if the alarm had never fired, and the final delivery carries every
+    /// task.
     #[tokio::test]
-    async fn poll_pending_rounds_does_not_feed_backlog_after_fallback() {
+    async fn a_stall_alarmed_panel_keeps_its_backlog_and_is_fed_on_the_next_idle() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
-        mux.main_panel_id = Some(main);
-        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Idle);
+        let (_main, sub) = worker_with_manifest(&mut mux);
 
-        mux.register_round(
-            vec![sub],
-            None,
-            Some(3600),
-            Some(HashMap::from([(sub, vec!["late task".to_string()])])),
-            None,
+        mux.note_prompt_delivered(sub);
+        mux.queue_tasks(sub, vec!["second task".to_string()], None, Some(60), None);
+        let i = watch_of(&mux, sub);
+        mux.watches[i].stall = StallClock::Armed(Instant::now() - Duration::from_secs(1));
+
+        let interim = mux.take_ready_round_deliveries();
+        assert_eq!(
+            interim.len(),
+            1,
+            "a silent window raises one interim notice"
         );
-        mux.pending_rounds[0].fallback_deadline = Instant::now() - Duration::from_secs(1);
-
-        mux.poll_pending_rounds();
-
+        assert!(interim[0].contains("may be stuck"), "{}", interim[0]);
         assert!(
-            mux.pending_rounds.is_empty(),
-            "fallback-due round should be delivered and dropped"
+            interim[0].contains("1 task(s) still queued"),
+            "{}",
+            interim[0]
         );
+        let i = watch_of(&mux, sub);
+        assert_eq!(mux.watches[i].backlog.len(), 1, "the backlog is kept");
+        assert_eq!(
+            mux.watches[i].stall,
+            StallClock::Alarmed,
+            "the alarmed watch waits for a screen change"
+        );
+
+        // The first task ends: fed the queued one, as with no deadline.
+        stop_turn(&mut mux, sub, "first done");
+        assert!(mux.take_ready_round_deliveries().is_empty());
         assert_eq!(
             mux.panels().iter().find(|p| p.id == sub).unwrap().state(),
-            PanelState::Idle,
-            "fallback delivery must not start another queued backlog task"
-        );
-        assert_eq!(
-            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
             PanelState::Working,
-            "delivery injects the partial report into the main panel"
+            "the kept backlog is fed on the next idle"
+        );
+        assert!(mux.watches[watch_of(&mux, sub)].backlog.is_empty());
+
+        stop_turn(&mut mux, sub, "second done");
+        let last = mux.take_ready_round_deliveries();
+        assert_eq!(last.len(), 1, "the drained panel delivers its result");
+        assert!(last[0].contains("finished"), "{}", last[0]);
+        assert!(
+            mux.watches.is_empty(),
+            "a finished delivery spends the watch"
+        );
+        let report = std::fs::read_dir(mux.session.root_dir.join("rounds"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .find(|r| r.contains("finished."))
+            .expect("the final report is spilled");
+        assert!(
+            report.contains("first done") && report.contains("second done"),
+            "{report}"
+        );
+
+        mux.shutdown();
+    }
+
+    /// Killing a watched panel is where its queued backlog is discarded: the
+    /// watch is retired with the panel, and nothing is fed or delivered.
+    #[tokio::test]
+    async fn killing_a_watched_panel_clears_its_backlog() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (_main, sub) = worker_with_manifest(&mut mux);
+
+        mux.note_prompt_delivered(sub);
+        mux.queue_tasks(sub, vec!["never run".to_string()], None, Some(60), None);
+        Multiplexer::kill_panel(&mut mux, sub).unwrap();
+
+        assert!(mux.take_ready_round_deliveries().is_empty());
+        assert!(
+            mux.watches.is_empty(),
+            "a killed panel's watch and its backlog are retired"
         );
 
         mux.shutdown();
@@ -2836,8 +3942,18 @@ mod tests {
     /// `last_message` (what `ReadPanelMode::LastMessage` reads) left holding
     /// `message`. Panel ends `Idle`.
     fn finish_turn(mux: &mut Multiplexer, panel: PanelId, message: &str) {
-        let session_id = mux.session.id;
         mux.note_prompt_delivered(panel);
+        stop_turn(mux, panel, message);
+    }
+
+    /// End the turn already running on `panel` with a `Stop` carrying
+    /// `message`, delivering no prompt of its own. For panels the test already
+    /// prompted: `finish_turn` would deliver a *second* prompt, which the agent
+    /// CLI queues behind the first, so this `Stop` would be the first prompt's
+    /// boundary with the second still to run — the panel stays `Working` and
+    /// never settles.
+    fn stop_turn(mux: &mut Multiplexer, panel: PanelId, message: &str) {
+        let session_id = mux.session.id;
         mux.handle_signal(TurnSignal::now(
             session_id,
             panel,
@@ -2856,7 +3972,7 @@ mod tests {
     /// that window wakes its CLI into a fresh turn — and the old code, which
     /// re-judged the barrier from live panel state on every tick, saw the panel
     /// back in `Working`, un-dued the finished round, and (via
-    /// `round_panel_contribution`) skipped the panel's read entirely, so even the
+    /// `worker_contribution`) skipped the panel's read entirely, so even the
     /// eventual fallback delivery reported it as "still working, no output
     /// captured". The latch makes the settle stick and freezes the contribution.
     ///
@@ -2877,19 +3993,15 @@ mod tests {
         };
 
         finish_turn(&mut mux, sub, "finished the audit: 3 findings");
-        mux.register_round(vec![sub], None, Some(3600), None, None);
+        arm(&mut mux, sub, 3600);
 
         // Main is mid-turn, so the push is gated: the round stays pending with
         // the sub latched — exactly the window the incident lived in.
         mux.note_prompt_delivered(main);
-        mux.poll_pending_rounds();
-        assert_eq!(
-            mux.pending_rounds.len(),
-            1,
-            "the push is gated on idle main"
-        );
+        mux.poll_worker_watches();
+        assert_eq!(mux.watches.len(), 1, "the push is gated on idle main");
         assert!(
-            mux.pending_rounds[0].settled.contains_key(&sub),
+            mux.watches[watch_of(&mux, sub)].settled.is_some(),
             "the settled sub-panel must latch",
         );
 
@@ -2902,19 +4014,22 @@ mod tests {
             "the wake-up reopens the panel's turn",
         );
 
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert!(
-            mux.round_settled(&mux.pending_rounds[0]),
+            mux.watches[watch_of(&mux, sub)].settled.is_some(),
             "a re-woken panel must not un-settle a round it already finished",
         );
 
-        let report = mux.assemble_round_report(&mux.pending_rounds[0], true);
+        let c = mux
+            .worker_contribution(&mux.watches[watch_of(&mux, sub)])
+            .unwrap();
+        let report = mux.assemble_watch_report(&mux.watches[watch_of(&mux, sub)], &c);
         assert!(
             report.contains("finished the audit: 3 findings"),
             "the latched contribution must survive the wake-up: {report}",
         );
         assert!(
-            !report.contains("still working"),
+            !report.contains("turn still running"),
             "a latched panel must never be reported unfinished: {report}",
         );
 
@@ -2950,12 +4065,12 @@ mod tests {
         };
 
         finish_turn(&mut mux, sub, "PARITY REPORT: 3 divergences, all fixed");
-        mux.register_round(vec![sub], None, Some(3600), None, None);
+        arm(&mut mux, sub, 3600);
 
         // Latch the sub while main is mid-turn (the push is gated).
         mux.note_prompt_delivered(main);
-        mux.poll_pending_rounds();
-        assert!(mux.pending_rounds[0].settled.contains_key(&sub));
+        mux.poll_worker_watches();
+        assert!(mux.watches[watch_of(&mux, sub)].settled.is_some());
 
         // The leftover shell finishes; the CLI runs a turn caucus never prompted
         // and its `Stop` hook overwrites the manifest's `last_message`.
@@ -2967,7 +4082,10 @@ mod tests {
             serde_json::Value::Null,
         ));
 
-        let report = mux.assemble_round_report(&mux.pending_rounds[0], true);
+        let c = mux
+            .worker_contribution(&mux.watches[watch_of(&mux, sub)])
+            .unwrap();
+        let report = mux.assemble_watch_report(&mux.watches[watch_of(&mux, sub)], &c);
         assert!(
             report.contains("PARITY REPORT: 3 divergences, all fixed"),
             "the round must report the result captured at settle-time: {report}",
@@ -2984,16 +4102,17 @@ mod tests {
     /// round (Invariant I-10) — the escape from the livelock the push-only path
     /// created.
     ///
-    /// The push (`poll_pending_rounds`) can only type into an *idle* main panel.
-    /// A main worker that stays in its turn polling `round_status` is `Working`
-    /// for the whole poll, so the push never fires: main waits for the round and
-    /// the round waits for main to stop waiting. The fallback deadline does not
-    /// break it — that makes a round *due*, not *deliverable*. `round_status`
-    /// therefore returns the assembled report itself and completes the round.
+    /// The push (`poll_worker_watches`) can only type into an *idle* main panel.
+    /// A main worker that stays in its turn polling `collect_workers` is
+    /// `Working` for the whole poll, so the push never fires: main waits for its
+    /// workers and the workers wait for main to stop waiting. The stall
+    /// alarm does not break it — that makes a worker *due*, not
+    /// *deliverable*. `collect_workers` therefore returns the assembled report
+    /// itself and spends the watch.
     ///
     /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
-    async fn round_status_pulls_a_completed_round_for_a_busy_main() {
+    async fn collect_workers_pulls_a_settled_worker_for_a_busy_main() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
 
@@ -3011,57 +4130,60 @@ mod tests {
         // Main never ends its turn — it polls, which is what an LLM main worker
         // actually does.
         mux.note_prompt_delivered(main);
-        let ControlResponse::RoundRegistered { round_id, .. } =
-            mux.register_round(vec![sub], None, Some(3600), None, None)
-        else {
-            panic!("register_round must ack with a round id");
-        };
 
         // The push is dead while main is working: it will re-queue forever.
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert_eq!(
-            mux.pending_rounds.len(),
+            mux.watches.len(),
             1,
             "the push cannot land in a working main panel",
         );
 
-        // The pull delivers the round to the poller instead.
-        let ControlResponse::Panel { text } = mux.round_status(round_id) else {
-            panic!("a completed round must answer with its report");
+        // The pull streams the settled worker to the poller instead.
+        let ControlResponse::Panel { text } = mux.collect_workers() else {
+            panic!("a settled worker must answer with its report");
         };
         assert!(
-            text.contains("Round complete"),
-            "the poller must get the assembled report, not a status line: {text}",
+            text.contains(&format!("panel {sub}")),
+            "the poller must get the panel's delivery, not a status line: {text}",
         );
         assert!(
             text.contains("the sub-agent's result"),
             "the report must carry the panel's captured result: {text}",
         );
 
-        // Exactly-once: the round is completed, not left for a second delivery.
+        // Exactly-once: the watch is spent, not left for a second delivery.
         assert!(
-            mux.pending_rounds.is_empty(),
-            "a pulled round must be completed, not re-queued for the push",
+            mux.watches.is_empty(),
+            "a pulled worker's watch must be spent, not re-queued for the push",
         );
-        mux.poll_pending_rounds();
-        assert!(matches!(
-            mux.round_status(round_id),
-            ControlResponse::Error { .. }
-        ));
+        mux.poll_worker_watches();
+        let ControlResponse::Panel { text } = mux.collect_workers() else {
+            panic!("collect_workers always answers with text");
+        };
+        assert!(
+            text.contains("No workers"),
+            "a spent watch cannot be delivered again: {text}"
+        );
 
         mux.shutdown();
     }
 
-    /// A round whose panels are still working is **not** pulled: `round_status`
-    /// answers with its live status and leaves it pending. The other side of the
-    /// pull boundary from `round_status_pulls_a_completed_round_for_a_busy_main`.
+    /// A worker still working is **not** pulled: `collect_workers` answers with
+    /// its live status and leaves the watch armed. The other side of the pull
+    /// boundary from `collect_workers_pulls_a_settled_worker_for_a_busy_main`.
     ///
     /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
-    async fn round_status_leaves_an_unfinished_round_pending() {
+    async fn collect_workers_leaves_an_unfinished_worker_watched() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
 
+        let Some(main) = spawn_idle(&mut mux, "main") else {
+            eprintln!("skipping: no agent CLI on PATH");
+            return;
+        };
+        mux.main_panel_id = Some(main);
         let Some(sub) = spawn_idle(&mut mux, "reviewer") else {
             eprintln!("skipping: no agent CLI on PATH");
             return;
@@ -3069,40 +4191,30 @@ mod tests {
         // Mid-turn: nothing to latch.
         mux.note_prompt_delivered(sub);
 
-        let ControlResponse::RoundRegistered { round_id, .. } =
-            mux.register_round(vec![sub], None, Some(3600), None, None)
-        else {
-            panic!("register_round must ack with a round id");
-        };
-
-        let ControlResponse::Panel { text } = mux.round_status(round_id) else {
-            panic!("a live round must answer with its status");
+        let ControlResponse::Panel { text } = mux.collect_workers() else {
+            panic!("a live worker must answer with its status");
         };
         assert!(
             text.contains("working"),
             "an unfinished panel must be reported as working: {text}",
         );
         assert!(
-            !text.contains("Round complete"),
-            "an unfinished round must not be delivered: {text}",
+            !text.contains("Full report:"),
+            "an unfinished panel must not be delivered: {text}",
         );
-        assert_eq!(
-            mux.pending_rounds.len(),
-            1,
-            "an unfinished round stays pending",
-        );
+        assert_eq!(mux.watches.len(), 1, "an unfinished worker stays watched",);
 
         mux.shutdown();
     }
 
-    /// The fallback tick still **latches** (captures) a panel that settled with
-    /// queued work left — it only stops *feeding* it more. Without this the
-    /// partial report the deadline forces would carry nothing for a panel whose
-    /// finished turns were never read.
+    /// A tick with the stall alarm due feeds an idle panel with queued work
+    /// exactly as any other tick does — the alarm never discards the backlog.
+    /// The panel is then mid-turn, so the alarm's notice is an interim one: it
+    /// counts the finished turn and holds its body for the final delivery.
     ///
     /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
-    async fn the_fallback_tick_latches_an_idle_panel_with_queued_backlog() {
+    async fn the_fallback_tick_feeds_an_idle_panel_with_queued_backlog() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
 
@@ -3117,39 +4229,272 @@ mod tests {
         };
 
         finish_turn(&mut mux, sub, "what the panel got through");
-        mux.register_round(
-            vec![sub],
-            None,
-            Some(3600),
-            Some(HashMap::from([(sub, vec!["never-run".to_string()])])),
-            None,
-        );
-        // Force the deadline: the feeding window is closed.
-        mux.pending_rounds[0].fallback_deadline = Instant::now();
+        mux.queue_tasks(sub, vec!["never-run".to_string()], None, Some(3600), None);
+        // Address the round by the panel it watches: caucus also arms implicit
+        // watches (`arm_worker_watch`), so position in `watches` is not
+        // part of any contract.
+        let idx = watch_of(&mux, sub);
+        // Make the stall alarm due.
+        mux.watches[idx].stall = StallClock::Armed(Instant::now());
 
         // Hold the push so the pending round can be inspected post-latch.
         mux.main_compose_since = Some(Instant::now());
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
 
+        let idx = watch_of(&mux, sub);
         assert!(
-            mux.pending_rounds[0].settled.contains_key(&sub),
-            "the deadline latches an idle panel rather than leaving it unread",
+            mux.watches[idx].settled.is_none(),
+            "an idle panel with queued work is fed, not latched",
         );
+        assert!(
+            mux.watches[idx].backlog.is_empty(),
+            "the deadline does not hold back the backlog",
+        );
+        assert_eq!(mux.watches[idx].captured, ["what the panel got through"]);
+
+        let c = mux.worker_contribution(&mux.watches[idx]).unwrap();
+        let report = mux.assemble_watch_report(&mux.watches[idx], &c);
+        assert!(
+            report.contains("1 earlier task(s) finished"),
+            "the interim notice counts the finished turn: {report}",
+        );
+        assert!(
+            !report.contains("what the panel got through"),
+            "the finished body comes once, with the final result: {report}",
+        );
+
+        mux.shutdown();
+    }
+
+    /// A fed worker whose prompt stalls settles as stalled with the rest of
+    /// its queue unfed, and the report says the prompt never ran.
+    #[tokio::test]
+    async fn a_stalled_prompt_settles_the_watch_without_feeding_the_backlog() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (_main, sub) = worker_with_manifest(&mut mux);
+
+        let tasks = vec!["first".to_string(), "second".to_string()];
+        mux.queue_tasks(sub, tasks, None, Some(3600), None);
+        // Hold the push so the latched watch can be inspected.
+        mux.main_compose_since = Some(Instant::now());
+        mux.poll_worker_watches();
+        assert_eq!(mux.watches[watch_of(&mux, sub)].backlog, ["second"]);
+
+        let grid = &mut mux.panels.iter_mut().find(|p| p.id == sub).unwrap().grid;
+        grid.advance(b"\x1b[2J\x1b[H");
+        grid.advance(
+            "● hi\r\n──────────\r\n❯ \r\n──────────\r\n  ⏵⏵ bypass permissions on".as_bytes(),
+        );
+        mux.age_out_prompt_effect(sub);
+        mux.poll_lost_turns();
+        mux.poll_worker_watches();
+
+        let w = &mux.watches[watch_of(&mux, sub)];
+        assert_eq!(w.settled, Some(Settled::Stalled));
+        assert_eq!(w.backlog, ["second"], "a stalled prompt's queue is not fed");
+        let c = mux.worker_contribution(w).unwrap();
+        let report = mux.assemble_watch_report(w, &c);
+        assert!(report.contains("prompt stalled"), "{report}");
+        assert!(report.contains("1 queued task(s) were not run"), "{report}");
+        mux.shutdown();
+    }
+
+    /// A hermetic `/bin/cat` worker with a manifest, so turn signals and notes
+    /// land on a real lane timeline, plus an idle cat main to deliver to.
+    fn worker_with_manifest(mux: &mut Multiplexer) -> (PanelId, PanelId) {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+        let main = push_cat_panel(mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let sub = push_cat_panel(mux, "reviewer", PanelState::Idle);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            sub,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        mux.manifests.insert(sub, mf);
+        (main, sub)
+    }
+
+    fn post_note(mux: &mut Multiplexer, panel: PanelId, body: &str) {
+        let session_id = mux.session.id;
+        mux.handle_note(crate::signal::AgentNote::now(
+            session_id,
+            panel,
+            crate::signal::NoteKind::Progress,
+            body.to_string(),
+        ));
+    }
+
+    /// A stall alarm mid-turn after an earlier, already-delivered turn: neither
+    /// that turn's message nor its note may appear under the alarm's header.
+    /// The path that used to leak it: `queue_tasks` arms a fresh watch on the
+    /// idle panel, the first poll captured the idle panel's old
+    /// `last_message` as task 1 before feeding, and every interim notice after
+    /// that re-delivered it.
+    #[tokio::test]
+    async fn a_stall_alarm_after_an_earlier_turn_carries_no_old_message() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (main, sub) = worker_with_manifest(&mut mux);
+
+        post_note(&mut mux, sub, "old turn progress");
+        finish_turn(&mut mux, sub, "OLD REPORT");
+        mux.poll_worker_watches();
+        assert!(
+            mux.watches.is_empty(),
+            "the old turn is delivered and spent"
+        );
+        mux.panels.iter_mut().find(|p| p.id == main).unwrap().state = PanelState::Idle;
+
+        mux.queue_tasks(sub, vec!["long task".to_string()], None, Some(3600), None);
+        mux.main_compose_since = Some(Instant::now());
+        mux.poll_worker_watches();
         assert_eq!(
-            mux.pending_rounds[0].backlog[&sub].len(),
-            1,
-            "no new backlog work starts after the deadline",
+            mux.panels().iter().find(|p| p.id == sub).unwrap().state(),
+            PanelState::Working,
+            "the queued task is fed",
+        );
+        post_note(&mut mux, sub, "halfway through the long task");
+
+        let i = watch_of(&mux, sub);
+        let c = mux.worker_contribution(&mux.watches[i]).unwrap();
+        let report = mux.assemble_watch_report(&mux.watches[i], &c);
+        assert!(report.contains("may be stuck"), "{report}");
+        assert!(
+            !report.contains("OLD REPORT"),
+            "an earlier turn's message must not be delivered as this turn's: {report}"
+        );
+        assert!(
+            !report.contains("old turn progress"),
+            "an earlier turn's note is not this turn's: {report}"
+        );
+        assert!(
+            report.contains("last note: [progress] halfway through the long task"),
+            "{report}"
         );
 
-        let report = mux.assemble_round_report(&mux.pending_rounds[0], false);
+        mux.shutdown();
+    }
+
+    /// A stall alarm on the panel's first turn: no body, no note, and the
+    /// report says the turn has no result yet rather than "no output captured".
+    #[tokio::test]
+    async fn a_stall_alarm_on_the_first_turn_says_no_result_yet() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (_main, sub) = worker_with_manifest(&mut mux);
+
+        mux.note_prompt_delivered(sub);
+        let i = watch_of(&mux, sub);
+        let c = mux.worker_contribution(&mux.watches[i]).unwrap();
+        let summary = {
+            let mut out = String::new();
+            mux.push_panel_summary_block(&mut out, sub, &c);
+            out
+        };
+        let report = mux.assemble_watch_report(&mux.watches[i], &c);
+        for text in [&report, &summary] {
+            assert!(
+                text.contains("turn still running, no result yet; no note posted during this turn"),
+                "{text}"
+            );
+            assert!(!text.contains("(no output captured)"), "{text}");
+        }
+
+        mux.shutdown();
+    }
+
+    /// A working watched panel whose silence window has already run out: its
+    /// stall alarm is due and its screen has not changed since the clock saw it.
+    fn silent_working_worker(mux: &mut Multiplexer) -> PanelId {
+        let (_main, sub) = worker_with_manifest(mux);
+        mux.note_prompt_delivered(sub);
+        let generation = mux
+            .panels()
+            .iter()
+            .find(|p| p.id == sub)
+            .unwrap()
+            .grid()
+            .generation();
+        let i = watch_of(mux, sub);
+        mux.watches[i].seen_generation = generation;
+        mux.watches[i].stall = StallClock::Armed(Instant::now() - Duration::from_secs(1));
+        sub
+    }
+
+    fn change_screen(mux: &mut Multiplexer, panel: PanelId) {
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == panel)
+            .unwrap()
+            .grid
+            .advance(b"x");
+    }
+
+    /// A screen change seen in the same tick withdraws a due alarm and
+    /// restarts the silence window.
+    #[tokio::test]
+    async fn a_screen_change_rearms_the_stall_clock() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let sub = silent_working_worker(&mut mux);
+
+        change_screen(&mut mux, sub);
+        assert!(mux.take_ready_round_deliveries().is_empty());
+        let w = &mux.watches[watch_of(&mux, sub)];
         assert!(
-            report.contains("what the panel got through"),
-            "the partial report must carry the work the panel finished: {report}",
+            matches!(w.stall, StallClock::Armed(d) if d > Instant::now()),
+            "{:?}",
+            w.stall
         );
+
+        mux.shutdown();
+    }
+
+    /// A silent window raises one alarm, and further silence raises no other.
+    #[tokio::test]
+    async fn a_silent_panel_raises_one_stall_alarm_per_silence() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let sub = silent_working_worker(&mut mux);
+        let secs = mux.watches[watch_of(&mux, sub)].fallback_budget.as_secs();
+
+        let alarm = mux.take_ready_round_deliveries();
+        assert_eq!(alarm.len(), 1);
         assert!(
-            report.contains("1 queued backlog task(s) were not run"),
-            "the partial report must name the un-run work: {report}",
+            alarm[0].contains(&format!(
+                "may be stuck: its screen has not changed for {secs} s"
+            )),
+            "{}",
+            alarm[0]
         );
+        assert!(mux.take_ready_round_deliveries().is_empty());
+        assert_eq!(mux.watches[watch_of(&mux, sub)].stall, StallClock::Alarmed);
+
+        mux.shutdown();
+    }
+
+    /// After an alarm, a screen change re-arms the clock, and the next full
+    /// silent window raises a new alarm.
+    #[tokio::test]
+    async fn progress_after_a_stall_alarm_lets_a_new_silence_alarm_again() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let sub = silent_working_worker(&mut mux);
+        assert_eq!(mux.take_ready_round_deliveries().len(), 1);
+
+        change_screen(&mut mux, sub);
+        assert!(mux.take_ready_round_deliveries().is_empty());
+        let i = watch_of(&mux, sub);
+        assert!(matches!(mux.watches[i].stall, StallClock::Armed(_)));
+
+        mux.watches[i].stall = StallClock::Armed(Instant::now() - Duration::from_secs(1));
+        assert_eq!(mux.take_ready_round_deliveries().len(), 1);
 
         mux.shutdown();
     }
@@ -3192,17 +4537,18 @@ mod tests {
         };
         mux.main_panel_id = Some(main);
 
-        // A sub-panel left `Working`, and deliberately no round registered.
-        let Ok(sub) = mux.spawn_panel("reviewer", None, None, None) else {
-            eprintln!("skipping: no agent CLI on PATH");
-            return;
-        };
-        mux.note_prompt_delivered(sub);
+        // A sub-panel `Working` on something caucus never handed it — the only
+        // way to be unwatched now, since every prompt caucus delivers arms a
+        // watch (`arm_worker_watch`). Pushed straight in, bypassing the prompt.
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
         assert_eq!(
             mux.panels().iter().find(|p| p.id == sub).unwrap().state(),
             PanelState::Working,
         );
-        assert!(mux.pending_rounds.is_empty());
+        assert!(
+            mux.watches.is_empty(),
+            "an un-prompted panel is not watched, so nothing will wake main",
+        );
 
         mux.poll_stranded_main();
         assert_eq!(
@@ -3215,6 +4561,75 @@ mod tests {
             "nudging must arm the cooldown latch",
         );
 
+        mux.shutdown();
+    }
+
+    /// Claude Code's folder-trust dialog enables bracketed paste, so main is
+    /// `Idle` on it, and its default is "No, exit": a push there quits main.
+    /// Every push waits until main's screen shows its prompt again.
+    #[tokio::test]
+    async fn no_push_lands_on_a_main_showing_a_dialog() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let mf = AgentManifest::new(mux.session.id, main, "main", "main", AgentCli::Claude, None);
+        mux.manifests.insert(main, mf);
+        let draw = |mux: &mut Multiplexer, screen: &str| {
+            let panel = mux.panels.iter_mut().find(|p| p.id == main).unwrap();
+            panel
+                .grid
+                .advance(format!("\x1b[2J\x1b[H{}", screen.replace('\n', "\r\n")).as_bytes());
+        };
+        draw(
+            &mut mux,
+            "Quick safety check: Is this a project you trust?\n\n❯ No, exit\n  Yes, I trust this folder\n\nEnter to confirm · Esc to cancel",
+        );
+        push_cat_panel(&mut mux, "reviewer", PanelState::Working);
+
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle
+        );
+        assert!(mux.main_stranded_last_nudge.is_none());
+
+        draw(&mut mux, "● ok\n────────\n❯ \n────────\n  ? for shortcuts");
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working
+        );
+        mux.shutdown();
+    }
+
+    /// A booting sub-panel is not busy: resume respawns every panel, and a
+    /// main that boots first must not be told its subs run work it never
+    /// handed out. The same panel counts once it is `Working`.
+    #[tokio::test]
+    async fn a_spawning_sub_does_not_strand_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let main = push_cat_panel(&mut mux, "main", PanelState::Idle);
+        mux.main_panel_id = Some(main);
+        let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Spawning);
+
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Idle
+        );
+        assert!(mux.main_stranded_last_nudge.is_none());
+
+        let panel = mux.panels.iter_mut().find(|p| p.id == sub).unwrap();
+        crate::panel::lifecycle::transition(panel, PanelState::Working).unwrap();
+        mux.poll_stranded_main();
+        assert_eq!(
+            mux.panels().iter().find(|p| p.id == main).unwrap().state(),
+            PanelState::Working
+        );
         mux.shutdown();
     }
 
@@ -3357,16 +4772,16 @@ mod tests {
         );
     }
 
-    /// A hermetic main + settled-sub round: main mid-turn (`Working`), the sub
-    /// finished, the round registered and due. The window the hook-reply path
-    /// exists for.
+    /// A hermetic main + settled sub: main mid-turn (`Working`), the sub
+    /// finished, its watch armed and due. The window the hook-reply path exists
+    /// for.
     fn due_round_with_working_main(mux: &mut Multiplexer) -> (PanelId, PanelId) {
         let main = push_cat_panel(mux, "main", PanelState::Working);
         mux.main_panel_id = Some(main);
         let sub = push_cat_panel(mux, "reviewer", PanelState::Working);
         finish_turn(mux, sub, "audit done: 3 findings");
-        mux.register_round(vec![sub], None, Some(3600), None, None);
-        assert_eq!(mux.pending_rounds.len(), 1);
+        arm(mux, sub, 3600);
+        assert_eq!(mux.watches.len(), 1);
         (main, sub)
     }
 
@@ -3393,20 +4808,17 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        let (main, _sub) = due_round_with_working_main(&mut mux);
+        let (main, sub) = due_round_with_working_main(&mut mux);
 
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
 
         let StopDirective::Deliver { reason } = rx.try_recv().expect("directive must be sent");
         assert!(
-            reason.contains("Round complete"),
-            "the directive carries the round summary: {reason}"
+            reason.contains(&format!("panel {sub}")),
+            "the directive carries the panel's streamed delivery: {reason}"
         );
-        assert!(
-            mux.pending_rounds.is_empty(),
-            "the delivered round is consumed"
-        );
+        assert!(mux.watches.is_empty(), "the delivered round is consumed");
         assert_eq!(
             mux.panels.iter().find(|p| p.id == main).unwrap().state(),
             PanelState::Working,
@@ -3414,8 +4826,8 @@ mod tests {
         );
 
         // Exactly-once: the keystroke push has nothing left to deliver.
-        mux.poll_pending_rounds();
-        assert!(mux.pending_rounds.is_empty());
+        mux.poll_worker_watches();
+        assert!(mux.watches.is_empty());
         mux.shutdown();
     }
 
@@ -3440,7 +4852,7 @@ mod tests {
             "the sender must be dropped (allow), not answered"
         );
         assert_eq!(
-            mux.pending_rounds.len(),
+            mux.watches.len(),
             1,
             "the round stays for the keystroke push after the grace"
         );
@@ -3477,7 +4889,7 @@ mod tests {
         mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
 
         assert_eq!(
-            mux.pending_rounds.len(),
+            mux.watches.len(),
             1,
             "a dead hook must not consume the round"
         );
@@ -3492,8 +4904,8 @@ mod tests {
         );
 
         // The ordinary push completes the delivery.
-        mux.poll_pending_rounds();
-        assert!(mux.pending_rounds.is_empty(), "the push delivered it");
+        mux.poll_worker_watches();
+        assert!(mux.watches.is_empty(), "the push delivered it");
         assert_eq!(
             mux.panels.iter().find(|p| p.id == main).unwrap().state(),
             PanelState::Working,
@@ -3517,7 +4929,7 @@ mod tests {
 
         assert!(rx.try_recv().is_err(), "a sub panel's hook is always allow");
         assert_eq!(
-            mux.pending_rounds.len(),
+            mux.watches.len(),
             1,
             "no round is consumed by a sub panel's signal"
         );
@@ -3578,7 +4990,7 @@ mod tests {
             "a second consecutive boundary must be allowed, not delivered"
         );
         assert_eq!(
-            mux.pending_rounds.len(),
+            mux.watches.len(),
             1,
             "the round stays pending for the keystroke push"
         );
@@ -3593,8 +5005,8 @@ mod tests {
         );
 
         // The still-due round now rides the keystroke push into the idle main.
-        mux.poll_pending_rounds();
-        assert!(mux.pending_rounds.is_empty(), "the push delivered it");
+        mux.poll_worker_watches();
+        assert!(mux.watches.is_empty(), "the push delivered it");
         assert_eq!(
             mux.panels.iter().find(|p| p.id == main).unwrap().state(),
             PanelState::Working,
@@ -3656,61 +5068,65 @@ mod tests {
         mux.handle_signal_with_reply(stop_signal(&mux, main), Some(tx));
 
         let StopDirective::Deliver { reason } = rx.try_recv().expect("directive must be sent");
-        let round_at = reason.find("Round complete").expect("round in reason");
+        let round_at = reason
+            .find(&format!("panel {sub}"))
+            .expect("round in reason");
         let notice_at = reason.find("which schema?").expect("notice in reason");
         assert!(
             round_at < notice_at,
             "the round leads, notices follow: {reason}"
         );
-        assert!(mux.pending_rounds.is_empty(), "the round is consumed");
+        assert!(mux.watches.is_empty(), "the round is consumed");
         assert!(
             mux.pending_question_notices.is_empty(),
             "the notices are consumed"
         );
 
         // Exactly-once on both: neither push has anything left.
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         mux.poll_question_notices();
-        assert!(mux.pending_rounds.is_empty());
+        assert!(mux.watches.is_empty());
         assert!(mux.pending_question_notices.is_empty());
         mux.shutdown();
     }
 
-    /// `take_due_round_summary` judges dueness fresh and takes at most one
-    /// round: an unfinished round is left pending and yields `None`; once due
-    /// it is completed, removed, and a second call finds nothing.
+    /// `take_ready_round_deliveries` judges readiness fresh and takes each ready
+    /// panel exactly once: an unfinished round yields nothing and stays pending;
+    /// once the panel settles it is streamed, marked delivered, the round
+    /// retired, and a second call finds nothing.
     #[tokio::test]
-    async fn take_due_round_summary_takes_exactly_the_due_round() {
+    async fn take_ready_round_deliveries_takes_each_ready_panel_once() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
         mux.note_prompt_delivered(sub);
-        mux.register_round(vec![sub], None, Some(3600), None, None);
+        arm(&mut mux, sub, 3600);
 
-        assert_eq!(
-            mux.take_due_round_summary(),
-            None,
-            "an unfinished round is not taken"
+        assert!(
+            mux.take_ready_round_deliveries().is_empty(),
+            "a working panel is not ready to deliver"
         );
-        assert_eq!(mux.pending_rounds.len(), 1, "and it stays pending");
+        assert_eq!(mux.watches.len(), 1, "and the round stays pending");
 
-        finish_turn(&mut mux, sub, "done");
-        let summary = mux
-            .take_due_round_summary()
-            .expect("a settled round is due");
-        assert!(summary.contains("Round complete"), "got: {summary}");
-        assert!(mux.pending_rounds.is_empty());
-        assert_eq!(
-            mux.take_due_round_summary(),
-            None,
-            "a taken round cannot be taken twice"
+        stop_turn(&mut mux, sub, "done");
+        let deliveries = mux.take_ready_round_deliveries();
+        assert_eq!(deliveries.len(), 1, "the settled panel is streamed once");
+        assert!(
+            deliveries[0].contains(&format!("panel {sub}")),
+            "got: {}",
+            deliveries[0]
+        );
+        assert!(mux.watches.is_empty(), "the round retires once drained");
+        assert!(
+            mux.take_ready_round_deliveries().is_empty(),
+            "a delivered panel cannot be taken twice"
         );
         mux.shutdown();
     }
 
     /// A pending round is itself a wake path, so a main idle with a `Working`
     /// sub is *not* stranded while a round is queued — no nudge fires and the
-    /// round stays queued for [`Multiplexer::poll_pending_rounds`] to deliver.
+    /// round stays queued for [`Multiplexer::poll_worker_watches`] to deliver.
     ///
     /// Spawning panels needs a real agent CLI; skipped when none is on PATH.
     #[tokio::test]
@@ -3729,7 +5145,7 @@ mod tests {
             return;
         };
         mux.note_prompt_delivered(sub);
-        mux.register_round(vec![sub], None, Some(600), None, None);
+        arm(&mut mux, sub, 600);
 
         mux.poll_stranded_main();
         assert_eq!(
@@ -3737,7 +5153,7 @@ mod tests {
             PanelState::Idle,
             "a queued round is a wake path: main must not be nudged",
         );
-        assert_eq!(mux.pending_rounds.len(), 1, "the round stays queued");
+        assert_eq!(mux.watches.len(), 1, "the round stays queued");
         assert!(
             mux.main_stranded_last_nudge.is_none(),
             "latch stays disarmed"
@@ -3797,11 +5213,8 @@ mod tests {
             return;
         };
         mux.main_panel_id = Some(main);
-        let Ok(sub) = mux.spawn_panel("reviewer", None, None, None) else {
-            eprintln!("skipping: no agent CLI on PATH");
-            return;
-        };
-        mux.note_prompt_delivered(sub);
+        // Un-prompted `Working` panel: unwatched, so main really is stranded.
+        let _sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
 
         // First nudge fires and flips main to Working.
         mux.poll_stranded_main();
@@ -3917,11 +5330,11 @@ mod tests {
         assert_ne!(menu, perm, "a menu and a yes/no prompt must not collide");
     }
 
-    /// `panel_blocked_prompt` glues the grid rows to the scanners: a `[y/n]`
+    /// `scan_panel_screen` glues the grid rows to the scanners: a `[y/n]`
     /// prompt rendered into a live panel's grid is detected as a `Permission`
     /// blocker (the grid → `row_text` → `scan_yes_no_prompt` path end to end).
     #[tokio::test]
-    async fn panel_blocked_prompt_detects_a_live_yes_no_prompt() {
+    async fn scan_panel_screen_detects_a_live_yes_no_prompt() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let pid = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
@@ -3932,7 +5345,7 @@ mod tests {
             .grid
             .advance(b"Building project...\r\nContinue? [y/N]");
 
-        match Multiplexer::panel_blocked_prompt(panel) {
+        match Multiplexer::scan_panel_screen(panel, None).blocked {
             Some(BlockedPrompt::Permission(line)) => assert!(
                 line.contains("[y/N]"),
                 "the detected prompt line must be the y/n line: {line:?}"
@@ -3966,7 +5379,7 @@ mod tests {
             .unwrap()
             .grid
             .advance(b"Building...\r\nContinue? [y/N]");
-        mux.register_round(vec![sub], None, Some(600), None, None);
+        arm(&mut mux, sub, 600);
 
         // Kill main's PTY: a send_keys to it now errors.
         mux.panels
@@ -4015,11 +5428,11 @@ Enter to select - up/down to navigate - Esc to cancel";
             .grid
             .advance(screen.as_bytes());
 
-        mux.register_round(
-            vec![sub],
+        mux.queue_tasks(
+            sub,
+            vec![],
             None,
             Some(600),
-            None,
             Some(SelectionPolicy {
                 prefer: vec!["structural".to_string()],
                 avoid: vec![],
@@ -4035,15 +5448,15 @@ Enter to select - up/down to navigate - Esc to cancel";
             !mux.notified_blockers.contains_key(&sub),
             "an auto-answered menu must not also escalate a notice to main",
         );
-        // The round records the answered fork for the delivered report.
+        // The watch records the answered fork for the delivered report.
         assert_eq!(
-            mux.pending_rounds[0].auto_answers.len(),
+            mux.watches[watch_of(&mux, sub)].auto_answers.len(),
             1,
             "the auto-answer must be recorded on the round",
         );
-        assert_eq!(mux.pending_rounds[0].auto_answers[0].number, 2);
+        assert_eq!(mux.watches[watch_of(&mux, sub)].auto_answers[0].number, 2);
         assert!(
-            mux.pending_rounds[0].auto_answers[0]
+            mux.watches[watch_of(&mux, sub)].auto_answers[0]
                 .label
                 .contains("Structural")
         );
@@ -4082,11 +5495,11 @@ Enter to select - up/down to navigate - Esc to cancel";
             .advance(screen.as_bytes());
 
         // No option label contains `structural` → no unique match → escalate.
-        mux.register_round(
-            vec![sub],
+        mux.queue_tasks(
+            sub,
+            vec![],
             None,
             Some(600),
-            None,
             Some(SelectionPolicy {
                 prefer: vec!["structural".to_string()],
                 avoid: vec![],
@@ -4228,37 +5641,40 @@ Enter to select - up/down to navigate - Esc to cancel";
         );
     }
 
-    /// `push_auto_answers` emits nothing for a round that auto-answered no menu,
-    /// and one line per recorded auto-answer otherwise.
+    /// `push_panel_auto_answers` emits nothing for a worker caucus auto-answered
+    /// no menu on, and one line per recorded auto-answer. Cross-panel leakage is
+    /// structurally impossible now that records live on a per-panel
+    /// [`WorkerWatch`] — there is no other panel's list to read.
     #[test]
-    fn auto_answers_block_lists_each_resolved_menu() {
-        let mut round = pending_round(
-            vec![],
-            ReadPanelMode::LastMessage,
-            HashMap::new(),
-            HashMap::new(),
-        );
+    fn auto_answers_block_lists_each_resolved_menu_for_the_panel() {
+        let p = PanelId::new();
+        let mut w = watch(p, ReadPanelMode::LastMessage, Vec::new(), VecDeque::new());
 
         let mut out = String::new();
-        push_auto_answers(&mut out, &round);
+        push_panel_auto_answers(&mut out, &w);
         assert!(out.is_empty(), "no auto-answers → no block");
 
-        let p = PanelId::new();
-        round.auto_answers.push(AutoAnswerRecord {
-            panel: p,
+        w.auto_answers.push(AutoAnswerRecord {
             role: "reviewer".to_string(),
             number: 2,
             label: "Structural fix at source".to_string(),
         });
-        push_auto_answers(&mut out, &round);
+        w.auto_answers.push(AutoAnswerRecord {
+            role: "reviewer".to_string(),
+            number: 9,
+            label: "A later fork".to_string(),
+        });
+        push_panel_auto_answers(&mut out, &w);
         assert!(
-            out.contains("caucus auto-answered 1 selection menu(s)"),
+            out.contains("caucus auto-answered 2 selection menu(s) on this panel"),
             "got: {out}"
         );
         assert!(
-            out.contains(&format!(
-                "panel {p} (role: reviewer) → option 2 \"Structural fix at source\""
-            )),
+            out.contains("→ option 2 \"Structural fix at source\" (role: reviewer)"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("→ option 9 \"A later fork\" (role: reviewer)"),
             "got: {out}"
         );
     }
@@ -4304,13 +5720,12 @@ Enter to select - up/down to navigate - Esc to cancel";
         let mut mux = mux(&tmp);
         let sub = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
 
-        mux.register_round(vec![sub], None, Some(600), None, None);
+        arm(&mut mux, sub, 600);
 
         let recs = crate::session::round_record::read(&mux.session.root_dir);
-        assert_eq!(recs.len(), 1, "the registered round must be persisted");
-        assert_eq!(recs[0].panels.len(), 1);
+        assert_eq!(recs.len(), 1, "the armed watch must be persisted");
         assert_eq!(
-            recs[0].panels[0].role, "reviewer",
+            recs[0].role, "reviewer",
             "the panel id must be resolved to its role label"
         );
 
@@ -4328,15 +5743,15 @@ Enter to select - up/down to navigate - Esc to cancel";
 
         // A round on a non-existent id is due immediately and delivers to the
         // idle main panel.
-        mux.register_round(vec![PanelId::new()], None, Some(600), None, None);
+        arm(&mut mux, PanelId::new(), 600);
         assert!(
             crate::session::round_record::path(&mux.session.root_dir).exists(),
             "registration writes the snapshot"
         );
 
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
         assert!(
-            mux.pending_rounds.is_empty(),
+            mux.watches.is_empty(),
             "the round delivered to the idle main panel"
         );
         assert!(
@@ -4353,17 +5768,15 @@ Enter to select - up/down to navigate - Esc to cancel";
     /// delivers to the idle main worker (flipping it to `Working`), one-shot.
     #[tokio::test]
     async fn resume_ingests_dropped_rounds_and_notifies_main() {
-        use crate::session::round_record::{PendingRoundRecord, RoundPanelRecord};
+        use crate::session::round_record::WorkerWatchRecord;
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
 
-        // A round the prior instance left in flight when it quit/crashed.
-        let recs = vec![PendingRoundRecord {
-            panels: vec![RoundPanelRecord {
-                role: "backend".into(),
-                captured: vec!["finished analysis".into()],
-                pending_backlog: 1,
-            }],
+        // A worker the prior instance was still watching when it quit/crashed.
+        let recs = vec![WorkerWatchRecord {
+            role: "backend".into(),
+            captured: vec!["finished analysis".into()],
+            pending_backlog: 1,
             read_mode: ReadPanelMode::LastMessage,
         }];
         crate::session::round_record::write(&mux.session.root_dir, &recs).unwrap();
@@ -4421,16 +5834,14 @@ Enter to select - up/down to navigate - Esc to cancel";
     /// durable backup.
     #[tokio::test]
     async fn ingest_persists_the_notice_until_delivered() {
-        use crate::session::round_record::{self, PendingRoundRecord, RoundPanelRecord};
+        use crate::session::round_record::{self, WorkerWatchRecord};
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
 
-        let recs = vec![PendingRoundRecord {
-            panels: vec![RoundPanelRecord {
-                role: "backend".into(),
-                captured: vec![],
-                pending_backlog: 0,
-            }],
+        let recs = vec![WorkerWatchRecord {
+            role: "backend".into(),
+            captured: vec![],
+            pending_backlog: 0,
             read_mode: ReadPanelMode::LastMessage,
         }];
         round_record::write(&mux.session.root_dir, &recs).unwrap();
@@ -4553,8 +5964,17 @@ Enter to select - up/down to navigate - Esc to cancel";
             .generation();
 
         let sentinel = BlockedPrompt::Permission("Continue? [y/N]".into());
-        mux.blocked_scan_cache
-            .insert(pid, (generation, Some(sentinel.clone())));
+        mux.screen_scan_cache.insert(
+            pid,
+            (
+                generation,
+                ScreenScan {
+                    blocked: Some(sentinel.clone()),
+                    activity: crate::term::ScreenActivity::Unknown,
+                    dialog: false,
+                },
+            ),
+        );
 
         // Same generation → cache hit → the sentinel, no re-scan.
         assert_eq!(
@@ -4567,7 +5987,7 @@ Enter to select - up/down to navigate - Esc to cancel";
         // cache is refreshed to the new generation.
         assert!(mux.panel_blocked_cached(pid, generation + 1).is_none());
         assert_eq!(
-            mux.blocked_scan_cache.get(&pid).map(|(g, _)| *g),
+            mux.screen_scan_cache.get(&pid).map(|(g, _)| *g),
             Some(generation + 1),
             "the cache must track the latest generation it scanned"
         );
@@ -4575,19 +5995,29 @@ Enter to select - up/down to navigate - Esc to cancel";
         mux.shutdown();
     }
 
-    /// A killed panel's blocked-scan cache entry is pruned, so the cache cannot
+    /// A killed panel's screen-scan cache entry is pruned, so the cache cannot
     /// grow with dead-panel ids over a long session.
     #[tokio::test]
-    async fn kill_panel_prunes_the_blocked_scan_cache() {
+    async fn kill_panel_prunes_the_screen_scan_cache() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
         let pid = push_cat_panel(&mut mux, "reviewer", PanelState::Working);
-        mux.blocked_scan_cache.insert(pid, (0, None));
+        mux.screen_scan_cache.insert(
+            pid,
+            (
+                0,
+                ScreenScan {
+                    blocked: None,
+                    activity: crate::term::ScreenActivity::Unknown,
+                    dialog: false,
+                },
+            ),
+        );
 
         mux.kill_panel(pid).unwrap();
         assert!(
-            !mux.blocked_scan_cache.contains_key(&pid),
-            "killing a panel must drop its blocked-scan cache entry"
+            !mux.screen_scan_cache.contains_key(&pid),
+            "killing a panel must drop its screen-scan cache entry"
         );
 
         mux.shutdown();

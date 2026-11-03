@@ -20,9 +20,10 @@ use crate::agent::manifest::AgentManifest;
 use crate::config::Config;
 use crate::input::FocusRouter;
 use crate::mcp::control_server::ControlServer;
+use crate::mcp::events::EventFeed;
 use crate::panel::lifecycle::Panel;
 use crate::render::{Layout, LayoutMode, LayoutTree, Rect};
-use crate::session::id::PanelId;
+use crate::session::id::{PanelId, SessionId};
 use crate::session::lock::{SessionLock, SessionLockError};
 use crate::session::state::Session;
 use crate::signal::server::SignalServer;
@@ -38,9 +39,10 @@ mod scroll;
 mod spawn;
 mod spawn_async;
 mod unbound;
+mod wait;
 
 use self::mcp::PendingSubmit;
-use self::rounds::{PendingRound, QuestionNotice};
+use self::rounds::{QuestionNotice, WorkerWatch};
 pub(crate) use self::scroll::ScrollState;
 
 /// The live multiplexer: one [`Session`] plus every panel running in it.
@@ -84,18 +86,37 @@ pub struct Multiplexer {
     quit: bool,
     /// Monotonic counter for agent-name suffixes per role.
     role_counts: HashMap<String, usize>,
-    /// Rounds caucus is watching to deliver to the main worker
-    /// ([`Multiplexer::poll_pending_rounds`]).
-    pending_rounds: Vec<PendingRound>,
+    /// One watch per worker caucus owes the main worker a result for
+    /// ([`Multiplexer::poll_worker_watches`]). Armed when caucus hands a
+    /// sub-panel a prompt, dropped when its result is delivered.
+    watches: Vec<WorkerWatch>,
+    /// Panels a watch still owes main while that watch is *moved out* of
+    /// `watches` — each delivery path takes the list so its per-watch poll can
+    /// borrow `self` mutably.
+    ///
+    /// Without this, "is this panel already watched"
+    /// ([`Multiplexer::worker_watched`]) would read `false` for every panel
+    /// mid-poll, and the backlog feed — which re-prompts a panel from *inside*
+    /// the poll, through `send_keys` → `note_prompt_delivered` →
+    /// [`Multiplexer::arm_worker_watch`] — would arm a second watch on a panel
+    /// that already has one, delivering it to main twice. Holding the owed
+    /// panels here keeps that predicate true wherever the watch currently
+    /// lives.
+    watched_in_flight: HashSet<PanelId>,
     /// `spawn_role(worktree=true)` calls whose `git worktree add` is running on
     /// a worker thread. Finished off the event loop so a slow worktree create
     /// never freezes the TUI; completed by [`Multiplexer::poll_pending_spawns`].
     pending_spawns: Vec<spawn_async::PendingSpawn>,
-    /// Submitting Enters held back from bracketed pastes until the agent has
-    /// ingested the paste. A bracketed-paste agent (Claude Code) that commits a
-    /// large paste to a `[Pasted text #N]` placeholder swallows a `\r` arriving
-    /// in the *same* PTY burst, so the submit is delivered as a discrete
-    /// keypress on a later tick ([`Multiplexer::poll_pending_submits`]).
+    /// `wait` calls whose panel was still busy when drained; answered by
+    /// [`Multiplexer::poll_waits`].
+    pending_waits: Vec<wait::PendingWait>,
+    /// Input owed to panels, written by [`Multiplexer::poll_pending_submits`]:
+    /// everything sent to an agent that has not yet enabled bracketed paste,
+    /// and submitting Enters held back from bracketed pastes until the agent
+    /// has ingested the paste. A bracketed-paste agent (Claude Code) that
+    /// commits a large paste to a `[Pasted text #N]` placeholder swallows a
+    /// `\r` arriving in the *same* PTY burst, so the submit is delivered as a
+    /// discrete keypress on a later tick.
     pending_submits: Vec<PendingSubmit>,
     /// The panel awaiting a close confirmation (`Ctrl-A x`), or `None`. While
     /// `Some`, the close-confirm prompt is drawn and the focus router captures
@@ -123,7 +144,7 @@ pub struct Multiplexer {
     /// next Stop is *allowed* — the main reaches a real `Idle` boundary, where
     /// Claude Code can compact and the user can type, and any still-due round
     /// rides the `main_deliverable`-gated keystroke push
-    /// ([`Multiplexer::poll_pending_rounds`]) instead. Without the bound a
+    /// ([`Multiplexer::poll_worker_watches`]) instead. Without the bound a
     /// stream of due rounds answers `Deliver` every turn and the main never
     /// returns to idle — it wedges in a continue→compact→continue loop. Set on
     /// every main Stop to whether *this* boundary was hook-continued, so an
@@ -148,13 +169,56 @@ pub struct Multiplexer {
     /// this tracks prompts caucus answered *for* it under its pre-authorized
     /// [`crate::mcp::protocol::SelectionPolicy`].
     auto_answered: HashMap<PanelId, u64>,
+    /// Panels on which caucus submitted a *local* slash command (`/compact`,
+    /// `/clear`) and, having classified it, deliberately opened **no** capture
+    /// turn for it ([`McpToolSurface::send_keys`]). Consumed by
+    /// [`Multiplexer::close_local_command`] when the command's lifecycle hook
+    /// fires: with the marker set there is no turn of caucus's to close, so the
+    /// close must touch neither the capture turn nor the panel state.
+    ///
+    /// This is the identity `close_local_command` otherwise lacks. Without it
+    /// the close decides from the *live* state and so cannot tell "the turn I
+    /// opened" from "a prompt that arrived while the command was still
+    /// running" — the second case ends a turn the command never started, flips
+    /// the panel to `Idle`, and lets its watch settle on the *previous* turn's
+    /// output (Invariant I-9's latch, taken from work the new prompt never
+    /// did). A panel *not* in this set typed the command by hand: keystrokes
+    /// arrive byte-by-byte and cannot be classified, so a turn *was* opened for
+    /// it and the hook is the only thing that can close it.
+    local_commands_without_turn: HashSet<PanelId>,
+    /// Prompts caucus delivered to a panel whose own turn has not closed yet.
+    ///
+    /// A prompt submitted while the panel's turn is already open does not start
+    /// a turn: the agent CLI queues it and runs it after the current one. caucus
+    /// would otherwise have no record of it at all — `begin_turn` no-ops on an
+    /// open turn and `arm_worker_watch` no-ops on a watched panel — so the
+    /// *earlier* turn's Stop looked like the queued prompt's boundary: the panel
+    /// went `Idle`, its watch latched (Invariant I-9), and main was handed the
+    /// earlier turn's output as the queued prompt's answer while the queued
+    /// prompt had not run. Delivery then spent the watch, so the queued prompt's
+    /// real result was never reported at all.
+    ///
+    /// Symmetric accounting through one owner each: incremented only by
+    /// [`Multiplexer::note_prompt_delivered`] (and its hook-reply sibling), the
+    /// paths that actually submit a prompt; decremented only by
+    /// [`Multiplexer::consume_outstanding_prompt`] at a real turn boundary. A
+    /// non-zero remainder means the panel is *between* queued prompts, not
+    /// between turns — the boundary re-opens a capture turn and keeps the panel
+    /// `Working`, so the watch cannot latch until the last queued prompt ends.
+    outstanding_prompts: HashMap<PanelId, u32>,
+    /// Per-panel evidence for lost-turn reconciliation
+    /// ([`Multiplexer::poll_lost_turns`], [`input::LostTurnProbe`]). Only
+    /// panels currently `Working` carry an entry; it is dropped when the panel
+    /// leaves `Working` (a real boundary), sits on a blocked prompt, or is
+    /// detached.
+    lost_turn_probe: HashMap<PanelId, input::LostTurnProbe>,
     /// `question` notes posted by panel agents (`caucus signal note --kind
     /// question`), waiting to be announced to the main worker. FIFO, drained
     /// one per tick by [`Multiplexer::poll_question_notices`] under the same
     /// `main_deliverable` gate as every other caucus→main push. Capped at
     /// [`rounds::QUESTION_NOTICE_CAP`] (oldest dropped, with a warning) so a
     /// runaway agent cannot grow it unbounded. Ephemeral, like
-    /// `pending_rounds`: a notice does not survive a caucus restart.
+    /// `watches`: a notice does not survive a caucus restart.
     pending_question_notices: VecDeque<QuestionNotice>,
     /// Instant of the last stranded-main nudge, or `None` while not stranded.
     /// caucus's only caucus→main pushes require a registered round; if the
@@ -186,15 +250,16 @@ pub struct Multiplexer {
     /// shutdown); the branch persists and is what `caucus resume` re-attaches
     /// a worktree on. Populated at spawn, dropped on kill.
     worktree_branches: HashMap<PanelId, String>,
-    /// Cached blocking-prompt scan per panel, keyed by panel id, valued by the
-    /// grid `generation` it was computed against plus the detected
-    /// [`rounds::BlockedPrompt`] (or `None`).
-    /// [`Multiplexer::poll_round_blocked_panels`] runs every tick while a round
-    /// is pending; without this it would re-materialise each round panel's full
-    /// viewport and re-run the grid scanners on every iteration even when the
-    /// grid did not change. The cache recomputes only when a panel's grid
-    /// generation advances; an entry is pruned when its panel is killed.
-    blocked_scan_cache: HashMap<PanelId, (u64, Option<rounds::BlockedPrompt>)>,
+    /// Cached screen scan per panel, keyed by panel id, valued by the grid
+    /// `generation` it was computed against plus the [`rounds::ScreenScan`]
+    /// (blocked prompt and turn activity).
+    /// [`Multiplexer::poll_round_blocked_panels`] and
+    /// [`Multiplexer::poll_lost_turns`] run every tick; without this they
+    /// would re-materialise each panel's full viewport and re-run the grid
+    /// scanners on every iteration even when the grid did not change. The
+    /// cache recomputes only when a panel's grid generation advances; an entry
+    /// is pruned when its panel is killed.
+    screen_scan_cache: HashMap<PanelId, (u64, rounds::ScreenScan)>,
     /// The branch tip each panel's lane was last checked against for superseded
     /// commits ([`Multiplexer::record_commit_supersessions`]). A commit's
     /// reachability from a branch can only change when the branch ref moves, so
@@ -245,6 +310,9 @@ pub struct Multiplexer {
     /// ours cannot become ours later — panels caucus spawns are matched by the
     /// exact-id rule before this cache is consulted.
     unbound_unclaimed: HashSet<String>,
+    /// The `subscribe_events` feed: the `list_panels` rows last published and
+    /// their `seq` ([`Multiplexer::publish_panel_events`]).
+    events: EventFeed,
 }
 
 /// Whether [`Multiplexer::new`] is opening a brand-new session or reopening a
@@ -332,8 +400,9 @@ impl Multiplexer {
         let signal_server = SignalServer::bind(&sock_path)
             .with_context(|| format!("bind turn-signal socket {}", sock_path.display()))?;
 
-        let control_sock_path = control_socket_path(&session);
-        let control_server = ControlServer::bind(&control_sock_path)
+        let events = EventFeed::new();
+        let control_sock_path = control_socket_path(session.id);
+        let control_server = ControlServer::bind(&control_sock_path, events.subscriber())
             .with_context(|| format!("bind control socket {}", control_sock_path.display()))?;
 
         let (cleanup, _consumer) = CleanupQueue::spawn();
@@ -360,8 +429,10 @@ impl Multiplexer {
                 area,
                 quit: false,
                 role_counts: HashMap::new(),
-                pending_rounds: Vec::new(),
+                watches: Vec::new(),
+                watched_in_flight: HashSet::new(),
                 pending_spawns: Vec::new(),
+                pending_waits: Vec::new(),
                 pending_submits: Vec::new(),
                 pending_close: None,
                 main_panel_id: None,
@@ -370,19 +441,23 @@ impl Multiplexer {
                 notified_blockers: HashMap::new(),
                 pending_question_notices: VecDeque::new(),
                 auto_answered: HashMap::new(),
+                local_commands_without_turn: HashSet::new(),
+                outstanding_prompts: HashMap::new(),
+                lost_turn_probe: HashMap::new(),
                 main_stranded_last_nudge: None,
                 layout_mode,
                 zoom: None,
                 show_transcript: false,
                 scroll: None,
                 worktree_branches: HashMap::new(),
-                blocked_scan_cache: HashMap::new(),
+                screen_scan_cache: HashMap::new(),
                 checked_branch_tips: HashMap::new(),
                 resume_round_notice: None,
                 last_liveness_probe: None,
                 view_epoch: 0,
                 pending_clipboard: None,
                 unbound_unclaimed: HashSet::new(),
+                events,
             },
             signal_server,
             control_server,
@@ -454,10 +529,14 @@ impl Multiplexer {
     ///
     /// The inputs partition cleanly by what can change them:
     /// - **PTY reads** bump each panel's grid `generation` (any byte ingest,
-    ///   including cursor moves — see `Grid::advance`).
+    ///   including cursor moves — see `Grid::advance`). Only panels holding a
+    ///   layout slot contribute it: `draw` paints no other grid, so output
+    ///   behind a zoom repaints nothing.
     /// - **Spawn/kill** change the panel set (ids + count).
-    /// - **Turn signals / exit reaping** change `state_label` and the
-    ///   manifest-derived state.
+    /// - **Turn signals / exit reaping** change `state_label`, the
+    ///   manifest-derived state, and the lane-event count (the transcript
+    ///   overlay's turn count and last message change only with an appended
+    ///   event).
     /// - **Keystrokes and terminal resizes** change the view with no other
     ///   counter, so they bump `view_epoch` (focus, layout, zoom, scroll,
     ///   transcript, prefix hint, close-confirm, resize reflow).
@@ -475,15 +554,15 @@ impl Multiplexer {
         }
         let mut acc = hash_one((self.view_epoch, self.focused(), self.panels.len()));
         for p in &self.panels {
-            acc ^= hash_one((
-                p.id,
-                p.grid().generation(),
-                p.state_label(),
-                p.role.as_str(),
-            ));
+            let generation = self.layout.rect_of(p.id).map(|_| p.grid().generation());
+            acc ^= hash_one((p.id, generation, p.state_label(), p.role.as_str()));
         }
         for (id, manifest) in &self.manifests {
-            acc ^= hash_one((*id, manifest.derived_state().as_str()));
+            acc ^= hash_one((
+                *id,
+                manifest.derived_state().as_str(),
+                manifest.lane_events().len(),
+            ));
         }
         acc
     }
@@ -498,19 +577,20 @@ impl Multiplexer {
 /// injected into every agent as `CAUCUS_SOCK`, so its exact location is an
 /// internal detail — only the env var is contract.
 fn socket_path(session: &Session) -> PathBuf {
-    std::env::temp_dir().join(format!("caucus-{}.sock", session_suffix(session)))
+    std::env::temp_dir().join(format!("caucus-{}.sock", session_suffix(session.id)))
 }
 
-/// Choose the MCP control socket path for `session` — distinct from the
-/// turn-signal socket, same SUN_LEN-safe temp-dir scheme.
-fn control_socket_path(session: &Session) -> PathBuf {
-    std::env::temp_dir().join(format!("caucus-{}-ctl.sock", session_suffix(session)))
+/// The control socket path of session `id` — distinct from the turn-signal
+/// socket, same SUN_LEN-safe temp-dir scheme. `caucus ctl --session` derives
+/// it the same way.
+pub fn control_socket_path(id: SessionId) -> PathBuf {
+    std::env::temp_dir().join(format!("caucus-{}-ctl.sock", session_suffix(id)))
 }
 
 /// Short, collision-safe session suffix (last 10 ULID chars) — keeps socket
 /// paths well under the OS `SUN_LEN` cap.
-fn session_suffix(session: &Session) -> String {
-    let id = session.id.to_string();
+fn session_suffix(id: SessionId) -> String {
+    let id = id.to_string();
     id.chars()
         .rev()
         .take(10)
@@ -522,6 +602,14 @@ fn session_suffix(session: &Session) -> String {
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+/// Per-pass loop-turn cost against panel count (`#[ignore]`d profile).
+#[cfg(test)]
+mod tick_profile;
+
+/// Loop stall from a control-socket burst (`#[ignore]`d profile).
+#[cfg(test)]
+mod control_profile;
 
 #[cfg(test)]
 mod tests {

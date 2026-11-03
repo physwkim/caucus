@@ -18,9 +18,9 @@ use super::manifest::AgentManifest;
 /// the sub-agent panels through this server's tools (`spawn_role`, `list_panels`,
 /// ...). claude registers it via the written `.mcp.json` (`mcp_config_path`,
 /// `--mcp-config`); codex has no such flag, so its argv injects
-/// `-c mcp_servers.caucus.{command,args}` built from this. `None` for every
-/// non-main panel — a sub-agent is not an orchestrator and must not receive the
-/// caucus tool surface.
+/// `-c mcp_servers.caucus.{command,args,tool_timeout_sec}` built from this.
+/// `None` for every non-main panel — a sub-agent is not an orchestrator and
+/// must not receive the caucus tool surface.
 #[derive(Debug, Clone)]
 pub struct CaucusMcp {
     pub caucus_bin: PathBuf,
@@ -31,8 +31,8 @@ pub struct CaucusMcp {
 ///
 /// codex has no equivalent of claude's `Stop` hook (the turn-signal mechanism
 /// in `docs/design.md` §7), so without this a codex panel never reports its
-/// turn as done: caucus would keep it `Working` forever and a registered round
-/// would settle only at its fallback deadline. codex *does* invoke a `notify`
+/// turn as done: caucus would keep it `Working` forever and its watch would
+/// report it only through the stall alarm. codex *does* invoke a `notify`
 /// program on `agent-turn-complete`, passing the event JSON as a trailing
 /// argument (verified empirically — `-c notify=[...]` is honoured in the
 /// interactive TUI mode caucus drives over a PTY). caucus registers
@@ -383,7 +383,8 @@ fn claude_args(
     args
 }
 
-/// `codex` argv: `--model` (omitted when unset — codex rejects claude model
+/// `codex` argv: `-c features.daemon_auto_start=false` and
+/// `-c check_for_update_on_startup=false` (no startup chooser), `--model` (omitted when unset — codex rejects claude model
 /// ids), the role's system prompt as `-c instructions=<text>` (codex's base
 /// instructions config override — it has no `--append-system-prompt` flag),
 /// the caucus MCP server as `-c mcp_servers.caucus.*` for the main worker panel
@@ -404,7 +405,20 @@ fn codex_args(
     caucus_mcp: Option<&CaucusMcp>,
     notify: Option<&CodexNotify>,
 ) -> Vec<OsString> {
-    let mut args: Vec<OsString> = Vec::new();
+    // Two startup choosers would stop a codex panel before its first turn, and
+    // an Enter caucus sends there picks the highlighted option: "Update now"
+    // (runs the installer) or "Cancel" (codex exits when the shared background
+    // server's feature settings differ). The panel process must also own its
+    // agent; the per-launch `-c` overrides below already keep codex off that
+    // shared server, and turning off its auto-start drops the warning about it.
+    // Not `--no-daemon`: codex before 0.156 rejects the flag, but ignores an
+    // unknown feature key. Verified on codex 0.162.
+    let mut args: Vec<OsString> = vec![
+        "-c".into(),
+        "features.daemon_auto_start=false".into(),
+        "-c".into(),
+        "check_for_update_on_startup=false".into(),
+    ];
     if let Some(m) = model {
         args.push("--model".into());
         args.push(m.into());
@@ -433,6 +447,15 @@ fn codex_args(
         server_args.push(mcp.control_sock.as_os_str());
         server_args.push("\"]");
         args.push(server_args);
+
+        args.push("-c".into());
+        args.push(
+            format!(
+                "mcp_servers.caucus.tool_timeout_sec={}",
+                crate::mcp::serve::TOOL_TIMEOUT_SECS
+            )
+            .into(),
+        );
     }
     // Turn-completion signalling: codex invokes this `notify` program on
     // `agent-turn-complete` with the event JSON appended as a final argument.
@@ -948,6 +971,14 @@ mod tests {
                         \"/repo/.caucus/sessions/S1/control.sock\"]"),
             "codex must register the caucus server args: {args:?}"
         );
+        let timeout = format!(
+            "mcp_servers.caucus.tool_timeout_sec={}",
+            crate::mcp::serve::TOOL_TIMEOUT_SECS
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "-c" && w[1] == timeout),
+            "codex must raise the caucus tool timeout above the longest wait: {args:?}"
+        );
         // No claude-only MCP flag leaks onto a codex invocation.
         assert!(!args.contains(&"--mcp-config".to_string()));
     }
@@ -1024,6 +1055,43 @@ mod tests {
         };
         let args = args_of(&build_command(&req, PanelId::new()));
         assert!(!args.iter().any(|a| a.starts_with("notify=[")));
+    }
+
+    /// Every codex panel, main or sub-agent, starts past both startup
+    /// choosers: with the shared background server's auto-start off, and
+    /// without the update check. `--no-daemon` stays out: codex before 0.156
+    /// rejects it.
+    #[test]
+    fn codex_argv_skips_the_startup_choosers() {
+        for caucus_mcp in [
+            None,
+            Some(CaucusMcp {
+                caucus_bin: PathBuf::from("/usr/local/bin/caucus"),
+                control_sock: PathBuf::from("/repo/.caucus/sessions/S1/control.sock"),
+            }),
+        ] {
+            let mut r = role();
+            r.agent_cli = AgentCli::Codex;
+            r.model = None;
+            let req = SpawnRequest {
+                role: r,
+                agent_name: "sr".into(),
+                caucus_mcp,
+                ..SpawnRequest::default()
+            };
+            let args = args_of(&build_command(&req, PanelId::new()));
+            assert!(!args.contains(&"--no-daemon".to_string()), "{args:?}");
+            assert!(
+                args.windows(2)
+                    .any(|w| w == ["-c", "features.daemon_auto_start=false"]),
+                "{args:?}"
+            );
+            assert!(
+                args.windows(2)
+                    .any(|w| w == ["-c", "check_for_update_on_startup=false"]),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]

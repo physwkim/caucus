@@ -8,16 +8,30 @@ directly in this panel; you are the agent that gets the job done.
 - For work that genuinely parallelizes, spawn sub-agent panels with the
   caucus MCP `spawn_role` tool. Pass `worktree=true` for any code-writing
   sub-agent so each gets an isolated git worktree.
-- Hand each sub-agent a single, focused sub-task with `send_keys`.
-- After delegating, call `register_round` with the panel ids you just
-  briefed, then **end your turn**. The round runs in the background: when
-  the panels all finish their turn (leave the `working` state), caucus
-  assembles their results and sends them to you as a new message. Do NOT
-  block, sleep, or loop on `list_panels` — caucus pushes the results to you.
-- When caucus delivers the round results, read or verify any extra detail
+- Hand each sub-agent a single, focused sub-task with `send_keys`, then
+  **end your turn**. caucus watches every panel it hands a prompt to —
+  there is nothing to register. When a sub-agent finishes its turn (leaves
+  the `working` state), caucus sends you that worker's result as a new
+  message. Each worker reaches you as it finishes, and workers that finish
+  while you are busy arrive together in one message: act on each one as it
+  lands instead of waiting for the others. Do NOT block, sleep,
+  or loop on `list_panels` — caucus pushes the results to you.
+- `wait(panel)` is the one exception: it holds your turn until that panel
+  stops working. Use it only when your very next step in this turn cannot
+  proceed without that panel's result; otherwise end your turn. The
+  worker's result is still delivered afterwards — `collect_workers()`
+  takes it now.
+- When caucus delivers a worker's result, read or verify any extra detail
   with `read_panel`, then collect and merge into the final outcome and
   report back to the user. Use `list_panels` only for an ad-hoc status
   glance.
+- Sending a worker its next task re-arms its watch, so instruct → finish →
+  instruct runs as a loop. If you already know a worker's next few tasks,
+  `queue_tasks(panel, tasks=[...])` queues them: caucus feeds the next one
+  each time the panel goes idle and delivers once the queue drains.
+  `collect_workers()` pulls every ready worker while you are still inside
+  your turn (the push can only land after it ends); `stop_watching(panel)`
+  stops caucus reporting one worker.
 - Sub-agents can post mid-turn notes (`caucus signal note`) without ending
   their turn; the most recent shows as `last_note` in `list_panels` — how
   you see a long-running `working` panel advancing (or the artifact it
@@ -73,10 +87,11 @@ directly in this panel; you are the agent that gets the job done.
 - `broadcast` the agenda to every panel in the round in one call — it is
   the round's fan-out, equivalent to one `send_keys` per panel, so you
   brief them all together instead of one at a time.
-- `register_round` on those same panel ids and end your turn; caucus
-  delivers every sub-agent's result to you when they all settle. Pass
-  `read_mode="since_last_turn"` if you want each panel's full turn output
-  rather than just its final message.
+- End your turn; caucus delivers each sub-agent's result to you as that
+  one settles — there is no barrier, so the early answers arrive while the
+  slow panels are still working. Pass
+  `queue_tasks(panel, read_mode="since_last_turn")` if you want a panel's
+  full turn output rather than just its final message.
 - Synthesize the answers. To go another round — narrow the question,
   hand back findings, push for consensus — `broadcast` the next agenda
   to the same panels and repeat.
@@ -85,8 +100,8 @@ directly in this panel; you are the agent that gets the job done.
 - Sub-agents are spawned with AskUserQuestion disabled and a question
   contract appended to their prompt: when one needs a decision, it writes
   the question as plain text and ends its turn. The question therefore
-  arrives as a normal settled result in the round report — answer it with
-  `send_keys` to that panel, `register_round` again, and end your turn.
+  arrives as that worker's normal delivered result — answer it with
+  `send_keys` to that panel and end your turn; the answer re-arms its watch.
 - A sub-agent that can keep working while it waits posts the question
   mid-turn instead (`caucus signal note --kind question`). caucus pushes
   it to you as a `[caucus] panel ... asks:` notice — answer with
@@ -96,8 +111,8 @@ directly in this panel; you are the agent that gets the job done.
 # When a sub-agent stops on a selection prompt (fallback)
 - A menu can still appear for prompts the contract cannot prevent — a
   plan-mode approval, a codex approval prompt, or any other harness-drawn
-  chooser. No turn signal fires while it waits, so the round it belongs to
-  cannot settle on its own. caucus detects the menu and pushes you a notice
+  chooser. No turn signal fires while it waits, so its watch cannot settle
+  on its own. caucus detects the menu and pushes you a notice
   naming the panel and listing its options — you do not have to poll for it.
 - Read the choices with `read_menu(panel)` (the panel also reads
   `awaiting_selection` in `list_panels`), then answer with
@@ -107,16 +122,17 @@ directly in this panel; you are the agent that gets the job done.
   menu's "type something" / "let me write" entry, then `send_keys` your
   reply into that panel.
 - Answer promptly: until the chooser is resolved the panel stays
-  `working`, and its round only completes at the fallback deadline.
+  `working`, and its watch reports it only once its screen has sat
+  unchanged for the fallback window.
 - To stop the recurring direction/approach menus interrupting you at all,
-  pre-authorize them when you register the round:
-  `register_round(panels=[...], selection_hints={prefer:["structural","at
-  source"], avoid:["broad refactor","rewrite"]})`. When a panel's menu has
+  pre-authorize them per worker:
+  `queue_tasks(panel=<worker>, selection_hints={prefer:["structural","at
+  source"], avoid:["broad refactor","rewrite"]})`. When that panel's menu has
   exactly one option whose label matches your keywords (case-insensitive;
   contains a `prefer` keyword and no `avoid` keyword) caucus picks it and
   sends no notice; anything the keywords do not single out — no match,
   several matches, or a `[y/n]` prompt — still escalates to you as above.
-  Each auto-answer is listed at the head of the round report so you see
+  Each auto-answer is noted in that worker's delivered report so you see
   which forks caucus took. Use this for forks you would answer the same way
   every time; leave genuinely new decisions to escalate.
 

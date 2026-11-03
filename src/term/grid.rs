@@ -536,9 +536,7 @@ impl Grid {
         }
         let blank = Cell::blank_with(&self.pen);
         let start = self.idx(row, 0);
-        for c in &mut self.viewport[start..start + self.cols] {
-            *c = blank;
-        }
+        self.viewport[start..start + self.cols].fill(blank);
     }
 
     /// Advance the cursor one line down, scrolling the region when it would
@@ -789,13 +787,9 @@ impl Grid {
                 // Cursor to end of current row, then all rows below.
                 let start = self.idx(cr, cc);
                 let row_end = self.idx(cr, 0) + self.cols;
-                for c in &mut self.viewport[start..row_end] {
-                    *c = blank;
-                }
+                self.viewport[start..row_end].fill(blank);
                 let below = self.idx(cr + 1, 0).min(self.viewport.len());
-                for c in &mut self.viewport[below..] {
-                    *c = blank;
-                }
+                self.viewport[below..].fill(blank);
                 // Only the cursor row is partially erased — the rows below are
                 // fully blank — so a split pair can only survive there.
                 self.heal_wide_pairs(cr);
@@ -803,19 +797,13 @@ impl Grid {
             1 => {
                 // Start of screen through cursor (inclusive).
                 let above = self.idx(cr, 0);
-                for c in &mut self.viewport[..above] {
-                    *c = blank;
-                }
+                self.viewport[..above].fill(blank);
                 let end = self.idx(cr, cc) + 1;
-                for c in &mut self.viewport[above..end] {
-                    *c = blank;
-                }
+                self.viewport[above..end].fill(blank);
                 self.heal_wide_pairs(cr);
             }
             2 | 3 => {
-                for c in &mut self.viewport {
-                    *c = blank;
-                }
+                self.viewport.fill(blank);
                 if mode == 3 {
                     self.scrollback.clear();
                 }
@@ -837,9 +825,7 @@ impl Grid {
             2 => row_start..row_end,
             _ => return,
         };
-        for c in &mut self.viewport[range] {
-            *c = blank;
-        }
+        self.viewport[range].fill(blank);
         self.heal_wide_pairs(cr);
         self.wrap_pending = false;
     }
@@ -894,9 +880,7 @@ impl Grid {
         let cur = self.idx(cr, cc);
         self.viewport.copy_within(cur..row_end - n, cur + n);
         let blank = Cell::blank_with(&self.pen);
-        for c in &mut self.viewport[cur..cur + n] {
-            *c = blank;
-        }
+        self.viewport[cur..cur + n].fill(blank);
         self.heal_wide_pairs(cr);
         self.wrap_pending = false;
     }
@@ -911,9 +895,7 @@ impl Grid {
         let cur = self.idx(cr, cc);
         self.viewport.copy_within(cur + n..row_end, cur);
         let blank = Cell::blank_with(&self.pen);
-        for c in &mut self.viewport[row_end - n..row_end] {
-            *c = blank;
-        }
+        self.viewport[row_end - n..row_end].fill(blank);
         self.heal_wide_pairs(cr);
         self.wrap_pending = false;
     }
@@ -924,9 +906,7 @@ impl Grid {
         let n = n.min(self.cols - cc);
         let cur = self.idx(cr, cc);
         let blank = Cell::blank_with(&self.pen);
-        for c in &mut self.viewport[cur..cur + n] {
-            *c = blank;
-        }
+        self.viewport[cur..cur + n].fill(blank);
         self.heal_wide_pairs(cr);
         self.wrap_pending = false;
     }

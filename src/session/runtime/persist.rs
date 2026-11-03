@@ -59,6 +59,7 @@ impl Multiplexer {
         // panel will never launch), and answer the blocked MCP call. Done before
         // `persist_record` so the record reflects no half-spawned panels.
         self.abort_pending_spawns();
+        self.abort_pending_waits();
 
         // Persist the final roster before tearing panels down — this is the
         // record `caucus resume` reads. Worktree directories are removed

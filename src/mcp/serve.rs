@@ -17,7 +17,14 @@ use serde_json::{Value, json};
 
 use super::control_client::ControlClient;
 use super::jsonrpc::{McpDispatch, serve_stdio};
+use super::protocol::MAX_WAIT_SECS;
 use super::tool_catalogue;
+
+/// The per-call timeout caucus registers with the main worker's MCP client:
+/// the longest `wait` plus a margin, so the client never abandons a call
+/// caucus is still holding. Claude Code reads it as the server's `timeout`
+/// (milliseconds), codex as `tool_timeout_sec`.
+pub const TOOL_TIMEOUT_SECS: u64 = MAX_WAIT_SECS + 60;
 
 /// How often to probe the caucus control socket, and how many consecutive
 /// failed probes mark caucus as gone. Two failures (~10s) tolerates a momentary
@@ -28,9 +35,8 @@ const LIVENESS_FAILURES_TO_EXIT: u32 = 2;
 /// Run `caucus mcp-serve`: serve the caucus tools over stdio, forwarding
 /// each call to the control socket at `control_sock`.
 ///
-/// Builds its own multi-thread tokio runtime — the synchronous tool-handler
-/// path ([`ControlClient`]) blocks on the control-socket round-trip, which a
-/// current-thread runtime would deadlock.
+/// Builds its own multi-thread tokio runtime, so concurrent tool calls
+/// ([`serve_stdio`]) spread across threads.
 ///
 /// Exits when *either* stdin reaches EOF (the parent agent closed the pipe) or
 /// the caucus control socket becomes unreachable (`await_caucus_gone`). The
@@ -108,6 +114,7 @@ pub fn mcp_config_json(caucus_bin: &Path, control_sock: &Path) -> Value {
                     "--control-sock",
                     control_sock.display().to_string(),
                 ],
+                "timeout": TOOL_TIMEOUT_SECS * 1000,
             }
         }
     })
@@ -166,6 +173,7 @@ mod tests {
             args,
             vec!["mcp-serve", "--control-sock", "/tmp/caucus-ctl.sock"]
         );
+        assert_eq!(server["timeout"], TOOL_TIMEOUT_SECS * 1000);
     }
 
     #[test]

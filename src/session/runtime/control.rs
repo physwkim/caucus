@@ -4,6 +4,11 @@ use crate::mcp::protocol::{ControlRequest, ControlResponse};
 use crate::mcp::{McpToolSurface, PanelSummary};
 use crate::session::id::PanelId;
 
+/// Most control jobs one [`Multiplexer::drain_control`] call executes. A
+/// burst larger than this is answered over several loop turns, so input,
+/// the PTY pump and the frame keep running while it drains.
+pub(super) const CONTROL_DRAIN_LIMIT: usize = 64;
+
 impl Multiplexer {
     /// Execute one queued [`ControlRequest`] against the live panels and
     /// produce its [`ControlResponse`] (`docs/design.md` §0 #4).
@@ -72,15 +77,15 @@ impl Multiplexer {
             ControlRequest::ListPanels => ControlResponse::Panels {
                 panels: self.list_panels(),
             },
-            ControlRequest::RegisterRound {
-                panels,
+            ControlRequest::QueueTasks {
+                panel,
+                tasks,
                 read_mode,
                 fallback_secs,
-                backlog,
                 selection_hints,
-            } => self.register_round(panels, read_mode, fallback_secs, backlog, selection_hints),
-            ControlRequest::RoundStatus { round } => self.round_status(round),
-            ControlRequest::CancelRound { round } => self.cancel_round(round),
+            } => self.queue_tasks(panel, tasks, read_mode, fallback_secs, selection_hints),
+            ControlRequest::CollectWorkers => self.collect_workers(),
+            ControlRequest::StopWatching { panel } => self.stop_watching(panel),
             ControlRequest::ReadMenu { panel } => match self.read_menu(panel) {
                 Ok(text) => ControlResponse::Panel { text },
                 Err(err) => ControlResponse::error(err),
@@ -91,25 +96,57 @@ impl Multiplexer {
                     Err(err) => ControlResponse::error(err),
                 }
             }
+            // This path cannot hold a reply; `drain_control` parks a wait.
+            ControlRequest::Wait {
+                panel,
+                timeout_secs,
+            } => self.wait_now(panel, timeout_secs),
+            ControlRequest::SubscribeEvents => {
+                // Publish first: the snapshot must be the rows as of its
+                // seq, and they go stale while no one is subscribed.
+                self.refresh_event_feed();
+                let (seq, panels) = self.events.snapshot();
+                ControlResponse::Subscribed { seq, panels }
+            }
         }
     }
 
-    /// Drain every queued control job from `server`, execute it, and answer
-    /// each through its oneshot reply. Called once per event-loop tick — the
-    /// single point at which main worker MCP tool calls touch live panels, on
-    /// the same thread that pumps PTYs (Invariant I-5).
+    /// Publish what changed in the `list_panels` rows since the last call to
+    /// `subscribe_events` clients. Called once per event-loop tick, after
+    /// every step that can change a row. With no subscriber connected it
+    /// returns at once: the rows are not even read.
+    pub fn publish_panel_events(&mut self) {
+        if self.events.has_subscribers() {
+            self.refresh_event_feed();
+        }
+    }
+
+    fn refresh_event_feed(&mut self) {
+        let rows = self.list_panels();
+        self.events.publish(rows);
+    }
+
+    /// Execute up to `CONTROL_DRAIN_LIMIT` queued control jobs from
+    /// `server` in arrival order and answer each through its oneshot reply;
+    /// the rest wait for the next loop turn. Called once per event-loop tick
+    /// — the single point at which main worker MCP tool calls touch live
+    /// panels, on the same thread that pumps PTYs (Invariant I-5).
     ///
     /// Most requests are answered immediately via
-    /// [`Multiplexer::execute_control`]. The one exception is
+    /// [`Multiplexer::execute_control`]. Two are deferred.
     /// `spawn_role(worktree=true)`: its `git worktree add` is slow enough to
     /// freeze the single-threaded loop, so it is deferred off-thread
     /// (`Multiplexer::begin_spawn_role_worktree`) and its reply is sent later
-    /// from `Multiplexer::poll_pending_spawns`. `register_round` is
+    /// from `Multiplexer::poll_pending_spawns`. `wait` on a busy panel is
+    /// parked (`Multiplexer::begin_wait`) and answered from
+    /// `Multiplexer::poll_waits`. `register_round` is
     /// non-blocking in a different way: it acks now and the round is delivered
-    /// later by the caucus→main push in [`Multiplexer::poll_pending_rounds`].
+    /// later by the caucus→main push in [`Multiplexer::poll_worker_watches`].
     pub fn drain_control(&mut self, server: &mut ControlServer) {
-        while let Ok(job) = server.jobs().try_recv() {
-            let ControlJob { request, reply } = job;
+        for _ in 0..CONTROL_DRAIN_LIMIT {
+            let Ok(ControlJob { request, reply }) = server.jobs().try_recv() else {
+                break;
+            };
             match request {
                 // Defer the worktree create off the event loop; the reply is
                 // moved into the pending entry and answered on completion.
@@ -122,6 +159,10 @@ impl Multiplexer {
                 } => {
                     self.begin_spawn_role_worktree(role, model, agent_cli, prompt, reply);
                 }
+                ControlRequest::Wait {
+                    panel,
+                    timeout_secs,
+                } => self.begin_wait(panel, timeout_secs, reply),
                 other => {
                     let response = self.execute_control(other);
                     // A dropped reply channel means the control-socket
@@ -159,7 +200,7 @@ impl Multiplexer {
     /// The [`PanelSummary`] for each id in `panels` that still exists, in the
     /// caller's order — missing ids are omitted (they were killed or the id
     /// was bad).
-    pub(crate) fn panel_summaries(&self, panels: &[PanelId]) -> Vec<PanelSummary> {
+    pub(crate) fn panel_summaries(&mut self, panels: &[PanelId]) -> Vec<PanelSummary> {
         let all = self.list_panels();
         panels
             .iter()
@@ -205,6 +246,47 @@ mod tests {
                 matches!(resp, ControlResponse::Error { .. }),
                 "expected an error response for an unknown panel"
             );
+        }
+    }
+
+    /// A burst over [`CONTROL_DRAIN_LIMIT`] is answered in loop-turn-sized
+    /// batches: each drain answers at most the limit and leaves the rest
+    /// queued for the next turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_control_answers_at_most_the_limit_per_turn() {
+        use crate::mcp::control_client::call;
+        let tmp = TempDir::new().unwrap();
+        let session = Session::new("test", tmp.path().to_path_buf());
+        let config = Config::load(tmp.path()).unwrap();
+        let (mut mux, _signal, mut control) =
+            Multiplexer::new(session, config, area(), 'a', LaunchMode::Fresh).unwrap();
+        let sock = control.sock_path().to_path_buf();
+        let count = CONTROL_DRAIN_LIMIT * 2 + 1;
+        let clients: Vec<_> = (0..count)
+            .map(|_| {
+                let sock = sock.clone();
+                tokio::spawn(async move {
+                    call(&sock, "t", "list_panels", &serde_json::Value::Null).await
+                })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while control.jobs().len() < count {
+            assert!(std::time::Instant::now() < deadline, "burst never queued");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        let mut left = count;
+        while left > 0 {
+            mux.drain_control(&mut control);
+            left -= CONTROL_DRAIN_LIMIT.min(left);
+            assert_eq!(control.jobs().len(), left);
+        }
+        for client in clients {
+            assert!(matches!(
+                client.await.unwrap().unwrap(),
+                Ok(ControlResponse::Panels { .. })
+            ));
         }
     }
 
@@ -266,6 +348,54 @@ mod tests {
             );
         }
 
+        mux.shutdown();
+    }
+
+    /// `subscribe_events` answers with the current rows at the feed's seq;
+    /// each tick then publishes one event per changed row and nothing for an
+    /// unchanged one. With no subscriber the tick publishes nothing.
+    #[tokio::test]
+    async fn subscribe_then_ticks_publish_row_changes() {
+        use crate::mcp::events::PanelEvent;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let panel = crate::bench_support::cat_panel("worker");
+        let id = panel.id;
+        mux.panels.push(panel);
+        mux.rebuild_layout_tree();
+
+        mux.publish_panel_events();
+        assert_eq!(mux.events.snapshot().0, 0, "no subscriber, no publish");
+
+        let mut rx = mux.events.subscriber().subscribe();
+        let ControlResponse::Subscribed { seq, panels } =
+            mux.execute_control(ControlRequest::SubscribeEvents)
+        else {
+            panic!("expected Subscribed");
+        };
+        assert_eq!(seq, 1);
+        assert_eq!(panels, mux.list_panels());
+        assert_eq!(rx.try_recv().unwrap().seq(), 1);
+
+        mux.publish_panel_events();
+        assert!(rx.try_recv().is_err(), "an unchanged row publishes nothing");
+
+        mux.panels[0].state = PanelState::Working;
+        mux.publish_panel_events();
+        match rx.try_recv().unwrap() {
+            PanelEvent::PanelUpdated { seq: 2, panel } => assert_eq!(panel.state, "working"),
+            other => panic!("expected the working row at seq 2, got {other:?}"),
+        }
+
+        mux.kill_panel(id).unwrap();
+        mux.publish_panel_events();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            PanelEvent::PanelRemoved {
+                seq: 3,
+                panel_id: id
+            }
+        );
         mux.shutdown();
     }
 }

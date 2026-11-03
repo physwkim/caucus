@@ -42,6 +42,8 @@ use crate::session::record::{PanelRecord, SessionRecord};
 use crate::session::state::Session;
 use crate::session::{LaunchMode, Multiplexer};
 
+mod loop_prof;
+
 /// Event-loop redraw period — ~60 Hz. Paces the *fastest* redraw and the
 /// render-signature check; within a tick a frame is painted only when the
 /// signature changed (see [`Multiplexer::render_signature`]).
@@ -648,6 +650,7 @@ async fn event_loop(
     // cannot see when caucus is its pty's session leader (see [`orphaned`]).
     let initial_ppid = parent_pid();
     let mut orphaned_since: Option<Instant> = None;
+    let mut prof = loop_prof::LoopProf::from_env();
     loop {
         // Hosting process gone (tmux server killed, terminal emulator died):
         // confirm over the same window as a hangup, then end the session
@@ -707,7 +710,9 @@ async fn event_loop(
         //    briefly fail inside its SIGWINCH handler): warn and keep the
         //    session alive — the reader thread already backed off. Only a
         //    confirmed hangup or orphaning (checked above) ends the loop.
-        match input_rx.recv_timeout(Duration::from_millis(4)) {
+        let received = input_rx.recv_timeout(Duration::from_millis(4));
+        prof.begin();
+        match received {
             Ok(Ok(Event::Key(key))) if key.kind == event::KeyEventKind::Press => {
                 mux.handle_key(key);
             }
@@ -744,6 +749,7 @@ async fn event_loop(
                 break;
             }
         }
+        prof.lap("input");
 
         // 1b. Clipboard — a copy-mode yank (`v` then `y` in the pager) queued an
         //     OSC 52 set-clipboard sequence; emit it to the host terminal so the
@@ -755,6 +761,7 @@ async fn event_loop(
         {
             warn!(error = %e, "clipboard OSC 52 write failed");
         }
+        prof.lap("clipboard");
 
         // 2. Signal events — drain whatever the socket server has queued: turn
         //    signals settle panels (a main-panel signal's reply slot may carry
@@ -773,25 +780,32 @@ async fn event_loop(
                 crate::signal::SignalEvent::Lifecycle(sig) => mux.handle_lifecycle(sig),
             }
         }
+        prof.lap("signals");
 
         // 3. Control jobs — execute the main worker's queued MCP tool calls against
         //    live panels on this same thread (Invariant I-5).
         mux.drain_control(&mut control_server);
+        prof.lap("drain_control");
 
         // 3b. Deferred worktree spawns — a `spawn_role(worktree=true)` runs its
         //     slow `git worktree add` on a worker thread so it never freezes this
         //     loop; finish any whose worktree is now ready (launch the panel and
         //     answer the deferred MCP call). New panels are pumped by step 4.
         mux.poll_pending_spawns();
+        prof.lap("poll_pending_spawns");
 
         // 4. PTY pump — drain every panel into its grid + capture, reap exits.
         mux.pump_all();
+        prof.lap("pump_all");
 
         // 4b. Deferred submits — a bracketed paste's submitting Enter is held
         //     out of the paste burst (the agent swallows a `\r` while it commits
         //     a `[Pasted text #N]` placeholder) and written here as a discrete
         //     keypress once its delay has elapsed, a tick after the paste landed.
+        //     Input sent to a booting agent is pasted here once the pump above
+        //     has seen it enable bracketed paste.
         mux.poll_pending_submits();
+        prof.lap("poll_pending_submits");
 
         // 4c. Resume notice — if this session resumed with rounds left in flight
         //     by the prior instance, tell the main worker (whose conversation
@@ -799,12 +813,23 @@ async fn event_loop(
         //     stops waiting. One-shot; shares the one-push-per-tick gate and
         //     runs before round delivery so the dropped-round notice lands first.
         mux.poll_resume_notice();
+        prof.lap("poll_resume_notice");
 
         // 4d. In-band notifications — drain the OSC 9/99/777 texts the pump
         //     just parsed into each grid and record them on the panel's
         //     manifest timeline (`NotificationSeen`). Capture only — no state
         //     transition, no push — so it competes with nothing below.
         mux.poll_notifications();
+        prof.lap("poll_notifications");
+
+        // 4e. Lost-turn recovery — a panel wedged `Working` with no Stop hook
+        //     coming (a hookless local slash command like `/model`, or a
+        //     dropped Stop) is reconciled to `Idle` once its PTY has sat idle
+        //     at a static prompt long enough. Runs after the pump (grids are
+        //     fresh) and before the pushes below: a reconciled worker can then
+        //     settle, and a reconciled main becomes deliverable, this same tick.
+        mux.poll_lost_turns();
+        prof.lap("poll_lost_turns");
 
         // 5. Blocked panels — if a panel in a pending round has stopped on an
         //    interactive chooser or a raw `[y/n]` prompt (no Stop hook fires, so
@@ -813,24 +838,40 @@ async fn event_loop(
         //    unblocking a stuck panel takes precedence, and both share the
         //    one-push-per-tick gate.
         mux.poll_round_blocked_panels();
+        prof.lap("poll_round_blocked_panels");
 
         // 6. Round delivery — if a registered round's panels have now settled
-        //    (or its fallback deadline passed), assemble their results and
+        //    (or its stall alarm is due), assemble their results and
         //    inject them into the main worker's panel (the caucus→main push).
-        mux.poll_pending_rounds();
+        mux.poll_worker_watches();
+        prof.lap("poll_worker_watches");
+
+        // 6a. Parked `wait` calls — answer each whose panel stopped working.
+        //     After round delivery, so a backlog task fed this tick has
+        //     already turned its panel `working` again.
+        mux.poll_waits();
+        prof.lap("poll_waits");
 
         // 6b. Question notices — a panel agent posted a `question` note
         //     (`caucus signal note`); announce it to the main worker. After
         //     round delivery: a finished round is the primary deliverable, and
         //     all pushes share the one-push-per-tick gate.
         mux.poll_question_notices();
+        prof.lap("poll_question_notices");
 
         // 7. Stranded-main guard — if the main worker went idle with no round
         //    registered while sub-panels still run, nothing above can ever
         //    re-prompt it (both pushes need a round). Nudge it. Runs last: it
-        //    only fires when `pending_rounds` is empty, so it never competes
+        //    only fires when `watches` is empty, so it never competes
         //    with steps 5–6 for the one-push-per-tick gate.
         mux.poll_stranded_main();
+        prof.lap("poll_stranded_main");
+
+        // 7b. Event stream — publish this tick's `list_panels` row changes to
+        //     `subscribe_events` clients. Last, so it sees every change the
+        //     steps above made. Free while no client is subscribed.
+        mux.publish_panel_events();
+        prof.lap("publish_panel_events");
 
         if mux.should_quit() {
             break;
@@ -866,18 +907,22 @@ async fn event_loop(
                     let _ = mux.resize(body);
                 }
             }
+            prof.lap("size_probe");
             let sig = mux.render_signature();
+            prof.lap("render_signature");
             let forced = last_forced_draw.elapsed() >= FORCED_REDRAW_INTERVAL;
             if forced || Some(sig) != last_sig {
                 if let Err(e) = draw(&mut terminal, &mux) {
                     warn!(error = %e, "terminal draw error; continuing");
                 }
+                prof.lap("draw");
                 last_sig = Some(sig);
                 // Any paint — dirty or forced — resets the safety-net timer.
                 last_forced_draw = Instant::now();
             }
             last_draw = Instant::now();
         }
+        prof.flush_if_due();
     }
 
     mux.shutdown();

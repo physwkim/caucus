@@ -2,6 +2,7 @@
 //! instance of one role. Manifest, lane events, derived state, provenance.
 //! See `docs/design.md` §8.
 
+pub(crate) mod codex_home;
 pub mod codex_trust;
 pub mod derive_state;
 pub mod lane_event;

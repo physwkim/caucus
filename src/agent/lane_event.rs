@@ -78,6 +78,24 @@ pub enum LaneEventKind {
     /// way a turn signal would. Produced by
     /// `manifest::record_local_command_completed`.
     LocalCommandCompleted { command: String },
+    /// caucus reconciled a panel wedged `Working` with no turn boundary ever
+    /// coming: a hookless local slash command (`/model`, `/help`, `/status`,
+    /// …) or a dropped Stop hook left the capture turn open, and the panel's
+    /// PTY then sat idle at a static prompt. Unlike `/compact` / `/clear` these
+    /// fire no lifecycle hook, so nothing else would ever close the turn.
+    /// Produced by `manifest::record_turn_reconciled`
+    /// (`Multiplexer::reconcile_lost_turn`); settles the panel the way a turn
+    /// signal would, but records that no signal actually arrived — the timeline
+    /// must not claim a turn completed when caucus only inferred idleness.
+    TurnReconciled,
+    /// caucus closed a turn whose prompt never started one: after the submit
+    /// the panel's screen showed its idle prompt for the prompt-effect window
+    /// with no live-turn indicator or blocked prompt in between, so the text
+    /// may still sit unsubmitted in the agent's input. Produced by
+    /// `manifest::record_prompt_stalled` (`Multiplexer::reconcile_lost_turn`);
+    /// settles the panel like `TurnReconciled`, and tells the watch delivery
+    /// the prompt stalled rather than finished.
+    PromptStalled,
     /// The turn ended blocked (recoverable) — see `blocker`. Produced by
     /// `manifest::record_turn_completed` from a `tool_blocked` signal.
     Blocked { blocker: LaneEventBlocker },
@@ -204,6 +222,12 @@ mod tests {
                 LaneEventKind::LocalCommandCompleted { .. } => {
                     (manifest, "LaneEventKind::LocalCommandCompleted {")
                 }
+                LaneEventKind::TurnReconciled => {
+                    (manifest, "LaneEvent::now(LaneEventKind::TurnReconciled)")
+                }
+                LaneEventKind::PromptStalled => {
+                    (manifest, "LaneEvent::now(LaneEventKind::PromptStalled)")
+                }
                 LaneEventKind::Blocked { .. } => (manifest, "LaneEventKind::Blocked { blocker"),
                 LaneEventKind::Failed { .. } => (manifest, "LaneEventKind::Failed { blocker"),
                 LaneEventKind::CommitCreated { .. } => (input, "LaneEventKind::CommitCreated {"),
@@ -232,6 +256,7 @@ mod tests {
             LaneEventKind::LocalCommandCompleted {
                 command: "/compact".into(),
             },
+            LaneEventKind::PromptStalled,
             LaneEventKind::Blocked {
                 blocker: blocker.clone(),
             },

@@ -8,7 +8,7 @@
 //! makes the reader allocate without bound until it is killed. One source of
 //! truth for "read a line, but never more than a fixed cap" closes that for
 //! every such reader at once (Invariant: no external stream read may allocate
-//! past [`MAX_IPC_LINE_BYTES`]).
+//! past `MAX_IPC_LINE_BYTES`).
 
 use tokio::io::{AsyncBufRead, AsyncReadExt};
 

@@ -476,12 +476,15 @@ impl Multiplexer {
             agent_id: panel.agent_id,
         };
         self.manifests.remove(&panel_id);
-        self.blocked_scan_cache.remove(&panel_id);
+        self.screen_scan_cache.remove(&panel_id);
         self.checked_branch_tips.remove(&panel_id);
+        self.local_commands_without_turn.remove(&panel_id);
+        self.outstanding_prompts.remove(&panel_id);
+        self.lost_turn_probe.remove(&panel_id);
 
         // Keep `main_panel_id` an accurate invariant: it points to a live
         // panel or is None. Without this, killing main leaves it Some(stale),
-        // so `poll_pending_rounds` neither delivers (the gate resolves the id
+        // so `poll_worker_watches` neither delivers (the gate resolves the id
         // to no live panel) nor drops the round (its drop arm fires only when
         // the id is None) — every due round would re-queue forever.
         if self.main_panel_id == Some(panel_id) {
@@ -599,7 +602,7 @@ impl Multiplexer {
             role: role.to_string(),
             branch: Some(format!(
                 "caucus/{}/{}-{}",
-                session_suffix(&self.session),
+                session_suffix(self.session.id),
                 stem,
                 next
             )),
@@ -608,7 +611,7 @@ impl Multiplexer {
             // per-role spawn counter.
             name_override: Some(format!(
                 "{}-{}-{}",
-                session_suffix(&self.session),
+                session_suffix(self.session.id),
                 stem,
                 next,
             )),

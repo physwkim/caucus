@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod cli;
 pub mod config;
+pub mod ctl;
 pub mod doctor;
 pub mod gc;
 pub mod hook;
@@ -27,6 +28,10 @@ pub mod worktree;
 /// Coordinates subprocess-heavy tests so they do not flake under CI load.
 #[cfg(test)]
 mod test_serial;
+
+/// Timing summaries and stand-in panels for the `#[ignore]`d profiles.
+#[cfg(test)]
+mod bench_support;
 
 /// Compile-time package version, exposed for `caucus --version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

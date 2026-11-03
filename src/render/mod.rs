@@ -31,6 +31,9 @@ use crate::term::grid::attr;
 mod tree;
 pub use tree::LayoutTree;
 
+#[cfg(test)]
+mod scale_profile;
+
 /// A rectangle of the terminal, in cells.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Rect {
@@ -542,9 +545,11 @@ pub struct TranscriptRow {
 impl TranscriptRow {
     /// Build a row from a panel and its manifest. The manifest is optional —
     /// before the first manifest write a panel falls back to its coarse
-    /// panel-state label and a zero turn count.
+    /// panel-state label and a zero turn count; a booting panel shows its
+    /// coarse label too
+    /// ([`crate::panel::PanelState::manifest_reports_state`]).
     pub fn build(panel: &Panel, manifest: Option<&AgentManifest>, focused: bool) -> Self {
-        let state = match manifest {
+        let state = match manifest.filter(|_| panel.state().manifest_reports_state()) {
             Some(m) => derived_state_label(m.derived_state()).to_string(),
             None => panel.state_label().to_string(),
         };
@@ -991,6 +996,33 @@ mod tests {
             grid: crate::term::Grid::new(78, 22),
             capture: OutputCapture::new(),
         }
+    }
+
+    /// A fresh manifest has no boot phase: the row shows the coarse
+    /// `spawning` while the CLI boots and the manifest's `idle` after.
+    #[test]
+    fn a_booting_panel_row_shows_spawning_not_the_manifest_state() {
+        use crate::role::spec::AgentCli;
+        use crate::session::id::SessionId;
+        let mut panel = cat_panel();
+        let manifest = AgentManifest::new(
+            SessionId::new(),
+            panel.id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        panel.state = crate::panel::PanelState::Spawning;
+        assert_eq!(
+            TranscriptRow::build(&panel, Some(&manifest), false).state,
+            "spawning"
+        );
+        panel.state = crate::panel::PanelState::Idle;
+        assert_eq!(
+            TranscriptRow::build(&panel, Some(&manifest), false).state,
+            "idle"
+        );
     }
 
     /// Display-wake crash regression (ratatui `buffer.rs` "index outside of

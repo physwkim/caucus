@@ -7,6 +7,7 @@ use crate::panel::lifecycle::{self, PanelState};
 use crate::signal::{
     AgentNote, CompactTrigger, LifecycleKind, LifecycleSignal, NoteKind, TurnSignal,
 };
+use crate::term::ScreenActivity;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -15,6 +16,126 @@ use tracing::{debug, warn};
 /// ~250 Hz idle loop is pure overhead; a child exit surfaces within one
 /// interval, imperceptible for a UI reap.
 const LIVENESS_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long a panel must sit `Working` with an unchanging grid — and no
+/// blocked prompt — before [`Multiplexer::poll_lost_turns`] treats it as a lost
+/// turn boundary and reconciles it to `Idle`.
+///
+/// This is the false-positive guard, so it is generous. A genuinely working
+/// agent repaints continuously: Claude Code advances its elapsed-seconds and
+/// spinner status line roughly once a second, and each repaint ingests PTY
+/// bytes that bump the grid `generation`, resetting the window. Only a panel
+/// idle at a static prompt with no Stop coming — a hookless local slash command
+/// (`/model`, `/help`, …) or a dropped Stop hook — stays silent this long. The
+/// wait is the price of never reconciling a turn that is still running.
+const LOST_TURN_RECONCILE_QUIESCENCE: Duration = Duration::from_secs(20);
+
+/// How long a `Working` panel that visibly ran its turn must then show its
+/// idle prompt, continuously, before [`Multiplexer::poll_lost_turns`]
+/// reconciles it. Claude Code runs the Stop hook before it repaints the idle
+/// prompt (the hook lands 50–65 ms ahead of that frame on 2.1.316), so a
+/// delivered Stop always wins; the hold only rides out a transient frame
+/// between two live indicators.
+const SCREEN_IDLE_RECONCILE_HOLD: Duration = Duration::from_secs(1);
+
+/// How long after a prompt's submit reaches the PTY its panel may still show
+/// the idle prompt, with no live-turn indicator or blocked prompt in between,
+/// before [`Multiplexer::poll_lost_turns`] declares the prompt stalled. Both
+/// CLIs paint their live indicator within a frame of accepting a prompt, so
+/// this is herdr's `agent_prompt_stalled` window, not a model-latency budget.
+const PROMPT_EFFECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What a `Working` panel's screen has shown during its current `Working`
+/// phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenTrack {
+    /// A prompt opened this phase and its submitting `\r` is still held back
+    /// ([`Multiplexer::poll_pending_submits`]): the agent has not been asked
+    /// to start anything yet.
+    AwaitingSubmit,
+    /// The prompt's submit reached the PTY at this instant and nothing has
+    /// shown since. An idle prompt [`PROMPT_EFFECT_TIMEOUT`] later means the
+    /// prompt stalled.
+    AwaitingEffect(Instant),
+    /// No live-turn indicator yet, and the phase did not start at a submit
+    /// caucus timed (a turn resumed past a blocked prompt): an idle prompt may
+    /// be a hookless local command that never runs a turn. Only grid
+    /// quiescence can reconcile it.
+    Unconfirmed,
+    /// A live-turn indicator was seen: the turn really ran.
+    Live,
+    /// After [`ScreenTrack::Live`], the idle prompt has shown continuously
+    /// since this instant.
+    IdleSince(Instant),
+}
+
+/// Lost-turn evidence for one `Working` panel
+/// ([`Multiplexer::poll_lost_turns`]): the grid-quiescence clock plus what the
+/// screen has shown since the panel went `Working`.
+#[derive(Debug, Clone)]
+pub(super) struct LostTurnProbe {
+    /// Grid generation last seen, and when it was first seen.
+    generation: u64,
+    since: Instant,
+    screen: ScreenTrack,
+}
+
+/// Why [`Multiplexer::poll_lost_turns`] closes a `Working` panel no turn
+/// signal ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LostTurn {
+    /// The turn ran, or may have, and its Stop never came.
+    Unsignalled,
+    /// The submitted prompt never started a turn.
+    Stalled,
+}
+
+impl LostTurnProbe {
+    fn new(generation: u64, now: Instant, screen: ScreenTrack) -> Self {
+        Self {
+            generation,
+            since: now,
+            screen,
+        }
+    }
+
+    /// Fold one tick's observation in. Returns the loss once the turn is
+    /// lost: a submit followed by [`PROMPT_EFFECT_TIMEOUT`] of no live
+    /// indicator ending on the idle prompt stalled; otherwise the grid has
+    /// been unchanged past [`LOST_TURN_RECONCILE_QUIESCENCE`], or a turn that
+    /// visibly ran has shown its idle prompt for [`SCREEN_IDLE_RECONCILE_HOLD`].
+    fn observe(
+        &mut self,
+        generation: u64,
+        activity: ScreenActivity,
+        now: Instant,
+    ) -> Option<LostTurn> {
+        // A screen showing another thread says nothing about this turn, not
+        // even by holding still.
+        if generation != self.generation || activity == ScreenActivity::OtherThread {
+            self.generation = generation;
+            self.since = now;
+        }
+        self.screen = match (self.screen, activity) {
+            (_, ScreenActivity::Working) => ScreenTrack::Live,
+            (ScreenTrack::Live, ScreenActivity::Idle) => ScreenTrack::IdleSince(now),
+            (ScreenTrack::IdleSince(_), ScreenActivity::Unknown | ScreenActivity::OtherThread) => {
+                ScreenTrack::Live
+            }
+            (track, _) => track,
+        };
+        if matches!(self.screen, ScreenTrack::AwaitingEffect(submit)
+            if activity == ScreenActivity::Idle
+                && now.duration_since(submit) >= PROMPT_EFFECT_TIMEOUT)
+        {
+            return Some(LostTurn::Stalled);
+        }
+        (now.duration_since(self.since) >= LOST_TURN_RECONCILE_QUIESCENCE
+            || matches!(self.screen, ScreenTrack::IdleSince(idle)
+                if now.duration_since(idle) >= SCREEN_IDLE_RECONCILE_HOLD))
+        .then_some(LostTurn::Unsignalled)
+    }
+}
 
 impl Multiplexer {
     /// Apply a key event via the focus router. Returns `true` while caucus
@@ -33,7 +154,7 @@ impl Multiplexer {
                 let is_main = Some(panel) == self.main_panel_id;
                 // A non-submit keystroke to the main panel means the user may
                 // be composing an un-submitted line: open the compose hold so a
-                // round delivery never lands mid-line (see `poll_pending_rounds`
+                // round delivery never lands mid-line (see `poll_worker_watches`
                 // / `COMPOSE_GRACE`). A submit is not a compose — it is handled
                 // by `note_prompt_delivered` below, which clears the hold.
                 if is_main && !submit {
@@ -170,12 +291,14 @@ impl Multiplexer {
         // responsiveness path and must not be throttled.
         for panel in &mut self.panels {
             match panel.pump() {
-                Ok(n) => {
-                    // First output from a freshly-spawned agent: its CLI
-                    // process is alive and drawing its UI — it has left
-                    // `Spawning` and is now an idle agent awaiting its first
-                    // instruction.
-                    if n > 0 && panel.state() == PanelState::Spawning {
+                Ok(_) => {
+                    // A freshly-spawned agent has booted once it enables
+                    // bracketed paste (`CSI ?2004h`): its input loop is live,
+                    // so a prompt `deliver_text` frames for it now submits.
+                    // Its first output byte is no such sign — it can be the
+                    // tty's echo of input written during boot, and a `\r`
+                    // written before `?2004h` is lost.
+                    if panel.state() == PanelState::Spawning && panel.grid().bracketed_paste() {
                         let _ = lifecycle::transition(panel, PanelState::Idle);
                     }
                 }
@@ -247,14 +370,14 @@ impl Multiplexer {
     /// (`main_last_boundary_hook_continued`, the alternation gate — caucus
     /// never continues the main on two consecutive boundaries, so it always
     /// reaches a real idle boundary where Claude Code can compact and the user
-    /// can type); and a round is actually due
-    /// ([`Multiplexer::take_due_round_summary`]). Every precondition that fails
-    /// simply drops the sender — allow — and the signal is handled exactly as
-    /// before; the still-due round then rides the keystroke push.
+    /// can type); and a round panel is actually ready to deliver
+    /// (`Multiplexer::take_ready_round_deliveries`). Every precondition that
+    /// fails simply drops the sender — allow — and the signal is handled exactly
+    /// as before; the still-ready panels then ride the keystroke push.
     ///
     /// A delivered reply means the turn *continues*: the panel skips the
     /// `Idle` transition and its capture turn is reopened
-    /// ([`Multiplexer::reopen_turn_after_hook_delivery`]). If the receiver
+    /// (`Multiplexer::reopen_turn_after_hook_delivery`). If the receiver
     /// disappears between the check and the send (the client timed out at
     /// that instant), the round has already been completed and removed — the
     /// summary falls back to the keystroke path immediately, and failing
@@ -273,8 +396,8 @@ impl Multiplexer {
         // contribution and deliver a still-working agent's "done" to main.
         // Treat it like a mid-turn note: nothing transitions, nothing is
         // recorded, the reply sender drops (allow) and the agent proceeds. The
-        // background task wakes the session and its real Stop lands later; the
-        // round's fallback deadline bounds the wait either way.
+        // background task wakes the session and its real Stop lands later; a
+        // panel left silent meanwhile still raises the watch's stall alarm.
         if let Some(in_flight) = signal.background_tasks_in_flight()
             && in_flight > 0
         {
@@ -286,17 +409,29 @@ impl Multiplexer {
             return;
         }
 
+        // This boundary belongs to the prompt whose turn just ended. Consume it,
+        // and learn whether caucus delivered a further prompt while that turn
+        // was open — the CLI queued it, so the agent runs it next and this is
+        // *not* the panel's return to idle.
+        let queued_prompt_pending = self.consume_outstanding_prompt(signal.panel_id);
+
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == signal.panel_id) else {
             // An unknown panel's reply sender (if any) drops here — allow.
             return;
         };
         panel.end_turn();
+        if queued_prompt_pending {
+            // Re-open immediately: with no turn open `OutputCapture::push`
+            // drops the bytes, so the queued prompt's output would be lost from
+            // both `since_last_turn` and the watch's capture.
+            panel.begin_turn();
+        }
 
         // Hook-reply delivery, decided before the Idle transition. The reason
-        // carries every deliverable waiting for main's attention: the first
-        // due round (the primary deliverable, so it leads), then the whole
-        // question-notice queue — the reply is one continuing turn, so a
-        // notice held back would wait an entire further main turn for the
+        // carries every deliverable waiting for main's attention: each round
+        // panel ready to deliver (the primary deliverable, so it leads), then
+        // the whole question-notice queue — the reply is one continuing turn,
+        // so anything held back would wait an entire further main turn for the
         // push path, which is the latency this delivery exists to remove.
         // Both takes are gated behind the checks, so nothing is consumed on a
         // path that cannot deliver; with nothing pending the sender drops —
@@ -310,7 +445,7 @@ impl Multiplexer {
             && !self.main_last_boundary_hook_continued
         {
             let mut parts: Vec<String> = Vec::new();
-            parts.extend(self.take_due_round_summary());
+            parts.extend(self.take_ready_round_deliveries());
             parts.extend(self.take_question_notice_texts());
             if !parts.is_empty() {
                 let reason = parts.join("\n\n");
@@ -333,8 +468,10 @@ impl Multiplexer {
         }
 
         // A turn signal means the agent is idle, waiting for the next prompt —
-        // unless the hook delivery just continued the turn.
+        // unless the hook delivery just continued the turn, or a prompt caucus
+        // already delivered is queued behind this one and about to run.
         if !delivered_by_hook
+            && !queued_prompt_pending
             && let Some(panel) = self.panels.iter_mut().find(|p| p.id == signal.panel_id)
             && panel.state() == PanelState::Working
         {
@@ -407,6 +544,7 @@ impl Multiplexer {
             let _ = lifecycle::transition(panel, PanelState::Working);
         }
         self.record_prompt_delivered(panel_id);
+        self.note_prompt_outstanding(panel_id);
     }
 
     /// Ingest a lifecycle hook signal (`PostCompact` / `SessionStart`) — the
@@ -446,26 +584,167 @@ impl Multiplexer {
         }
     }
 
-    /// Close the turn phase a local slash command occupied: end the capture
-    /// turn, flip a `Working` panel back to `Idle` (via `lifecycle::transition`,
-    /// Invariant I-5), and record `LocalCommandCompleted` on the manifest so
-    /// `derived_state` follows in lockstep (Invariant I-2) and a pending round
-    /// on the panel can settle. A panel that was not `Working` (the submit
-    /// path already classified the command and never opened a turn) keeps its
-    /// state — the manifest still records the completion fact.
+    /// Close the turn phase a local slash command occupied, and record
+    /// `LocalCommandCompleted` on the manifest so `derived_state` follows in
+    /// lockstep (Invariant I-2).
+    ///
+    /// **Only a turn this command itself opened may be closed.** caucus knows
+    /// which those are: when the submit path classified the command it opened
+    /// no turn and marked the panel in `local_commands_without_turn`. With the
+    /// marker set this close touches neither the capture turn nor the panel
+    /// state — it consumes the marker and records the fact. Ending a turn here
+    /// would end whatever turn is open *now*, which after a prompt arrived
+    /// mid-command is that prompt's turn: the panel would flip to `Idle` and
+    /// its watch would latch the *previous* turn's output as the new prompt's
+    /// answer (a false positive main then acts on).
+    ///
+    /// Without the marker the command was typed by hand — unclassifiable, so a
+    /// turn *was* opened for it and no Stop hook will ever fire to close it.
+    /// That is the one case where this is the turn's owner: end the capture
+    /// turn and flip a `Working` panel back to `Idle` (via
+    /// `lifecycle::transition`, Invariant I-5).
     fn close_local_command(&mut self, panel_id: PanelId, command: &str) {
+        let caucus_opened_no_turn = self.local_commands_without_turn.remove(&panel_id);
+        // A hand-typed command was counted as a prompt on the way in
+        // (`note_prompt_delivered` cannot classify keystrokes), so this close is
+        // its boundary and must consume it — otherwise the count never returns
+        // to zero and the panel can never settle again.
+        let queued_prompt_pending =
+            !caucus_opened_no_turn && self.consume_outstanding_prompt(panel_id);
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
             return;
         };
-        panel.end_turn();
-        if panel.state() == PanelState::Working {
-            let _ = lifecycle::transition(panel, PanelState::Idle);
+        if !caucus_opened_no_turn && !queued_prompt_pending {
+            panel.end_turn();
+            if panel.state() == PanelState::Working {
+                let _ = lifecycle::transition(panel, PanelState::Idle);
+            }
         }
         if let Some(manifest) = self.manifests.get_mut(&panel_id)
             && let Err(err) =
                 manifest::record_local_command_completed(manifest, &self.session.root_dir, command)
         {
             warn!(panel = %panel_id, error = %err, "local-command manifest write failed");
+        }
+    }
+
+    /// Recover panels wedged `Working` with no turn boundary coming — the whole
+    /// family that `close_local_command` cannot reach.
+    ///
+    /// caucus opens a capture turn and flips a panel to `Working` on every
+    /// submitted line, trusting the agent's `Stop` hook to close it. A *local*
+    /// slash command runs no agent turn, so it fires no Stop. `/compact` and
+    /// `/clear` are closed by the `PostCompact` / `SessionStart` lifecycle
+    /// hooks, but `/model`, `/help`, `/status`, `/config`, `/agents`, … fire no
+    /// hook at all — and a directly-typed command cannot be classified at
+    /// submit time (keystrokes arrive byte-by-byte). The turn then never
+    /// closes: the panel is stuck `Working`, so a watched worker can never
+    /// settle, and the **main** panel — which carries no watch — never becomes
+    /// `main_deliverable`, stranding every finished worker with nothing able to
+    /// push it. A dropped Stop hook has the same shape.
+    ///
+    /// The evidence that no turn is really running is the PTY. The screen
+    /// shows it directly: a turn that rendered a live indicator and then
+    /// holds its idle prompt for `SCREEN_IDLE_RECONCILE_HOLD` has ended
+    /// (`LostTurnProbe`). Without that evidence (no live indicator yet, or
+    /// a layout the detector does not know) only silence remains: a working
+    /// agent repaints (see `LOST_TURN_RECONCILE_QUIESCENCE`), an agent idle
+    /// at a static prompt emits nothing. A panel **sitting on a blocked
+    /// prompt** is never reconciled — that is
+    /// [`Multiplexer::poll_round_blocked_panels`]'s job, a live chooser is a
+    /// static grid too, but a genuine attention state. The rules close the
+    /// whole hookless-command family and dropped Stops at once, for main and
+    /// workers alike.
+    pub fn poll_lost_turns(&mut self) {
+        let now = Instant::now();
+        let working: Vec<(PanelId, u64)> = self
+            .panels
+            .iter()
+            .filter(|p| p.state() == PanelState::Working)
+            .map(|p| (p.id, p.grid().generation()))
+            .collect();
+        let mut due: Vec<(PanelId, LostTurn)> = Vec::new();
+        for (id, generation) in working {
+            // This runs every tick, so only through the generation cache.
+            let Some(scan) = self.panel_screen_cached(id, generation) else {
+                continue;
+            };
+            if scan.blocked.is_some() {
+                self.lost_turn_probe.remove(&id);
+                continue;
+            }
+            let activity = scan.activity;
+            let probe = self
+                .lost_turn_probe
+                .entry(id)
+                .or_insert_with(|| LostTurnProbe::new(generation, now, ScreenTrack::Unconfirmed));
+            if let Some(loss) = probe.observe(generation, activity, now) {
+                due.push((id, loss));
+            }
+        }
+        // Drop probes for panels that left `Working` between ticks (a real
+        // boundary moved them), so a later `Working` phase starts a fresh clock.
+        self.lost_turn_probe.retain(|id, _| {
+            self.panels
+                .iter()
+                .any(|p| p.id == *id && p.state() == PanelState::Working)
+        });
+        for (id, loss) in due {
+            self.reconcile_lost_turn(id, loss);
+        }
+    }
+
+    /// The deferred submitting `\r` of `panel`'s prompt reached the PTY
+    /// ([`Multiplexer::poll_pending_submits`]): start its prompt-effect clock.
+    pub(super) fn note_submit_written(&mut self, panel: PanelId) {
+        if let Some(probe) = self.lost_turn_probe.get_mut(&panel)
+            && probe.screen == ScreenTrack::AwaitingSubmit
+        {
+            probe.screen = ScreenTrack::AwaitingEffect(Instant::now());
+        }
+    }
+
+    /// Single owner of lost-turn recovery ([`Multiplexer::poll_lost_turns`]):
+    /// synthesize the missing turn boundary for a wedged `Working` panel
+    /// *without inventing a result*. Close the phantom capture turn, clear the
+    /// panel's outstanding-prompt accounting (the phantom prompt will never
+    /// produce a Stop; a genuinely-queued later prompt is treated as a fresh
+    /// turn), flip `Working -> Idle`, and record `TurnReconciled` so
+    /// `derived_state` follows in lockstep (Invariant I-2) without the timeline
+    /// claiming a turn completed. A stalled prompt records `PromptStalled`
+    /// instead, which the watch delivery reports as such.
+    fn reconcile_lost_turn(&mut self, panel_id: PanelId, loss: LostTurn) {
+        self.lost_turn_probe.remove(&panel_id);
+        self.outstanding_prompts.remove(&panel_id);
+        let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
+            return;
+        };
+        if panel.state() != PanelState::Working {
+            return;
+        }
+        panel.end_turn();
+        let _ = lifecycle::transition(panel, PanelState::Idle);
+        let record = match loss {
+            LostTurn::Unsignalled => {
+                warn!(
+                    panel = %panel_id,
+                    "reconciled a lost turn signal: panel idle at a static prompt, no Stop hook fired"
+                );
+                manifest::record_turn_reconciled
+            }
+            LostTurn::Stalled => {
+                warn!(
+                    panel = %panel_id,
+                    timeout_ms = PROMPT_EFFECT_TIMEOUT.as_millis() as u64,
+                    "prompt stalled: no working or blocked state observed after the submit"
+                );
+                manifest::record_prompt_stalled
+            }
+        };
+        if let Some(manifest) = self.manifests.get_mut(&panel_id)
+            && let Err(err) = record(manifest, &self.session.root_dir)
+        {
+            warn!(panel = %panel_id, error = %err, "lost-turn reconcile manifest write failed");
         }
     }
 
@@ -642,15 +921,46 @@ impl Multiplexer {
         if Some(panel_id) == self.main_panel_id {
             self.main_compose_since = None;
         }
+        // Does this submission add a turn, or resume the one already running?
+        //
+        // A panel paused on a blocked prompt (selection menu, `[y/N]`) has an
+        // open turn that has *not* ended — the agent is waiting inside it. A
+        // submission there is an **answer**: it resumes that same turn, so
+        // exactly one Stop still follows. Counting it as a second outstanding
+        // prompt makes that single Stop read as "a queued prompt is still
+        // pending", which pins the panel `Working` forever and its watch never
+        // settles — the worker finishes and main is never told.
+        //
+        // A submission into a *running but unblocked* turn is the opposite: the
+        // agent CLI queues it and runs it next, so it does bring its own Stop
+        // and must be counted. Computed here, before the mutable borrow, so the
+        // rule is uniform across every caller (`send_keys`, `select_option`, a
+        // human typing) rather than a flag each one has to get right.
+        let working_generation = self
+            .panels
+            .iter()
+            .find(|p| p.id == panel_id && p.state() == PanelState::Working)
+            .map(|p| p.grid().generation());
+        let resumes_open_turn = working_generation
+            .is_some_and(|generation| self.panel_blocked_cached(panel_id, generation).is_some());
         let Some(panel) = self.panels.iter_mut().find(|p| p.id == panel_id) else {
             return;
         };
         panel.begin_turn();
-        match panel.state() {
-            PanelState::Spawning | PanelState::Idle => {
-                let _ = lifecycle::transition(panel, PanelState::Working);
-            }
-            _ => {}
+        let opened = matches!(panel.state(), PanelState::Spawning | PanelState::Idle);
+        if opened {
+            let _ = lifecycle::transition(panel, PanelState::Working);
+            // The phase starts at this submit, so its effect is timed: from
+            // now when the `\r` went inline, from the deferred write otherwise.
+            let generation = panel.grid().generation();
+            let now = Instant::now();
+            let screen = if self.submit_pending(panel_id) {
+                ScreenTrack::AwaitingSubmit
+            } else {
+                ScreenTrack::AwaitingEffect(now)
+            };
+            self.lost_turn_probe
+                .insert(panel_id, LostTurnProbe::new(generation, now, screen));
         }
         // This is the only `Idle -> Working` path, so it is where a delivered
         // prompt becomes a fact — the timeline's `PromptDelivered` is written
@@ -658,6 +968,47 @@ impl Multiplexer {
         // to `Working` (what `list_panels` reports) in lockstep with the live
         // `PanelState` transition above.
         self.record_prompt_delivered(panel_id);
+        // Same reason this is the arming point: a worker that has been given
+        // work is watched from here on, so its result reaches main whether or
+        // not main registered a round, and the watch re-arms on every later
+        // prompt ([`Multiplexer::arm_worker_watch`]).
+        self.arm_worker_watch(panel_id);
+        // Forward half of the outstanding-prompt accounting. Submitted while
+        // the panel's turn was already open, this prompt opens no turn of its
+        // own (the agent CLI queues it), so without this count the *earlier*
+        // turn's Stop would pass for its boundary. An answer to a blocked
+        // prompt is excluded: it resumes the open turn and brings no extra Stop.
+        if !resumes_open_turn {
+            self.note_prompt_outstanding(panel_id);
+        }
+    }
+
+    /// Forward half of `outstanding_prompts`: one more prompt is in flight on
+    /// `panel_id`. Called only from the two paths that actually submit one —
+    /// [`Multiplexer::note_prompt_delivered`] and
+    /// [`Multiplexer::reopen_turn_after_hook_delivery`].
+    fn note_prompt_outstanding(&mut self, panel_id: PanelId) {
+        *self.outstanding_prompts.entry(panel_id).or_insert(0) += 1;
+    }
+
+    /// Reverse half of `outstanding_prompts`, and its only decrement: consume
+    /// the prompt whose turn just ended on `panel_id`, and report whether
+    /// another one is still queued behind it.
+    ///
+    /// `true` means the panel is not between turns at all — the agent CLI is
+    /// about to run the next queued prompt — so the caller must keep the panel
+    /// `Working` and re-open a capture turn instead of treating this boundary
+    /// as the panel's return to idle.
+    fn consume_outstanding_prompt(&mut self, panel_id: PanelId) -> bool {
+        let Some(n) = self.outstanding_prompts.get_mut(&panel_id) else {
+            return false;
+        };
+        *n = n.saturating_sub(1);
+        let remaining = *n;
+        if remaining == 0 {
+            self.outstanding_prompts.remove(&panel_id);
+        }
+        remaining > 0
     }
 
     /// Single owner of lane-event appends for a live panel (Invariant I-2).
@@ -1030,6 +1381,71 @@ mod tests {
             "the completion is on the persisted timeline: {:?}",
             on_disk.lane_events()
         );
+        assert!(
+            mux.outstanding_prompts.is_empty(),
+            "this close is the hand-typed command's own boundary: it consumes \
+             the prompt it was counted as, or the panel could never settle again",
+        );
+        mux.shutdown();
+    }
+
+    /// The other boundary of the same close: when *caucus* submitted the
+    /// `/compact` it classified it and opened no turn, so the close owns no
+    /// turn here. A prompt that arrived while the compaction was still running
+    /// did open one — closing it would end a turn the compaction never started
+    /// and flip the panel `Idle` while the prompt is still queued. The
+    /// completion fact still reaches the manifest either way.
+    #[tokio::test]
+    async fn lifecycle_manual_compact_leaves_a_later_prompts_turn_alone() {
+        use crate::mcp::McpToolSurface;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+        // Undo the helper's prompt: this panel is idle when the compact starts.
+        {
+            let panel = mux.panels.iter_mut().find(|p| p.id == id).unwrap();
+            panel.end_turn();
+            let _ = lifecycle::transition(panel, PanelState::Idle);
+        }
+
+        McpToolSurface::send_keys(&mut mux, id, "/compact", true).unwrap();
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Idle,
+            "a classified local command opens no turn"
+        );
+
+        // The brief lands while the compaction is still running: it opens a
+        // turn and flips the panel `Working`, but the agent has not run it.
+        McpToolSurface::send_keys(&mut mux, id, "audit the TLS path", true).unwrap();
+        assert_eq!(panel_state(&mux, id), PanelState::Working);
+
+        lifecycle(
+            &mut mux,
+            id,
+            LifecycleKind::PostCompact {
+                trigger: CompactTrigger::Manual,
+            },
+        );
+
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "the compact's completion is not the brief's turn boundary"
+        );
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert!(
+            on_disk.lane_events().iter().any(|e| matches!(
+                &e.kind,
+                LaneEventKind::LocalCommandCompleted { command } if command == "/compact"
+            )),
+            "the completion fact is still recorded: {:?}",
+            on_disk.lane_events()
+        );
+
+        // The marker is spent: a *hand-typed* `/compact` later on this panel is
+        // unclassifiable, so that one's close does own the turn.
+        assert!(!mux.local_commands_without_turn.contains(&id));
         mux.shutdown();
     }
 
@@ -1150,6 +1566,486 @@ mod tests {
             lifecycle(&mut mux, stray, kind);
         }
         assert!(!mux.manifests.contains_key(&stray));
+        mux.shutdown();
+    }
+
+    impl LostTurnProbe {
+        /// Backdate the quiescence clock past its window, as if the grid had
+        /// been unchanged since before now.
+        pub(crate) fn age_out_quiescence(&mut self) {
+            self.since = Instant::now() - LOST_TURN_RECONCILE_QUIESCENCE - Duration::from_secs(1);
+        }
+    }
+
+    impl Multiplexer {
+        /// `panel`'s prompt-effect phase: `Some(false)` while its submit is
+        /// held back, `Some(true)` once the effect clock runs, `None` outside
+        /// either.
+        pub(crate) fn prompt_effect_armed(&self, panel: PanelId) -> Option<bool> {
+            match self.lost_turn_probe.get(&panel)?.screen {
+                ScreenTrack::AwaitingSubmit => Some(false),
+                ScreenTrack::AwaitingEffect(_) => Some(true),
+                _ => None,
+            }
+        }
+
+        /// Backdate `panel`'s running prompt-effect clock past its window.
+        pub(crate) fn age_out_prompt_effect(&mut self, panel: PanelId) {
+            let probe = self.lost_turn_probe.get_mut(&panel).unwrap();
+            assert!(matches!(probe.screen, ScreenTrack::AwaitingEffect(_)));
+            probe.screen = ScreenTrack::AwaitingEffect(Instant::now() - PROMPT_EFFECT_TIMEOUT);
+        }
+    }
+
+    /// Backdate a panel's lost-turn probe so its quiescence window has already
+    /// elapsed, as if the grid had been unchanged since before now. Requires an
+    /// entry to already exist (one `poll_lost_turns` seeds it).
+    fn age_out_lost_turn_probe(mux: &mut Multiplexer, id: PanelId) {
+        mux.lost_turn_probe
+            .get_mut(&id)
+            .unwrap()
+            .age_out_quiescence();
+    }
+
+    /// The core recovery: a panel wedged `Working` with no Stop coming — a
+    /// hookless local command like `/model`, or a dropped Stop — is reconciled
+    /// to `Idle` once its PTY has sat silent past the quiescence window. The
+    /// phantom turn is closed, the outstanding-prompt count cleared, and the
+    /// manifest records `TurnReconciled` (not `TurnCompleted`) so `derived_state`
+    /// reports `idle` without the timeline claiming a turn ran.
+    #[tokio::test]
+    async fn poll_lost_turns_reconciles_a_working_panel_gone_silent() {
+        use crate::agent::derive_state::DerivedState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+        assert_eq!(panel_state(&mux, id), PanelState::Working);
+
+        // First poll seeds the probe; the window has not elapsed, so nothing
+        // happens yet. Backdate the probe and poll again.
+        mux.poll_lost_turns();
+        assert_eq!(panel_state(&mux, id), PanelState::Working);
+        age_out_lost_turn_probe(&mut mux, id);
+        mux.poll_lost_turns();
+
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Idle,
+            "a silent working panel is reconciled to idle"
+        );
+        assert!(
+            !mux.lost_turn_probe.contains_key(&id),
+            "the probe is cleared once reconciled"
+        );
+        assert!(
+            !mux.outstanding_prompts.contains_key(&id),
+            "the phantom prompt's count is cleared, not left to wedge the next turn"
+        );
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert_eq!(
+            on_disk.derived_state(),
+            DerivedState::Idle,
+            "list_panels must report idle in lockstep with the live state"
+        );
+        assert!(
+            on_disk
+                .lane_events()
+                .iter()
+                .any(|e| matches!(&e.kind, LaneEventKind::TurnReconciled)),
+            "the timeline records reconciliation, not a fabricated completion: {:?}",
+            on_disk.lane_events()
+        );
+        assert!(
+            !on_disk
+                .lane_events()
+                .iter()
+                .any(|e| matches!(&e.kind, LaneEventKind::TurnCompleted)),
+            "no turn actually completed, so none may be claimed: {:?}",
+            on_disk.lane_events()
+        );
+        mux.shutdown();
+    }
+
+    /// The false-positive guard: before the window elapses, a `Working` panel is
+    /// left alone. `poll_lost_turns` only arms a clock; it does not reconcile on
+    /// the tick it first sees the panel.
+    #[tokio::test]
+    async fn poll_lost_turns_waits_out_the_quiescence_window() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+
+        mux.poll_lost_turns();
+        mux.poll_lost_turns();
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "within the window the panel is presumed to be really working"
+        );
+        assert!(mux.lost_turn_probe.contains_key(&id));
+        mux.shutdown();
+    }
+
+    /// A changing grid is the signature of a live turn (Claude Code repaints its
+    /// status line continuously). Any grid change resets the clock, so the window
+    /// never elapses for a genuinely working agent — even one already backdated.
+    #[tokio::test]
+    async fn poll_lost_turns_resets_the_clock_when_the_grid_changes() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+
+        mux.poll_lost_turns();
+        age_out_lost_turn_probe(&mut mux, id);
+        // The agent paints output: the grid generation advances.
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == id)
+            .unwrap()
+            .grid
+            .advance(b"still working... (12s)");
+
+        mux.poll_lost_turns();
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "a grid change restarts the window — a working agent is never reconciled"
+        );
+        let since = mux.lost_turn_probe[&id].since;
+        assert!(
+            Instant::now().duration_since(since) < LOST_TURN_RECONCILE_QUIESCENCE,
+            "the clock was reset to now, not left aged out"
+        );
+        mux.shutdown();
+    }
+
+    /// A panel sitting on a live selection / `[y/N]` prompt is a static grid too,
+    /// but it is a genuine attention state owned by `poll_round_blocked_panels`.
+    /// Reconciliation must never flip it out from under that path.
+    #[tokio::test]
+    async fn poll_lost_turns_skips_a_blocked_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == id)
+            .unwrap()
+            .grid
+            .advance(b"Apply this change? [y/N]");
+
+        mux.poll_lost_turns();
+        // Even fully aged out, a blocked panel is skipped (and its probe dropped).
+        let generation = mux
+            .panels
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .grid()
+            .generation();
+        let mut probe = LostTurnProbe::new(generation, Instant::now(), ScreenTrack::Unconfirmed);
+        probe.age_out_quiescence();
+        mux.lost_turn_probe.insert(id, probe);
+        mux.poll_lost_turns();
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "a panel awaiting a prompt answer is not idle — it must not be reconciled"
+        );
+        assert!(
+            !mux.lost_turn_probe.contains_key(&id),
+            "a blocked panel's probe is dropped, so the clock restarts when it unblocks"
+        );
+        mux.shutdown();
+    }
+
+    /// `poll_lost_turns` runs every tick, so it must take the blocked-prompt
+    /// answer from the generation cache, not re-scan an unchanged viewport. The
+    /// cat grid holds no prompt, so only a cache read sees the seeded one.
+    #[tokio::test]
+    async fn poll_lost_turns_reads_the_screen_scan_cache() {
+        use super::super::rounds::{BlockedPrompt, ScreenScan};
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        let generation = mux
+            .panels
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .grid()
+            .generation();
+        let prompt = BlockedPrompt::Permission("Continue? [y/N]".into());
+        mux.screen_scan_cache.insert(
+            id,
+            (
+                generation,
+                ScreenScan {
+                    blocked: Some(prompt),
+                    activity: ScreenActivity::Unknown,
+                    dialog: false,
+                },
+            ),
+        );
+
+        mux.poll_lost_turns();
+        assert!(
+            !mux.lost_turn_probe.contains_key(&id),
+            "the cached prompt marks the panel blocked, so no probe is armed"
+        );
+        mux.shutdown();
+    }
+
+    /// The screen rule's boundaries, one per transition: an idle prompt
+    /// reconciles only after a live indicator was seen and only once it has
+    /// held for [`SCREEN_IDLE_RECONCILE_HOLD`]; a live indicator or an
+    /// unknown frame restarts the hold.
+    #[test]
+    fn lost_turn_probe_screen_boundaries() {
+        use ScreenActivity::{Idle, Unknown, Working};
+        let t0 = Instant::now();
+        let hold = SCREEN_IDLE_RECONCILE_HOLD;
+        let tick = Duration::from_millis(10);
+
+        // Idle before any live indicator: only quiescence could reconcile.
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::Unconfirmed);
+        assert_eq!(p.observe(1, Idle, t0), None);
+        assert_eq!(p.observe(1, Idle, t0 + hold * 5), None);
+        assert_eq!(p.screen, ScreenTrack::Unconfirmed);
+
+        // Live, then idle: not before the hold, yes at it.
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::Unconfirmed);
+        assert_eq!(p.observe(1, Working, t0), None);
+        assert_eq!(p.observe(2, Idle, t0 + tick), None);
+        assert_eq!(p.observe(3, Idle, t0 + tick + hold - tick), None);
+        assert_eq!(
+            p.observe(3, Idle, t0 + tick + hold),
+            Some(LostTurn::Unsignalled)
+        );
+
+        // A live indicator during the hold restarts it.
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::Unconfirmed);
+        p.observe(1, Working, t0);
+        p.observe(2, Idle, t0 + tick);
+        p.observe(3, Working, t0 + hold / 2);
+        assert_eq!(p.observe(4, Idle, t0 + hold + tick), None);
+        assert_eq!(
+            p.observe(4, Idle, t0 + hold + tick + hold),
+            Some(LostTurn::Unsignalled)
+        );
+
+        // An unknown frame breaks continuity but keeps the live evidence.
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::Unconfirmed);
+        p.observe(1, Working, t0);
+        p.observe(2, Idle, t0 + tick);
+        p.observe(3, Unknown, t0 + hold / 2);
+        assert_eq!(p.screen, ScreenTrack::Live);
+        assert_eq!(p.observe(4, Idle, t0 + hold + tick), None);
+        assert_eq!(
+            p.observe(4, Idle, t0 + hold + tick + hold),
+            Some(LostTurn::Unsignalled)
+        );
+    }
+
+    /// A codex sub-agent view is another thread's screen: neither its idle
+    /// prompt nor its stillness reconciles the panel, however long it stays
+    /// up, and it breaks an idle hold like an unknown frame. Back on the
+    /// panel's own screen the rules resume, a stalled submit included.
+    #[test]
+    fn lost_turn_probe_holds_while_another_thread_is_shown() {
+        use ScreenActivity::{Idle, OtherThread, Working};
+        let t0 = Instant::now();
+        let hold = SCREEN_IDLE_RECONCILE_HOLD;
+        let quiet = LOST_TURN_RECONCILE_QUIESCENCE;
+        let tick = Duration::from_millis(10);
+
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::Unconfirmed);
+        p.observe(1, Working, t0);
+        p.observe(2, Idle, t0 + tick);
+        assert_eq!(p.observe(3, OtherThread, t0 + tick * 2), None);
+        assert_eq!(p.screen, ScreenTrack::Live);
+        assert_eq!(p.observe(3, OtherThread, t0 + quiet * 3), None);
+        assert_eq!(p.observe(4, Idle, t0 + quiet * 3 + tick), None);
+        assert_eq!(
+            p.observe(4, Idle, t0 + quiet * 3 + tick + hold),
+            Some(LostTurn::Unsignalled)
+        );
+
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::AwaitingEffect(t0));
+        assert_eq!(
+            p.observe(1, OtherThread, t0 + PROMPT_EFFECT_TIMEOUT * 2),
+            None
+        );
+        assert_eq!(
+            p.observe(2, Idle, t0 + PROMPT_EFFECT_TIMEOUT * 2 + tick),
+            Some(LostTurn::Stalled)
+        );
+    }
+
+    /// Quiescence still reconciles whatever the screen showed: a live
+    /// indicator frozen on a static grid is a hung repaint, not a turn.
+    #[test]
+    fn lost_turn_probe_quiescence_applies_in_every_track() {
+        let t0 = Instant::now();
+        let late = t0 + LOST_TURN_RECONCILE_QUIESCENCE;
+        for activity in [
+            ScreenActivity::Working,
+            ScreenActivity::Idle,
+            ScreenActivity::Unknown,
+        ] {
+            let mut p = LostTurnProbe::new(7, t0, ScreenTrack::Unconfirmed);
+            assert_eq!(p.observe(7, activity, t0), None, "{activity:?}");
+            assert_eq!(
+                p.observe(7, activity, late),
+                Some(LostTurn::Unsignalled),
+                "{activity:?}"
+            );
+        }
+        let mut p = LostTurnProbe::new(7, t0, ScreenTrack::Unconfirmed);
+        assert!(
+            p.observe(8, ScreenActivity::Unknown, late).is_none(),
+            "a new generation restarts the clock"
+        );
+    }
+
+    fn paint(mux: &mut Multiplexer, id: PanelId, screen: &str) {
+        let grid = &mut mux.panels.iter_mut().find(|p| p.id == id).unwrap().grid;
+        grid.advance(b"\x1b[2J\x1b[H");
+        grid.advance(screen.replace('\n', "\r\n").as_bytes());
+    }
+
+    const CLAUDE_WORKING: &str =
+        "✢ Thinking…\n──────────\n❯ \n──────────\n  ⏵⏵ bypass permissions on · esc to interrupt";
+    const CLAUDE_IDLE: &str =
+        "● hi\n✻ Worked for 1s\n──────────\n❯ \n──────────\n  ⏵⏵ bypass permissions on";
+
+    /// End to end through the grid and the panel's CLI: a Claude panel whose
+    /// Stop never arrives is reconciled once its screen has shown the turn
+    /// run and then held the idle prompt — without waiting out quiescence.
+    #[tokio::test]
+    async fn poll_lost_turns_reconciles_when_the_screen_shows_the_turn_ended() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+
+        paint(&mut mux, id, CLAUDE_WORKING);
+        mux.poll_lost_turns();
+        assert_eq!(mux.lost_turn_probe[&id].screen, ScreenTrack::Live);
+
+        paint(&mut mux, id, CLAUDE_IDLE);
+        mux.poll_lost_turns();
+        assert!(matches!(
+            mux.lost_turn_probe[&id].screen,
+            ScreenTrack::IdleSince(_)
+        ));
+        assert_eq!(
+            panel_state(&mux, id),
+            PanelState::Working,
+            "the hold has not elapsed"
+        );
+
+        mux.lost_turn_probe.get_mut(&id).unwrap().screen = ScreenTrack::IdleSince(
+            Instant::now() - SCREEN_IDLE_RECONCILE_HOLD - Duration::from_millis(1),
+        );
+        mux.poll_lost_turns();
+        assert_eq!(panel_state(&mux, id), PanelState::Idle);
+        mux.shutdown();
+    }
+
+    /// Within [`PROMPT_EFFECT_TIMEOUT`] of the submit, an idle prompt never
+    /// seen working is left alone: the agent may not have painted its first
+    /// live frame yet.
+    #[tokio::test]
+    async fn poll_lost_turns_does_not_trust_an_idle_screen_never_seen_working() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, _) = working_panel_with_manifest(&mut mux);
+
+        paint(&mut mux, id, CLAUDE_IDLE);
+        mux.poll_lost_turns();
+        mux.lost_turn_probe.get_mut(&id).unwrap().since = Instant::now();
+        mux.poll_lost_turns();
+        assert_eq!(mux.prompt_effect_armed(id), Some(true));
+        assert_eq!(panel_state(&mux, id), PanelState::Working);
+        mux.shutdown();
+    }
+
+    /// Past [`PROMPT_EFFECT_TIMEOUT`], that idle prompt is a stalled prompt:
+    /// the panel settles and the timeline records `PromptStalled`, not a
+    /// reconciled turn, so the watch can say the prompt never ran.
+    #[tokio::test]
+    async fn poll_lost_turns_closes_a_stalled_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+
+        paint(&mut mux, id, CLAUDE_IDLE);
+        mux.age_out_prompt_effect(id);
+        mux.poll_lost_turns();
+
+        assert_eq!(panel_state(&mux, id), PanelState::Idle);
+        assert!(!mux.lost_turn_probe.contains_key(&id));
+        assert!(!mux.outstanding_prompts.contains_key(&id));
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        let kinds: Vec<_> = on_disk.lane_events().iter().map(|e| &e.kind).collect();
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, LaneEventKind::PromptStalled)),
+            "{kinds:?}"
+        );
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| matches!(k, LaneEventKind::TurnReconciled)),
+            "{kinds:?}"
+        );
+        mux.shutdown();
+    }
+
+    /// The prompt-effect rule's boundaries, one per transition: an idle
+    /// prompt stalls at [`PROMPT_EFFECT_TIMEOUT`] after the submit, not before;
+    /// a live indicator or no idle evidence (an unknown frame) never stalls;
+    /// and a held-back submit is not timed at all.
+    #[test]
+    fn lost_turn_probe_prompt_effect_boundaries() {
+        use ScreenActivity::{Idle, Unknown, Working};
+        let t0 = Instant::now();
+        let window = PROMPT_EFFECT_TIMEOUT;
+        let tick = Duration::from_millis(10);
+        let effect = ScreenTrack::AwaitingEffect(t0);
+
+        let mut p = LostTurnProbe::new(0, t0, effect);
+        assert_eq!(p.observe(0, Idle, t0 + window - tick), None);
+        assert_eq!(p.observe(0, Idle, t0 + window), Some(LostTurn::Stalled));
+
+        // A live frame is the effect: from then on the screen-idle hold rules.
+        let mut p = LostTurnProbe::new(0, t0, effect);
+        assert_eq!(p.observe(1, Working, t0 + tick), None);
+        assert_eq!(p.observe(2, Idle, t0 + window), None);
+        assert!(matches!(p.screen, ScreenTrack::IdleSince(_)));
+
+        // No idle evidence, no stall: the clock waits for an idle frame.
+        let mut p = LostTurnProbe::new(0, t0, effect);
+        assert_eq!(p.observe(1, Unknown, t0 + window * 2), None);
+        assert_eq!(p.observe(2, Idle, t0 + window * 2), Some(LostTurn::Stalled));
+
+        // A submit still held back is never timed.
+        let mut p = LostTurnProbe::new(0, t0, ScreenTrack::AwaitingSubmit);
+        assert_eq!(p.observe(0, Idle, t0 + window * 2), None);
+    }
+
+    /// An `Idle` panel carries no phantom turn: `poll_lost_turns` never touches
+    /// it and never arms a probe for it.
+    #[tokio::test]
+    async fn poll_lost_turns_ignores_idle_panels() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Idle);
+
+        mux.poll_lost_turns();
+        assert!(!mux.lost_turn_probe.contains_key(&id));
+        assert_eq!(panel_state(&mux, id), PanelState::Idle);
         mux.shutdown();
     }
 
@@ -1845,6 +2741,116 @@ mod tests {
         .unwrap();
         let s3 = mux.render_signature();
         assert_ne!(s2, s3, "a resize must change the render signature");
+    }
+
+    /// `draw` paints a grid only through its layout slot: output from a
+    /// panel hidden behind a zoom must leave the signature alone, while the
+    /// zoomed panel's output, and the hidden panel's once unzoomed, change it.
+    #[tokio::test]
+    async fn render_signature_ignores_output_hidden_behind_a_zoom() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let shown = push_cat_panel(&mut mux, PanelState::Working);
+        let hidden = push_cat_panel(&mut mux, PanelState::Working);
+        let ingest = |mux: &mut Multiplexer, id: PanelId| {
+            let panel = mux.panels.iter_mut().find(|p| p.id == id).unwrap();
+            panel.grid.advance(b"output");
+        };
+        mux.focus.set_focus(Some(shown));
+        mux.toggle_zoom();
+        assert_eq!(mux.zoomed(), Some(shown));
+
+        let s0 = mux.render_signature();
+        ingest(&mut mux, hidden);
+        assert_eq!(
+            s0,
+            mux.render_signature(),
+            "output behind a zoom must not repaint"
+        );
+        ingest(&mut mux, shown);
+        let s1 = mux.render_signature();
+        assert_ne!(s0, s1, "the zoomed panel's output must repaint");
+
+        mux.toggle_zoom();
+        let s2 = mux.render_signature();
+        ingest(&mut mux, hidden);
+        assert_ne!(
+            s2,
+            mux.render_signature(),
+            "a tiled panel's output must repaint"
+        );
+        mux.shutdown();
+    }
+
+    /// The transcript overlay shows every manifest's turn count and last
+    /// message, hidden panels included; a turn completion that leaves the
+    /// derived state unchanged must still change the signature.
+    #[tokio::test]
+    async fn render_signature_tracks_transcript_turns() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::role::spec::AgentCli;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        mux.manifests.insert(id, mf);
+
+        let s0 = mux.render_signature();
+        let mf = mux.manifests.get_mut(&id).unwrap();
+        let state = mf.derived_state();
+        mf.lane_events
+            .push(LaneEvent::now(LaneEventKind::TurnCompleted));
+        mf.last_message = Some("done".to_string());
+        assert_eq!(mf.derived_state(), state);
+        assert_ne!(
+            s0,
+            mux.render_signature(),
+            "a turn completion must repaint the transcript"
+        );
+        mux.shutdown();
+    }
+
+    /// A booting panel stays `Spawning` through plain output (here `cat`
+    /// echoing a line) and becomes `Idle` once the agent enables bracketed
+    /// paste — the point a delivered prompt's Enter is no longer lost.
+    #[tokio::test]
+    async fn a_booting_panel_is_spawning_until_it_enables_bracketed_paste() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Spawning);
+        fn panel(mux: &mut Multiplexer, id: PanelId) -> &mut lifecycle::Panel {
+            mux.panels.iter_mut().find(|p| p.id == id).unwrap()
+        }
+        let pump_until = |mux: &mut Multiplexer, done: &dyn Fn(&lifecycle::Panel) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                mux.pump_all();
+                if done(mux.panels.iter().find(|p| p.id == id).unwrap())
+                    || Instant::now() > deadline
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        panel(&mut mux, id).write_input(b"boot\n").unwrap();
+        pump_until(&mut mux, &|p| p.grid().generation() > 0);
+        assert!(panel(&mut mux, id).grid().generation() > 0, "cat echoed");
+        assert_eq!(panel(&mut mux, id).state(), PanelState::Spawning);
+
+        panel(&mut mux, id).write_input(b"\x1b[?2004h\n").unwrap();
+        pump_until(&mut mux, &|p| p.state() == PanelState::Idle);
+        assert_eq!(panel(&mut mux, id).state(), PanelState::Idle);
+        mux.shutdown();
     }
 
     /// `pump_all` probes child liveness on its first call, then throttles:

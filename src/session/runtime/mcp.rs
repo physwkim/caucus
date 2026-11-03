@@ -1,9 +1,72 @@
 use super::*;
+use crate::agent::derive_state::DerivedState;
 use crate::mcp::{McpError, McpToolSurface, PanelSummary, ReadPanelMode};
+use crate::panel::lifecycle::PanelState;
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+/// A panel's state as `list_panels` reports it: the manifest's derived state
+/// with a live grid prompt overlaid, or the coarse panel state before the
+/// panel has a manifest. `wait` holds on this same value, so it returns on
+/// exactly the state `list_panels` shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportedState {
+    Derived(DerivedState),
+    Coarse(PanelState),
+}
+
+impl ReportedState {
+    /// A live grid-detected prompt (selection menu or `[y/n]`) overlays the
+    /// derived state: no Stop hook fires while one is open, so the
+    /// signal-derived state alone would read `working`. A booting panel
+    /// reads its coarse `spawning` ([`PanelState::manifest_reports_state`]).
+    fn of(
+        manifest: Option<&AgentManifest>,
+        coarse: PanelState,
+        blocked: Option<&rounds::BlockedPrompt>,
+    ) -> Self {
+        match manifest.filter(|_| coarse.manifest_reports_state()) {
+            Some(m) => Self::Derived(Multiplexer::overlay_blocked_state(
+                m.derived_state(),
+                blocked,
+            )),
+            None => Self::Coarse(coarse),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Derived(state) => state.as_str(),
+            Self::Coarse(state) => state.label(),
+        }
+    }
+
+    /// Mid-turn: neither settled nor stopped on something that needs the
+    /// main worker.
+    pub(crate) fn is_busy(self) -> bool {
+        matches!(
+            self,
+            Self::Derived(DerivedState::Working)
+                | Self::Coarse(PanelState::Spawning | PanelState::Working)
+        )
+    }
+}
+
+impl Multiplexer {
+    /// The [`ReportedState`] of `panel`, or `None` if it does not exist.
+    pub(crate) fn reported_state(&mut self, panel: PanelId) -> Option<ReportedState> {
+        let p = self.panels.iter().find(|p| p.id == panel)?;
+        let (generation, coarse) = (p.grid().generation(), p.state());
+        let blocked = self.panel_blocked_cached(panel, generation);
+        Some(ReportedState::of(
+            self.manifests.get(&panel),
+            coarse,
+            blocked.as_ref(),
+        ))
+    }
+}
 
 /// The main worker's MCP tool surface, backed by the live panel registry
 /// (`docs/design.md` §0 #4). Every method runs on the multiplexer's own
@@ -23,17 +86,34 @@ impl McpToolSurface for Multiplexer {
         // the deferral is only the mechanical separation the agent needs to
         // accept the Enter.
         //
-        // A *local* slash command (`/compact`, `/clear`) is not a prompt: it
-        // runs entirely inside the agent client, starts no agent turn, and so
-        // fires no Stop hook — the only other `Working -> Idle` producer.
-        // Opening `Working` for it wedges the panel there on machines whose
-        // lifecycle hooks (`PostCompact`/`SessionStart`) are not installed;
-        // with the hooks installed [`Multiplexer::handle_lifecycle`] would
-        // close it, but this classification keeps the panel truthful either
-        // way. Direct typing cannot be classified (keystrokes arrive
-        // byte-by-byte) — that path is covered by the lifecycle hooks alone.
-        if enter && !is_local_slash_command(text) {
-            self.note_prompt_delivered(panel);
+        // A *local* slash command is not a prompt: it runs entirely inside the
+        // agent client, starts no agent turn, and so fires no Stop hook — the
+        // only other `Working -> Idle` producer. Treating one as work is not
+        // merely cosmetic: `note_prompt_delivered` opens a capture turn, flips
+        // the panel `Working`, **arms a worker watch**, and counts an
+        // outstanding prompt. The watch then reports the command's own screen
+        // to main as a finished task, and nothing ever closes the turn.
+        //
+        // Two kinds, and the difference is what closes them:
+        //  * hook-closed (`/compact`, `/clear`) — a lifecycle hook follows, so
+        //    the panel is *marked*: that marker is the only evidence its open
+        //    turn (if any) is not the command's, which `close_local_command`
+        //    needs to avoid closing a turn some later prompt opened.
+        //  * hookless (`/model`, `/status`, …) — nothing ever arrives. Marking
+        //    would leave a marker no one consumes, which would later suppress a
+        //    legitimate hand-typed `/compact` close, so no marker is recorded.
+        //
+        // Direct typing cannot be classified (keystrokes arrive byte-by-byte,
+        // so the submitted line never exists here) — that path is covered by
+        // the lifecycle hooks and `poll_lost_turns` reconciliation instead.
+        if enter {
+            match classify_local_slash_command(text) {
+                Some(LocalCommandKind::HookClosed) => {
+                    self.local_commands_without_turn.insert(panel);
+                }
+                Some(LocalCommandKind::Hookless) => {}
+                None => self.note_prompt_delivered(panel),
+            }
         }
         Ok(())
     }
@@ -136,31 +216,27 @@ impl McpToolSurface for Multiplexer {
             .map_err(|e| McpError::Tool(format!("restart_panel: {e:#}")))
     }
 
-    fn list_panels(&self) -> Vec<PanelSummary> {
+    fn list_panels(&mut self) -> Vec<PanelSummary> {
+        let generations: Vec<(PanelId, u64)> = self
+            .panels
+            .iter()
+            .map(|p| (p.id, p.grid().generation()))
+            .collect();
+        let blocked: Vec<_> = generations
+            .into_iter()
+            .map(|(id, generation)| self.panel_blocked_cached(id, generation))
+            .collect();
         self.panels
             .iter()
-            .map(|p| {
+            .zip(blocked)
+            .map(|(p, blocked)| {
                 let manifest = self.manifests.get(&p.id);
-                // Prefer the manifest's derived_state (turn-signal fed); fall
-                // back to the coarse panel-state label before the first turn.
-                // A live grid-detected prompt (selection menu or `[y/n]`)
-                // overlays its blocked state — no Stop hook fires while one is
-                // open, so the signal-derived state alone would read `working`.
-                let (state, agent_cli) = match manifest {
-                    Some(m) => {
-                        let st = Self::overlay_blocked_state(
-                            m.derived_state(),
-                            Self::panel_blocked_prompt(p).as_ref(),
-                        );
-                        (st.as_str().to_string(), m.agent_cli)
-                    }
-                    None => (p.state_label().to_string(), AgentCli::Claude),
-                };
+                let state = ReportedState::of(manifest, p.state(), blocked.as_ref());
                 PanelSummary {
                     panel_id: p.id,
                     role: p.role.clone(),
-                    state,
-                    agent_cli,
+                    state: state.as_str().to_string(),
+                    agent_cli: manifest.map_or(AgentCli::Claude, |m| m.agent_cli),
                     // The manifest holds the live worktree path and the model
                     // override; the branch lives in `worktree_branches` (it
                     // outlives the path, which is removed on shutdown).
@@ -181,30 +257,23 @@ impl McpToolSurface for Multiplexer {
             .collect()
     }
 
-    fn read_menu(&self, panel: PanelId) -> Result<String, McpError> {
-        let p = self
-            .panels
-            .iter()
-            .find(|p| p.id == panel)
-            .ok_or(McpError::NoSuchPanel(panel))?;
-        Ok(match Self::panel_menu(p) {
+    fn read_menu(&mut self, panel: PanelId) -> Result<String, McpError> {
+        if !self.panels.iter().any(|p| p.id == panel) {
+            return Err(McpError::NoSuchPanel(panel));
+        }
+        Ok(match self.panel_menu(panel) {
             Some(menu) => Self::render_menu(&menu),
             None => "(no selection menu visible on this panel)".to_string(),
         })
     }
 
     fn select_option(&mut self, panel: PanelId, index: usize) -> Result<(), McpError> {
-        // Scan the menu (immutable) before writing (mutable) — no overlapping
-        // borrows of `self.panels`.
-        let menu = {
-            let p = self
-                .panels
-                .iter()
-                .find(|p| p.id == panel)
-                .ok_or(McpError::NoSuchPanel(panel))?;
-            Self::panel_menu(p)
-                .ok_or_else(|| McpError::Tool("no selection menu visible on this panel".into()))?
-        };
+        if !self.panels.iter().any(|p| p.id == panel) {
+            return Err(McpError::NoSuchPanel(panel));
+        }
+        let menu = self
+            .panel_menu(panel)
+            .ok_or_else(|| McpError::Tool("no selection menu visible on this panel".into()))?;
         let target = menu
             .options
             .iter()
@@ -262,26 +331,104 @@ fn submit_delay_for(paste_len: usize) -> Duration {
     scaled.min(SUBMIT_DELAY_MAX)
 }
 
-/// Whether a submitted line invokes a *local* Claude Code slash command
-/// (`/compact`, `/clear`) — a client builtin that runs no agent turn and fires
-/// no Stop hook. First-token match on a word boundary: `/compact focus on X`
-/// is still `/compact` (it takes instructions), while `/compactify` is an
-/// ordinary prompt.
-fn is_local_slash_command(text: &str) -> bool {
-    matches!(
-        text.split_whitespace().next(),
-        Some("/compact") | Some("/clear")
-    )
+/// Local slash commands that run no agent turn but *do* announce their
+/// completion through a lifecycle hook caucus installs (`PostCompact` /
+/// `SessionStart` — `docs/design.md` §7.9).
+const HOOK_CLOSED_LOCAL_COMMANDS: &[&str] = &["/compact", "/clear"];
+
+/// Local slash commands that run no agent turn and fire **no hook at all** —
+/// pure client-side UI inside the agent CLI.
+///
+/// Deliberately conservative, because the two failure directions are not
+/// symmetric:
+///  * **Omitting** a genuinely-local command degrades gracefully — the panel
+///    wedges `Working` until [`Multiplexer::poll_lost_turns`] reconciles it
+///    (§7.9 layer 3). Late, but correct.
+///  * **Wrongly listing** a command that really does run an agent turn is much
+///    worse — caucus would open no turn and arm no watch for real work, so the
+///    worker's result would never reach main at all.
+///
+/// So this lists only commands that are unambiguously client-local UI. Anything
+/// that can run a turn (`/init`, `/review`, `/security-review`, `/pr-comments`,
+/// and every user-defined command) is deliberately absent. When unsure, leave
+/// it out and let reconciliation handle it.
+const HOOKLESS_LOCAL_COMMANDS: &[&str] = &[
+    "/model",
+    "/status",
+    "/cost",
+    "/help",
+    "/config",
+    "/agents",
+    "/mcp",
+    "/memory",
+    "/permissions",
+    "/hooks",
+    "/doctor",
+    "/vim",
+    "/terminal-setup",
+    "/login",
+    "/logout",
+    "/resume",
+    "/release-notes",
+    "/upgrade",
+    "/privacy-settings",
+    "/exit",
+    "/quit",
+];
+
+/// How a submitted line classifies as a local slash command — the distinction
+/// is what, if anything, will later close it. See [`McpToolSurface::send_keys`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalCommandKind {
+    /// A lifecycle hook (`PostCompact` / `SessionStart`) will report completion.
+    HookClosed,
+    /// Nothing will ever report completion; the command is pure client UI.
+    Hookless,
 }
 
-/// A submitting Enter held back from a bracketed paste, waiting to be delivered
-/// as a discrete keypress (see [`Multiplexer::pending_submits`]).
+/// Classify a submitted line as a *local* Claude Code slash command — a client
+/// builtin that runs no agent turn and fires no Stop hook — or `None` for an
+/// ordinary prompt.
+///
+/// First-token match on a word boundary: `/compact focus on X` is still
+/// `/compact` (it takes instructions), while `/compactify` is an ordinary
+/// prompt.
+pub(crate) fn classify_local_slash_command(text: &str) -> Option<LocalCommandKind> {
+    let first = text.split_whitespace().next()?;
+    if HOOK_CLOSED_LOCAL_COMMANDS.contains(&first) {
+        Some(LocalCommandKind::HookClosed)
+    } else if HOOKLESS_LOCAL_COMMANDS.contains(&first) {
+        Some(LocalCommandKind::Hookless)
+    } else {
+        None
+    }
+}
+
+/// Input caucus has committed to a panel but not yet written in full (see
+/// [`Multiplexer::pending_submits`]). At most one per panel.
 pub(crate) struct PendingSubmit {
-    /// Panel the held-back `\r` is destined for.
+    /// Panel the held input is destined for.
     panel: PanelId,
-    /// Earliest instant the `\r` may be written — `now + submit_delay_for(len)`
-    /// at enqueue time (the hold scales with the paste size).
-    due: Instant,
+    /// What is still owed.
+    stage: SubmitStage,
+}
+
+enum SubmitStage {
+    /// The agent has not enabled bracketed paste since it spawned, so its
+    /// input loop is not running: a `\r` written now reaches the tty first
+    /// and arrives as a newline, not a submit. Every delivery is held, in
+    /// order, and framed by [`plan_delivery`] once the mode is on.
+    Booting(Vec<HeldText>),
+    /// A bracketed paste was written; its submitting `\r` may be written at
+    /// this instant — `now + submit_delay_for(len)` at enqueue time (the hold
+    /// scales with the paste size).
+    Enter(Instant),
+}
+
+/// One `deliver_text` call held for a booting panel.
+struct HeldText {
+    text: String,
+    enter: bool,
 }
 
 /// How `send_keys` should deliver `text` to a panel's PTY, framed for the
@@ -354,13 +501,42 @@ impl Multiplexer {
     /// both must frame multi-line input as one bracketed paste rather than let
     /// each embedded newline submit. The caller owns turn bookkeeping
     /// (`note_prompt_delivered`) — this only writes the bytes and schedules the
-    /// deferred submit when one is needed.
+    /// deferred submit when one is needed. Input for a panel still booting is
+    /// held instead ([`SubmitStage::Booting`]).
     pub(crate) fn deliver_text(
         &mut self,
         panel: PanelId,
         text: &str,
         enter: bool,
     ) -> Result<(), McpError> {
+        let p = self
+            .panels
+            .iter()
+            .find(|p| p.id == panel)
+            .ok_or(McpError::NoSuchPanel(panel))?;
+        let booting = p.state() == PanelState::Spawning && !p.grid().bracketed_paste();
+        let held = HeldText {
+            text: text.to_owned(),
+            enter,
+        };
+        let slot = self.pending_submits.iter_mut().find(|s| s.panel == panel);
+        match slot.map(|s| &mut s.stage) {
+            // Behind input already held, even once a prompt has moved the
+            // panel past `Spawning`.
+            Some(SubmitStage::Booting(queue)) => queue.push(held),
+            Some(stage) if booting => *stage = SubmitStage::Booting(vec![held]),
+            None if booting => self.pending_submits.push(PendingSubmit {
+                panel,
+                stage: SubmitStage::Booting(vec![held]),
+            }),
+            _ => return self.write_delivery(panel, text, enter),
+        }
+        Ok(())
+    }
+
+    /// Write `text` framed for `panel`'s current input mode, deferring a
+    /// bracketed paste's `\r`.
+    fn write_delivery(&mut self, panel: PanelId, text: &str, enter: bool) -> Result<(), McpError> {
         let p = self
             .panels
             .iter_mut()
@@ -385,32 +561,66 @@ impl Multiplexer {
     /// the paste size. Replaces any pending submit already queued for the same
     /// panel (the latest paste wins) so a panel never accrues stale Enters.
     fn enqueue_submit(&mut self, panel: PanelId, paste_len: usize) {
-        let due = Instant::now() + submit_delay_for(paste_len);
+        let stage = SubmitStage::Enter(Instant::now() + submit_delay_for(paste_len));
         match self.pending_submits.iter_mut().find(|s| s.panel == panel) {
-            Some(s) => s.due = due,
-            None => self.pending_submits.push(PendingSubmit { panel, due }),
+            Some(s) => s.stage = stage,
+            None => self.pending_submits.push(PendingSubmit { panel, stage }),
         }
     }
 
-    /// Flush every deferred submit whose delay has elapsed: write the held-back
-    /// `\r` as a discrete keypress to its panel. Called once per event-loop
-    /// tick. A submit whose panel has been killed is dropped (the panel can no
-    /// longer accept input).
+    /// Write what each panel is owed: a booting panel's held input once its
+    /// agent has enabled bracketed paste, and a deferred `\r` once its delay
+    /// has elapsed. Called once per event-loop tick, after `pump_all` has
+    /// parsed this tick's output. Input for a killed or exited panel is
+    /// dropped (nothing can read it).
     pub(crate) fn poll_pending_submits(&mut self) {
         let now = Instant::now();
         let mut still_pending = Vec::with_capacity(self.pending_submits.len());
-        for s in std::mem::take(&mut self.pending_submits) {
-            if s.due > now {
-                still_pending.push(s);
+        for PendingSubmit { panel, stage } in std::mem::take(&mut self.pending_submits) {
+            if let SubmitStage::Enter(due) = stage
+                && due > now
+            {
+                still_pending.push(PendingSubmit { panel, stage });
                 continue;
             }
-            if let Some(p) = self.panels.iter_mut().find(|p| p.id == s.panel)
-                && let Err(e) = p.write_input(b"\r")
-            {
-                warn!(panel = %s.panel, error = %e, "deferred submit write failed");
+            let Some(p) = self.panels.iter_mut().find(|p| p.id == panel) else {
+                continue;
+            };
+            match stage {
+                SubmitStage::Booting(_) if p.state() == PanelState::Exited => {}
+                SubmitStage::Booting(queue) if p.grid().bracketed_paste() => {
+                    for HeldText { text, enter } in queue {
+                        match self.write_delivery(panel, &text, enter) {
+                            // A bare Enter has no paste to wait behind and
+                            // went inline: its submit reached the PTY now.
+                            Ok(()) if enter && !self.submit_pending(panel) => {
+                                self.note_submit_written(panel)
+                            }
+                            Ok(()) => {}
+                            Err(e) => warn!(panel = %panel, error = %e, "held input write failed"),
+                        }
+                    }
+                }
+                SubmitStage::Enter(_) => match p.write_input(b"\r") {
+                    Ok(()) => self.note_submit_written(panel),
+                    Err(e) => warn!(panel = %panel, error = %e, "deferred submit write failed"),
+                },
+                stage => still_pending.push(PendingSubmit { panel, stage }),
             }
         }
-        self.pending_submits = still_pending;
+        // Flushing held input above may have queued fresh Enters.
+        self.pending_submits.extend(still_pending);
+    }
+
+    /// Whether `panel` has a submitting `\r` still held back.
+    pub(crate) fn submit_pending(&self, panel: PanelId) -> bool {
+        self.pending_submits.iter().any(|s| {
+            s.panel == panel
+                && match &s.stage {
+                    SubmitStage::Booting(queue) => queue.iter().any(|h| h.enter),
+                    SubmitStage::Enter(_) => true,
+                }
+        })
     }
 
     /// Render a panel's turn at absolute `index` for the `turn` read mode.
@@ -495,6 +705,22 @@ mod tests {
     use crate::session::runtime::test_support::*;
     use tempfile::TempDir;
 
+    impl PendingSubmit {
+        fn enter_at(panel: PanelId, due: Instant) -> Self {
+            Self {
+                panel,
+                stage: SubmitStage::Enter(due),
+            }
+        }
+
+        fn due(&self) -> Option<Instant> {
+            match self.stage {
+                SubmitStage::Enter(due) => Some(due),
+                SubmitStage::Booting(_) => None,
+            }
+        }
+    }
+
     /// Bracketed + submit: the paste carries the text with NO trailing `\r`
     /// (the submit is held back, never inline with the paste), and
     /// `defer_submit` is set so `send_keys` queues the discrete Enter.
@@ -562,13 +788,13 @@ mod tests {
         let panel = PanelId::new();
 
         mux.enqueue_submit(panel, 0);
-        let first_due = mux.pending_submits[0].due;
+        let first_due = mux.pending_submits[0].due();
         assert_eq!(mux.pending_submits.len(), 1);
 
         mux.enqueue_submit(panel, 0);
         assert_eq!(mux.pending_submits.len(), 1, "same panel must not stack");
         assert!(
-            mux.pending_submits[0].due >= first_due,
+            mux.pending_submits[0].due() >= first_due,
             "re-enqueue pushes the deadline out, it does not add a second submit"
         );
     }
@@ -608,14 +834,14 @@ mod tests {
         let mut mux = mux(&tmp);
         let due_panel = PanelId::new();
         let pending_panel = PanelId::new();
-        mux.pending_submits.push(PendingSubmit {
-            panel: due_panel,
-            due: Instant::now() - Duration::from_millis(1),
-        });
-        mux.pending_submits.push(PendingSubmit {
-            panel: pending_panel,
-            due: Instant::now() + Duration::from_secs(60),
-        });
+        mux.pending_submits.push(PendingSubmit::enter_at(
+            due_panel,
+            Instant::now() - Duration::from_millis(1),
+        ));
+        mux.pending_submits.push(PendingSubmit::enter_at(
+            pending_panel,
+            Instant::now() + Duration::from_secs(60),
+        ));
 
         mux.poll_pending_submits();
 
@@ -625,6 +851,87 @@ mod tests {
             "the due submit is flushed/dropped, the not-yet-due one stays"
         );
         assert_eq!(mux.pending_submits[0].panel, pending_panel);
+    }
+
+    /// A prompt's effect clock starts when its deferred `\r` reaches the
+    /// PTY, not when the paste was typed.
+    #[tokio::test]
+    async fn a_deferred_submit_starts_the_prompt_effect_clock() {
+        use crate::panel::lifecycle::PanelState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Idle);
+        mux.pending_submits.push(PendingSubmit::enter_at(
+            id,
+            Instant::now() + Duration::from_secs(60),
+        ));
+        mux.note_prompt_delivered(id);
+        assert_eq!(mux.prompt_effect_armed(id), Some(false));
+
+        mux.poll_pending_submits();
+        assert_eq!(mux.prompt_effect_armed(id), Some(false), "not yet due");
+
+        mux.pending_submits[0] =
+            PendingSubmit::enter_at(id, Instant::now() - Duration::from_millis(1));
+        mux.poll_pending_submits();
+        assert_eq!(mux.prompt_effect_armed(id), Some(true));
+        mux.shutdown();
+    }
+
+    /// Input to an agent that has not enabled bracketed paste since it spawned
+    /// is held, in order, so its Enter is not written into the tty before the
+    /// agent's input loop runs. Once the mode is on it is pasted and its Enter
+    /// is owed as a discrete keypress, as for any live panel.
+    #[tokio::test]
+    async fn input_to_a_booting_panel_waits_for_bracketed_paste() {
+        use crate::panel::lifecycle::PanelState;
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Spawning);
+        let pump_until =
+            |mux: &mut Multiplexer, wait: Duration, done: &dyn Fn(&Multiplexer) -> bool| {
+                let deadline = Instant::now() + wait;
+                while !done(mux) && Instant::now() < deadline {
+                    mux.pump_all();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+        let screen = |mux: &Multiplexer| {
+            let grid = mux.panels.iter().find(|p| p.id == id).unwrap().grid();
+            (0..grid.size().1)
+                .map(|row| grid.row_text(row))
+                .collect::<String>()
+        };
+        let bracketed = |mux: &Multiplexer| {
+            let p = mux.panels.iter().find(|p| p.id == id).unwrap();
+            p.grid().bracketed_paste()
+        };
+
+        McpToolSurface::send_keys(&mut mux, id, "first", true).unwrap();
+        McpToolSurface::send_keys(&mut mux, id, "second", true).unwrap();
+        assert_eq!(mux.prompt_effect_armed(id), Some(false), "Enter still owed");
+        pump_until(&mut mux, Duration::from_millis(300), &|_| false);
+        mux.poll_pending_submits();
+        pump_until(&mut mux, Duration::from_millis(100), &|_| false);
+        assert!(!screen(&mux).contains("first"), "{}", screen(&mux));
+
+        mux.panels
+            .iter_mut()
+            .find(|p| p.id == id)
+            .unwrap()
+            .write_input(b"\x1b[?2004h\n")
+            .unwrap();
+        pump_until(&mut mux, Duration::from_secs(5), &bracketed);
+        mux.poll_pending_submits();
+        assert!(mux.submit_pending(id), "the paste's Enter is deferred");
+        assert_eq!(mux.prompt_effect_armed(id), Some(false));
+        pump_until(&mut mux, Duration::from_secs(5), &|mux| {
+            screen(mux).contains("second")
+        });
+        let screen = screen(&mux);
+        let (first, second) = (screen.find("first"), screen.find("second"));
+        assert!(first.is_some() && first < second, "{screen}");
+        mux.shutdown();
     }
 
     /// `menu_nav_bytes` emits the right count + direction of arrow keys, then
@@ -678,7 +985,7 @@ mod tests {
 
         // A plain (non-worktree) panel: no path, no branch, no transcript or
         // note yet.
-        let plain = McpToolSurface::list_panels(&mux);
+        let plain = McpToolSurface::list_panels(&mut mux);
         assert_eq!(plain[0].worktree_path, None);
         assert_eq!(plain[0].branch, None);
         assert_eq!(plain[0].transcript_path, None);
@@ -700,7 +1007,7 @@ mod tests {
         mux.worktree_branches
             .insert(panel, "caucus/reviewer-1".to_string());
 
-        let s = McpToolSurface::list_panels(&mux);
+        let s = McpToolSurface::list_panels(&mut mux);
         assert_eq!(s[0].worktree_path, Some(wt.display().to_string()));
         assert_eq!(s[0].branch.as_deref(), Some("caucus/reviewer-1"));
         assert_eq!(s[0].model.as_deref(), Some("opus"));
@@ -719,16 +1026,47 @@ mod tests {
     /// with* the letters (`/compactify`) or mentions the command mid-line does
     /// not.
     #[test]
-    fn is_local_slash_command_matches_first_token_only() {
-        assert!(is_local_slash_command("/compact"));
-        assert!(is_local_slash_command("/clear"));
-        assert!(is_local_slash_command("/compact focus on the parser"));
-        assert!(is_local_slash_command("  /compact"));
-        assert!(!is_local_slash_command("/compactify the structs"));
-        assert!(!is_local_slash_command("/clearance check"));
-        assert!(!is_local_slash_command("please run /compact"));
-        assert!(!is_local_slash_command("summarize the findings"));
-        assert!(!is_local_slash_command(""));
+    fn classify_local_slash_command_matches_first_token_only() {
+        use LocalCommandKind::{HookClosed, Hookless};
+        let c = classify_local_slash_command;
+
+        // Hook-closed: a lifecycle hook will report completion.
+        assert_eq!(c("/compact"), Some(HookClosed));
+        assert_eq!(c("/clear"), Some(HookClosed));
+        assert_eq!(c("/compact focus on the parser"), Some(HookClosed));
+        assert_eq!(c("  /compact"), Some(HookClosed));
+
+        // Hookless: nothing will ever report completion.
+        assert_eq!(c("/model"), Some(Hookless));
+        assert_eq!(c("/model opus"), Some(Hookless));
+        assert_eq!(c("/status"), Some(Hookless));
+        assert_eq!(c("/cost"), Some(Hookless));
+
+        // Word boundary, and ordinary prompts.
+        assert_eq!(c("/compactify the structs"), None);
+        assert_eq!(c("/clearance check"), None);
+        assert_eq!(c("/modelling the flow"), None);
+        assert_eq!(c("please run /compact"), None);
+        assert_eq!(c("summarize the findings"), None);
+        assert_eq!(c(""), None);
+
+        // Commands that really do run an agent turn must stay unclassified —
+        // skipping their turn would lose real work (no watch, no report).
+        for turn_running in ["/init", "/review", "/security-review", "/pr-comments"] {
+            assert_eq!(c(turn_running), None, "{turn_running} runs an agent turn");
+        }
+    }
+
+    /// The two sets must not overlap: a command can only have one closer, and an
+    /// entry in both would make the classification order-dependent.
+    #[test]
+    fn local_command_sets_are_disjoint() {
+        for hookless in HOOKLESS_LOCAL_COMMANDS {
+            assert!(
+                !HOOK_CLOSED_LOCAL_COMMANDS.contains(hookless),
+                "{hookless} is listed in both sets"
+            );
+        }
     }
 
     /// Insert a hermetic `/bin/cat` panel so `send_keys` tests do not depend
@@ -755,6 +1093,54 @@ mod tests {
         });
         mux.rebuild_layout_tree();
         id
+    }
+
+    /// `list_panels` and `read_menu` take the blocked prompt from the
+    /// generation cache, as the per-tick passes do. The cat grid holds no
+    /// prompt, so only a cache read sees the seeded menu.
+    #[tokio::test]
+    async fn list_panels_and_read_menu_read_the_screen_scan_cache() {
+        use crate::agent::manifest::AgentManifest;
+        use crate::panel::lifecycle::PanelState;
+        use crate::term::{Menu, MenuOption};
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let id = push_cat_panel(&mut mux, PanelState::Working);
+        let mf = AgentManifest::new(
+            mux.session.id,
+            id,
+            "reviewer",
+            "reviewer-1",
+            AgentCli::Claude,
+            None,
+        );
+        mux.manifests.insert(id, mf);
+        let generation = mux.panels[0].grid().generation();
+        let menu = Menu {
+            question: "Proceed?".into(),
+            options: vec![MenuOption {
+                number: 1,
+                label: "Yes".into(),
+            }],
+            cursor: 0,
+        };
+        mux.screen_scan_cache.insert(
+            id,
+            (
+                generation,
+                rounds::ScreenScan {
+                    blocked: Some(rounds::BlockedPrompt::Selection(menu)),
+                    activity: crate::term::ScreenActivity::Unknown,
+                    dialog: false,
+                },
+            ),
+        );
+
+        let panels = McpToolSurface::list_panels(&mut mux);
+        assert_eq!(panels[0].state, "awaiting_selection");
+        let text = McpToolSurface::read_menu(&mut mux, id).unwrap();
+        assert!(text.contains("1. Yes"), "{text}");
+        mux.shutdown();
     }
 
     /// The defense line for machines without the lifecycle hooks: submitting a

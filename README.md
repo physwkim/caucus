@@ -58,7 +58,7 @@ and renders the panels (`ratatui`). tmux and zellij are *not* dependencies —
 they are studied as references for the grid and layout design.
 
 **The main worker drives sub-agents over MCP.** caucus runs an MCP server.
-The main worker gets fourteen caucus tools (see [MCP tools](#mcp-tools) below)
+The main worker gets fifteen caucus tools (see [MCP tools](#mcp-tools) below)
 so a single instruction from you turns into the main worker decomposing the
 task, spawning sub-agent panels, and feeding each one its sub-task as real
 keystrokes.
@@ -152,7 +152,7 @@ pages the pager, exactly as the key does.
 
 ## MCP tools
 
-caucus exposes fourteen tools to the main worker over MCP. The main worker
+caucus exposes fifteen tools to the main worker over MCP. The main worker
 calls them to spawn, drive, observe, and reap sub-agent panels:
 
 | Tool              | What it does                                                              |
@@ -166,11 +166,12 @@ calls them to spawn, drive, observe, and reap sub-agent panels:
 | `kill_panel`      | Kill a panel; its worktree (if any) is enqueued for cleanup.              |
 | `restart_panel`   | Restart a panel's agent CLI in place, reusing its role and worktree.      |
 | `list_panels`     | List every live panel with its role and derived state.                   |
-| `register_round`  | Register a round; caucus pushes the panels' results back when they settle (or `fallback_secs`). A per-panel `backlog` queue keeps early finishers working until their tasks drain. Optional `selection_hints` let caucus auto-answer a panel's direction menus by option-label keyword, so a pre-authorized fork never interrupts you. |
-| `round_status`    | Report a registered round's progress — which panels have settled, which are still working. |
-| `cancel_round`    | Cancel a registered round so caucus stops awaiting it.                    |
+| `queue_tasks`     | Queue follow-up tasks on one worker and tune its watch (`read_mode`, `fallback_secs`, `selection_hints`). Not needed to hear back: caucus watches every panel it hands a prompt to and pushes each worker's result the moment it finishes. Queued tasks keep an early finisher working until they drain; `selection_hints` let caucus auto-answer that worker's direction menus by option-label keyword. |
+| `collect_workers` | Pull every worker that is ready right now, from inside the main worker's turn; the rest are reported as still working and stay watched. |
+| `stop_watching`   | Stop reporting one worker and drop its queued tasks; the panel itself is untouched, and the next prompt re-arms the watch. |
 | `read_menu`       | Read a panel's interactive selection menu (question + numbered options).  |
 | `select_option`   | Answer a panel's selection menu by picking an option number.              |
+| `wait`            | Hold the main worker's turn until one panel stops working, then return its `list_panels` entry. For a result the next step in this turn needs; otherwise end the turn and let caucus push it. |
 
 `read_panel` takes a `mode`: `screen` (the visible grid), `scrollback` (the
 full scrollback buffer), `since_last_turn` (everything since the last
@@ -179,16 +180,16 @@ agent's final message from its turn signal).
 
 When a sub-agent stops mid-turn on an interactive chooser (an
 AskUserQuestion-style menu), no turn signal fires, so the panel reads
-`awaiting_selection` and its round cannot settle on its own. caucus detects
+`awaiting_selection` and its watch cannot settle on its own. caucus detects
 the menu and pushes the main worker a notice; the main worker answers it
 with `read_menu` + `select_option` (or, for a free-text reply, picks the
-menu's "type something" option, then `send_keys`), unblocking the round.
+menu's "type something" option, then `send_keys`), unblocking the worker.
 
 ## CLI
 
 `caucus` with no subcommand launches the multiplexer TUI. The subcommands
 are for bootstrap, inspection, and resume — live control is exposed to the
-main worker over MCP, not the CLI.
+main worker over MCP, and `caucus ctl` makes the same calls from a shell.
 
 ```
 caucus                              # launch the multiplexer TUI in the current git repo
@@ -205,6 +206,14 @@ caucus role list                    # list known roles
 caucus role show <name>             # show one role's full spec
 caucus sessions [--format json]     # list resumable sessions, newest first
 caucus resume <session_id>          # relaunch the TUI restoring a persisted session
+caucus ctl list_panels              # call an MCP tool on a running session; the
+                                    # session comes from --session or
+                                    # CAUCUS_SESSION_ID, or pass --sock
+caucus ctl read_panel '{"panel":"<id>","mode":"screen"}'
+                                    # params are the tool's arguments as JSON;
+                                    # each reply is printed as one JSON line
+caucus ctl subscribe_events         # print the list_panels rows, then one JSON
+                                    # line per row change until interrupted
 ```
 
 (`caucus signal post` and `caucus mcp-serve` also exist but are internal —
@@ -252,7 +261,7 @@ caucus doctor                # verifies the chain with a live end-to-end signal 
 ```
 
 The Stop hook is how caucus learns an agent's turn has finished. **Without
-it, every panel stays `working` forever and rounds never settle** — the TUI
+it, every panel stays `working` forever and no worker is ever delivered** — the TUI
 runs, agents work, but no result ever comes back. Plain `caucus init`
 (without `--install-hook`) creates `.caucus/` and leaves your Claude
 settings, and the hook script, untouched.

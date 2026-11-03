@@ -360,7 +360,8 @@ pub enum StopDirective {
     /// prints Claude's Stop-hook block JSON (`{"decision":"block","reason":…}`),
     /// and Claude receives `reason` as feedback in the same turn.
     Deliver {
-        /// The round summary to inject (`Multiplexer::take_due_round_summary`).
+        /// The per-panel round deliveries and/or notices to inject
+        /// (`Multiplexer::take_ready_round_deliveries`).
         reason: String,
     },
 }
