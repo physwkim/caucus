@@ -5,7 +5,17 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
-## [Unreleased]
+## [0.12.0] — 2026-11-04
+
+caucus wakes the main worker less. Every main turn re-reads main's whole
+conversation from the prompt cache, and in a 7-day session 43.5% of main's
+API calls were caucus reporting a worker that was still running; a running
+worker now reports only when its screen falls silent, and workers that
+finish together arrive in one message. A turn whose completion signal is
+lost ends about 1 s after the agent finishes instead of 20 s, codex panels
+start and finish reliably, and `caucus ctl` drives a session from a shell.
+The control socket's format changed, so restart running sessions after
+upgrading; no hook reinstall is needed.
 
 ### Added
 
@@ -137,6 +147,8 @@ versions.
   panel's own conversation is back on screen.
 
 ## [0.11.0] — 2026-10-15
+
+Never tagged or published to crates.io; its changes first ship in 0.12.0.
 
 caucus no longer works in rounds. A main worker used to register a round over
 the panels it had briefed and hear back once, when the last of them settled;
