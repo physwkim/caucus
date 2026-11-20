@@ -10,8 +10,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::proto::{ClientFrame, DaemonFrame, PROTO_VERSION, encode};
-use super::{HostLink, HostPaths, LinkStatus, RemotePty, RemoteSignal, Transport, daemon};
-use crate::pty::PtyCommand;
+use super::{
+    HostInfo, HostLink, HostPaths, LinkStatus, RemotePty, RemoteSignal, Transport, daemon,
+};
+use crate::pty::{PtyCommand, PtyError};
 use crate::session::id::{PanelId, SessionId};
 use crate::signal::server::ingest;
 use crate::signal::{SignalEvent, TurnKind, TurnSignal};
@@ -391,4 +393,58 @@ async fn the_daemon_refuses_another_protocol_version() {
         DaemonFrame::Error { msg } if msg.contains("protocol")
     ));
     host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_made_while_the_queue_is_full_still_reaches_the_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("host.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let (tx, _signals) = mpsc::unbounded_channel();
+    let link = HostLink::connect("sub-1", SessionId::new(), Transport::Socket(sock), tx);
+    // A host that answers hello, then reads nothing until the queue is full.
+    let (stream, _) = listener.accept().await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut read = BufReader::new(read);
+    let mut line = String::new();
+    read.read_line(&mut line).await.unwrap();
+    let welcome = DaemonFrame::Welcome(HostInfo {
+        proto: PROTO_VERSION,
+        version: "test".into(),
+        hostname: "stalled".into(),
+        caucus_bin: "caucus".into(),
+        signal_sock: "/nonexistent".into(),
+        session_dir: "/nonexistent".into(),
+        panels: Vec::new(),
+    });
+    write.write_all(encode(&welcome).as_bytes()).await.unwrap();
+    link.wait_connected(WAIT).await.unwrap();
+
+    let panel = PanelId::new();
+    let mut pty = link.spawn(panel, &sh("cat"), 80, 24, false).unwrap();
+    let chunk = vec![b'x'; 4096];
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match pty.write(&chunk) {
+            Ok(()) => assert!(Instant::now() < deadline, "the queue never filled"),
+            Err(PtyError::WriterFull) => break,
+            Err(err) => panic!("{err}"),
+        }
+    }
+    pty.kill().unwrap();
+
+    let kill_arrives = async {
+        loop {
+            line.clear();
+            assert_ne!(read.read_line(&mut line).await.unwrap(), 0, "link closed");
+            if let Ok(ClientFrame::Kill { panel: killed }) = serde_json::from_str(&line)
+                && killed == panel
+            {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(WAIT, kill_arrives)
+        .await
+        .expect("the kill never reached the host");
 }

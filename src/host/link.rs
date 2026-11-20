@@ -8,7 +8,7 @@
 //! panel from the first byte main has not seen. Frames written while
 //! disconnected wait in the outbound queue.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -130,6 +130,8 @@ struct Inner {
     state: Mutex<LinkState>,
     status: watch::Sender<LinkStatus>,
     outbound: mpsc::Sender<ClientFrame>,
+    /// Wakes the connection's writer for a kill ([`HostLink::kill`]).
+    kill_ready: Notify,
     stop: watch::Sender<bool>,
     supervisor: Mutex<Option<JoinHandle<()>>>,
 }
@@ -137,8 +139,10 @@ struct Inner {
 #[derive(Default)]
 struct LinkState {
     panels: HashMap<PanelId, LinkPanel>,
-    /// Panels killed but not yet confirmed by the daemon.
-    kills: HashSet<PanelId>,
+    /// Panels killed but not yet confirmed by the daemon, and whether the
+    /// current connection has carried each kill. Only the connection's writer
+    /// sends a kill, never the bounded queue, so none can be refused.
+    kills: HashMap<PanelId, Kill>,
     /// Worktree requests the daemon has not answered, by id. Dropping one
     /// (when the link closes) answers its caller with "link closed".
     requests: BTreeMap<u64, Request>,
@@ -146,6 +150,12 @@ struct LinkState {
     /// The host's load as of the current connection's latest report.
     load: Option<HostLoad>,
     closed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kill {
+    Unsent,
+    Sent,
 }
 
 struct LinkPanel {
@@ -184,6 +194,7 @@ impl HostLink {
             state: Mutex::default(),
             status: watch::Sender::new(LinkStatus::Connecting { last_error: None }),
             outbound,
+            kill_ready: Notify::new(),
             stop: watch::Sender::new(false),
             supervisor: Mutex::new(None),
         });
@@ -345,9 +356,9 @@ impl HostLink {
             if state.closed {
                 return;
             }
-            state.kills.insert(panel);
+            state.kills.entry(panel).or_insert(Kill::Unsent);
         }
-        let _ = self.send(ClientFrame::Kill { panel });
+        self.inner.kill_ready.notify_one();
     }
 
     /// Check out the existing `branch` at `path` as a worktree of the host's
@@ -395,7 +406,7 @@ impl HostLink {
 
     async fn request(&self, frame: impl FnOnce(u64) -> ClientFrame) -> Result<String, String> {
         let (done, answer) = oneshot::channel();
-        let (frame, kills) = {
+        let frame = {
             let mut state = self.inner.lock();
             if state.closed {
                 return Err(self.closed().to_string());
@@ -410,15 +421,9 @@ impl HostLink {
                     done,
                 },
             );
-            (frame, state.kills.iter().copied().collect::<Vec<_>>())
+            frame
         };
-        // A kill the full queue refused waits for the next connection; queue a
-        // copy ahead of the request so the host never works in a worktree a
-        // panel it has yet to kill still writes to. Waiting for room here,
-        // unlike `send`, drops nothing.
-        for panel in kills {
-            let _ = self.inner.outbound.send(ClientFrame::Kill { panel }).await;
-        }
+        // Waiting for room here, unlike `send`, drops nothing.
         let _ = self.inner.outbound.send(frame).await;
         answer
             .await
@@ -462,7 +467,7 @@ impl Inner {
 
     /// What a new connection sends before anything queued.
     fn reattach_frames(&self) -> Vec<ClientFrame> {
-        let state = self.lock();
+        let mut state = self.lock();
         let mut frames = Vec::new();
         for (&panel, p) in state.panels.iter().filter(|(_, p)| !p.exited) {
             if let Some(spec) = &p.unconfirmed {
@@ -481,8 +486,25 @@ impl Inner {
                 rows: p.size.1,
             });
         }
-        frames.extend(state.kills.iter().map(|&panel| ClientFrame::Kill { panel }));
+        for (&panel, kill) in &mut state.kills {
+            *kill = Kill::Sent;
+            frames.push(ClientFrame::Kill { panel });
+        }
         frames.extend(state.requests.values().map(|r| r.frame.clone()));
+        frames
+    }
+
+    /// The kills the current connection has yet to carry, now counted as
+    /// carried.
+    fn unsent_kills(&self) -> Vec<ClientFrame> {
+        let mut state = self.lock();
+        let mut frames = Vec::new();
+        for (&panel, kill) in &mut state.kills {
+            if *kill == Kill::Unsent {
+                *kill = Kill::Sent;
+                frames.push(ClientFrame::Kill { panel });
+            }
+        }
         frames
     }
 
@@ -817,11 +839,27 @@ async fn write_frames<W: AsyncWrite + Unpin>(
     outbound: &mut mpsc::Receiver<ClientFrame>,
     retry: &mut Option<ClientFrame>,
 ) {
-    while let Some(frame) = outbound.recv().await {
-        if !inner.still_wanted(&frame) {
-            continue;
+    loop {
+        let queued = tokio::select! {
+            biased;
+            () = inner.kill_ready.notified() => None,
+            frame = outbound.recv() => match frame {
+                Some(frame) => Some(frame),
+                None => return,
+            },
+        };
+        // Kills go out ahead of the frame queued after them: a worktree
+        // request must not run while a panel being killed still works there.
+        // One whose write fails is re-sent by the next connection.
+        for kill in inner.unsent_kills() {
+            if writer.write_all(encode(&kill).as_bytes()).await.is_err() {
+                *retry = queued.filter(|frame| inner.still_wanted(frame));
+                return;
+            }
         }
-        if writer.write_all(encode(&frame).as_bytes()).await.is_err() {
+        if let Some(frame) = queued.filter(|frame| inner.still_wanted(frame))
+            && writer.write_all(encode(&frame).as_bytes()).await.is_err()
+        {
             *retry = Some(frame);
             return;
         }
