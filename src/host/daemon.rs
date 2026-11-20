@@ -133,9 +133,9 @@ pub async fn run(
     _lock: DaemonLock,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    if let Some(dir) = paths.control_sock.parent() {
-        private_dir(dir).with_context(|| format!("prepare {}", dir.display()))?;
-    }
+    paths
+        .own_control_dir()
+        .with_context(|| format!("prepare {}", paths.control_sock.display()))?;
     // A socket file left by a dead daemon; the lock says none is alive.
     let _ = std::fs::remove_file(&paths.control_sock);
     let listener = UnixListener::bind(&paths.control_sock)

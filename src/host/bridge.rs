@@ -50,6 +50,9 @@ fn copy_flushing(from: &mut impl Read, to: &mut impl Write) -> io::Result<()> {
 }
 
 fn connect_or_start(paths: &HostPaths) -> Result<UnixStream> {
+    paths
+        .own_control_dir()
+        .with_context(|| format!("prepare {}", paths.control_sock.display()))?;
     if let Ok(stream) = UnixStream::connect(&paths.control_sock) {
         return Ok(stream);
     }
@@ -107,4 +110,31 @@ fn start_daemon(paths: &HostPaths) -> Result<()> {
     // Reap it if it exits while the bridge still runs (the lost-race case).
     std::thread::spawn(move || child.wait());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixListener;
+
+    use super::*;
+
+    /// A control socket reached through a symlink is not this user's daemon,
+    /// even with something listening on it.
+    #[test]
+    fn a_control_socket_behind_a_symlink_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let theirs = tmp.path().join("theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        let _listener = UnixListener::bind(theirs.join("daemon.sock")).unwrap();
+        let dir = tmp.path().join("caucus-host");
+        std::os::unix::fs::symlink(&theirs, &dir).unwrap();
+        let paths = HostPaths::resolve(
+            Some(tmp.path().join("state")),
+            Some(dir.join("daemon.sock")),
+            Some(tmp.path().join("signal.sock")),
+        )
+        .unwrap();
+        let err = connect_or_start(&paths).unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+    }
 }

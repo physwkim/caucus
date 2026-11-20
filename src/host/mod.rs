@@ -77,17 +77,34 @@ impl HostPaths {
     pub fn log_file(&self) -> PathBuf {
         self.state_dir.join("daemon.log")
     }
+
+    /// Make the control socket's directory this user's alone
+    /// ([`private_dir`]), so a socket in it can only be this user's daemon.
+    /// The daemon runs it before binding, the bridge before connecting.
+    pub(crate) fn own_control_dir(&self) -> io::Result<()> {
+        match self.control_sock.parent() {
+            Some(dir) => private_dir(dir),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Create `dir` mode 0700, or accept an existing one only if this user owns it
 /// and no one else can enter it. In a shared `/tmp`, a directory another user
-/// made first would let them swap the daemon's socket for their own.
+/// made first would let them swap the daemon's socket for their own; so would
+/// a symlink of theirs, which they can repoint after the check.
 pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
-    let meta = std::fs::metadata(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a symlink, not a directory", dir.display()),
+        ));
+    }
     // SAFETY: `getuid` has no preconditions and cannot fail.
     if meta.uid() != unsafe { libc::getuid() } {
         return Err(io::Error::new(
@@ -128,6 +145,17 @@ mod tests {
         private_dir(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn private_dir_refuses_a_symlink_even_to_this_users_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("sock");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = private_dir(&link).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
     }
 
     #[test]
