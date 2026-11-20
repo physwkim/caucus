@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent::lane_event::{LaneEvent, LaneEventKind};
 use crate::agent::manifest;
-use crate::agent::provenance::{self, LaneCommitProvenance, SupersededBy};
+use crate::agent::provenance::{self, LaneCommitProvenance};
 use crate::input::CaucusCommand;
 use crate::panel::lifecycle::{self, PanelState};
 use crate::signal::{
@@ -831,25 +831,10 @@ impl Multiplexer {
         }
     }
 
-    /// Record a `CommitCreated` event when a turn whose final message was
-    /// `last_message` named a commit this agent left on its own branch
-    /// (`docs/design.md` §5). `git_dir` is a checkout holding the branch: the
-    /// lane's worktree, or this repo once a sub-host lane's branch is fetched.
-    ///
-    /// A sub-agent's commits live on its worktree's branch and outlive the panel,
-    /// but nothing tied them back to the agent that made them: `git log` on the
-    /// branch shows the commit, and the manifest showed the branch, and no record
-    /// joined the two. The turn signal's `last_message` is where an agent says
-    /// what it did, so a SHA it names there is the join — but only once git has
-    /// confirmed both halves of it (`provenance::extract_branch_commit`): the
-    /// commit exists, *and* it is on this panel's branch. A worktree shares its
-    /// object database with every other worktree, so the first half alone would
-    /// let an agent claim a sibling panel's commit merely by mentioning it.
-    ///
-    /// Panels with no worktree are skipped: they commit in the shared checkout if
-    /// they commit at all, and a SHA there names no work this panel owns. So are
-    /// panels whose branch caucus never learned — with no branch there is no join
-    /// to verify, and an unverified join is what this exists to prevent.
+    /// Record the [`commit_created`] of a live panel's turn whose final message
+    /// was `last_message`. `git_dir` is a checkout holding the panel's branch:
+    /// the lane's worktree, or this repo once a sub-host lane's branch is
+    /// fetched.
     pub(super) fn record_commit_provenance(
         &mut self,
         panel_id: PanelId,
@@ -859,32 +844,12 @@ impl Multiplexer {
         let Some(manifest) = self.manifests.get(&panel_id) else {
             return;
         };
-        let Some(worktree) = manifest.worktree_path.clone() else {
+        let Some(branch) = self.worktree_branches.get(&panel_id) else {
             return;
         };
-        let Some(branch) = self.worktree_branches.get(&panel_id).cloned() else {
-            return;
-        };
-        let Some(commit) = provenance::extract_branch_commit(git_dir, &branch, last_message) else {
-            return;
-        };
-        // An agent that keeps referring to the commit it made ("still working on
-        // top of abc1234") names it again every turn. The commit was created
-        // once, so it is recorded once — a timeline that repeats the same
-        // creation reads like repeated work.
-        if manifest.live_commits().iter().any(|p| p.commit == commit) {
-            return;
+        if let Some(event) = commit_created(manifest, git_dir, branch, last_message) {
+            self.record_lane_event(panel_id, event);
         }
-        self.record_lane_event(
-            panel_id,
-            LaneEventKind::CommitCreated {
-                provenance: LaneCommitProvenance {
-                    commit,
-                    branch,
-                    worktree: Some(worktree),
-                },
-            },
-        );
     }
 
     /// Record a `CommitSuperseded` event for every commit the panel created that
@@ -915,29 +880,21 @@ impl Multiplexer {
         if manifest.worktree_path.is_none() {
             return;
         }
-        let live = manifest.live_commits();
-        if live.is_empty() {
+        if manifest.live_commits().is_empty() {
             return; // No recorded commit on this lane — nothing can have left it.
         }
-        let Some(branch) = self.worktree_branches.get(&panel_id).cloned() else {
+        let Some(branch) = self.worktree_branches.get(&panel_id) else {
             return;
         };
-        let Some(tip) = provenance::branch_tip(git_dir, &branch) else {
+        let Some(tip) = provenance::branch_tip(git_dir, branch) else {
             return; // git cannot say where the branch is; make no claim.
         };
         if self.checked_branch_tips.get(&panel_id) == Some(&tip) {
             return;
         }
 
-        let retired: Vec<(String, SupersededBy)> = live
-            .into_iter()
-            .filter_map(|p| {
-                provenance::detect_supersession(git_dir, &p.branch, &p.commit)
-                    .map(|by| (p.commit, by))
-            })
-            .collect();
-        for (commit, by) in retired {
-            self.record_lane_event(panel_id, LaneEventKind::CommitSuperseded { commit, by });
+        for event in commits_superseded(manifest, git_dir) {
+            self.record_lane_event(panel_id, event);
         }
         // Only after the checks ran: a turn that returned early above must
         // re-check next time rather than trust a tip it never looked past.
@@ -1056,10 +1013,11 @@ impl Multiplexer {
     /// timeline is a record of the session, not a gate on it — losing an event
     /// to a full disk must not fail the prompt that produced it.
     ///
-    /// Not every event passes through here, and cannot: `WorktreeRemoved` is a
-    /// fact known only after the panel is detached and its manifest dropped from
-    /// this map, so the cleanup worker records it against the manifest on disk
-    /// (`worktree::cleanup`). That is the one writer outside this owner, and it
+    /// Not every event passes through here, and cannot: what is learned of a
+    /// lane after its panel is detached and its manifest dropped from this map
+    /// — the worktree's removal (`worktree::cleanup`), a sub-host lane's turns
+    /// whose fetch had not landed (`hosts::record_left_turns`) — is recorded
+    /// against the manifest on disk by whoever disposes of the lane, which
     /// owns the manifest exclusively by then.
     pub(crate) fn record_lane_event(&mut self, panel_id: PanelId, kind: LaneEventKind) {
         let Some(manifest) = self.manifests.get_mut(&panel_id) else {
@@ -1087,6 +1045,68 @@ impl Multiplexer {
             warn!(panel = %panel_id, error = %err, "prompt-delivered manifest write failed");
         }
     }
+}
+
+/// The `CommitCreated` event a turn whose final message was `last_message`
+/// earns on `manifest`'s lane, whose branch is `branch`, as `git_dir` sees the
+/// branch (`docs/design.md` §5); `None` when it earns none.
+///
+/// A sub-agent's commits live on its worktree's branch and outlive the panel,
+/// but nothing tied them back to the agent that made them: `git log` on the
+/// branch shows the commit, and the manifest showed the branch, and no record
+/// joined the two. The turn signal's `last_message` is where an agent says
+/// what it did, so a SHA it names there is the join — but only once git has
+/// confirmed both halves of it (`provenance::extract_branch_commit`): the
+/// commit exists, *and* it is on this lane's branch. A worktree shares its
+/// object database with every other worktree, so the first half alone would
+/// let an agent claim a sibling lane's commit merely by mentioning it.
+///
+/// Lanes with no worktree earn none: they commit in the shared checkout if
+/// they commit at all, and a SHA there names no work the lane owns. Callers
+/// skip lanes whose branch caucus never learned — with no branch there is no
+/// join to verify, and an unverified join is what this exists to prevent.
+pub(super) fn commit_created(
+    manifest: &manifest::AgentManifest,
+    git_dir: &Path,
+    branch: &str,
+    last_message: &str,
+) -> Option<LaneEventKind> {
+    let worktree = manifest.worktree_path.clone()?;
+    let commit = provenance::extract_branch_commit(git_dir, branch, last_message)?;
+    // An agent that keeps referring to the commit it made ("still working on
+    // top of abc1234") names it again every turn. The commit was created
+    // once, so it is recorded once — a timeline that repeats the same
+    // creation reads like repeated work.
+    if manifest.live_commits().iter().any(|p| p.commit == commit) {
+        return None;
+    }
+    Some(LaneEventKind::CommitCreated {
+        provenance: LaneCommitProvenance {
+            commit,
+            branch: branch.to_string(),
+            worktree: Some(worktree),
+        },
+    })
+}
+
+/// A `CommitSuperseded` event for every commit `manifest`'s lane created
+/// that its branch no longer holds, as `git_dir` sees the branch.
+pub(super) fn commits_superseded(
+    manifest: &manifest::AgentManifest,
+    git_dir: &Path,
+) -> Vec<LaneEventKind> {
+    manifest
+        .live_commits()
+        .into_iter()
+        .filter_map(|p| {
+            provenance::detect_supersession(git_dir, &p.branch, &p.commit).map(|by| {
+                LaneEventKind::CommitSuperseded {
+                    commit: p.commit,
+                    by,
+                }
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -13,7 +13,8 @@
 //! so main reviews the lane's commits here and the turn's commit records are
 //! checked against this repo, as a local lane's are against its worktree.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -21,11 +22,15 @@ use tokio::task::JoinSet;
 use tracing::warn;
 
 use super::host_restore::HostRestore;
+use super::input::{commit_created, commits_superseded};
 use super::spawn::Orphan;
 use super::*;
+use crate::agent::lane_event::LaneEvent;
+use crate::agent::manifest::{self, AgentManifest};
 use crate::config::hosts::{HostConfig, LOCAL_HOST};
 use crate::host::{HostInfo, HostLink, LinkStatus, RemoteSignal};
 use crate::mcp::HostSummary;
+use crate::session::id::AgentId;
 use crate::signal::{SignalEvent, StopDirective};
 use crate::worktree::cleanup::{WorktreeOwner, record_removal};
 use crate::worktree::remote::fetch_branch;
@@ -111,6 +116,75 @@ impl Hosts {
             lane_fetches: HashMap::new(),
             restores: Vec::new(),
         }
+    }
+
+    /// Take the ended turns of `panel_id`'s lane not yet recorded, oldest
+    /// first. A panel going away hands them to whatever fetches its branch
+    /// last ([`fetch_left_lane`]).
+    pub(super) fn take_unrecorded_turns(&mut self, panel_id: PanelId) -> Vec<Option<String>> {
+        let Some(lane) = self.lane_fetches.remove(&panel_id) else {
+            return Vec::new();
+        };
+        let mut turns = lane.running.map(|r| r.turns).unwrap_or_default();
+        turns.extend(lane.waiting);
+        turns
+    }
+}
+
+/// Fetch `branch` of a lane on `host` here, then record the `turns` agent
+/// `agent_id` ended on it that its panel went away without recording.
+async fn fetch_left_lane(
+    host: &str,
+    here: PathBuf,
+    url: &OsStr,
+    branch: String,
+    session_root: PathBuf,
+    agent_id: AgentId,
+    turns: Vec<Option<String>>,
+) {
+    if let Err(err) = within(fetch_branch(&here, url, &branch)).await {
+        warn!(%host, %branch, unrecorded_turns = turns.len(), error = %err, "sub-host lane branch not fetched");
+        return;
+    }
+    if turns.is_empty() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        record_left_turns(&session_root, agent_id, &here, &branch, &turns)
+    })
+    .await;
+}
+
+/// Record `turns` of agent `agent_id`'s lane, as the live path does once a
+/// fetch lands (`Multiplexer::poll_lane_fetches`), against its manifest on
+/// disk: no live panel holds that manifest any more, so whoever disposes of
+/// the lane owns it.
+fn record_left_turns(
+    session_root: &Path,
+    agent_id: AgentId,
+    here: &Path,
+    branch: &str,
+    turns: &[Option<String>],
+) {
+    let mut manifest = match manifest::read(session_root, agent_id) {
+        Ok(m) => m,
+        Err(err) => {
+            warn!(agent = %agent_id, error = %err, "left lane turns not recorded");
+            return;
+        }
+    };
+    let record = |manifest: &mut AgentManifest, kind| {
+        if let Err(err) = manifest::write(manifest, session_root, Some(LaneEvent::now(kind))) {
+            warn!(agent = %agent_id, error = %err, "left lane turn write failed");
+        }
+    };
+    for message in turns.iter().flatten() {
+        if let Some(event) = commit_created(&manifest, here, branch, message) {
+            record(&mut manifest, event);
+        }
+    }
+    for event in commits_superseded(&manifest, here) {
+        record(&mut manifest, event);
     }
 }
 
@@ -205,6 +279,7 @@ impl Multiplexer {
                 path,
                 branch,
                 owner,
+                unrecorded_turns,
                 ..
             } = orphan;
             let delete = owner.is_none().then_some(branch.as_deref()).flatten();
@@ -218,16 +293,52 @@ impl Multiplexer {
             if removed.is_ok() {
                 let owner = WorktreeOwner {
                     worktree: path,
-                    session_root,
+                    session_root: session_root.clone(),
                     agent_id,
                 };
                 let _ = tokio::task::spawn_blocking(move || record_removal(&owner)).await;
             }
-            if let Some(branch) = branch
-                && let Err(err) = within(fetch_branch(&here, &url, &branch)).await
-            {
-                warn!(%host, %branch, error = %err, "sub-host lane branch not fetched");
+            if let Some(branch) = branch {
+                fetch_left_lane(
+                    &host,
+                    here,
+                    &url,
+                    branch,
+                    session_root,
+                    agent_id,
+                    unrecorded_turns,
+                )
+                .await;
             }
+        });
+    }
+
+    /// Record `turns`, which agent `agent_id` ended on its lane's `branch` on
+    /// `host` and left unrecorded when its panel went, once a fetch from a
+    /// host task lands the branch here. For a lane whose worktree stays, as
+    /// [`Multiplexer::dispose_host_worktree`] does it for one that goes.
+    pub(super) fn record_left_lane(
+        &mut self,
+        host: &str,
+        agent_id: AgentId,
+        branch: String,
+        turns: Vec<Option<String>>,
+    ) {
+        if turns.is_empty() {
+            return;
+        }
+        let url = match self.host_repo(host) {
+            Ok(repo) => repo.url,
+            Err(err) => {
+                warn!(%host, %branch, unrecorded_turns = turns.len(), error = %err, "left lane turns not recorded");
+                return;
+            }
+        };
+        let here = self.session.repo_path.clone();
+        let session_root = self.session.root_dir.clone();
+        let host = host.to_string();
+        self.spawn_host_task(async move {
+            fetch_left_lane(&host, here, &url, branch, session_root, agent_id, turns).await;
         });
     }
 
@@ -851,6 +962,63 @@ mod tests {
 
         mux.shutdown();
         mux.close_hosts().await;
+        daemon.stop().await;
+    }
+
+    /// A sub-host lane whose turn ended with a commit, the turn's fetch not
+    /// landed yet, and whose panel then went — killed, restarted or shut
+    /// down — still has the commit recorded against its agent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sub_host_lane_gone_mid_fetch_still_records_its_turn() {
+        let tmp = TempDir::new().unwrap();
+        let host_tmp = TempDir::new().unwrap();
+        let (mut mux, mut daemon, _there) = with_host_checkout(&tmp, &host_tmp).await;
+
+        let mut lanes = Vec::new();
+        for how in ["killed", "restarted", "shut down"] {
+            // A spawn counts the role; these lanes bypass it.
+            *mux.role_counts.entry("reviewer".into()).or_default() += 1;
+            let req = mux.role_worktree_request("reviewer");
+            let repo = mux.host_repo("box").unwrap();
+            let made = mux.make_host_worktree("box", repo, req);
+            let handle = tokio::time::timeout(WAIT, made)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let path = handle.path.clone();
+            let id = push_remote_lane(&mut mux, "box", Some((path.clone(), handle.branch)));
+            std::fs::write(path.join("a.txt"), how).unwrap();
+            git(&path, &["add", "a.txt"]).unwrap();
+            git(&path, &["commit", "-q", "-m", how]).unwrap();
+            let sha = git(&path, &["rev-parse", "HEAD"]).unwrap();
+            mux.ingest_signal(
+                stop_saying(&mux, id, &format!("committed {}", &sha[..12])),
+                None,
+                Some("box"),
+            );
+            lanes.push((how, id, mux.manifests[&id].agent_id, sha));
+        }
+        // Never polled: as far as main knows, every turn is still fetching.
+        assert_eq!(mux.hosts.lane_fetches.len(), 3);
+
+        mux.kill_panel(lanes[0].1).unwrap();
+        mux.restart_panel(lanes[1].1).unwrap();
+        mux.shutdown();
+        mux.close_hosts().await;
+
+        let unrecorded: Vec<_> = lanes
+            .iter()
+            .filter(|(_, _, agent, sha)| {
+                !manifest::read(&mux.session.root_dir, *agent)
+                    .unwrap()
+                    .live_commits()
+                    .iter()
+                    .any(|c| c.commit == *sha)
+            })
+            .map(|(how, ..)| *how)
+            .collect();
+        assert!(unrecorded.is_empty(), "turns lost when {unrecorded:?}");
         daemon.stop().await;
     }
 

@@ -202,6 +202,7 @@ impl Multiplexer {
                             path,
                             branch,
                             owner: Some(agent),
+                            unrecorded_turns: Vec::new(),
                         }],
                         false,
                     );
@@ -228,6 +229,7 @@ impl Multiplexer {
                     path,
                     branch: restore.record.worktree_branch,
                     owner: Some(restore.agent),
+                    unrecorded_turns: Vec::new(),
                 }],
                 false,
             );
@@ -254,6 +256,7 @@ impl Multiplexer {
                 path,
                 branch: restore.record.worktree_branch,
                 owner: Some(restore.agent),
+                unrecorded_turns: Vec::new(),
             }));
         }
         self.dispose_worktrees(orphans, true);

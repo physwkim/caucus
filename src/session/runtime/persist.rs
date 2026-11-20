@@ -96,6 +96,7 @@ impl Multiplexer {
                     path,
                     branch: self.worktree_branches.get(&panel.id).cloned(),
                     owner: Some(panel.agent_id),
+                    unrecorded_turns: self.hosts.take_unrecorded_turns(panel.id),
                 });
             }
         }

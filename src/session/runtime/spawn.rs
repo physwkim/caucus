@@ -55,6 +55,10 @@ struct DetachedPanel {
     /// of the worktree still has to credit its removal to this agent's timeline
     /// (`worktree::cleanup::WorktreeOwner`).
     agent_id: AgentId,
+    /// The ended turns of its sub-host lane whose fetch had not landed
+    /// ([`super::hosts::Hosts::take_unrecorded_turns`]); whoever fetches the
+    /// branch next records them.
+    unrecorded_turns: Vec<Option<String>>,
 }
 
 /// A worktree no panel holds any more, for [`Multiplexer::dispose_worktrees`].
@@ -66,6 +70,9 @@ pub(super) struct Orphan {
     /// The agent that worked in it. Its branch holds that agent's commits and
     /// is kept; with no agent, the branch holds nothing and goes too.
     pub(super) owner: Option<AgentId>,
+    /// The ended turns of the owner's sub-host lane not yet recorded, for
+    /// the fetch that follows the removal to record.
+    pub(super) unrecorded_turns: Vec<Option<String>>,
 }
 
 impl Orphan {
@@ -76,6 +83,7 @@ impl Orphan {
             path: handle.path,
             branch: Some(handle.branch),
             owner: None,
+            unrecorded_turns: Vec::new(),
         }
     }
 }
@@ -439,6 +447,7 @@ impl Multiplexer {
                 path,
                 branch: detached.worktree_branch.clone(),
                 owner: Some(detached.agent_id),
+                unrecorded_turns: detached.unrecorded_turns.clone(),
             }],
             false,
         );
@@ -565,6 +574,11 @@ impl Multiplexer {
                 return Err(err);
             }
         };
+        // The worktree goes on under a new agent; the turns the old one left
+        // unrecorded are still its own.
+        if let (Some(host), Some(branch)) = (orphan.host, orphan.worktree_branch) {
+            self.record_left_lane(&host, orphan.agent_id, branch, orphan.unrecorded_turns);
+        }
         // The fresh PTY carries a fresh PanelId, but the panel is the same
         // logical round member. Re-key its membership so live rounds follow it
         // to the new id instead of dropping it as a vanished panel.
@@ -598,11 +612,11 @@ impl Multiplexer {
             worktree_path: panel.worktree_path.clone(),
             worktree_branch: self.worktree_branches.remove(&panel_id),
             agent_id: panel.agent_id,
+            unrecorded_turns: self.hosts.take_unrecorded_turns(panel_id),
         };
         self.manifests.remove(&panel_id);
         self.screen_scan_cache.remove(&panel_id);
         self.checked_branch_tips.remove(&panel_id);
-        self.hosts.lane_fetches.remove(&panel_id);
         self.local_commands_without_turn.remove(&panel_id);
         self.outstanding_prompts.remove(&panel_id);
         self.lost_turn_probe.remove(&panel_id);
