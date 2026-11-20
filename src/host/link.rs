@@ -5,10 +5,11 @@
 //! whenever it drops. On every new connection it first re-sends what the
 //! daemon may not have — spawns it has not confirmed, kills it has not
 //! confirmed, worktree requests it has not answered — then re-attaches each
-//! panel from the first byte main has not seen. Frames written while
-//! disconnected wait in the outbound queue.
+//! panel from the first byte main has not seen and re-sends its input from
+//! the first byte the host has not taken. Frames written while disconnected
+//! wait in the outbound queue.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -35,6 +36,9 @@ use crate::session::id::{PanelId, SessionId};
 const OUTBOUND_QUEUE: usize = 1024;
 /// Output chunks buffered for one panel before the link stops reading.
 const PANEL_QUEUE: usize = 1024;
+/// Input a panel keeps to re-send after a drop; more than a connection holds
+/// in flight.
+const INPUT_REPLAY: usize = 1 << 20;
 /// How long a connection has to answer `hello`.
 const HANDSHAKE_WAIT: Duration = Duration::from_secs(15);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
@@ -151,6 +155,11 @@ struct LinkState {
     next_req: u64,
     /// The host's load as of the current connection's latest report.
     load: Option<HostLoad>,
+    /// Each panel the latest welcome listed, with the first input byte the
+    /// host had not taken.
+    taken: HashMap<PanelId, u64>,
+    /// The next signal of the link itself main has not seen.
+    signals_next: u64,
     closed: bool,
 }
 
@@ -168,6 +177,25 @@ struct LinkPanel {
     size: (u16, u16),
     exited: bool,
     out: mpsc::Sender<Chunk>,
+    /// The latest input, kept to re-send what a dropped connection lost;
+    /// `input[0]` is input byte `input_base`, counted from the spawn.
+    input: VecDeque<u8>,
+    input_base: u64,
+    /// The next signal of this panel main has not seen.
+    signals_next: u64,
+}
+
+impl LinkPanel {
+    fn input_end(&self) -> u64 {
+        self.input_base + self.input.len() as u64
+    }
+
+    /// Forget input before `upto`, which the host has taken.
+    fn drop_input_before(&mut self, upto: u64) {
+        let taken = (upto.saturating_sub(self.input_base) as usize).min(self.input.len());
+        self.input.drain(..taken);
+        self.input_base += taken as u64;
+    }
 }
 
 struct Request {
@@ -270,6 +298,7 @@ impl HostLink {
             panel,
             (cols, rows),
             Some(spec.clone()),
+            0,
             [ClientFrame::Spawn { panel, spec }],
         )
     }
@@ -278,10 +307,12 @@ impl HostLink {
     /// before main restarted, replaying its output from the first byte the
     /// host kept.
     pub fn adopt(&self, panel: PanelId, cols: u16, rows: u16) -> Result<RemotePty, PtyError> {
+        let taken = self.inner.lock().taken.get(&panel).copied().unwrap_or(0);
         self.open(
             panel,
             (cols, rows),
             None,
+            taken,
             [
                 ClientFrame::Attach { panel, from: 0 },
                 ClientFrame::Resize { panel, cols, rows },
@@ -294,6 +325,7 @@ impl HostLink {
         panel: PanelId,
         size: (u16, u16),
         unconfirmed: Option<SpawnSpec>,
+        input_base: u64,
         frames: [ClientFrame; N],
     ) -> Result<RemotePty, PtyError> {
         let (out, rx) = mpsc::channel(PANEL_QUEUE);
@@ -313,6 +345,9 @@ impl HostLink {
                     size,
                     exited: false,
                     out,
+                    input: VecDeque::new(),
+                    input_base,
+                    signals_next: 0,
                 },
             );
         }
@@ -340,6 +375,21 @@ impl HostLink {
                 mpsc::error::TrySendError::Full(_) => PtyError::WriterFull,
                 mpsc::error::TrySendError::Closed(_) => PtyError::WriterClosed,
             })
+    }
+
+    /// Send `bytes` as `panel`'s next input, kept to re-send after a drop.
+    fn input(&self, panel: PanelId, bytes: &[u8]) -> Result<(), PtyError> {
+        let mut state = self.inner.lock();
+        let p = state.panels.get_mut(&panel).ok_or(PtyError::WriterClosed)?;
+        self.send(ClientFrame::Input {
+            panel,
+            offset: p.input_end(),
+            data: Bytes(bytes.to_vec()),
+        })?;
+        p.input.extend(bytes);
+        let over = p.input.len().saturating_sub(INPUT_REPLAY) as u64;
+        p.drop_input_before(p.input_base + over);
+        Ok(())
     }
 
     fn resize(&self, panel: PanelId, cols: u16, rows: u16) -> Result<(), PtyError> {
@@ -470,8 +520,15 @@ impl Inner {
     /// What a new connection sends before anything queued.
     fn reattach_frames(&self) -> Vec<ClientFrame> {
         let mut state = self.lock();
+        let LinkState {
+            panels,
+            kills,
+            requests,
+            taken,
+            ..
+        } = &mut *state;
         let mut frames = Vec::new();
-        for (&panel, p) in state.panels.iter().filter(|(_, p)| !p.exited) {
+        for (&panel, p) in panels.iter_mut().filter(|(_, p)| !p.exited) {
             if let Some(spec) = &p.unconfirmed {
                 frames.push(ClientFrame::Spawn {
                     panel,
@@ -487,12 +544,24 @@ impl Inner {
                 cols: p.size.0,
                 rows: p.size.1,
             });
+            // A panel the welcome does not list has taken none of its input
+            // yet, or is gone and drops it.
+            if let Some(&upto) = taken.get(&panel) {
+                p.drop_input_before(upto);
+            }
+            if !p.input.is_empty() {
+                frames.push(ClientFrame::Input {
+                    panel,
+                    offset: p.input_base,
+                    data: Bytes(p.input.iter().copied().collect()),
+                });
+            }
         }
-        for (&panel, kill) in &mut state.kills {
+        for (&panel, kill) in kills.iter_mut() {
             *kill = Kill::Sent;
             frames.push(ClientFrame::Kill { panel });
         }
-        frames.extend(state.requests.values().map(|r| r.frame.clone()));
+        frames.extend(requests.values().map(|r| r.frame.clone()));
         frames
     }
 
@@ -577,10 +646,34 @@ impl Inner {
                     let _ = out.send(Chunk::Exited(reason)).await;
                 }
             }
-            DaemonFrame::Signal { line } => {
-                let _ = signals.send(RemoteSignal {
-                    host: self.name.clone(),
-                    line,
+            DaemonFrame::Signal { panel, seq, line } => {
+                let fresh = {
+                    let mut state = self.lock();
+                    let next = match panel {
+                        Some(panel) => state.panels.get_mut(&panel).map(|p| &mut p.signals_next),
+                        None => Some(&mut state.signals_next),
+                    };
+                    match next {
+                        Some(next) if seq < *next => false,
+                        Some(next) => {
+                            *next = seq + 1;
+                            true
+                        }
+                        // A panel main has let go of; the host forgets it too.
+                        None => true,
+                    }
+                };
+                if fresh {
+                    let _ = signals.send(RemoteSignal {
+                        host: self.name.clone(),
+                        line,
+                    });
+                }
+                // A confirmation the full queue refuses is made good by the
+                // next one; until then the host may send the signal again.
+                let _ = self.outbound.try_send(ClientFrame::SignalsSeen {
+                    panel,
+                    next: seq + 1,
                 });
             }
             DaemonFrame::WorktreeDone { req, result } => {
@@ -747,6 +840,7 @@ async fn connection(
     };
     let connected = Instant::now();
     info!(host = %inner.name, hostname = %info.hostname, version = %info.version, "sub-host connected");
+    inner.lock().taken = info.panels.iter().map(|p| (p.id, p.input)).collect();
     inner.status.send_replace(LinkStatus::Connected(info));
 
     let mut first = inner.reattach_frames();
@@ -931,10 +1025,7 @@ impl RemotePty {
         if self.exited || self.killed {
             return Err(PtyError::WriterClosed);
         }
-        self.link.send(ClientFrame::Input {
-            panel: self.panel,
-            data: Bytes(bytes.to_vec()),
-        })
+        self.link.input(self.panel, bytes)
     }
 
     pub(crate) fn is_alive(&mut self) -> bool {

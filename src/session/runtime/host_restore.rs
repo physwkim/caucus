@@ -112,7 +112,10 @@ impl Multiplexer {
                 None
             }
         };
-        if let Some(old) = old.as_ref().filter(|m| info.panels.contains(&m.panel_id)) {
+        if let Some(old) = old
+            .as_ref()
+            .filter(|m| info.panels.iter().any(|p| p.id == m.panel_id))
+        {
             let branch = restore.record.worktree_branch.clone();
             return match self.adopt_panel(&repo.link, old.clone(), branch) {
                 Ok(panel) => {

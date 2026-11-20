@@ -7,6 +7,12 @@
 //! ([`ClientFrame::Attach`]), so a reconnect replays exactly the missing
 //! bytes into the panel's grid.
 //!
+//! Input and signals cross the same way: main numbers a panel's input bytes
+//! from its spawn and re-sends from the first byte the welcome says the host
+//! has not taken; the daemon numbers each signal and keeps it until main
+//! confirms it ([`ClientFrame::SignalsSeen`]), so a connection that dies with
+//! either in flight loses neither.
+//!
 //! [`Output`]: DaemonFrame::Output
 
 use std::collections::BTreeMap;
@@ -22,7 +28,7 @@ use crate::session::id::{PanelId, SessionId};
 
 /// Bumped on any incompatible frame change; a daemon refuses a client
 /// speaking another version instead of misreading its frames.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 
 /// Longest line either side reads. Input frames carry whole pastes and spawn
 /// frames carry the role prompt, so this sits well above the signal socket's
@@ -127,12 +133,12 @@ pub enum ClientFrame {
     },
     /// Start `spec` as `panel`. Idempotent per panel id: a client that resends
     /// an unconfirmed spawn after a reconnect gets the existing panel.
-    Spawn {
-        panel: PanelId,
-        spec: SpawnSpec,
-    },
+    Spawn { panel: PanelId, spec: SpawnSpec },
+    /// `data` is the panel's input starting at byte `offset`, counted from
+    /// its spawn. The daemon writes only the bytes it has not taken yet.
     Input {
         panel: PanelId,
+        offset: u64,
         data: Bytes,
     },
     Resize {
@@ -141,14 +147,12 @@ pub enum ClientFrame {
         rows: u16,
     },
     /// Stream `panel`'s output starting at byte `from`.
-    Attach {
-        panel: PanelId,
-        from: u64,
-    },
+    Attach { panel: PanelId, from: u64 },
     /// Kill the panel's process and forget it.
-    Kill {
-        panel: PanelId,
-    },
+    Kill { panel: PanelId },
+    /// Main has every signal before `next` of `panel` (`None`: of the link
+    /// itself); the daemon forgets them.
+    SignalsSeen { panel: Option<PanelId>, next: u64 },
     /// Check out the existing `branch` at `path` as a new worktree of the
     /// repo at `repo` (a leading `~` is the host user's home). Answered by
     /// [`DaemonFrame::WorktreeDone`] with the worktree's absolute path. A
@@ -187,7 +191,15 @@ pub struct HostInfo {
     pub session_dir: PathBuf,
     /// This session's panels still running here, which a resumed main
     /// re-adopts instead of starting again.
-    pub panels: Vec<PanelId>,
+    pub panels: Vec<HostPanel>,
+}
+
+/// A panel the welcome lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostPanel {
+    pub id: PanelId,
+    /// The first input byte the host has not taken.
+    pub input: u64,
 }
 
 /// Daemon → main caucus.
@@ -216,8 +228,12 @@ pub enum DaemonFrame {
         reason: Option<String>,
     },
     /// A line a panel on this host posted to the daemon's turn-signal socket,
-    /// re-serialised as the signal server parsed it.
+    /// re-serialised as the signal server parsed it. `seq` numbers the
+    /// signals of `panel` (`None`: of the link itself, for a panel not here
+    /// or no session); one may come again until main confirms it.
     Signal {
+        panel: Option<PanelId>,
+        seq: u64,
         line: String,
     },
     /// The answer to worktree request `req`: the worktree's absolute path on

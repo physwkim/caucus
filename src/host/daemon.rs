@@ -31,8 +31,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use super::proto::{
-    Bytes, ClientFrame, DaemonFrame, HostInfo, MAX_FRAME_BYTES, OUTPUT_CHUNK, PROTO_VERSION,
-    SpawnSpec, encode,
+    Bytes, ClientFrame, DaemonFrame, HostInfo, HostPanel, MAX_FRAME_BYTES, OUTPUT_CHUNK,
+    PROTO_VERSION, SpawnSpec, encode,
 };
 use super::{HostPaths, home_relative, private_dir};
 use crate::line_io::{CappedLine, read_capped_line};
@@ -51,7 +51,7 @@ const TICK: Duration = Duration::from_millis(5);
 const LIVENESS_PROBE: Duration = Duration::from_millis(250);
 /// Lines queued toward one connection before output waits in the ring.
 const CONNECTION_QUEUE: usize = 64;
-/// Signals held for one panel or session before the oldest is dropped.
+/// Unconfirmed signals held for one panel or link before the oldest is dropped.
 const SIGNAL_BACKLOG: usize = 1024;
 /// How long a fresh connection has to say `hello`.
 const HELLO_WAIT: Duration = Duration::from_secs(10);
@@ -321,7 +321,7 @@ struct Client {
     conn: u64,
     tx: mpsc::Sender<String>,
     _kick: oneshot::Sender<()>,
-    /// Replies and session-wide signals, sent ahead of panel output.
+    /// Replies, sent ahead of panel output.
     queued: VecDeque<String>,
 }
 
@@ -352,6 +352,65 @@ impl Client {
     }
 }
 
+/// Signals for one receiver, kept until main confirms them: a line handed to
+/// a connection that dies goes out again on the next. `lines[0]` is signal
+/// `base`.
+#[derive(Default)]
+struct SignalLog {
+    base: u64,
+    lines: VecDeque<String>,
+    /// Next to send on the current connection.
+    sent: u64,
+}
+
+impl SignalLog {
+    fn end(&self) -> u64 {
+        self.base + self.lines.len() as u64
+    }
+
+    fn push(&mut self, line: String) {
+        if self.lines.len() >= SIGNAL_BACKLOG {
+            self.lines.pop_front();
+            self.base += 1;
+            warn!("sub-host signal backlog full; dropped the oldest signal");
+        }
+        self.lines.push_back(line);
+    }
+
+    /// Main has every signal before `next`.
+    fn confirm(&mut self, next: u64) {
+        let seen = (next.saturating_sub(self.base) as usize).min(self.lines.len());
+        self.lines.drain(..seen);
+        self.base += seen as u64;
+    }
+
+    /// Send from the oldest unconfirmed signal on, as a new connection needs.
+    fn rewind(&mut self) {
+        self.sent = self.base;
+    }
+
+    fn unsent(&self) -> bool {
+        self.sent < self.end()
+    }
+
+    /// Send to `client` until its queue fills. `true` once all has gone out.
+    fn stream(&mut self, panel: Option<PanelId>, client: &Client) -> bool {
+        self.sent = self.sent.max(self.base);
+        while self.unsent() {
+            if !client.has_room() {
+                return false;
+            }
+            client.send_now(&DaemonFrame::Signal {
+                panel,
+                seq: self.sent,
+                line: self.lines[(self.sent - self.base) as usize].clone(),
+            });
+            self.sent += 1;
+        }
+        true
+    }
+}
+
 /// Where a panel's child is in dying. A child seen dead stays `Dying` for one
 /// probe interval so output its reader thread still holds reaches the ring
 /// before the panel is reported gone.
@@ -375,8 +434,10 @@ struct DPanel {
     life: Life,
     /// Whether this connection has been told about the exit.
     exit_sent: bool,
-    /// Signals the panel posted, held until its output has gone out.
-    signals: VecDeque<String>,
+    /// Signals the panel posted; each goes out after the output before it.
+    signals: SignalLog,
+    /// The first input byte not yet taken, counted from the spawn.
+    input_next: u64,
 }
 
 impl DPanel {
@@ -389,7 +450,8 @@ impl DPanel {
             sent: None,
             life: Life::Running,
             exit_sent: false,
-            signals: VecDeque::new(),
+            signals: SignalLog::default(),
+            input_next: 0,
         }
     }
 
@@ -432,12 +494,8 @@ impl DPanel {
             sent += (stop - start) as u64;
         }
         self.sent = Some(sent);
-        while let Some(line) = self.signals.pop_front() {
-            if !client.has_room() {
-                self.signals.push_front(line);
-                return false;
-            }
-            let _ = client.tx.try_send(line);
+        if !self.signals.stream(Some(id), client) {
+            return false;
         }
         if let Life::Exited(reason) = &self.life
             && !self.exit_sent
@@ -452,6 +510,26 @@ impl DPanel {
             self.exit_sent = true;
         }
         true
+    }
+
+    /// Write main's input from byte `offset` on to the child, skipping what
+    /// it already took: main re-sends what a dropped connection may have
+    /// lost.
+    fn take_input(&mut self, id: PanelId, offset: u64, data: &[u8]) {
+        let end = offset + data.len() as u64;
+        if end <= self.input_next {
+            return;
+        }
+        if offset > self.input_next {
+            warn!(panel = %id, lost = offset - self.input_next, "sub-host input gap");
+        }
+        let skip = self.input_next.saturating_sub(offset) as usize;
+        self.input_next = end;
+        if let Some(pty) = self.pty.as_mut()
+            && let Err(err) = pty.write(&data[skip..])
+        {
+            warn!(panel = %id, error = %err, "input to a sub-host panel was dropped");
+        }
     }
 }
 
@@ -527,6 +605,9 @@ struct Daemon {
     caucus_bin: PathBuf,
     panels: HashMap<PanelId, DPanel>,
     clients: HashMap<Link, Client>,
+    /// Signals for a link rather than one of its panels, kept while the link
+    /// has a connection or a panel here.
+    link_signals: HashMap<Link, SignalLog>,
     last_probe: Instant,
     /// `None` once shutdown has drained it.
     chores: Option<Chores>,
@@ -542,6 +623,7 @@ impl Daemon {
             caucus_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caucus")),
             panels: HashMap::new(),
             clients: HashMap::new(),
+            link_signals: HashMap::new(),
             last_probe: Instant::now(),
             chores: Some(Chores::start(chores_done)),
         }
@@ -554,7 +636,12 @@ impl Daemon {
     }
 
     fn wants_tick(&self) -> bool {
-        !self.panels.is_empty() || self.clients.values().any(|c| !c.queued.is_empty())
+        !self.panels.is_empty()
+            || self.clients.values().any(|c| !c.queued.is_empty())
+            || self
+                .link_signals
+                .iter()
+                .any(|(link, log)| log.unsent() && self.clients.contains_key(link))
     }
 
     fn on_event(&mut self, event: ConnEvent) {
@@ -578,6 +665,11 @@ impl Daemon {
             }
             ConnEvent::Closed { conn } => {
                 self.clients.retain(|_, c| c.conn != conn);
+                // Signals for a link with no panel here belong to no one main
+                // still runs.
+                self.link_signals.retain(|link, _| {
+                    self.clients.contains_key(link) || self.panels.values().any(|p| p.link == *link)
+                });
             }
         }
     }
@@ -606,7 +698,10 @@ impl Daemon {
                     .panels
                     .iter()
                     .filter(|(_, p)| p.link == link && !matches!(p.life, Life::Exited(_)))
-                    .map(|(&id, _)| id)
+                    .map(|(&id, p)| HostPanel {
+                        id,
+                        input: p.input_next,
+                    })
                     .collect(),
             }),
             Err(err) => {
@@ -626,6 +721,7 @@ impl Daemon {
             ]),
         };
         client.flush();
+        self.link_signals.entry(link.clone()).or_default().rewind();
         // Dropping the replaced client kicks its connection.
         if self.clients.insert(link.clone(), client).is_some() {
             info!(session = %link.session, host = %link.host, "link reconnected; replacing its old connection");
@@ -692,6 +788,12 @@ impl Daemon {
                 self.chore(Chore::Worktree { link, req, op });
                 return;
             }
+            ClientFrame::SignalsSeen { panel: None, next } => {
+                if let Some(log) = self.link_signals.get_mut(&link) {
+                    log.confirm(next);
+                }
+                return;
+            }
             frame => frame,
         };
         let panel_id = match &frame {
@@ -699,10 +801,14 @@ impl Daemon {
             | ClientFrame::Input { panel, .. }
             | ClientFrame::Resize { panel, .. }
             | ClientFrame::Attach { panel, .. }
-            | ClientFrame::Kill { panel } => *panel,
+            | ClientFrame::Kill { panel }
+            | ClientFrame::SignalsSeen {
+                panel: Some(panel), ..
+            } => *panel,
             ClientFrame::Hello { .. }
             | ClientFrame::AddWorktree { .. }
-            | ClientFrame::RemoveWorktree { .. } => unreachable!("answered above"),
+            | ClientFrame::RemoveWorktree { .. }
+            | ClientFrame::SignalsSeen { panel: None, .. } => unreachable!("answered above"),
         };
         if self.panels.get(&panel_id).is_some_and(|p| p.link != link) {
             self.reply(
@@ -716,18 +822,21 @@ impl Daemon {
         match frame {
             ClientFrame::Hello { .. }
             | ClientFrame::AddWorktree { .. }
-            | ClientFrame::RemoveWorktree { .. } => unreachable!("answered above"),
+            | ClientFrame::RemoveWorktree { .. }
+            | ClientFrame::SignalsSeen { panel: None, .. } => unreachable!("answered above"),
             ClientFrame::Spawn { panel, spec } => {
                 self.panels
                     .entry(panel)
                     .or_insert_with(|| spawn_panel(link.clone(), &spec));
                 self.reply(&link, &DaemonFrame::Spawned { panel });
             }
-            ClientFrame::Input { panel, data } => {
-                if let Some(pty) = self.panels.get_mut(&panel).and_then(|p| p.pty.as_mut())
-                    && let Err(err) = pty.write(&data.0)
-                {
-                    warn!(%panel, error = %err, "input to a sub-host panel was dropped");
+            ClientFrame::Input {
+                panel,
+                offset,
+                data,
+            } => {
+                if let Some(p) = self.panels.get_mut(&panel) {
+                    p.take_input(panel, offset, &data.0);
                 }
             }
             ClientFrame::Resize { panel, cols, rows } => {
@@ -748,6 +857,7 @@ impl Daemon {
                     }
                     p.sent = Some(from.max(p.base));
                     p.exit_sent = false;
+                    p.signals.rewind();
                 }
                 None => self.reply(
                     &link,
@@ -757,6 +867,14 @@ impl Daemon {
                     },
                 ),
             },
+            ClientFrame::SignalsSeen {
+                panel: Some(panel),
+                next,
+            } => {
+                if let Some(p) = self.panels.get_mut(&panel) {
+                    p.signals.confirm(next);
+                }
+            }
             ClientFrame::Kill { panel } => {
                 if let Some(mut p) = self.panels.remove(&panel)
                     && let Some(pty) = p.pty.take()
@@ -777,7 +895,7 @@ impl Daemon {
     /// Route a signal posted on this host to the connections of its session.
     fn on_signal(&mut self, event: &SignalEvent) {
         let line = match serde_json::to_string(event) {
-            Ok(line) => encode(&DaemonFrame::Signal { line }),
+            Ok(line) => line,
             Err(err) => {
                 warn!(error = %err, "signal does not re-serialise");
                 return;
@@ -794,26 +912,24 @@ impl Daemon {
                 if let Some(p) = self.panels.get_mut(&panel)
                     && p.link.session == session
                 {
-                    push_capped(&mut p.signals, line);
+                    p.signals.push(line);
                 } else {
                     // Main takes a panel's signal only through the host the
                     // panel runs on, so each of the session's links gets it.
-                    for (_, client) in self
-                        .clients
+                    for (_, log) in self
+                        .link_signals
                         .iter_mut()
                         .filter(|(link, _)| link.session == session)
                     {
-                        push_capped(&mut client.queued, line.clone());
-                        client.flush();
+                        log.push(line.clone());
                     }
                 }
             }
             // An unbound hook names no session; each link decides whether
             // the conversation is one of its panels' sub-agents.
             None => {
-                for client in self.clients.values_mut() {
-                    push_capped(&mut client.queued, line.clone());
-                    client.flush();
+                for log in self.link_signals.values_mut() {
+                    log.push(line.clone());
                 }
             }
         }
@@ -847,7 +963,12 @@ impl Daemon {
 
     fn stream(&mut self) {
         for (link, client) in &mut self.clients {
-            if !client.flush() {
+            if !client.flush()
+                || self
+                    .link_signals
+                    .get_mut(link)
+                    .is_some_and(|log| !log.stream(None, client))
+            {
                 continue;
             }
             for (id, panel) in self.panels.iter_mut() {
@@ -969,14 +1090,6 @@ fn jiggle(panel: &mut DPanel) {
     }
 }
 
-fn push_capped(queue: &mut VecDeque<String>, line: String) {
-    if queue.len() >= SIGNAL_BACKLOG {
-        queue.pop_front();
-        warn!("sub-host signal backlog full; dropped the oldest signal");
-    }
-    queue.push_back(line);
-}
-
 pub(crate) fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is valid for `buf.len()` bytes; gethostname writes at most
@@ -1072,9 +1185,10 @@ mod tests {
                 .iter()
                 .all(|f| matches!(f, DaemonFrame::Output { .. }))
         );
-        let DaemonFrame::Signal { line } = &rest[3] else {
+        let DaemonFrame::Signal { panel, seq, line } = &rest[3] else {
             panic!("expected the signal last, got {:?}", rest[3]);
         };
+        assert_eq!((*panel, *seq), (Some(id), 0));
         assert!(matches!(
             crate::signal::server::ingest(line).unwrap(),
             SignalEvent::Turn(sig) if sig.panel_id == id
@@ -1122,6 +1236,72 @@ mod tests {
         assert!(kicked.try_recv().is_err(), "the new connection stays open");
         let p = &daemon.panels[&id];
         assert_eq!((p.sent, p.exit_sent), (None, false));
+        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
+    }
+
+    /// A signal for the link itself goes out again on each new connection
+    /// until main confirms it, and is forgotten with the link once it has
+    /// neither a connection nor a panel here.
+    #[test]
+    fn a_link_signal_is_sent_again_until_confirmed() {
+        let session = SessionId::new();
+        let ours = link(session, "sub-1");
+        let (mut daemon, _old) = daemon_with_client(ours.clone());
+        let hello = |daemon: &mut Daemon, conn| {
+            let (tx, rx) = mpsc::channel(CONNECTION_QUEUE);
+            let (kick, _kicked) = oneshot::channel::<()>();
+            daemon.on_event(ConnEvent::Hello {
+                conn,
+                link: ours.clone(),
+                tx,
+                kick,
+            });
+            rx
+        };
+        let signals = |rx: &mut mpsc::Receiver<String>| -> Vec<(Option<PanelId>, u64)> {
+            frames(rx)
+                .into_iter()
+                .filter_map(|f| match f {
+                    DaemonFrame::Signal { panel, seq, .. } => Some((panel, seq)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let id = PanelId::new();
+        daemon.panels.insert(id, DPanel::new(ours.clone(), None));
+
+        let mut first = hello(&mut daemon, 2);
+        // A panel this daemon does not run, so the link gets it.
+        daemon.on_signal(&SignalEvent::Turn(TurnSignal::now(
+            session,
+            PanelId::new(),
+            TurnKind::Stop,
+            None,
+            serde_json::json!({}),
+        )));
+        daemon.pump(Instant::now());
+        assert_eq!(signals(&mut first), [(None, 0)]);
+        daemon.on_event(ConnEvent::Closed { conn: 2 });
+
+        let mut second = hello(&mut daemon, 3);
+        daemon.pump(Instant::now());
+        assert_eq!(signals(&mut second), [(None, 0)], "sent again");
+        daemon.on_event(ConnEvent::Frame {
+            conn: 3,
+            frame: ClientFrame::SignalsSeen {
+                panel: None,
+                next: 1,
+            },
+        });
+        daemon.on_event(ConnEvent::Closed { conn: 3 });
+
+        let mut third = hello(&mut daemon, 4);
+        daemon.pump(Instant::now());
+        assert!(signals(&mut third).is_empty(), "confirmed, so not again");
+
+        daemon.panels.remove(&id);
+        daemon.on_event(ConnEvent::Closed { conn: 4 });
+        assert!(!daemon.link_signals.contains_key(&ours));
         let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 

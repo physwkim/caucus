@@ -1,7 +1,7 @@
 //! A daemon and a link in one process, over real sockets and real PTYs.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -219,10 +219,28 @@ async fn killing_a_remote_panel_kills_its_process_on_the_host() {
 }
 
 /// A socket relay the test can cut and block, standing in for an SSH drop.
+/// It can also swallow chosen frame lines, as a connection that dies with
+/// them in flight does.
 struct Relay {
     path: std::path::PathBuf,
     open: Arc<AtomicBool>,
     cut: broadcast::Sender<()>,
+    drops: Arc<Mutex<Drops>>,
+}
+
+#[derive(Clone, Copy)]
+enum Toward {
+    Host,
+    Main,
+}
+
+/// Lines containing `host` or `main` going that way are swallowed, and kept
+/// in `dropped`.
+#[derive(Default)]
+struct Drops {
+    host: Option<&'static str>,
+    main: Option<&'static str>,
+    dropped: Vec<String>,
 }
 
 impl Relay {
@@ -230,33 +248,214 @@ impl Relay {
         let listener = UnixListener::bind(&path).unwrap();
         let open = Arc::new(AtomicBool::new(true));
         let (cut, _) = broadcast::channel(4);
-        let (gate, cuts) = (Arc::clone(&open), cut.clone());
+        let drops = Arc::new(Mutex::new(Drops::default()));
+        let (gate, cuts, all_drops) = (Arc::clone(&open), cut.clone(), Arc::clone(&drops));
         tokio::spawn(async move {
-            while let Ok((mut client, _)) = listener.accept().await {
+            while let Ok((client, _)) = listener.accept().await {
                 if !gate.load(Ordering::SeqCst) {
                     continue;
                 }
                 let mut cut = cuts.subscribe();
-                let mut server = UnixStream::connect(&upstream).await.unwrap();
+                let server = UnixStream::connect(&upstream).await.unwrap();
+                let ((from_main, to_main), (from_host, to_host)) =
+                    (client.into_split(), server.into_split());
+                let drops = Arc::clone(&all_drops);
                 tokio::spawn(async move {
                     tokio::select! {
-                        _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                        () = relay_lines(from_main, to_host, Toward::Host, Arc::clone(&drops)) => {}
+                        () = relay_lines(from_host, to_main, Toward::Main, drops) => {}
                         _ = cut.recv() => {}
                     }
                 });
             }
         });
-        Self { path, open, cut }
+        Self {
+            path,
+            open,
+            cut,
+            drops,
+        }
+    }
+
+    /// Swallow lines toward `to` that contain `pattern`, until [`Self::sever`].
+    fn swallow(&self, to: Toward, pattern: &'static str) {
+        let mut drops = self.drops.lock().unwrap();
+        match to {
+            Toward::Host => drops.host = Some(pattern),
+            Toward::Main => drops.main = Some(pattern),
+        }
+    }
+
+    async fn wait_swallowed(&self, pattern: &str) {
+        let deadline = Instant::now() + WAIT;
+        while !self
+            .drops
+            .lock()
+            .unwrap()
+            .dropped
+            .iter()
+            .any(|line| line.contains(pattern))
+        {
+            assert!(Instant::now() < deadline, "no {pattern} line came by");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     fn sever(&self) {
         self.open.store(false, Ordering::SeqCst);
+        let mut drops = self.drops.lock().unwrap();
+        (drops.host, drops.main) = (None, None);
         let _ = self.cut.send(());
     }
 
     fn reopen(&self) {
         self.open.store(true, Ordering::SeqCst);
     }
+
+    /// Cut the connection and wait for the link to make a new one.
+    async fn reconnect(&self, link: &HostLink) {
+        self.sever();
+        wait_status(link, |s| matches!(s, LinkStatus::Connecting { .. })).await;
+        self.reopen();
+        link.wait_connected(WAIT).await.unwrap();
+    }
+}
+
+async fn relay_lines(
+    from: tokio::net::unix::OwnedReadHalf,
+    mut to: tokio::net::unix::OwnedWriteHalf,
+    toward: Toward,
+    drops: Arc<Mutex<Drops>>,
+) {
+    let mut from = BufReader::new(from);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if matches!(from.read_line(&mut line).await, Ok(0) | Err(_)) {
+            return;
+        }
+        {
+            let mut drops = drops.lock().unwrap();
+            let pattern = match toward {
+                Toward::Host => drops.host,
+                Toward::Main => drops.main,
+            };
+            if pattern.is_some_and(|p| line.contains(p)) {
+                drops.dropped.push(line.clone());
+                continue;
+            }
+        }
+        if to.write_all(line.as_bytes()).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// A signal the host handed to a connection that died before main read it
+/// reaches main over the next connection, and a re-send of one main already
+/// has (its confirmation lost too) does not reach it twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signal_lost_with_its_connection_reaches_main_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(&tmp);
+    let mut host = TestDaemon::start(&paths).await;
+    let relay = Relay::start(tmp.path().join("relay.sock"), paths.control_sock.clone());
+    let session = SessionId::new();
+    let (tx, mut signals) = mpsc::unbounded_channel();
+    let link = HostLink::connect("sub-1", session, Transport::Socket(relay.path.clone()), tx);
+    link.wait_connected(WAIT).await.unwrap();
+    let panel = PanelId::new();
+    let mut pty = link
+        .spawn(panel, &sh("echo ready; exec cat"), 80, 24, false)
+        .unwrap();
+    let mut out = String::new();
+    read_until(&mut pty, &mut out, "ready").await;
+
+    relay.swallow(Toward::Main, "\"t\":\"signal\"");
+    let signal = TurnSignal::now(session, panel, TurnKind::Stop, None, serde_json::json!({}));
+    let mut post = UnixStream::connect(&paths.signal_sock).await.unwrap();
+    let mut line = serde_json::to_string(&signal).unwrap();
+    line.push('\n');
+    post.write_all(line.as_bytes()).await.unwrap();
+    post.shutdown().await.unwrap();
+    relay.wait_swallowed("\"t\":\"signal\"").await;
+
+    relay.sever();
+    wait_status(&link, |s| matches!(s, LinkStatus::Connecting { .. })).await;
+    relay.swallow(Toward::Host, "\"t\":\"signals_seen\"");
+    relay.reopen();
+    link.wait_connected(WAIT).await.unwrap();
+    let got = tokio::time::timeout(WAIT, signals.recv())
+        .await
+        .expect("the signal never reached main")
+        .unwrap();
+    assert!(matches!(
+        ingest(&got.line).unwrap(),
+        SignalEvent::Turn(sig) if sig.panel_id == panel
+    ));
+    relay.wait_swallowed("\"t\":\"signals_seen\"").await;
+
+    // The host sends the unconfirmed signal again on attach, ahead of the
+    // echo below.
+    relay.reconnect(&link).await;
+    pty.write(b"ping\n").unwrap();
+    read_until(&mut pty, &mut out, "ping\r\nping").await;
+    assert!(signals.try_recv().is_err(), "the signal reached main twice");
+
+    link.close(WAIT).await;
+    host.stop().await;
+}
+
+/// Input written into a connection that died before the host read it
+/// reaches the panel over the next connection. Input the host took before
+/// the drop, and input written while down (queued and kept for re-sending
+/// both), is typed once.
+#[tokio::test(flavor = "multi_thread")]
+async fn input_lost_with_its_connection_reaches_the_panel_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(&tmp);
+    let mut host = TestDaemon::start(&paths).await;
+    let relay = Relay::start(tmp.path().join("relay.sock"), paths.control_sock.clone());
+    let (tx, _signals) = mpsc::unbounded_channel();
+    let link = HostLink::connect(
+        "sub-1",
+        SessionId::new(),
+        Transport::Socket(relay.path.clone()),
+        tx,
+    );
+    link.wait_connected(WAIT).await.unwrap();
+    let mut pty = link
+        .spawn(
+            PanelId::new(),
+            &sh("echo ready; for _ in 1 2 3 4; do read x; echo got-$x; done"),
+            80,
+            24,
+            false,
+        )
+        .unwrap();
+    let mut out = String::new();
+    read_until(&mut pty, &mut out, "ready").await;
+    pty.write(b"a\n").unwrap();
+    read_until(&mut pty, &mut out, "got-a").await;
+
+    relay.swallow(Toward::Host, "\"t\":\"input\"");
+    pty.write(b"b\n").unwrap();
+    relay.wait_swallowed("\"t\":\"input\"").await;
+    relay.sever();
+    wait_status(&link, |s| matches!(s, LinkStatus::Connecting { .. })).await;
+    pty.write(b"c\n").unwrap();
+    relay.reopen();
+    link.wait_connected(WAIT).await.unwrap();
+
+    read_until(&mut pty, &mut out, "got-c").await;
+    pty.write(b"d\n").unwrap();
+    read_until(&mut pty, &mut out, "got-d").await;
+    for word in ["got-a", "got-b", "got-c", "got-d"] {
+        assert_eq!(out.matches(word).count(), 1, "{word} in {out:?}");
+    }
+
+    link.close(WAIT).await;
+    host.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -452,6 +651,46 @@ async fn a_kill_made_while_the_queue_is_full_still_reaches_the_host() {
     tokio::time::timeout(WAIT, kill_arrives)
         .await
         .expect("the kill never reached the host");
+}
+
+/// A resumed main that adopts a panel numbers its input after what the host
+/// took from the main before it, so its first keystrokes are typed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_adopted_panel_takes_input_after_what_it_took_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(&tmp);
+    let mut host = TestDaemon::start(&paths).await;
+    let session = SessionId::new();
+    let (before, _signals) = link(&paths, session);
+    before.wait_connected(WAIT).await.unwrap();
+    let panel = PanelId::new();
+    let mut pty = before
+        .spawn(
+            panel,
+            &sh("echo ready; for _ in 1 2; do read x; echo got-$x; done"),
+            80,
+            24,
+            false,
+        )
+        .unwrap();
+    let mut out = String::new();
+    read_until(&mut pty, &mut out, "ready").await;
+    pty.write(b"a\n").unwrap();
+    read_until(&mut pty, &mut out, "got-a").await;
+    before.close(WAIT).await;
+
+    let (after, _signals) = link(&paths, session);
+    let info = after.wait_connected(WAIT).await.unwrap();
+    assert_eq!(info.panels.len(), 1);
+    assert_eq!((info.panels[0].id, info.panels[0].input), (panel, 2));
+    let mut pty = after.adopt(panel, 80, 24).unwrap();
+    let mut out = String::new();
+    read_until(&mut pty, &mut out, "got-a").await;
+    pty.write(b"b\n").unwrap();
+    read_until(&mut pty, &mut out, "got-b").await;
+
+    after.close(WAIT).await;
+    host.stop().await;
 }
 
 /// Two host entries reaching one daemon are two links: neither's connection

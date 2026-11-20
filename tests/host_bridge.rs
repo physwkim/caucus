@@ -177,6 +177,7 @@ fn a_bridge_starts_the_daemon_once_and_runs_panels_behind_it() {
     });
     first.send(&ClientFrame::Input {
         panel,
+        offset: 0,
         data: Bytes(b"hello-bridge\n".to_vec()),
     });
     let mut out = Vec::new();

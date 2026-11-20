@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 pub use link::{HostLink, LinkError, LinkStatus, RemotePty, RemoteSignal, Transport};
 pub use load::HostLoad;
-pub use proto::HostInfo;
+pub use proto::{HostInfo, HostPanel};
 
 /// Where a sub-host daemon keeps its state and listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
