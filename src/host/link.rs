@@ -25,7 +25,7 @@ use super::load::HostLoad;
 use super::proto::{
     Bytes, ClientFrame, DaemonFrame, HostInfo, MAX_FRAME_BYTES, PROTO_VERSION, SpawnSpec, encode,
 };
-use super::sh_quote;
+use super::{sh_quote, sh_quote_path};
 use crate::line_io::{CappedLine, read_capped_line};
 use crate::pty::{PtyCommand, PtyError};
 use crate::session::id::{PanelId, SessionId};
@@ -57,7 +57,7 @@ impl Transport {
     /// `ssh <destination>` running `<caucus> host bridge` in the remote user's
     /// login shell, so `caucus` resolves on the PATH their profile sets.
     pub fn ssh(destination: &str, caucus: &str) -> Self {
-        let bridge = format!("exec {} host bridge", sh_quote(caucus));
+        let bridge = format!("exec {} host bridge", sh_quote_path(caucus));
         let login = format!("exec \"${{SHELL:-/bin/sh}}\" -lc {}", sh_quote(&bridge));
         let remote = format!("sh -c {}", sh_quote(&login));
         let args = [
@@ -938,6 +938,38 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
             "exec 'caucus' host bridge"
+        );
+    }
+
+    #[test]
+    fn a_caucus_path_under_home_is_found_on_the_host() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("my bin");
+        std::fs::create_dir(&bin).unwrap();
+        let caucus = bin.join("caucus");
+        std::fs::write(&caucus, "#!/bin/sh\nprintf 'ran %s' \"$*\"\n").unwrap();
+        std::fs::set_permissions(&caucus, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let Transport::Command { args, .. } = Transport::ssh("h", "~/my bin/caucus") else {
+            panic!("ssh is a command transport");
+        };
+        // A plain shell stands in for the login shell, whose profile is the
+        // host's business.
+        let remote = args[9]
+            .to_str()
+            .unwrap()
+            .replace("exec \"${SHELL:-/bin/sh}\" -lc", "exec /bin/sh -c");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&remote)
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "ran host bridge",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }

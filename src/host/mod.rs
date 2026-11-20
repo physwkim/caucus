@@ -132,6 +132,15 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Quote `path` as one POSIX shell word whose leading `~/`, as in
+/// `hosts.toml`, is the home of the user the shell runs as.
+pub(crate) fn sh_quote_path(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("\"$HOME\"/{}", sh_quote(rest)),
+        None => sh_quote(path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
