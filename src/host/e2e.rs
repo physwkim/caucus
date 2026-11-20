@@ -608,49 +608,147 @@ fn fake_welcome() -> String {
     }))
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_kill_made_while_the_queue_is_full_still_reaches_the_host() {
-    let tmp = tempfile::tempdir().unwrap();
-    let sock = tmp.path().join("host.sock");
-    let listener = UnixListener::bind(&sock).unwrap();
-    let (tx, _signals) = mpsc::unbounded_channel();
-    let link = HostLink::connect("sub-1", SessionId::new(), Transport::Socket(sock), tx);
-    // A host that answers hello, then reads nothing until the queue is full.
-    let (stream, _) = listener.accept().await.unwrap();
-    let (read, mut write) = stream.into_split();
-    let mut read = BufReader::new(read);
-    let mut line = String::new();
-    read.read_line(&mut line).await.unwrap();
-    write.write_all(fake_welcome().as_bytes()).await.unwrap();
-    link.wait_connected(WAIT).await.unwrap();
+/// A link to a fake host that answered hello and then reads nothing, with
+/// one panel whose input has filled the link's outbound queue.
+struct StalledHost {
+    _tmp: tempfile::TempDir,
+    link: HostLink,
+    panel: PanelId,
+    pty: RemotePty,
+    read: BufReader<tokio::net::unix::OwnedReadHalf>,
+    write: tokio::net::unix::OwnedWriteHalf,
+}
 
-    let panel = PanelId::new();
-    let mut pty = link.spawn(panel, &sh("cat"), 80, 24, false).unwrap();
-    let chunk = vec![b'x'; 4096];
-    let deadline = Instant::now() + WAIT;
-    loop {
-        match pty.write(&chunk) {
-            Ok(()) => assert!(Instant::now() < deadline, "the queue never filled"),
-            Err(PtyError::WriterFull) => break,
-            Err(err) => panic!("{err}"),
+impl StalledHost {
+    async fn start() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("host.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (tx, _signals) = mpsc::unbounded_channel();
+        let link = HostLink::connect("sub-1", SessionId::new(), Transport::Socket(sock), tx);
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut read = BufReader::new(read);
+        read.read_line(&mut String::new()).await.unwrap();
+        let welcome = format!("{}{}", fake_welcome(), fake_load(1));
+        write.write_all(welcome.as_bytes()).await.unwrap();
+        // Main reads the load only once it has re-sent what a new connection
+        // carries first, while still unable to stall: a panel opened before
+        // then would be re-sent with its input to a host that reads nothing.
+        wait_load(&link, 1).await;
+
+        let panel = PanelId::new();
+        let mut pty = link.spawn(panel, &sh("cat"), 80, 24, false).unwrap();
+        // Full and staying full: the writer drains into the socket until
+        // the host's buffer is full too, so refill until a pause frees nothing.
+        let chunk = vec![b'x'; 4096];
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let mut wrote = false;
+            loop {
+                match pty.write(&chunk) {
+                    Ok(()) => wrote = true,
+                    Err(PtyError::WriterFull) => break,
+                    Err(err) => panic!("{err}"),
+                }
+                assert!(Instant::now() < deadline, "the queue never filled");
+            }
+            if !wrote {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Self {
+            _tmp: tmp,
+            link,
+            panel,
+            pty,
+            read,
+            write,
         }
     }
-    pty.kill().unwrap();
 
-    let kill_arrives = async {
-        loop {
-            line.clear();
-            assert_ne!(read.read_line(&mut line).await.unwrap(), 0, "link closed");
-            if let Ok(ClientFrame::Kill { panel: killed }) = serde_json::from_str(&line)
-                && killed == panel
-            {
-                return;
+    /// Read frames from main until `want` matches one.
+    async fn wait_for(&mut self, want: impl Fn(&ClientFrame) -> bool, what: &str) {
+        let arrives = async {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(
+                    self.read.read_line(&mut line).await.unwrap(),
+                    0,
+                    "link closed"
+                );
+                if serde_json::from_str(&line).is_ok_and(|frame| want(&frame)) {
+                    return;
+                }
             }
-        }
-    };
-    tokio::time::timeout(WAIT, kill_arrives)
+        };
+        tokio::time::timeout(WAIT, arrives)
+            .await
+            .unwrap_or_else(|_| panic!("{what} never reached the host"));
+    }
+}
+
+/// A load report a fake host sends, told apart by `cpus`.
+fn fake_load(cpus: usize) -> String {
+    encode(&DaemonFrame::Load(super::HostLoad {
+        load_avg: [0.0; 3],
+        cpus,
+        mem_available_mib: None,
+        mem_total_mib: None,
+    }))
+}
+
+/// Wait until `link` holds the load report [`fake_load`] made for `cpus`.
+async fn wait_load(link: &HostLink, cpus: usize) {
+    let deadline = Instant::now() + WAIT;
+    while link.load().is_none_or(|load| load.cpus != cpus) {
+        assert!(
+            Instant::now() < deadline,
+            "main never read load report {cpus}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_made_while_the_queue_is_full_still_reaches_the_host() {
+    let mut host = StalledHost::start().await;
+    host.pty.kill().unwrap();
+    let panel = host.panel;
+    host.wait_for(
+        |frame| matches!(frame, ClientFrame::Kill { panel: killed } if *killed == panel),
+        "the kill",
+    )
+    .await;
+}
+
+/// A signal that arrives while the outbound queue is full is still
+/// confirmed, so the host does not keep it, and send it again, for ever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signal_seen_while_the_queue_is_full_is_still_confirmed() {
+    let mut host = StalledHost::start().await;
+    let panel = host.panel;
+    let signal = encode(&DaemonFrame::Signal {
+        panel: Some(panel),
+        seq: 0,
+        line: "{}".into(),
+    });
+    // The load report goes after the signal, so once main holds it, main
+    // has dealt with the signal while the queue was still full.
+    host.write
+        .write_all(format!("{signal}{}", fake_load(2)).as_bytes())
         .await
-        .expect("the kill never reached the host");
+        .unwrap();
+    wait_load(&host.link, 2).await;
+    host.wait_for(
+        |frame| {
+            matches!(frame, ClientFrame::SignalsSeen { panel: seen, next: 1 } if *seen == Some(panel))
+        },
+        "the confirmation",
+    )
+    .await;
 }
 
 /// A resumed main that adopts a panel numbers its input after what the host

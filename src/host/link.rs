@@ -142,8 +142,9 @@ struct Inner {
     state: Mutex<LinkState>,
     status: watch::Sender<LinkStatus>,
     outbound: mpsc::Sender<ClientFrame>,
-    /// Wakes the connection's writer for a kill ([`HostLink::kill`]).
-    kill_ready: Notify,
+    /// Wakes the connection's writer for a frame kept in [`LinkState`]
+    /// rather than queued: a kill or a signal confirmation.
+    owed_ready: Notify,
     stop: watch::Sender<bool>,
     supervisor: Mutex<Option<JoinHandle<()>>>,
 }
@@ -166,6 +167,10 @@ struct LinkState {
     taken: HashMap<PanelId, u64>,
     /// The next signal of the link itself main has not seen.
     signals_next: u64,
+    /// Signal confirmations the current connection has yet to carry, the
+    /// latest per panel (`None`: the link's own). Like kills, only the
+    /// writer sends them, so a full queue cannot refuse one.
+    acks: HashMap<Option<PanelId>, u64>,
     closed: bool,
 }
 
@@ -230,7 +235,7 @@ impl HostLink {
             state: Mutex::default(),
             status: watch::Sender::new(LinkStatus::Connecting { last_error: None }),
             outbound,
-            kill_ready: Notify::new(),
+            owed_ready: Notify::new(),
             stop: watch::Sender::new(false),
             supervisor: Mutex::new(None),
         });
@@ -416,7 +421,7 @@ impl HostLink {
             }
             state.kills.entry(panel).or_insert(Kill::Unsent);
         }
-        self.inner.kill_ready.notify_one();
+        self.inner.owed_ready.notify_one();
     }
 
     /// Check out the existing `branch` at `path` as a worktree of the host's
@@ -531,6 +536,7 @@ impl Inner {
             kills,
             requests,
             taken,
+            acks,
             ..
         } = &mut *state;
         let mut frames = Vec::new();
@@ -567,13 +573,14 @@ impl Inner {
             *kill = Kill::Sent;
             frames.push(ClientFrame::Kill { panel });
         }
+        frames.extend(take_acks(acks));
         frames.extend(requests.values().map(|r| r.frame.clone()));
         frames
     }
 
-    /// The kills the current connection has yet to carry, now counted as
-    /// carried.
-    fn unsent_kills(&self) -> Vec<ClientFrame> {
+    /// The kills and signal confirmations the current connection has yet to
+    /// carry, now counted as carried.
+    fn owed_frames(&self) -> Vec<ClientFrame> {
         let mut state = self.lock();
         let mut frames = Vec::new();
         for (&panel, kill) in &mut state.kills {
@@ -582,6 +589,7 @@ impl Inner {
                 frames.push(ClientFrame::Kill { panel });
             }
         }
+        frames.extend(take_acks(&mut state.acks));
         frames
     }
 
@@ -675,12 +683,12 @@ impl Inner {
                         line,
                     });
                 }
-                // A confirmation the full queue refuses is made good by the
-                // next one; until then the host may send the signal again.
-                let _ = self.outbound.try_send(ClientFrame::SignalsSeen {
-                    panel,
-                    next: seq + 1,
-                });
+                {
+                    let mut state = self.lock();
+                    let ack = state.acks.entry(panel).or_default();
+                    *ack = (*ack).max(seq + 1);
+                }
+                self.owed_ready.notify_one();
             }
             DaemonFrame::WorktreeDone { req, result } => {
                 if let Some(request) = self.lock().requests.remove(&req) {
@@ -951,7 +959,7 @@ async fn write_frames<W: AsyncWrite + Unpin>(
     loop {
         let queued = tokio::select! {
             biased;
-            () = inner.kill_ready.notified() => None,
+            () = inner.owed_ready.notified() => None,
             frame = outbound.recv() => match frame {
                 Some(frame) => Some(frame),
                 None => return,
@@ -959,9 +967,10 @@ async fn write_frames<W: AsyncWrite + Unpin>(
         };
         // Kills go out ahead of the frame queued after them: a worktree
         // request must not run while a panel being killed still works there.
-        // One whose write fails is re-sent by the next connection.
-        for kill in inner.unsent_kills() {
-            if writer.write_all(encode(&kill).as_bytes()).await.is_err() {
+        // One whose write fails is re-sent by the next connection; a lost
+        // confirmation is made good when the host sends the signal again.
+        for owed in inner.owed_frames() {
+            if writer.write_all(encode(&owed).as_bytes()).await.is_err() {
                 *retry = queued.filter(|frame| inner.still_wanted(frame));
                 return;
             }
@@ -976,6 +985,11 @@ async fn write_frames<W: AsyncWrite + Unpin>(
             return;
         }
     }
+}
+
+fn take_acks(acks: &mut HashMap<Option<PanelId>, u64>) -> impl Iterator<Item = ClientFrame> {
+    acks.drain()
+        .map(|(panel, next)| ClientFrame::SignalsSeen { panel, next })
 }
 
 fn utf8_path(path: &Path) -> Result<String, String> {
