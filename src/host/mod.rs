@@ -34,40 +34,62 @@ pub use proto::{HostInfo, HostPanel};
 /// Where a sub-host daemon keeps its state and listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPaths {
-    /// Lock file, daemon log, and per-session directories.
+    /// Lock file, daemon log, per-session directories and, by default, both
+    /// sockets.
     pub state_dir: PathBuf,
     /// The daemon's control socket. Whoever can connect to it can run any
     /// command as this user, so it lives in a directory only the user can
     /// enter.
     pub control_sock: PathBuf,
     /// The daemon's turn-signal socket — `CAUCUS_SOCK` for panels on this
-    /// host. Named like a session's signal socket so an unbound hook's
-    /// broadcast (`caucus signal post --discover`) reaches it too.
+    /// host. An unbound hook's broadcast (`caucus signal post --discover`)
+    /// posts to the default one too.
     pub signal_sock: PathBuf,
 }
 
+/// Bytes a Unix socket address holds for its path, the closing NUL included.
+const SUN_PATH: usize =
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+
 impl HostPaths {
-    /// The per-user defaults, each replaced by its override when given.
+    /// The defaults, each replaced by its override when given. Both sockets
+    /// default into the state directory, which only this user can enter.
     pub fn resolve(
         state_dir: Option<PathBuf>,
         control_sock: Option<PathBuf>,
         signal_sock: Option<PathBuf>,
     ) -> io::Result<Self> {
-        // SAFETY: `getuid` has no preconditions and cannot fail.
-        let uid = unsafe { libc::getuid() };
-        let tmp = std::env::temp_dir();
         let state_dir = match state_dir {
             Some(dir) => dir,
             None => std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".caucus").join("host"))
+                .map(|home| Self::default_state_dir(Path::new(&home)))
                 .ok_or_else(|| io::Error::other("$HOME not set; pass --state-dir"))?,
         };
-        Ok(Self {
+        let paths = Self {
+            control_sock: control_sock.unwrap_or_else(|| state_dir.join("daemon.sock")),
+            signal_sock: signal_sock.unwrap_or_else(|| state_dir.join("signal.sock")),
             state_dir,
-            control_sock: control_sock
-                .unwrap_or_else(|| tmp.join(format!("caucus-host-{uid}")).join("daemon.sock")),
-            signal_sock: signal_sock.unwrap_or_else(|| tmp.join(format!("caucus-host-{uid}.sock"))),
-        })
+        };
+        for sock in [&paths.control_sock, &paths.signal_sock] {
+            let len = sock.as_os_str().len();
+            if len >= SUN_PATH {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} is {len} bytes, too long for a Unix socket (under {SUN_PATH}); \
+                         pass a shorter --state-dir, --control-sock or --signal-sock",
+                        sock.display()
+                    ),
+                ));
+            }
+        }
+        Ok(paths)
+    }
+
+    /// `~/.caucus/host/<hostname>`: one per machine, since several can share
+    /// a home.
+    pub fn default_state_dir(home: &Path) -> PathBuf {
+        home.join(".caucus").join("host").join(daemon::hostname())
     }
 
     /// Lock file a live daemon holds; it also carries the daemon's pid.
@@ -158,6 +180,26 @@ pub(crate) fn sh_quote_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Moving the state directory moves the sockets with it.
+    #[test]
+    fn the_sockets_default_into_the_state_dir() {
+        let paths = HostPaths::resolve(Some("/srv/caucus".into()), None, None).unwrap();
+        assert_eq!(paths.control_sock, Path::new("/srv/caucus/daemon.sock"));
+        assert_eq!(paths.signal_sock, Path::new("/srv/caucus/signal.sock"));
+    }
+
+    /// A socket path no address can hold is refused when the paths resolve,
+    /// not when a daemon started from them fails to bind.
+    #[test]
+    fn a_socket_path_too_long_for_an_address_is_refused() {
+        let deep = PathBuf::from("/").join("d".repeat(SUN_PATH));
+        let err = HostPaths::resolve(Some(deep), None, None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--state-dir"), "{err}");
+        let longest = PathBuf::from("/").join("s".repeat(SUN_PATH - 2));
+        HostPaths::resolve(None, Some(longest.clone()), Some(longest)).unwrap();
+    }
 
     #[test]
     fn private_dir_tightens_an_open_directory_this_user_owns() {

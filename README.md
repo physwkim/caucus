@@ -266,7 +266,7 @@ and turn signals the drop lost are delivered once. It runs until it gets
 `SIGTERM`, which kills its panels. ssh runs with `BatchMode=yes`, so login
 must already work without a prompt. A `socket` host is
 a daemon on this machine that you start yourself with `caucus host serve`
-(its default socket is `<tmp>/caucus-host-<uid>/daemon.sock`).
+(its default socket is `~/.caucus/host/<hostname>/daemon.sock`).
 
 Each host works in its own clone, `dir`. A worktree panel's lane starts as
 main's `HEAD` pushed to a branch of that clone, and the branch is fetched

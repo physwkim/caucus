@@ -326,14 +326,14 @@ pub enum HostCommand {
 #[derive(Debug, clap::Args)]
 pub struct HostPathArgs {
     /// State directory (lock, log, session directories). Default
-    /// `~/.caucus/host`.
+    /// `~/.caucus/host/<hostname>`.
     #[arg(long)]
     state_dir: Option<PathBuf>,
-    /// Control socket. Default `<tmp>/caucus-host-<uid>/daemon.sock`.
+    /// Control socket. Default `daemon.sock` in the state directory.
     #[arg(long)]
     control_sock: Option<PathBuf>,
-    /// Turn-signal socket for panels on this host. Default
-    /// `<tmp>/caucus-host-<uid>.sock`.
+    /// Turn-signal socket for panels on this host. Default `signal.sock` in
+    /// the state directory.
     #[arg(long)]
     signal_sock: Option<PathBuf>,
 }

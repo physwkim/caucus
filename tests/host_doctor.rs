@@ -10,12 +10,13 @@ use std::time::{Duration, Instant};
 use caucus::config::Config;
 use caucus::config::hosts::{HostConfig, HostReach};
 use caucus::doctor::{HostReport, Severity};
+use caucus::host::HostPaths;
 use caucus::host::proto::PROTO_VERSION;
 
 #[test]
 fn host_doctor_reports_this_host_on_one_line() {
+    // No daemon under this home, so the process checks itself.
     let home = tempfile::tempdir().unwrap();
-    // No daemon under this temp dir, so the process checks itself.
     let tmp = tempfile::tempdir().unwrap();
     let report = host_doctor(home.path(), tmp.path());
     assert_eq!(report.proto, PROTO_VERSION);
@@ -36,7 +37,7 @@ fn host_doctor_reports_the_running_daemon_in_its_environment() {
     let no_git = tempfile::tempdir().unwrap();
     let _daemon = Daemon::start(
         home.path(),
-        &default_control_sock(tmp.path()),
+        &default_control_sock(home.path()),
         no_git.path(),
     );
     let report = host_doctor(home.path(), tmp.path());
@@ -102,11 +103,9 @@ fn host_doctor(home: &Path, tmp: &Path) -> HostReport {
     serde_json::from_str(stdout.lines().last().unwrap()).unwrap()
 }
 
-/// The control socket a bridge or `caucus host doctor` uses under `tmp`.
-fn default_control_sock(tmp: &Path) -> PathBuf {
-    // SAFETY: `getuid` has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    tmp.join(format!("caucus-host-{uid}")).join("daemon.sock")
+/// The control socket a bridge or `caucus host doctor` uses under `home`.
+fn default_control_sock(home: &Path) -> PathBuf {
+    HostPaths::default_state_dir(home).join("daemon.sock")
 }
 
 /// A `caucus host serve` with `path` as its whole `PATH`; killed on drop.
