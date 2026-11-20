@@ -298,7 +298,9 @@ On `caucus resume`, a panel its host still runs is adopted again with its
 output replayed; any other starts again on its host, resuming its
 conversation in a worktree checked out again on its lane's branch. A panel
 the host still has for the session that the session record does not name is
-killed there.
+killed there. A host daemon kills the panels of a session no main has been
+connected to for a week; resuming it later starts them again, and their
+worktrees stay.
 
 ## Install
 

@@ -16,6 +16,7 @@
 //! signal for a panel is held until that panel's output has gone out, so main
 //! never sees a turn end before the bytes the turn printed.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::future::Future;
@@ -57,6 +58,11 @@ const SIGNAL_BACKLOG: usize = 1024;
 const HELLO_WAIT: Duration = Duration::from_secs(10);
 /// How often each connection is sent the host's load.
 const LOAD_EVERY: Duration = Duration::from_secs(5);
+/// How long a link may go without a connection before the daemon kills its
+/// panels and drops its signals. A resume after that starts them again.
+const FORGET_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How often the daemon looks for links past [`FORGET_AFTER`].
+const FORGET_CHECK: Duration = Duration::from_secs(60 * 60);
 
 /// The daemon's single-instance lock. Holding it is what makes removing a
 /// stale control socket safe, so [`run`] takes it as an argument.
@@ -158,6 +164,8 @@ pub async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut load_tick = tokio::time::interval(LOAD_EVERY);
     load_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut forget_tick = tokio::time::interval(FORGET_CHECK);
+    forget_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -172,7 +180,8 @@ pub async fn run(
                 daemon.on_signal(&signal);
             }
             _ = tick.tick(), if daemon.wants_tick() => daemon.pump(Instant::now()),
-            _ = load_tick.tick(), if !daemon.clients.is_empty() => daemon.push_load(),
+            _ = load_tick.tick(), if daemon.clients().next().is_some() => daemon.push_load(),
+            _ = forget_tick.tick() => daemon.forget_idle(Instant::now()),
         }
     }
     accept.abort();
@@ -365,6 +374,21 @@ impl Client {
         // Only called after `has_room`, and the daemon is the only sender.
         let _ = self.tx.try_send(encode(frame));
     }
+}
+
+/// What the daemon holds for a link besides its panels.
+struct LinkState {
+    attached: Attachment,
+    /// Signals for the link rather than one of its panels.
+    signals: SignalLog,
+}
+
+/// A link's connection, or since when it has had none.
+enum Attachment {
+    Connected(Client),
+    /// Its last connection closed then. The link stays while it has panels
+    /// here, until [`FORGET_AFTER`] has passed.
+    Detached(Instant),
 }
 
 /// Signals for one receiver, kept until main confirms them: a line handed to
@@ -669,10 +693,8 @@ struct Daemon {
     machine_id: Option<String>,
     caucus_bin: PathBuf,
     panels: HashMap<PanelId, DPanel>,
-    clients: HashMap<Link, Client>,
-    /// Signals for a link rather than one of its panels, kept while the link
-    /// has a connection or a panel here.
-    link_signals: HashMap<Link, SignalLog>,
+    /// Every link with a connection or a panel here.
+    links: HashMap<Link, LinkState>,
     last_probe: Instant,
     /// `None` once shutdown has drained it.
     chores: Option<Chores>,
@@ -688,8 +710,7 @@ impl Daemon {
             machine_id: super::machine_id(),
             caucus_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caucus")),
             panels: HashMap::new(),
-            clients: HashMap::new(),
-            link_signals: HashMap::new(),
+            links: HashMap::new(),
             last_probe: Instant::now(),
             chores: Some(Chores::start(chores_done)),
         }
@@ -701,13 +722,30 @@ impl Daemon {
         }
     }
 
+    fn clients(&self) -> impl Iterator<Item = (&Link, &Client)> {
+        self.links
+            .iter()
+            .filter_map(|(link, state)| match &state.attached {
+                Attachment::Connected(client) => Some((link, client)),
+                Attachment::Detached(_) => None,
+            })
+    }
+
+    fn client_mut(&mut self, link: &Link) -> Option<&mut Client> {
+        match &mut self.links.get_mut(link)?.attached {
+            Attachment::Connected(client) => Some(client),
+            Attachment::Detached(_) => None,
+        }
+    }
+
     fn wants_tick(&self) -> bool {
         !self.panels.is_empty()
-            || self.clients.values().any(|c| !c.queued.is_empty())
-            || self
-                .link_signals
-                .iter()
-                .any(|(link, log)| log.unsent() && self.clients.contains_key(link))
+            || self.links.values().any(|state| match &state.attached {
+                Attachment::Connected(client) => {
+                    !client.queued.is_empty() || state.signals.unsent()
+                }
+                Attachment::Detached(_) => false,
+            })
     }
 
     fn on_event(&mut self, event: ConnEvent) {
@@ -721,8 +759,7 @@ impl Daemon {
             ConnEvent::Frame { conn, frame } => {
                 // A replaced connection's last frames are dropped.
                 let Some(link) = self
-                    .clients
-                    .iter()
+                    .clients()
                     .find_map(|(l, c)| (c.conn == conn).then(|| l.clone()))
                 else {
                     return;
@@ -730,11 +767,16 @@ impl Daemon {
                 self.on_frame(link, frame);
             }
             ConnEvent::Closed { conn } => {
-                self.clients.retain(|_, c| c.conn != conn);
-                // Signals for a link with no panel here belong to no one main
-                // still runs.
-                self.link_signals.retain(|link, _| {
-                    self.clients.contains_key(link) || self.panels.values().any(|p| p.link == *link)
+                let now = Instant::now();
+                for state in self.links.values_mut() {
+                    if matches!(&state.attached, Attachment::Connected(c) if c.conn == conn) {
+                        state.attached = Attachment::Detached(now);
+                    }
+                }
+                // A link with no panel here is one no main still runs.
+                self.links.retain(|link, state| {
+                    matches!(state.attached, Attachment::Connected(_))
+                        || self.panels.values().any(|p| p.link == *link)
                 });
             }
         }
@@ -790,9 +832,25 @@ impl Daemon {
             ]),
         };
         client.flush();
-        self.link_signals.entry(link.clone()).or_default().rewind();
         // Dropping the replaced client kicks its connection.
-        if self.clients.insert(link.clone(), client).is_some() {
+        let replaced = match self.links.entry(link.clone()) {
+            Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                state.signals.rewind();
+                Some(std::mem::replace(
+                    &mut state.attached,
+                    Attachment::Connected(client),
+                ))
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(LinkState {
+                    attached: Attachment::Connected(client),
+                    signals: SignalLog::default(),
+                });
+                None
+            }
+        };
+        if matches!(replaced, Some(Attachment::Connected(_))) {
             info!(session = %link.session, host = %link.host, "link reconnected; replacing its old connection");
         }
         // Nothing streams until the new connection says where it left off.
@@ -806,13 +864,13 @@ impl Daemon {
     /// skips this sample; the next one supersedes it.
     fn push_load(&self) {
         let line = encode(&DaemonFrame::Load(super::load::sample()));
-        for client in self.clients.values() {
+        for (_, client) in self.clients() {
             let _ = client.tx.try_send(line.clone());
         }
     }
 
     fn reply(&mut self, link: &Link, frame: &DaemonFrame) {
-        if let Some(client) = self.clients.get_mut(link) {
+        if let Some(client) = self.client_mut(link) {
             client.queued.push_back(encode(frame));
             client.flush();
         }
@@ -867,8 +925,8 @@ impl Daemon {
                 return;
             }
             ClientFrame::SignalsSeen { panel: None, next } => {
-                if let Some(log) = self.link_signals.get_mut(&link) {
-                    log.confirm(next);
+                if let Some(state) = self.links.get_mut(&link) {
+                    state.signals.confirm(next);
                 }
                 return;
             }
@@ -949,11 +1007,7 @@ impl Daemon {
                 }
             }
             ClientFrame::Kill { panel } => {
-                if let Some(mut p) = self.panels.remove(&panel)
-                    && let Some(pty) = p.pty.take()
-                {
-                    self.chore(Chore::Kill(pty));
-                }
+                self.kill(panel);
                 self.reply(
                     &link,
                     &DaemonFrame::Exited {
@@ -989,20 +1043,20 @@ impl Daemon {
                 } else {
                     // Main takes a panel's signal only through the host the
                     // panel runs on, so each of the session's links gets it.
-                    for (_, log) in self
-                        .link_signals
+                    for (_, state) in self
+                        .links
                         .iter_mut()
                         .filter(|(link, _)| link.session == session)
                     {
-                        log.push(line.clone());
+                        state.signals.push(line.clone());
                     }
                 }
             }
             // An unbound hook names no session; each link decides whether
             // the conversation is one of its panels' sub-agents.
             None => {
-                for log in self.link_signals.values_mut() {
-                    log.push(line.clone());
+                for state in self.links.values_mut() {
+                    state.signals.push(line.clone());
                 }
             }
         }
@@ -1034,14 +1088,49 @@ impl Daemon {
         self.stream();
     }
 
+    /// Remove `panel` and have its child killed.
+    fn kill(&mut self, panel: PanelId) {
+        if let Some(mut p) = self.panels.remove(&panel)
+            && let Some(pty) = p.pty.take()
+        {
+            self.chore(Chore::Kill(pty));
+        }
+    }
+
+    /// Forget every link without a connection for [`FORGET_AFTER`] by `now`:
+    /// kill its panels and drop its signals. Its worktrees and session
+    /// directory stay for a resume to start the panels in again.
+    fn forget_idle(&mut self, now: Instant) {
+        let idle: Vec<Link> = self
+            .links
+            .iter()
+            .filter(|(_, state)| {
+                matches!(state.attached, Attachment::Detached(since)
+                    if now.saturating_duration_since(since) >= FORGET_AFTER)
+            })
+            .map(|(link, _)| link.clone())
+            .collect();
+        for link in idle {
+            self.links.remove(&link);
+            let panels: Vec<PanelId> = self
+                .panels
+                .iter()
+                .filter(|(_, p)| p.link == link)
+                .map(|(&id, _)| id)
+                .collect();
+            info!(session = %link.session, host = %link.host, panels = panels.len(), "forgetting a link idle for {FORGET_AFTER:?}");
+            for panel in panels {
+                self.kill(panel);
+            }
+        }
+    }
+
     fn stream(&mut self) {
-        for (link, client) in &mut self.clients {
-            if !client.flush()
-                || self
-                    .link_signals
-                    .get_mut(link)
-                    .is_some_and(|log| !log.stream(None, client))
-            {
+        for (link, state) in &mut self.links {
+            let Attachment::Connected(client) = &mut state.attached else {
+                continue;
+            };
+            if !client.flush() || !state.signals.stream(None, client) {
                 continue;
             }
             for (id, panel) in self.panels.iter_mut() {
@@ -1208,13 +1297,16 @@ mod tests {
         );
         let (tx, rx) = mpsc::channel(CONNECTION_QUEUE);
         let (kick, _kicked) = oneshot::channel();
-        daemon.clients.insert(
+        daemon.links.insert(
             link,
-            Client {
-                conn: 1,
-                tx,
-                _kick: kick,
-                queued: VecDeque::new(),
+            LinkState {
+                attached: Attachment::Connected(Client {
+                    conn: 1,
+                    tx,
+                    _kick: kick,
+                    queued: VecDeque::new(),
+                }),
+                signals: SignalLog::default(),
             },
         );
         (daemon, rx)
@@ -1335,7 +1427,7 @@ mod tests {
             frames(&mut rx).as_slice(),
             [DaemonFrame::Welcome(_), DaemonFrame::Load(_)]
         ));
-        assert_eq!(daemon.clients[&ours].conn, 2);
+        assert_eq!(daemon.client_mut(&ours).unwrap().conn, 2);
         assert!(kicked.try_recv().is_err(), "the new connection stays open");
         let p = &daemon.panels[&id];
         assert_eq!((p.sent, p.exit_sent), (None, false));
@@ -1438,7 +1530,70 @@ mod tests {
 
         daemon.panels.remove(&id);
         daemon.on_event(ConnEvent::Closed { conn: 4 });
-        assert!(!daemon.link_signals.contains_key(&ours));
+        assert!(!daemon.links.contains_key(&ours));
+        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
+    }
+
+    /// A link without a connection keeps its panels and signals until
+    /// `FORGET_AFTER` has passed since its connection closed, then loses
+    /// them; a connected link is never forgotten.
+    #[test]
+    fn a_link_without_a_connection_is_forgotten_after_forget_after() {
+        let left = link(SessionId::new(), "sub-1");
+        let (mut daemon, _left_rx) = daemon_with_client(left.clone());
+        let held = link(SessionId::new(), "sub-1");
+        let (tx, _held_rx) = mpsc::channel(CONNECTION_QUEUE);
+        let (kick, _kicked) = oneshot::channel::<()>();
+        daemon.on_event(ConnEvent::Hello {
+            conn: 2,
+            link: held.clone(),
+            tx,
+            kick,
+        });
+        let (left_panel, held_panel) = (PanelId::new(), PanelId::new());
+        daemon
+            .panels
+            .insert(left_panel, DPanel::new(left.clone(), None));
+        daemon
+            .panels
+            .insert(held_panel, DPanel::new(held.clone(), None));
+        daemon.on_event(ConnEvent::Closed { conn: 1 });
+        let Attachment::Detached(since) = daemon.links[&left].attached else {
+            panic!("a closed link is detached");
+        };
+
+        daemon.forget_idle(since + FORGET_AFTER - Duration::from_secs(1));
+        assert!(daemon.panels.contains_key(&left_panel));
+        assert!(daemon.links.contains_key(&left));
+
+        daemon.forget_idle(since + FORGET_AFTER);
+        assert!(!daemon.panels.contains_key(&left_panel));
+        assert!(!daemon.links.contains_key(&left));
+        assert!(daemon.panels.contains_key(&held_panel));
+        assert!(daemon.links.contains_key(&held));
+        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
+    }
+
+    /// A hello for a detached link connects it again, so the time it spent
+    /// detached never counts toward forgetting it.
+    #[test]
+    fn a_reconnected_link_is_not_forgotten() {
+        let ours = link(SessionId::new(), "sub-1");
+        let (mut daemon, _old) = daemon_with_client(ours.clone());
+        let id = PanelId::new();
+        daemon.panels.insert(id, DPanel::new(ours.clone(), None));
+        daemon.on_event(ConnEvent::Closed { conn: 1 });
+        let (tx, _rx) = mpsc::channel(CONNECTION_QUEUE);
+        let (kick, _kicked) = oneshot::channel::<()>();
+        daemon.on_event(ConnEvent::Hello {
+            conn: 2,
+            link: ours.clone(),
+            tx,
+            kick,
+        });
+        daemon.forget_idle(Instant::now() + FORGET_AFTER);
+        assert!(daemon.panels.contains_key(&id));
+        assert_eq!(daemon.client_mut(&ours).unwrap().conn, 2);
         let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 
@@ -1468,7 +1623,11 @@ mod tests {
             panic!("expected welcome and load, got {welcome:?}");
         };
         assert!(info.panels.is_empty(), "b is not offered a's panel");
-        assert_eq!(daemon.clients[&a].conn, 1, "b's hello left a connected");
+        assert_eq!(
+            daemon.client_mut(&a).unwrap().conn,
+            1,
+            "b's hello left a connected"
+        );
         assert_eq!(daemon.panels[&id].sent, Some(0), "a's panel still streams");
 
         daemon.on_event(ConnEvent::Frame {
