@@ -234,6 +234,63 @@ branch, and the Claude conversation id.
 from the record — re-attaching worktrees on their branches and continuing
 each Claude conversation via `claude --resume`.
 
+## Sub-hosts
+
+The main worker can run sub-agent panels on other machines and spread the
+work across them. `list_hosts` reports each host's connection, panel count,
+load averages, CPUs and free memory; `spawn_role`'s `host` places a panel
+there. A remote panel is a full panel in the TUI: you watch it, type into
+it, and its turn signals reach the main worker as a local panel's do.
+
+Hosts are listed in `~/.caucus/hosts.toml` and `<repo>/.caucus/hosts.toml`;
+a project entry replaces the global entry of the same name.
+
+```toml
+[[host]]
+name = "build-1"            # what spawn_role's `host` and list_hosts use
+ssh = "me@build-1.lan"      # ssh destination; defaults to `name`
+caucus = "~/bin/caucus"     # caucus on that host; defaults to `caucus`
+dir = "~/src/project"       # the host's clone of this repo; defaults to this repo's path
+
+[[host]]
+name = "box"
+socket = "/run/user/1000/caucus-host/daemon.sock"   # a daemon on this machine
+dir = "~/src/project-box"   # required: a clone of this repo apart from this one
+```
+
+An ssh host runs `caucus host bridge` in the remote user's login shell, which
+starts that user's host daemon if none is running. The daemon owns the
+host's panels and outlives the connection: after an ssh drop main reconnects,
+re-reads each panel's missed output (up to its last 8 MiB), and the input
+and turn signals the drop lost are delivered once. It runs until it gets
+`SIGTERM`, which kills its panels. ssh runs with `BatchMode=yes`, so login
+must already work without a prompt. A `socket` host is
+a daemon on this machine that you start yourself with `caucus host serve`
+(its default socket is `<tmp>/caucus-host-<uid>/daemon.sock`).
+
+Each host works in its own clone, `dir`. A worktree panel's lane starts as
+main's `HEAD` pushed to a branch of that clone, and the branch is fetched
+back into this repo after every turn, so the main worker reviews and merges
+the lane here. The clone must never be this repo: a `socket` host therefore
+needs `dir`, and so does an `ssh` host that is this machine. Two entries
+may reach one daemon, each with its own `dir`; they are separate hosts to
+the main worker. A host's `CAUCUS_SESSION_DIR` is its own, not shared with
+main or other hosts.
+
+On every host:
+
+- install a caucus that speaks main's protocol version (`list_hosts` shows
+  the mismatch otherwise); after upgrading it, stop the old daemon;
+- run `caucus init --install-hook` there: remote panels post their turn
+  signals through the host's own Claude Stop hook;
+- keep `caucus` on the login shell's `PATH`, since the hook runs it by bare
+  name; the `caucus` key only tells main how to start the bridge;
+- install the agent CLIs the roles placed there use.
+
+On `caucus resume`, a panel its host still runs is adopted again with its
+output replayed; any other starts again on its host, resuming its
+conversation in a worktree checked out again on its lane's branch.
+
 ## Install
 
 ```bash
