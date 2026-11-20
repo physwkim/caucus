@@ -237,7 +237,13 @@ async fn a_login_profile_printing_before_the_bridge_does_not_stop_the_link() {
         ],
     };
     let (tx, _signals) = tokio::sync::mpsc::unbounded_channel();
-    let link = HostLink::connect("chatty", SessionId::new(), transport, tx);
+    let link = HostLink::connect(
+        "chatty",
+        SessionId::new(),
+        transport,
+        tx,
+        Default::default(),
+    );
     let connected = link.wait_connected(WAIT).await;
     link.close(WAIT).await;
     connected.unwrap();

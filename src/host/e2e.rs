@@ -1,5 +1,6 @@
 //! A daemon and a link in one process, over real sockets and real PTYs.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -99,12 +100,22 @@ fn link(
     paths: &HostPaths,
     session: SessionId,
 ) -> (HostLink, mpsc::UnboundedReceiver<RemoteSignal>) {
+    resumed_link(paths, session, HashSet::new())
+}
+
+/// [`link`] for a main that adopts `adopting`.
+fn resumed_link(
+    paths: &HostPaths,
+    session: SessionId,
+    adopting: HashSet<PanelId>,
+) -> (HostLink, mpsc::UnboundedReceiver<RemoteSignal>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let link = HostLink::connect(
         "sub-1",
         session,
         Transport::Socket(paths.control_sock.clone()),
         tx,
+        adopting,
     );
     (link, rx)
 }
@@ -362,7 +373,13 @@ async fn a_signal_lost_with_its_connection_reaches_main_once() {
     let relay = Relay::start(tmp.path().join("relay.sock"), paths.control_sock.clone());
     let session = SessionId::new();
     let (tx, mut signals) = mpsc::unbounded_channel();
-    let link = HostLink::connect("sub-1", session, Transport::Socket(relay.path.clone()), tx);
+    let link = HostLink::connect(
+        "sub-1",
+        session,
+        Transport::Socket(relay.path.clone()),
+        tx,
+        HashSet::new(),
+    );
     link.wait_connected(WAIT).await.unwrap();
     let panel = PanelId::new();
     let mut pty = link
@@ -422,6 +439,7 @@ async fn input_lost_with_its_connection_reaches_the_panel_once() {
         SessionId::new(),
         Transport::Socket(relay.path.clone()),
         tx,
+        HashSet::new(),
     );
     link.wait_connected(WAIT).await.unwrap();
     let mut pty = link
@@ -470,6 +488,7 @@ async fn a_reconnect_replays_exactly_the_output_missed_while_the_link_was_down()
         SessionId::new(),
         Transport::Socket(relay.path.clone()),
         tx,
+        HashSet::new(),
     );
     link.wait_connected(WAIT).await.unwrap();
 
@@ -625,7 +644,13 @@ impl StalledHost {
         let sock = tmp.path().join("host.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let (tx, _signals) = mpsc::unbounded_channel();
-        let link = HostLink::connect("sub-1", SessionId::new(), Transport::Socket(sock), tx);
+        let link = HostLink::connect(
+            "sub-1",
+            SessionId::new(),
+            Transport::Socket(sock),
+            tx,
+            HashSet::new(),
+        );
         let (stream, _) = listener.accept().await.unwrap();
         let (read, mut write) = stream.into_split();
         let mut read = BufReader::new(read);
@@ -777,7 +802,7 @@ async fn an_adopted_panel_takes_input_after_what_it_took_before() {
     read_until(&mut pty, &mut out, "got-a").await;
     before.close(WAIT).await;
 
-    let (after, _signals) = link(&paths, session);
+    let (after, _signals) = resumed_link(&paths, session, HashSet::from([panel]));
     let info = after.wait_connected(WAIT).await.unwrap();
     assert_eq!(info.panels.len(), 1);
     assert_eq!((info.panels[0].id, info.panels[0].input), (panel, 2));
@@ -827,7 +852,7 @@ async fn an_adopted_panel_keeps_the_modes_its_dropped_output_set() {
     }
     before.close(WAIT).await;
 
-    let (after, _signals) = link(&paths, session);
+    let (after, _signals) = resumed_link(&paths, session, HashSet::from([panel]));
     after.wait_connected(WAIT).await.unwrap();
     let mut pty = after.adopt(panel, 80, 24).unwrap();
     let mut grid = crate::term::grid::Grid::new(80, 24);
@@ -863,7 +888,7 @@ async fn two_hosts_on_one_daemon_stay_connected_side_by_side() {
     let (tx, _signals) = mpsc::unbounded_channel();
     let links = ["gpu-a", "gpu-b"].map(|name| {
         let transport = Transport::Socket(paths.control_sock.clone());
-        HostLink::connect(name, session, transport, tx.clone())
+        HostLink::connect(name, session, transport, tx.clone(), HashSet::new())
     });
     for link in &links {
         link.wait_connected(WAIT).await.unwrap();
@@ -922,7 +947,13 @@ async fn a_host_that_hangs_up_after_its_welcome_is_redialled_ever_more_slowly() 
         }
     });
     let (tx, _signals) = mpsc::unbounded_channel();
-    let link = HostLink::connect("flaky", SessionId::new(), Transport::Socket(sock), tx);
+    let link = HostLink::connect(
+        "flaky",
+        SessionId::new(),
+        Transport::Socket(sock),
+        tx,
+        HashSet::new(),
+    );
     tokio::time::sleep(Duration::from_millis(1600)).await;
     let dials = dials.load(Ordering::SeqCst);
     // Backing off 250, 500, 1000 ms dials 3 times in 1.6 s; redialling

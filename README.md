@@ -292,7 +292,9 @@ starts its daemon from, including a live test of the host's hook.
 
 On `caucus resume`, a panel its host still runs is adopted again with its
 output replayed; any other starts again on its host, resuming its
-conversation in a worktree checked out again on its lane's branch.
+conversation in a worktree checked out again on its lane's branch. A panel
+the host still has for the session that the session record does not name is
+killed there.
 
 ## Install
 

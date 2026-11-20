@@ -31,6 +31,7 @@ use crate::config::hosts::{HostConfig, LOCAL_HOST};
 use crate::host::{HostInfo, HostLink, LinkStatus, RemoteSignal};
 use crate::mcp::HostSummary;
 use crate::session::id::AgentId;
+use crate::session::record::PanelRecord;
 use crate::signal::{SignalEvent, StopDirective};
 use crate::worktree::cleanup::{WorktreeOwner, record_removal};
 use crate::worktree::remote::LocalBranch;
@@ -191,17 +192,31 @@ fn record_left_turns(
 }
 
 impl Multiplexer {
-    /// Start a link to every host in `hosts.toml`. Must run inside the tokio
-    /// runtime; links connect (and reconnect) in the background.
-    pub fn connect_hosts(&mut self) {
-        for host in self.config.hosts.clone() {
+    /// Start a link to every host in `hosts.toml`, bringing back the
+    /// sub-host panels `restoring` names (a resumed session's). Must run
+    /// inside the tokio runtime; links connect (and reconnect) in the
+    /// background.
+    pub fn connect_hosts(&mut self, restoring: Vec<PanelRecord>) {
+        self.link_hosts(self.config.hosts.clone(), restoring);
+    }
+
+    /// [`Multiplexer::connect_hosts`] for `hosts`. Every restore is known
+    /// before any link starts: a link kills the panels its host has for this
+    /// session that it is not told to adopt.
+    fn link_hosts(&mut self, hosts: Vec<HostConfig>, restoring: Vec<PanelRecord>) {
+        for record in restoring {
+            if let Some(host) = record.host.clone() {
+                self.restore_host_panel(host, record);
+            }
+        }
+        for host in hosts {
             self.connect_host(host);
         }
     }
 
     /// Start a link to one host. A second link under a name already linked is
     /// refused.
-    pub fn connect_host(&mut self, host: HostConfig) {
+    fn connect_host(&mut self, host: HostConfig) {
         if self.host_link(&host.name).is_some() {
             warn!(host = %host.name, "host already linked; ignoring the second entry");
             return;
@@ -211,6 +226,7 @@ impl Multiplexer {
             self.session.id,
             host.transport(),
             self.hosts.signals_tx.clone(),
+            self.host_adoptions(&host.name),
         );
         self.hosts.links.push(Linked { link, host });
     }
@@ -586,7 +602,7 @@ mod tests {
     use crate::pty::{Pty, PtyCommand};
     use crate::role::spec::AgentCli;
     use crate::session::id::AgentId;
-    use crate::session::record::{PanelRecord, SessionRecord};
+    use crate::session::record::SessionRecord;
     use crate::session::runtime::test_support::*;
     use crate::signal::{TurnKind, TurnSignal, UnboundSignal};
     use crate::term::{Grid, OutputCapture};
@@ -1091,8 +1107,7 @@ mod tests {
         gone.close_hosts().await;
 
         let (mut back, record) = resume(gone, &tmp);
-        back.connect_host(host);
-        back.restore_host_panel("box".into(), record.panels[0].clone());
+        back.link_hosts(vec![host], vec![record.panels[0].clone()]);
         until("the panel to be re-adopted", || {
             back.poll_host_restores();
             !back.panels.is_empty()
@@ -1115,6 +1130,57 @@ mod tests {
 
         back.shutdown();
         back.close_hosts().await;
+        daemon.stop().await;
+    }
+
+    /// On resume, the panels the host still has for the session that the
+    /// record does not hold, running or exited, are killed there; the
+    /// recorded one is adopted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_kills_the_sub_host_panels_the_record_does_not_hold() {
+        let tmp = TempDir::new().unwrap();
+        let host_tmp = TempDir::new().unwrap();
+        let paths = test_paths(&host_tmp);
+        let mut daemon = TestDaemon::start(&paths).await;
+        let host = socket_host("box", paths.control_sock.clone());
+        let mut gone = mux(&tmp);
+        gone.link_hosts(vec![host.clone()], Vec::new());
+        until("box to connect", || gone.remote_target("box").is_ok()).await;
+        let kept = push_remote_panel(&mut gone, "box");
+        gone.persist_record();
+        // Started after the record was last written: one still running, one
+        // exited.
+        let link = gone.remote_target("box").unwrap().repo.link;
+        let cat = PtyCommand::new("/bin/cat");
+        let running = link.spawn(PanelId::new(), &cat, 80, 24, false).unwrap();
+        let true_ = PtyCommand::new("/bin/true");
+        let mut exited = link.spawn(PanelId::new(), &true_, 80, 24, false).unwrap();
+        until("the second to exit", || {
+            let _ = exited.read();
+            !exited.is_alive()
+        })
+        .await;
+        // Gone without a kill: the links close before the panels drop.
+        gone.close_hosts().await;
+        drop((running, exited));
+
+        let (mut back, record) = resume(gone, &tmp);
+        back.link_hosts(vec![host.clone()], record.panels.clone());
+        until("the recorded panel to be re-adopted", || {
+            back.poll_host_restores();
+            !back.panels.is_empty()
+        })
+        .await;
+        assert_eq!(back.panels[0].id, kept);
+        back.close_hosts().await;
+
+        let (tx, _signals) = mpsc::unbounded_channel();
+        let adopting = HashSet::from([kept]);
+        let probe = HostLink::connect("box", back.session.id, host.transport(), tx, adopting);
+        let info = probe.wait_connected(WAIT).await.unwrap();
+        let left: Vec<_> = info.panels.iter().map(|p| p.id).collect();
+        assert_eq!(left, vec![kept]);
+        probe.close(WAIT).await;
         daemon.stop().await;
     }
 
@@ -1145,8 +1211,7 @@ mod tests {
         assert!(!path.exists());
 
         let (mut back, record) = resume(gone, &tmp);
-        back.connect_host(host);
-        back.restore_host_panel("box".into(), record.panels[0].clone());
+        back.link_hosts(vec![host], vec![record.panels[0].clone()]);
         until("the lane to start again", || {
             back.poll_host_restores();
             back.hosts.restores.is_empty()
@@ -1185,7 +1250,6 @@ mod tests {
     async fn a_sub_host_panel_waiting_for_its_host_stays_recorded() {
         let tmp = TempDir::new().unwrap();
         let mut mux = mux(&tmp);
-        mux.connect_host(socket_host("box", tmp.path().join("absent.sock")));
         let waiting = PanelRecord {
             role: "reviewer".into(),
             agent_cli: AgentCli::Claude,
@@ -1197,13 +1261,15 @@ mod tests {
             host: Some("box".into()),
             agent_id: Some(AgentId::new()),
         };
-        mux.restore_host_panel("box".into(), waiting.clone());
-        mux.restore_host_panel(
-            "gone".into(),
-            PanelRecord {
-                host: Some("gone".into()),
-                ..waiting.clone()
-            },
+        mux.link_hosts(
+            vec![socket_host("box", tmp.path().join("absent.sock"))],
+            vec![
+                waiting.clone(),
+                PanelRecord {
+                    host: Some("gone".into()),
+                    ..waiting.clone()
+                },
+            ],
         );
         mux.poll_host_restores();
         mux.shutdown();

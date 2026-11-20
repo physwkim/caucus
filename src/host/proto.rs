@@ -191,8 +191,8 @@ pub struct HostInfo {
     /// This session's shared directory on the sub-host — `CAUCUS_SESSION_DIR`
     /// for panels here. Not shared with the main host or other sub-hosts.
     pub session_dir: PathBuf,
-    /// This session's panels still running here, which a resumed main
-    /// re-adopts instead of starting again.
+    /// This session's panels here, exited or not. A resumed main re-adopts
+    /// a running one instead of starting it again.
     pub panels: Vec<HostPanel>,
 }
 
@@ -202,6 +202,8 @@ pub struct HostPanel {
     pub id: PanelId,
     /// The first input byte the host has not taken.
     pub input: u64,
+    /// Its process ended; the host keeps its output until it is killed.
+    pub exited: bool,
 }
 
 /// Daemon → main caucus.

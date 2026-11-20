@@ -6,7 +6,8 @@
 //! agent, its output replayed. Any other starts again on the host, resuming
 //! its conversation, in a worktree checked out again on its lane's branch,
 //! which the host kept. Until then the panel stays in the session record as
-//! it was.
+//! it was. The panels to re-adopt are known before the links start, and a
+//! link kills every other panel its host still has for the session.
 
 use std::path::PathBuf;
 
@@ -16,7 +17,7 @@ use tracing::{info, warn};
 use super::hosts::{HostRepo, within};
 use super::spawn::Orphan;
 use super::*;
-use crate::agent::manifest;
+use crate::agent::manifest::{self, AgentManifest};
 use crate::host::LinkStatus;
 use crate::session::id::AgentId;
 use crate::session::record::PanelRecord;
@@ -26,6 +27,8 @@ pub(super) struct HostRestore {
     host: String,
     /// The agent the panel ran.
     agent: AgentId,
+    /// Its manifest as the earlier main left it; `None` if unreadable.
+    old: Option<AgentManifest>,
     /// What the session record keeps for it meanwhile.
     pub(super) record: PanelRecord,
     stage: Stage,
@@ -42,23 +45,38 @@ enum Stage {
 
 impl Multiplexer {
     /// Bring `record`'s panel back on `host` once that host connects
-    /// ([`Multiplexer::poll_host_restores`]).
-    pub fn restore_host_panel(&mut self, host: String, record: PanelRecord) {
-        if self.host_repo(&host).is_err() {
-            warn!(role = %record.role, %host, "hosts.toml no longer names the panel's host; not restored");
-            return;
-        }
+    /// ([`Multiplexer::poll_host_restores`]). Only before the host's link
+    /// starts ([`Multiplexer::connect_hosts`]).
+    pub(super) fn restore_host_panel(&mut self, host: String, record: PanelRecord) {
         let Some(agent) = record.agent_id else {
             warn!(role = %record.role, %host, "sub-host panel recorded by an older caucus; not restored");
             return;
+        };
+        let old = match manifest::read(&self.session.root_dir, agent) {
+            Ok(manifest) => Some(manifest),
+            Err(err) => {
+                warn!(role = %record.role, error = %err, "sub-host panel's manifest unreadable; starting it again");
+                None
+            }
         };
         info!(role = %record.role, %host, "sub-host panel waits for its host to connect");
         self.hosts.restores.push(HostRestore {
             host,
             agent,
+            old,
             record,
             stage: Stage::Linking,
         });
+    }
+
+    /// The panels waiting to come back on `host` that it may still run.
+    pub(super) fn host_adoptions(&self, host: &str) -> HashSet<PanelId> {
+        self.hosts
+            .restores
+            .iter()
+            .filter(|r| r.host == host)
+            .filter_map(|r| r.old.as_ref().map(|m| m.panel_id))
+            .collect()
     }
 
     /// Advance every waiting sub-host panel whose host is connected. Called
@@ -95,7 +113,7 @@ impl Multiplexer {
             }
         }
         let Ok(repo) = self.host_repo(&restore.host) else {
-            return self.give_up(restore, "host is no longer linked");
+            return self.give_up(restore, "hosts.toml no longer names its host");
         };
         let LinkStatus::Connected(info) = repo.link.status() else {
             return Some(restore);
@@ -105,16 +123,10 @@ impl Multiplexer {
             return self.relaunch(restore, Some(path));
         }
 
-        let old = match manifest::read(&self.session.root_dir, restore.agent) {
-            Ok(manifest) => Some(manifest),
-            Err(err) => {
-                warn!(role = %restore.record.role, error = %err, "sub-host panel's manifest unreadable; starting it again");
-                None
-            }
-        };
+        let old = restore.old.clone();
         if let Some(old) = old
             .as_ref()
-            .filter(|m| info.panels.iter().any(|p| p.id == m.panel_id))
+            .filter(|m| info.panels.iter().any(|p| p.id == m.panel_id && !p.exited))
         {
             let branch = restore.record.worktree_branch.clone();
             return match self.adopt_panel(&repo.link, old.clone(), branch) {

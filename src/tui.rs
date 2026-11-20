@@ -347,7 +347,7 @@ pub fn run(
         let _guard = TerminalGuard::enter(config.settings.mouse)?;
         let (terminal, mut mux, signal, control) =
             setup(config, session, prefix, LaunchMode::Fresh)?;
-        mux.connect_hosts();
+        mux.connect_hosts(Vec::new());
         spawn_fresh_roster(&mut mux, &roles, main_cli)?;
         event_loop(terminal, mux, signal, control).await
     })
@@ -394,7 +394,6 @@ pub fn run_resumed(
         let _guard = TerminalGuard::enter(config.settings.mouse)?;
         let (terminal, mut mux, signal, control) =
             setup(config, session, prefix, LaunchMode::Resume)?;
-        mux.connect_hosts();
         restore_roster(&mut mux, &record)?;
         event_loop(terminal, mux, signal, control).await
     })
@@ -489,10 +488,16 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
     panels.sort_by_key(|p| p.order_index);
     let has_explicit_main = panels.iter().any(|p| p.is_main);
     let mut restored_main = false;
+    mux.connect_hosts(
+        panels
+            .iter()
+            .filter(|p| p.host.is_some())
+            .cloned()
+            .collect(),
+    );
 
     for panel in &panels {
-        if let Some(host) = &panel.host {
-            mux.restore_host_panel(host.clone(), panel.clone());
+        if panel.host.is_some() {
             continue;
         }
         let is_main = should_restore_panel_as_main(panel, has_explicit_main, restored_main);

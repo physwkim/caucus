@@ -746,10 +746,11 @@ impl Daemon {
                 panels: self
                     .panels
                     .iter()
-                    .filter(|(_, p)| p.link == link && !matches!(p.life, Life::Exited(_)))
+                    .filter(|(_, p)| p.link == link)
                     .map(|(&id, p)| HostPanel {
                         id,
                         input: p.input_next,
+                        exited: matches!(p.life, Life::Exited(_)),
                     })
                     .collect(),
             }),
@@ -1308,6 +1309,40 @@ mod tests {
         assert!(kicked.try_recv().is_err(), "the new connection stays open");
         let p = &daemon.panels[&id];
         assert_eq!((p.sent, p.exit_sent), (None, false));
+        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
+    }
+
+    /// The welcome lists every panel of the link, an exited one marked so,
+    /// for a resumed main to adopt or kill.
+    #[test]
+    fn the_welcome_lists_the_links_exited_panels_too() {
+        let ours = link(SessionId::new(), "sub-1");
+        let (mut daemon, _old) = daemon_with_client(ours.clone());
+        let (running, exited) = (PanelId::new(), PanelId::new());
+        daemon
+            .panels
+            .insert(running, DPanel::new(ours.clone(), None));
+        let mut panel = DPanel::new(ours.clone(), None);
+        panel.life = Life::Exited(None);
+        daemon.panels.insert(exited, panel);
+
+        let (tx, mut rx) = mpsc::channel(CONNECTION_QUEUE);
+        let (kick, _kicked) = oneshot::channel::<()>();
+        daemon.on_event(ConnEvent::Hello {
+            conn: 2,
+            link: ours,
+            tx,
+            kick,
+        });
+        let welcome = frames(&mut rx);
+        let [DaemonFrame::Welcome(info), DaemonFrame::Load(_)] = welcome.as_slice() else {
+            panic!("expected welcome and load, got {welcome:?}");
+        };
+        let mut listed: Vec<_> = info.panels.iter().map(|p| (p.id, p.exited)).collect();
+        listed.sort();
+        let mut want = vec![(running, false), (exited, true)];
+        want.sort();
+        assert_eq!(listed, want);
         let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 

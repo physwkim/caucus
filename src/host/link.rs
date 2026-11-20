@@ -9,7 +9,7 @@
 //! the first byte the host has not taken. Frames written while disconnected
 //! wait in the outbound queue.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -152,6 +152,9 @@ struct Inner {
 #[derive(Default)]
 struct LinkState {
     panels: HashMap<PanelId, LinkPanel>,
+    /// Panels of this session the host may still have that main will adopt.
+    /// Any other the host lists and `panels` lacks is killed on the welcome.
+    adopting: HashSet<PanelId>,
     /// Panels killed but not yet confirmed by the daemon, and whether the
     /// current connection has carried each kill. Only the connection's writer
     /// sends a kill, never the bounded queue, so none can be refused.
@@ -223,16 +226,22 @@ enum Chunk {
 impl HostLink {
     /// Start connecting to `name` over `transport` as `session`. Must run
     /// inside a tokio runtime. Signals from the host's panels go to `signals`.
+    /// Of the panels the host already has for the session, those in
+    /// `adopting` are left for [`HostLink::adopt`] and every other is killed.
     pub fn connect(
         name: impl Into<String>,
         session: SessionId,
         transport: Transport,
         signals: mpsc::UnboundedSender<RemoteSignal>,
+        adopting: HashSet<PanelId>,
     ) -> Self {
         let (outbound, rx) = mpsc::channel(OUTBOUND_QUEUE);
         let inner = Arc::new(Inner {
             name: name.into(),
-            state: Mutex::default(),
+            state: Mutex::new(LinkState {
+                adopting,
+                ..LinkState::default()
+            }),
             status: watch::Sender::new(LinkStatus::Connecting { last_error: None }),
             outbound,
             owed_ready: Notify::new(),
@@ -315,8 +324,8 @@ impl HostLink {
     }
 
     /// Take over `panel`, which the host still runs for this session from
-    /// before main restarted, replaying its output from the first byte the
-    /// host kept.
+    /// before main restarted and [`HostLink::connect`] was told to adopt,
+    /// replaying its output from the first byte the host kept.
     pub fn adopt(&self, panel: PanelId, cols: u16, rows: u16) -> Result<RemotePty, PtyError> {
         let taken = self.inner.lock().taken.get(&panel).copied().unwrap_or(0);
         self.open(
@@ -340,7 +349,7 @@ impl HostLink {
         frames: [ClientFrame; N],
     ) -> Result<RemotePty, PtyError> {
         let (out, rx) = mpsc::channel(PANEL_QUEUE);
-        {
+        let adopting = {
             let mut state = self.inner.lock();
             if state.closed {
                 return Err(PtyError::Spawn(format!(
@@ -348,6 +357,7 @@ impl HostLink {
                     self.name()
                 )));
             }
+            let adopting = state.adopting.remove(&panel);
             state.panels.insert(
                 panel,
                 LinkPanel {
@@ -361,10 +371,15 @@ impl HostLink {
                     signals_next: 0,
                 },
             );
-        }
+            adopting
+        };
         for frame in frames {
             if let Err(err) = self.send(frame) {
-                self.inner.lock().panels.remove(&panel);
+                let mut state = self.inner.lock();
+                state.panels.remove(&panel);
+                if adopting {
+                    state.adopting.insert(panel);
+                }
                 return Err(err);
             }
         }
@@ -416,6 +431,7 @@ impl HostLink {
         {
             let mut state = self.inner.lock();
             state.panels.remove(&panel);
+            state.adopting.remove(&panel);
             if state.closed {
                 return;
             }
@@ -875,7 +891,23 @@ async fn connection(
     };
     let connected = Instant::now();
     info!(host = %inner.name, hostname = %info.hostname, version = %info.version, "sub-host connected");
-    inner.lock().taken = info.panels.iter().map(|p| (p.id, p.input)).collect();
+    {
+        let mut state = inner.lock();
+        let LinkState {
+            panels,
+            adopting,
+            kills,
+            taken,
+            ..
+        } = &mut *state;
+        *taken = info.panels.iter().map(|p| (p.id, p.input)).collect();
+        // Sent with the re-attach below.
+        for p in &info.panels {
+            if !panels.contains_key(&p.id) && !adopting.contains(&p.id) {
+                kills.entry(p.id).or_insert(Kill::Unsent);
+            }
+        }
+    }
     inner.status.send_replace(LinkStatus::Connected(info));
 
     let mut first = inner.reattach_frames();
