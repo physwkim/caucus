@@ -571,7 +571,6 @@ hook을 실행하게 되어 어떤 패널도 신호를 보내지 못하고 어�
 # CAUCUS_* env는 caucus가 패널 spawn 시 주입. Claude hook payload는 stdin JSON.
 # $1은 hook 이벤트 인자: Stop 항목은 인자 없이(기본 stop), PostCompact/
 # SessionStart 항목은 post-compact / session-start를 넘긴다 (§7.9).
-# 아래 discovery 분기가 위치 파라미터를 소켓 glob으로 덮어쓰므로 먼저 캡처한다.
 kind="${1:-stop}"
 if [ -n "$CAUCUS_SOCK" ]; then
   exec caucus signal post \
@@ -580,14 +579,14 @@ if [ -n "$CAUCUS_SOCK" ]; then
     --panel   "$CAUCUS_PANEL_ID" \
     --kind    "$kind"
 fi
-set -- "${TMPDIR:-/tmp}"/caucus-*.sock
-[ -e "$1" ] || exit 0
+command -v caucus >/dev/null 2>&1 || exit 0
 exec caucus signal post --discover --kind "$kind"
 ```
 
-env가 없는데 caucus 소켓이 하나라도 살아 있으면 `--discover`로 fallback한다
-(§7.8) — env 부재가 "caucus 패널이 아니다"를 뜻하지 않기 때문이다(daemon
-re-host). 소켓도 없으면 종전처럼 조용한 no-op.
+env가 없으면 `--discover`로 fallback한다(§7.8) — env 부재가 "caucus 패널이
+아니다"를 뜻하지 않기 때문이다(daemon re-host). 소켓이 어디 있는지는 바이너리만
+안다: 스크립트가 소켓을 미리 찾으면 소켓 위치가 바뀔 때 그 소켓을 건너뛴다.
+살아 있는 소켓이 없으면 post는 no-op이고, caucus가 없으면 조용히 끝난다.
 
 `caucus signal post`는 stdin JSON에서 `last_message`를 추출해 소켓에 한 줄 JSON으로
 쓴다. 파일도, 폴링도 없다 — caucus 실행 프로세스가 소켓 read로 즉시 수신한다.
@@ -833,9 +832,10 @@ resume`이 fork 이전 대화를 되살린다. env 상속을 끊는 **모든** �
 - **클라이언트** (`caucus signal post --discover`, §7.3 스크립트의 fallback):
   payload만으로 `UnboundSignal`(wire 마커 `unbound: true`, untagged
   `SignalEvent`가 shape로 판별)을 만들어 temp dir의 모든 `caucus-*.sock`
-  (`-ctl.sock` 제외)에 브로드캐스트하고, 소켓당 응답 한 줄을 읽는다. 소켓
-  파일이 곧 레지스트리다 — 별도 상태 파일 없음, 죽은 소켓은 connect 실패로
-  자체 스킵. 첫 deliver reason이 이긴다(한 대화의 owner는 최대 하나).
+  (`-ctl.sock` 제외)과 이 머신의 호스트 daemon 신호 소켓
+  (`~/.caucus/host/<hostname>/signal.sock`)에 브로드캐스트하고, 소켓당 응답
+  한 줄을 읽는다. 소켓 파일이 곧 레지스트리다 — 별도 상태 파일 없음, 죽은
+  소켓은 connect 실패로 자체 스킵. 첫 deliver reason이 이긴다(한 대화의 owner는 최대 하나).
 - **서버**: unbound 라인은 항상 reply slot을 받는다(§7.6과 동일한 대기).
   런타임의 `Multiplexer::handle_unbound_signal`이 단일 owner로서 unbound→bound
   변환을 수행한다. 해석 순서:

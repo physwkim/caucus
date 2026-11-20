@@ -24,17 +24,16 @@ use crate::hook::{
 /// project.
 ///
 /// One script serves every caucus hook event, selected by its single argument
-/// (absent = `stop`). The argument is captured into `kind` on the first line
-/// because the discovery branch below reuses the positional parameters for
-/// socket globbing — reading `$1` after that `set --` would name a socket
-/// path, not the hook event.
+/// (absent = `stop`).
 ///
 /// When the env is absent the conversation may still BE a caucus panel whose
 /// process no longer inherits the panel's env (Claude Code's daemon re-hosts
-/// live sessions across restarts as env-less forks). If any caucus session
-/// socket exists, fall back to `--discover`: post the payload unbound to every
-/// live socket and let each server decide ownership from the payload itself.
-/// With no socket present the hook is a harmless no-op, as before. The kind
+/// live sessions across restarts as env-less forks), so the hook falls back
+/// to `--discover`: post the payload unbound to every live socket and let each
+/// server decide ownership from the payload itself. Only the binary knows
+/// where the sockets live; the script never looks for them, so moving one
+/// cannot leave the hook skipping it. With no live socket the post is a
+/// no-op, and without `caucus` installed the hook exits quietly. The kind
 /// rides that branch unchanged — the binary, not the script, decides which
 /// kinds the unbound path can carry.
 const TURN_SIGNAL_SCRIPT: &str = "#!/bin/sh\n\
@@ -44,16 +43,15 @@ const TURN_SIGNAL_SCRIPT: &str = "#!/bin/sh\n\
 # One script serves every caucus hook event: settings.json invokes it bare for\n\
 # Stop (the default below) and with an argument for the lifecycle events\n\
 # (`post-compact` / `session-start`), which report a local /compact or /clear\n\
-# finishing — completions the Stop hook never fires for. Capture it now: the\n\
-# discovery branch below reuses the positional parameters for socket globbing.\n\
+# finishing — completions the Stop hook never fires for.\n\
 kind=\"${1:-stop}\"\n\
 #\n\
 # The hooks are installed globally (~/.claude/settings.json), so they also\n\
 # fire in ordinary Claude Code sessions that are NOT caucus panels — and in\n\
 # caucus panels whose env was lost to a daemon re-host. With the env present,\n\
-# post directly; otherwise, if any caucus socket is live, post unbound to all\n\
-# of them (each server resolves ownership from the payload); with neither,\n\
-# exit quietly so the hook is a harmless no-op.\n\
+# post directly; otherwise post unbound to every live caucus socket, which\n\
+# caucus finds itself (each server resolves ownership from the payload).\n\
+# Without caucus installed, exit quietly so the hook is a harmless no-op.\n\
 if [ -n \"$CAUCUS_SOCK\" ]; then\n\
   exec caucus signal post \\\n\
     --sock    \"$CAUCUS_SOCK\" \\\n\
@@ -61,8 +59,7 @@ if [ -n \"$CAUCUS_SOCK\" ]; then\n\
     --panel   \"$CAUCUS_PANEL_ID\" \\\n\
     --kind    \"$kind\"\n\
 fi\n\
-set -- \"${TMPDIR:-/tmp}\"/caucus-*.sock\n\
-[ -e \"$1\" ] || exit 0\n\
+command -v caucus >/dev/null 2>&1 || exit 0\n\
 exec caucus signal post --discover --kind \"$kind\"\n";
 
 /// Result of the `--install-hook` step.
@@ -1108,13 +1105,14 @@ mod tests {
         );
     }
 
-    /// Run [`TURN_SIGNAL_SCRIPT`] for real against a stub `caucus` on PATH and
-    /// return the argv it was invoked with (empty when it was never invoked).
+    /// Run [`TURN_SIGNAL_SCRIPT`] for real and return the argv a stub `caucus`
+    /// was invoked with (empty when it was never invoked).
     ///
-    /// `sock_present` controls whether a socket file exists under the script's
-    /// `TMPDIR` glob; `env_sock` sets (or clears) `CAUCUS_SOCK`. Those two are
-    /// the script's only branch inputs besides its argument.
-    fn run_hook_script(arg: Option<&str>, env_sock: bool, sock_present: bool) -> Vec<String> {
+    /// `env_sock` sets (or clears) `CAUCUS_SOCK`; `installed` puts the stub on
+    /// a `PATH` that holds nothing else. Those two are the script's only
+    /// branch inputs besides its argument. `TMPDIR` is an empty directory, so
+    /// no socket file is there to find.
+    fn run_hook_script(arg: Option<&str>, env_sock: bool, installed: bool) -> Vec<String> {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = TempDir::new().unwrap();
@@ -1126,39 +1124,29 @@ mod tests {
         let bin = tmp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let argv_out = tmp.path().join("argv.txt");
-        let stub = bin.join("caucus");
-        std::fs::write(
-            &stub,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
-                argv_out.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // The socket dir the script globs (`$TMPDIR/caucus-*.sock`).
-        let sock_dir = tmp.path().join("sockdir");
-        std::fs::create_dir_all(&sock_dir).unwrap();
-        if sock_present {
-            std::fs::write(sock_dir.join("caucus-abc.sock"), "").unwrap();
+        if installed {
+            let stub = bin.join("caucus");
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                    argv_out.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
 
         let mut cmd = std::process::Command::new(&script);
         if let Some(arg) = arg {
             cmd.arg(arg);
         }
-        cmd.env(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
-        .env("TMPDIR", &sock_dir)
-        .env("CAUCUS_SESSION_ID", "S")
-        .env("CAUCUS_PANEL_ID", "P");
+        cmd.env("PATH", &bin)
+            .env("TMPDIR", &empty)
+            .env("CAUCUS_SESSION_ID", "S")
+            .env("CAUCUS_PANEL_ID", "P");
         if env_sock {
             cmd.env("CAUCUS_SOCK", tmp.path().join("c.sock"));
         } else {
@@ -1178,42 +1166,40 @@ mod tests {
         argv.get(i + 1).map(String::as_str)
     }
 
-    /// One case per branch input of the hook script — the script has three
-    /// (argument, `CAUCUS_SOCK`, socket-file present) and every combination
-    /// must carry the *hook event* through to `--kind`.
-    ///
-    /// The discovery branch is the one that can silently lose it: it reuses the
-    /// positional parameters (`set -- "$TMPDIR"/caucus-*.sock`) to glob for a
-    /// socket, so a `--kind "${1:-stop}"` read *after* that line would name a
-    /// socket path instead of the hook event. The script captures the argument
-    /// into `kind` before the glob; these cases pin that.
+    /// One case per branch input of the hook script (argument, `CAUCUS_SOCK`,
+    /// `caucus` installed); every branch that runs `caucus` must carry the
+    /// *hook event* through to `--kind`.
     #[test]
     fn hook_script_carries_the_event_kind_down_every_branch() {
         // Env path: identity flags plus the event.
-        let argv = run_hook_script(Some("session-start"), true, false);
+        let argv = run_hook_script(Some("session-start"), true, true);
         assert_eq!(kind_of(&argv), Some("session-start"), "env path: {argv:?}");
         assert!(!argv.iter().any(|a| a == "--discover"), "{argv:?}");
 
         // Env path, bare invocation (the Stop entry) defaults to `stop`.
-        let argv = run_hook_script(None, true, false);
+        let argv = run_hook_script(None, true, true);
         assert_eq!(kind_of(&argv), Some("stop"), "env path, no arg: {argv:?}");
 
-        // Discovery path: no env, a live socket — the event must survive the
-        // positional-parameter glob.
+        // Discovery path: no env.
         let argv = run_hook_script(Some("session-start"), false, true);
         assert!(argv.iter().any(|a| a == "--discover"), "{argv:?}");
-        assert_eq!(
-            kind_of(&argv),
-            Some("session-start"),
-            "discovery path must not lose the event to the socket glob: {argv:?}"
-        );
+        assert_eq!(kind_of(&argv), Some("session-start"), "discovery: {argv:?}");
 
         // Discovery path, bare invocation.
         let argv = run_hook_script(None, false, true);
         assert_eq!(kind_of(&argv), Some("stop"), "discovery, no arg: {argv:?}");
 
-        // Neither env nor socket: a quiet no-op, `caucus` is never invoked.
+        // No env and no caucus: a quiet no-op.
         let argv = run_hook_script(Some("session-start"), false, false);
         assert!(argv.is_empty(), "no caucus on this machine: {argv:?}");
+    }
+
+    /// The script leaves finding sockets to `caucus`: with none in the temp
+    /// dir, as on a sub-host whose only socket is its daemon's under the
+    /// home, the hook still posts unbound.
+    #[test]
+    fn hook_script_discovers_without_a_socket_in_the_temp_dir() {
+        let argv = run_hook_script(None, false, true);
+        assert!(argv.iter().any(|a| a == "--discover"), "{argv:?}");
     }
 }
