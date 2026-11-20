@@ -195,10 +195,12 @@ fn output_within(command: &mut Command, wait: Duration) -> Result<Output, String
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run {:?}: {e}", command.get_program()))?;
+    let stdout = child.stdout.take().map(read_apart);
+    let stderr = child.stderr.take().map(read_apart);
     let deadline = Instant::now() + wait;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -209,8 +211,27 @@ fn output_within(command: &mut Command, wait: Duration) -> Result<Output, String
             }
             Err(e) => return Err(format!("cannot wait for {:?}: {e}", command.get_program())),
         }
-    }
-    child.wait_with_output().map_err(|e| e.to_string())
+    };
+    Ok(Output {
+        status,
+        stdout: read_back(stdout),
+        stderr: read_back(stderr),
+    })
+}
+
+/// Read a child's `pipe` to its end on a thread of its own, so the child
+/// never stalls on a full pipe while it is waited for.
+fn read_apart(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = pipe.read_to_end(&mut out);
+        out
+    })
+}
+
+/// What [`read_apart`] read.
+fn read_back(pipe: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    pipe.and_then(|pipe| pipe.join().ok()).unwrap_or_default()
 }
 
 /// `host`'s answer to `caucus host doctor`: a check of the host itself, then
@@ -653,6 +674,7 @@ fn run_selftest(hook_command: &str, sock: &Path) -> Result<(), String> {
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(b"{}");
     }
+    let stderr = child.stderr.take().map(read_apart);
 
     // Once the hook process has exited, any successful post's connect is
     // already queued on the listener — a short grace is enough to drain it,
@@ -706,10 +728,11 @@ fn run_selftest(hook_command: &str, sock: &Path) -> Result<(), String> {
     }
     // Nothing arrived: collect the hook's stderr for the diagnosis.
     let _ = child.kill();
-    let output = child
-        .wait_with_output()
+    child
+        .wait()
         .map_err(|e| format!("hook did not deliver and could not be reaped: {e}"))?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = read_back(stderr);
+    let stderr = String::from_utf8_lossy(&stderr);
     let stderr = stderr.trim();
     if stderr.is_empty() {
         Err(format!(
@@ -775,6 +798,20 @@ mod tests {
         // turn-signal script when $CAUCUS_SOCK's caucus binary is absent.
         let check = signal_selftest("exit 0");
         assert_eq!(check.severity, Severity::Warn, "detail: {}", check.detail);
+    }
+
+    /// A hook that writes more to stderr than a pipe holds still exits, so
+    /// it is diagnosed without waiting out the deadline.
+    #[test]
+    fn a_hook_writing_past_a_pipe_is_diagnosed_once_it_exits() {
+        let started = Instant::now();
+        let check = signal_selftest("yes e | head -c 200000 >&2");
+        assert_eq!(check.severity, Severity::Warn, "detail: {}", check.detail);
+        assert!(
+            started.elapsed() < SELFTEST_DEADLINE,
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -998,6 +1035,18 @@ mod tests {
         let out = output_within(Command::new("sleep").arg("10"), Duration::from_millis(100));
         assert!(out.is_err_and(|e| e.contains("within")));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// More output than a pipe holds is read as it comes, not taken for a
+    /// command that never ends.
+    #[test]
+    fn a_command_writing_past_a_pipe_still_answers() {
+        let out = output_within(
+            Command::new("sh").args(["-c", "yes o | head -c 200000; yes e | head -c 200000 >&2"]),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!((out.stdout.len(), out.stderr.len()), (200_000, 200_000));
     }
 
     #[test]
