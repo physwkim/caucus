@@ -10,6 +10,7 @@
 //! [[host]]
 //! name = "box"
 //! socket = "/run/user/1000/caucus-host/daemon.sock"   # a daemon on this machine
+//! dir = "~/src/project-box"   # required: a clone of this repo apart from this one
 //! ```
 //!
 //! Read from `~/.caucus/hosts.toml` and `<repo>/.caucus/hosts.toml`; a project
@@ -31,10 +32,10 @@ pub const LOCAL_HOST: &str = "local";
 pub struct HostConfig {
     pub name: String,
     pub reach: HostReach,
-    /// Where panels on the host start: its checkout of this repo. `None` means
-    /// the path the repo has on this machine. A leading `~` is the remote
-    /// user's home.
-    pub dir: Option<PathBuf>,
+    /// Where panels on the host start: its checkout of this repo. A leading
+    /// `~` is the host user's home. Never this repo itself: lanes are pushed
+    /// to it and fetched back from it.
+    pub dir: PathBuf,
 }
 
 /// How main reaches a host: its daemon, and git to its checkout.
@@ -54,13 +55,14 @@ impl HostConfig {
         }
     }
 
-    /// The git remote for the host's checkout at `dir`. A leading `~` is the
-    /// host user's home: git's ssh transport passes it through to the host's
+    /// The git remote for the host's checkout. A leading `~` is the host
+    /// user's home: git's ssh transport passes it through to the host's
     /// `git-receive-pack`/`git-upload-pack`, which expand it there.
-    pub fn git_url(&self, dir: &Path) -> OsString {
+    pub fn git_url(&self) -> OsString {
+        let dir = &self.dir;
         let mut url = OsString::new();
         match &self.reach {
-            HostReach::Socket(_) => url.push(home_relative(dir.to_path_buf())),
+            HostReach::Socket(_) => url.push(home_relative(dir.clone())),
             HostReach::Ssh { dest, .. } if dest.contains("://") => {
                 url.push(dest.trim_end_matches('/'));
                 if dir.starts_with("~") {
@@ -115,7 +117,8 @@ struct HostEntry {
 }
 
 impl HostEntry {
-    fn into_config(self) -> Result<HostConfig, String> {
+    /// The host this entry names, for the repo at `repo`.
+    fn into_config(self, repo: &Path) -> Result<HostConfig, String> {
         let name_ok = !self.name.is_empty()
             && self
                 .name
@@ -151,16 +154,54 @@ impl HostEntry {
                 caucus: self.caucus.unwrap_or_else(|| "caucus".to_string()),
             },
         };
+        // A socket host is on this machine, where this repo's own path is
+        // this repo.
+        let dir = match (&reach, self.dir) {
+            (_, Some(dir)) => dir,
+            (HostReach::Ssh { .. }, None) => repo.to_path_buf(),
+            (HostReach::Socket(_), None) => {
+                return Err(format!(
+                    "host {}: a socket host needs `dir`, a clone of this repo apart from this one",
+                    self.name
+                ));
+            }
+        };
+        if matches!(reach, HostReach::Socket(_))
+            && same_repository(&home_relative(dir.clone()), repo)
+        {
+            return Err(format!(
+                "host {}: `dir` {} is this repo; give the host a clone of its own",
+                self.name,
+                dir.display()
+            ));
+        }
         Ok(HostConfig {
             name: self.name,
             reach,
-            dir: self.dir,
+            dir,
         })
     }
 }
 
+/// Whether `dir` is in the repository at `repo`, as its worktrees and
+/// subdirectories are. A directory git cannot place counts as not.
+fn same_repository(dir: &Path, repo: &Path) -> bool {
+    let common_dir = |at: &Path| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(at)
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())?;
+        let path = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim_end());
+        path.canonicalize().ok()
+    };
+    matches!((common_dir(dir), common_dir(repo)), (Some(a), Some(b)) if a == b)
+}
+
 /// Read one `hosts.toml`; a missing file has no hosts.
-fn load_file(path: &Path) -> Result<Vec<HostConfig>, HostsError> {
+fn load_file(path: &Path, repo: &Path) -> Result<Vec<HostConfig>, HostsError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -181,7 +222,7 @@ fn load_file(path: &Path) -> Result<Vec<HostConfig>, HostsError> {
     };
     let mut hosts: Vec<HostConfig> = Vec::new();
     for entry in file.host {
-        let host = entry.into_config().map_err(invalid)?;
+        let host = entry.into_config(repo).map_err(invalid)?;
         if hosts.iter().any(|h| h.name == host.name) {
             return Err(invalid(format!("host {} is listed twice", host.name)));
         }
@@ -190,14 +231,14 @@ fn load_file(path: &Path) -> Result<Vec<HostConfig>, HostsError> {
     Ok(hosts)
 }
 
-/// Global hosts, then project hosts; a project host replaces the global host
-/// of the same name in place.
-pub fn load(global_dir: Option<&Path>, project_dir: &Path) -> Result<Vec<HostConfig>, HostsError> {
+/// Global hosts, then the hosts of the project at `repo`; a project host
+/// replaces the global host of the same name in place.
+pub fn load(global_dir: Option<&Path>, repo: &Path) -> Result<Vec<HostConfig>, HostsError> {
     let mut hosts = match global_dir {
-        Some(dir) => load_file(&dir.join("hosts.toml"))?,
+        Some(dir) => load_file(&dir.join("hosts.toml"), repo)?,
         None => Vec::new(),
     };
-    for host in load_file(&project_dir.join("hosts.toml"))? {
+    for host in load_file(&repo.join(".caucus").join("hosts.toml"), repo)? {
         match hosts.iter_mut().find(|h| h.name == host.name) {
             Some(slot) => *slot = host,
             None => hosts.push(host),
@@ -216,6 +257,21 @@ mod tests {
         std::fs::write(dir.join("hosts.toml"), text).unwrap();
     }
 
+    /// Write the `hosts.toml` of the project at `repo`.
+    fn write_project(repo: &Path, text: &str) {
+        write(&repo.join(".caucus"), text);
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "git {args:?}: {st:?}");
+    }
+
     #[test]
     fn missing_files_mean_no_hosts() {
         let tmp = TempDir::new().unwrap();
@@ -229,7 +285,7 @@ mod tests {
     #[test]
     fn ssh_defaults_to_the_name_and_socket_hosts_connect_locally() {
         let tmp = TempDir::new().unwrap();
-        write(
+        write_project(
             tmp.path(),
             r#"
             [[host]]
@@ -237,19 +293,69 @@ mod tests {
             dir = "~/src/p"
 
             [[host]]
+            name = "build-2"
+
+            [[host]]
             name = "box"
             socket = "/tmp/d.sock"
+            dir = "/srv/box-clone"
             "#,
         );
         let hosts = load(None, tmp.path()).unwrap();
         assert_eq!(hosts[0].name, "build-1");
         assert_eq!(hosts[0].transport(), Transport::ssh("build-1", "caucus"));
-        assert_eq!(hosts[0].dir, Some(PathBuf::from("~/src/p")));
+        assert_eq!(hosts[0].dir, PathBuf::from("~/src/p"));
+        assert_eq!(hosts[1].dir, tmp.path(), "this repo's path, on that host");
         assert_eq!(
-            hosts[1].transport(),
+            hosts[2].transport(),
             Transport::Socket("/tmp/d.sock".into())
         );
-        assert_eq!(hosts[1].dir, None);
+        assert_eq!(hosts[2].dir, PathBuf::from("/srv/box-clone"));
+    }
+
+    /// A socket host shares this machine, so its checkout must be a clone of
+    /// its own: git will not fetch a lane's branch into the repo whose
+    /// worktree has it checked out.
+    #[test]
+    fn a_socket_host_whose_checkout_is_this_repo_is_a_load_error() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "root",
+            ],
+        );
+        git(&repo, &["worktree", "add", "-q", "-b", "side", "../side"]);
+        let clone = tmp.path().join("clone");
+        git(tmp.path(), &["clone", "-q", "repo", "clone"]);
+        let socket_with = |dir: Option<&Path>| {
+            let dir = dir
+                .map(|d| format!("dir = {:?}\n", d.to_str().unwrap()))
+                .unwrap_or_default();
+            format!("[[host]]\nname = \"box\"\nsocket = \"/tmp/d.sock\"\n{dir}")
+        };
+        for (dir, why) in [
+            (None, "no dir: this repo's own path"),
+            (Some(repo.clone()), "this repo"),
+            (Some(repo.join(".caucus")), "inside this repo"),
+            (Some(tmp.path().join("side")), "a worktree of this repo"),
+        ] {
+            write_project(&repo, &socket_with(dir.as_deref()));
+            assert!(load(None, &repo).is_err(), "accepted {why}");
+        }
+        write_project(&repo, &socket_with(Some(&clone)));
+        assert_eq!(load(None, &repo).unwrap()[0].dir, clone);
     }
 
     #[test]
@@ -260,7 +366,7 @@ mod tests {
             &global,
             "[[host]]\nname = \"a\"\n[[host]]\nname = \"b\"\nssh = \"old\"\n",
         );
-        write(tmp.path(), "[[host]]\nname = \"b\"\nssh = \"new\"\n");
+        write_project(tmp.path(), "[[host]]\nname = \"b\"\nssh = \"new\"\n");
         let hosts = load(Some(&global), tmp.path()).unwrap();
         let names: Vec<_> = hosts.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, ["a", "b"]);
@@ -269,13 +375,13 @@ mod tests {
 
     #[test]
     fn git_url_names_the_checkout_in_scp_and_url_form() {
-        let ssh = |dest: &str| HostConfig {
+        let ssh = |dest: &str, dir: &str| HostConfig {
             name: "h".into(),
             reach: HostReach::Ssh {
                 dest: dest.into(),
                 caucus: "caucus".into(),
             },
-            dir: None,
+            dir: dir.into(),
         };
         for (dest, dir, url) in [
             ("me@h", "~/src/p", "me@h:~/src/p"),
@@ -285,14 +391,14 @@ mod tests {
             ("ssh://me@h:2222/", "/srv/p", "ssh://me@h:2222/srv/p"),
             ("ssh://h", "src/p", "ssh://h/~/src/p"),
         ] {
-            assert_eq!(ssh(dest).git_url(Path::new(dir)), *url, "{dest} {dir}");
+            assert_eq!(ssh(dest, dir).git_url(), *url, "{dest} {dir}");
         }
         let socket = HostConfig {
             name: "box".into(),
             reach: HostReach::Socket("/tmp/d.sock".into()),
-            dir: None,
+            dir: "/srv/p".into(),
         };
-        assert_eq!(socket.git_url(Path::new("/srv/p")), "/srv/p");
+        assert_eq!(socket.git_url(), "/srv/p");
     }
 
     #[test]
@@ -306,7 +412,7 @@ mod tests {
             "[[host]]\nname = \"a\"\nport = 22\n",
         ] {
             let tmp = TempDir::new().unwrap();
-            write(tmp.path(), text);
+            write_project(tmp.path(), text);
             assert!(load(None, tmp.path()).is_err(), "accepted {text:?}");
         }
     }

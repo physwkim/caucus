@@ -153,15 +153,10 @@ impl Multiplexer {
         let Some(linked) = self.hosts.links.iter().find(|l| l.link.name() == name) else {
             anyhow::bail!("no host named {name:?} (list_hosts shows the configured hosts)");
         };
-        let dir = linked
-            .host
-            .dir
-            .clone()
-            .unwrap_or_else(|| self.session.repo_path.clone());
         Ok(HostRepo {
             link: linked.link.clone(),
-            url: linked.host.git_url(&dir),
-            dir,
+            url: linked.host.git_url(),
+            dir: linked.host.dir.clone(),
         })
     }
 
@@ -485,11 +480,16 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(10);
 
+    /// A host on this machine at `sock`, whose panels start in the socket's
+    /// directory; [`with_host_checkout`] gives one a real checkout.
     fn socket_host(name: &str, sock: PathBuf) -> HostConfig {
         HostConfig {
             name: name.into(),
+            dir: sock
+                .parent()
+                .expect("a socket in a directory")
+                .to_path_buf(),
             reach: HostReach::Socket(sock),
-            dir: None,
         }
     }
 
@@ -613,7 +613,7 @@ mod tests {
         let daemon = TestDaemon::start(&paths).await;
         let mut mux = mux(here);
         mux.connect_host(HostConfig {
-            dir: Some(there.clone()),
+            dir: there.clone(),
             ..socket_host("box", paths.control_sock.clone())
         });
         until("box to connect", || mux.remote_target("box").is_ok()).await;

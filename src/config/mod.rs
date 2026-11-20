@@ -70,7 +70,7 @@ impl Config {
         merged = merged.override_with(RolesConfig::load(&project_dir.join("roles.toml"))?);
 
         let settings = settings::load(global_dir.as_deref(), &project_dir)?;
-        let hosts = hosts::load(global_dir.as_deref(), &project_dir)?;
+        let hosts = hosts::load(global_dir.as_deref(), repo)?;
 
         Ok(Self {
             roles: RoleRegistry::from_specs(merged.into_specs()),
