@@ -651,6 +651,7 @@ impl Chores {
 struct Daemon {
     paths: HostPaths,
     hostname: String,
+    machine_id: Option<String>,
     caucus_bin: PathBuf,
     panels: HashMap<PanelId, DPanel>,
     clients: HashMap<Link, Client>,
@@ -669,6 +670,7 @@ impl Daemon {
         Self {
             paths,
             hostname: hostname(),
+            machine_id: super::machine_id(),
             caucus_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caucus")),
             panels: HashMap::new(),
             clients: HashMap::new(),
@@ -740,6 +742,8 @@ impl Daemon {
                 proto: PROTO_VERSION,
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 hostname: self.hostname.clone(),
+                machine_id: self.machine_id.clone(),
+                home: std::env::var_os("HOME").map(PathBuf::from),
                 caucus_bin: self.caucus_bin.clone(),
                 signal_sock: self.paths.signal_sock.clone(),
                 session_dir,

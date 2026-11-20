@@ -116,6 +116,7 @@ fn resumed_link(
         Transport::Socket(paths.control_sock.clone()),
         tx,
         adopting,
+        None,
     );
     (link, rx)
 }
@@ -379,6 +380,7 @@ async fn a_signal_lost_with_its_connection_reaches_main_once() {
         Transport::Socket(relay.path.clone()),
         tx,
         HashSet::new(),
+        None,
     );
     link.wait_connected(WAIT).await.unwrap();
     let panel = PanelId::new();
@@ -440,6 +442,7 @@ async fn input_lost_with_its_connection_reaches_the_panel_once() {
         Transport::Socket(relay.path.clone()),
         tx,
         HashSet::new(),
+        None,
     );
     link.wait_connected(WAIT).await.unwrap();
     let mut pty = link
@@ -489,6 +492,7 @@ async fn a_reconnect_replays_exactly_the_output_missed_while_the_link_was_down()
         Transport::Socket(relay.path.clone()),
         tx,
         HashSet::new(),
+        None,
     );
     link.wait_connected(WAIT).await.unwrap();
 
@@ -620,6 +624,8 @@ fn fake_welcome() -> String {
         proto: PROTO_VERSION,
         version: "test".into(),
         hostname: "fake".into(),
+        machine_id: None,
+        home: None,
         caucus_bin: "caucus".into(),
         signal_sock: "/nonexistent".into(),
         session_dir: "/nonexistent".into(),
@@ -650,6 +656,7 @@ impl StalledHost {
             Transport::Socket(sock),
             tx,
             HashSet::new(),
+            None,
         );
         let (stream, _) = listener.accept().await.unwrap();
         let (read, mut write) = stream.into_split();
@@ -888,7 +895,7 @@ async fn two_hosts_on_one_daemon_stay_connected_side_by_side() {
     let (tx, _signals) = mpsc::unbounded_channel();
     let links = ["gpu-a", "gpu-b"].map(|name| {
         let transport = Transport::Socket(paths.control_sock.clone());
-        HostLink::connect(name, session, transport, tx.clone(), HashSet::new())
+        HostLink::connect(name, session, transport, tx.clone(), HashSet::new(), None)
     });
     for link in &links {
         link.wait_connected(WAIT).await.unwrap();
@@ -953,6 +960,7 @@ async fn a_host_that_hangs_up_after_its_welcome_is_redialled_ever_more_slowly() 
         Transport::Socket(sock),
         tx,
         HashSet::new(),
+        None,
     );
     tokio::time::sleep(Duration::from_millis(1600)).await;
     let dials = dials.load(Ordering::SeqCst);

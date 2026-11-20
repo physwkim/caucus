@@ -28,7 +28,7 @@ use super::*;
 use crate::agent::lane_event::LaneEvent;
 use crate::agent::manifest::{self, AgentManifest};
 use crate::config::hosts::{HostConfig, LOCAL_HOST};
-use crate::host::{HostInfo, HostLink, LinkStatus, RemoteSignal};
+use crate::host::{Checkout, HostInfo, HostLink, LinkStatus, RemoteSignal};
 use crate::mcp::HostSummary;
 use crate::session::id::AgentId;
 use crate::session::record::PanelRecord;
@@ -227,6 +227,10 @@ impl Multiplexer {
             host.transport(),
             self.hosts.signals_tx.clone(),
             self.host_adoptions(&host.name),
+            Some(Checkout {
+                dir: host.dir.clone(),
+                repo: self.session.repo_path.clone(),
+            }),
         );
         self.hosts.links.push(Linked { link, host });
     }
@@ -813,6 +817,34 @@ mod tests {
         mux.close_hosts().await;
     }
 
+    /// An ssh host can turn out to be this machine. One whose checkout then
+    /// is this repo never connects: its lanes would be pushed to and fetched
+    /// back from this repo itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_on_this_machine_whose_checkout_is_this_repo_never_connects() {
+        let tmp = TempDir::new().unwrap();
+        let host_tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let paths = test_paths(&host_tmp);
+        let mut daemon = TestDaemon::start(&paths).await;
+        let mut mux = mux(&tmp);
+        mux.connect_host(HostConfig {
+            dir: tmp.path().to_path_buf(),
+            ..socket_host("box", paths.control_sock.clone())
+        });
+
+        let error = |mux: &Multiplexer| mux.host_summaries()[1].error.clone();
+        until("box to refuse its checkout", || error(&mux).is_some()).await;
+        let error = error(&mux).unwrap();
+        assert!(error.contains("is this repo"), "{error}");
+        let spawn = error_of(spawn_on(&mut mux, "box"));
+        assert!(spawn.contains("is this repo"), "{spawn}");
+
+        mux.shutdown();
+        mux.close_hosts().await;
+        daemon.stop().await;
+    }
+
     /// A panel on a sub-host is counted, listed and recorded on that host;
     /// its turn signal counts only when it arrives through that host; and a
     /// restart is refused while the host is down, leaving the panel in place.
@@ -1176,7 +1208,7 @@ mod tests {
 
         let (tx, _signals) = mpsc::unbounded_channel();
         let adopting = HashSet::from([kept]);
-        let probe = HostLink::connect("box", back.session.id, host.transport(), tx, adopting);
+        let probe = HostLink::connect("box", back.session.id, host.transport(), tx, adopting, None);
         let info = probe.wait_connected(WAIT).await.unwrap();
         let left: Vec<_> = info.panels.iter().map(|p| p.id).collect();
         assert_eq!(left, vec![kept]);

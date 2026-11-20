@@ -30,6 +30,7 @@ use super::{sh_quote, sh_quote_path};
 use crate::line_io::{CappedLine, read_capped_line};
 use crate::pty::{PtyCommand, PtyError};
 use crate::session::id::{PanelId, SessionId};
+use crate::worktree::same_repository;
 
 /// Frames queued toward the host, connected or not, before writes report
 /// [`PtyError::WriterFull`].
@@ -91,6 +92,28 @@ pub fn ssh_args(destination: &str, caucus: &str, subcommand: &str) -> Vec<OsStri
     args.into_iter().map(OsString::from).collect()
 }
 
+/// A host's checkout of this repo: `dir` there, which git over ssh resolves
+/// against the host user's home, and this repo, `repo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkout {
+    pub dir: PathBuf,
+    pub repo: PathBuf,
+}
+
+impl Checkout {
+    /// Where `dir` is on this machine, if the daemon that welcomed with
+    /// `info` runs here.
+    fn here(&self, info: &HostInfo) -> Option<PathBuf> {
+        if info.machine_id.is_none() || info.machine_id != super::machine_id() {
+            return None;
+        }
+        Some(match &info.home {
+            Some(home) => home.join(self.dir.strip_prefix("~").unwrap_or(&self.dir)),
+            None => self.dir.clone(),
+        })
+    }
+}
+
 /// Where the link is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkStatus {
@@ -139,6 +162,7 @@ pub struct HostLink {
 
 struct Inner {
     name: String,
+    checkout: Option<Checkout>,
     state: Mutex<LinkState>,
     status: watch::Sender<LinkStatus>,
     outbound: mpsc::Sender<ClientFrame>,
@@ -228,16 +252,19 @@ impl HostLink {
     /// inside a tokio runtime. Signals from the host's panels go to `signals`.
     /// Of the panels the host already has for the session, those in
     /// `adopting` are left for [`HostLink::adopt`] and every other is killed.
+    /// A host whose `checkout` is this repo itself is never connected.
     pub fn connect(
         name: impl Into<String>,
         session: SessionId,
         transport: Transport,
         signals: mpsc::UnboundedSender<RemoteSignal>,
         adopting: HashSet<PanelId>,
+        checkout: Option<Checkout>,
     ) -> Self {
         let (outbound, rx) = mpsc::channel(OUTBOUND_QUEUE);
         let inner = Arc::new(Inner {
             name: name.into(),
+            checkout,
             state: Mutex::new(LinkState {
                 adopting,
                 ..LinkState::default()
@@ -889,6 +916,20 @@ async fn connection(
         }
         Err(_) => return Ended::Failed(format!("no welcome within {HANDSHAKE_WAIT:?}")),
     };
+    // Lanes are pushed to the checkout and fetched back from it, which this
+    // repo cannot do with itself.
+    if let Some(checkout) = &inner.checkout
+        && let Some(dir) = checkout.here(&info)
+    {
+        let repo = checkout.repo.clone();
+        let same = tokio::task::spawn_blocking(move || same_repository(&dir, &repo));
+        if matches!(same.await, Ok(true)) {
+            return Ended::Failed(format!(
+                "`dir` {} is this repo on this machine; give the host a clone of its own",
+                checkout.dir.display()
+            ));
+        }
+    }
     let connected = Instant::now();
     info!(host = %inner.name, hostname = %info.hostname, version = %info.version, "sub-host connected");
     {
@@ -1132,6 +1173,46 @@ impl Drop for RemotePty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checkout's `~/` or relative `dir` is under the daemon user's home,
+    /// which need not be main's.
+    #[test]
+    fn a_checkout_is_placed_here_only_for_a_daemon_on_this_machine() {
+        let welcome = |machine_id: Option<String>, home: Option<&str>| HostInfo {
+            proto: PROTO_VERSION,
+            version: "test".into(),
+            hostname: "h".into(),
+            machine_id,
+            home: home.map(PathBuf::from),
+            caucus_bin: "caucus".into(),
+            signal_sock: "/nonexistent".into(),
+            session_dir: "/nonexistent".into(),
+            panels: Vec::new(),
+        };
+        let checkout = |dir: &str| Checkout {
+            dir: dir.into(),
+            repo: "/repo".into(),
+        };
+        let here = super::super::machine_id();
+        assert!(here.is_some(), "this machine has a machine id");
+        for (dir, home, placed) in [
+            ("~/src/p", Some("/home/other"), "/home/other/src/p"),
+            ("src/p", Some("/home/other"), "/home/other/src/p"),
+            ("/srv/p", Some("/home/other"), "/srv/p"),
+            ("/srv/p", None, "/srv/p"),
+        ] {
+            let info = welcome(here.clone(), home);
+            assert_eq!(
+                checkout(dir).here(&info),
+                Some(PathBuf::from(placed)),
+                "{dir} {home:?}"
+            );
+        }
+        for elsewhere in [None, Some("another-machine".to_string())] {
+            let info = welcome(elsewhere.clone(), Some("/home/other"));
+            assert_eq!(checkout("/srv/p").here(&info), None, "{elsewhere:?}");
+        }
+    }
 
     #[test]
     fn ssh_transport_runs_the_bridge_through_a_login_shell() {

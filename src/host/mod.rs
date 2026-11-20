@@ -25,7 +25,9 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub use link::{HostLink, LinkError, LinkStatus, RemotePty, RemoteSignal, Transport, ssh_args};
+pub use link::{
+    Checkout, HostLink, LinkError, LinkStatus, RemotePty, RemoteSignal, Transport, ssh_args,
+};
 pub use load::HostLoad;
 pub use proto::{HostInfo, HostPanel};
 
@@ -116,6 +118,18 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+/// This machine's systemd or D-Bus machine id; `None` on a machine with
+/// neither.
+pub(crate) fn machine_id() -> Option<String> {
+    ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+        .iter()
+        .find_map(|path| {
+            let id = std::fs::read_to_string(path).ok()?;
+            let id = id.trim();
+            (!id.is_empty()).then(|| id.to_string())
+        })
 }
 
 /// Resolve a leading `~` against this process's `$HOME`: main names a host's

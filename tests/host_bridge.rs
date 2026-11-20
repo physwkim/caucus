@@ -243,6 +243,7 @@ async fn a_login_profile_printing_before_the_bridge_does_not_stop_the_link() {
         transport,
         tx,
         Default::default(),
+        None,
     );
     let connected = link.wait_connected(WAIT).await;
     link.close(WAIT).await;

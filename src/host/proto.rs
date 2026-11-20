@@ -183,6 +183,11 @@ pub struct HostInfo {
     pub proto: u32,
     pub version: String,
     pub hostname: String,
+    /// The daemon's machine id, if its machine has one.
+    pub machine_id: Option<String>,
+    /// The daemon user's `$HOME`, where git over ssh resolves the host
+    /// checkout's `~/` or relative `dir`.
+    pub home: Option<PathBuf>,
     /// The daemon's own executable, which a panel on this host runs for its
     /// turn-signal hooks and codex `notify`.
     pub caucus_bin: PathBuf,

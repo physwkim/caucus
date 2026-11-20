@@ -272,7 +272,9 @@ Each host works in its own clone, `dir`. A worktree panel's lane starts as
 main's `HEAD` pushed to a branch of that clone, and the branch is fetched
 back into this repo after every turn, so the main worker reviews and merges
 the lane here. The clone must never be this repo: a `socket` host therefore
-needs `dir`, and so does an `ssh` host that is this machine. Two entries
+needs `dir`, and so does an `ssh` host that is this machine. A host whose
+daemon runs on this machine (by its machine id) and whose `dir` is this repo
+is refused at connect, and `list_hosts` shows why. Two entries
 may reach one daemon, each with its own `dir`; they are separate hosts to
 the main worker. A host's `CAUCUS_SESSION_DIR` is its own, not shared with
 main or other hosts.

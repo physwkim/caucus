@@ -23,6 +23,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::host::{Transport, home_relative};
+use crate::worktree::same_repository;
 
 /// The name `list_hosts` gives the machine main runs on.
 pub const LOCAL_HOST: &str = "local";
@@ -181,23 +182,6 @@ impl HostEntry {
             dir,
         })
     }
-}
-
-/// Whether `dir` is in the repository at `repo`, as its worktrees and
-/// subdirectories are. A directory git cannot place counts as not.
-fn same_repository(dir: &Path, repo: &Path) -> bool {
-    let common_dir = |at: &Path| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(at)
-            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .output()
-            .ok()
-            .filter(|out| out.status.success())?;
-        let path = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim_end());
-        path.canonicalize().ok()
-    };
-    matches!((common_dir(dir), common_dir(repo)), (Some(a), Some(b)) if a == b)
 }
 
 /// Read one `hosts.toml`; a missing file has no hosts.
