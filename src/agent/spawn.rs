@@ -514,14 +514,19 @@ fn codex_args(
 pub(crate) fn spawn(request: &SpawnRequest) -> Result<SpawnOutcome, SpawnError> {
     let panel_id = PanelId::new();
     let command = build_command(request, panel_id);
-    let manifest = AgentManifest::new(
+    let cli = request.effective_cli();
+    let mut manifest = AgentManifest::new(
         request.session_id,
         panel_id,
         request.role.name.clone(),
         request.agent_name.clone(),
-        request.effective_cli(),
+        cli,
         request.effective_model(),
     );
+    // Until its first turn reports one, the conversation is the one resumed.
+    if cli == AgentCli::Claude {
+        manifest.claude_session_id = request.resume_session_id.clone();
+    }
     Ok(SpawnOutcome {
         panel_id,
         manifest,
@@ -1226,6 +1231,28 @@ mod tests {
             "codex must ignore resume_session_id: {args:?}"
         );
         assert!(!args.contains(&"conv-xyz".to_string()));
+    }
+
+    /// A resumed claude agent's manifest holds the conversation it resumes
+    /// before its first turn ends, so a record written meanwhile still names
+    /// it; codex resumes nothing, so its manifest names none.
+    #[test]
+    fn a_resumed_claude_manifest_names_its_conversation_from_the_start() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "reviewer-r1".into(),
+            resume_session_id: Some("conv-9f3a".into()),
+            ..SpawnRequest::default()
+        };
+        let outcome = spawn(&req).unwrap();
+        assert_eq!(outcome.manifest.claude_session_id(), Some("conv-9f3a"));
+
+        let codex = SpawnRequest {
+            agent_cli_override: Some(AgentCli::Codex),
+            ..req
+        };
+        let outcome = spawn(&codex).unwrap();
+        assert_eq!(outcome.manifest.claude_session_id(), None);
     }
 
     #[test]
