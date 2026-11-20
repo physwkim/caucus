@@ -68,8 +68,8 @@ impl Transport {
             "ServerAliveInterval=10",
             "-o",
             "ServerAliveCountMax=3",
-            destination,
             "--",
+            destination,
             &remote,
         ];
         Self::Command {
@@ -923,10 +923,10 @@ mod tests {
                 "ServerAliveInterval=10",
                 "-o",
                 "ServerAliveCountMax=3",
-                "build-1"
+                "--"
             ]
         );
-        assert_eq!(args[8], "--");
+        assert_eq!(args[8], "build-1", "the destination is never an option");
         // The remote command, run by `sh` here the way sshd would, reaches
         // the bridge invocation intact.
         let remote = args[9].replace("exec \"${SHELL:-/bin/sh}\" -lc", "printf %s");

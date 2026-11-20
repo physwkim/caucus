@@ -20,6 +20,7 @@ pub(crate) async fn push_head(repo: &Path, url: &OsStr, branch: &str) -> Result<
             OsStr::new("push"),
             OsStr::new("--quiet"),
             OsStr::new("--no-verify"),
+            OsStr::new("--"),
             url,
             OsStr::new(&format!("HEAD:refs/heads/{branch}")),
         ],
@@ -36,6 +37,7 @@ pub(crate) async fn fetch_branch(repo: &Path, url: &OsStr, branch: &str) -> Resu
             OsStr::new("--quiet"),
             OsStr::new("--no-tags"),
             OsStr::new("--no-write-fetch-head"),
+            OsStr::new("--"),
             url,
             OsStr::new(&format!("+refs/heads/{branch}:refs/heads/{branch}")),
         ],
@@ -102,6 +104,21 @@ mod tests {
             .unwrap()
             .trim()
             .to_string()
+    }
+
+    /// A url shaped like an option reaches git as the repository.
+    #[tokio::test]
+    async fn an_option_shaped_url_is_still_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let here = tmp.path().join("here");
+        git_init(&here);
+        let url = OsStr::new("-x");
+        for err in [
+            push_head(&here, url, "b").await.unwrap_err(),
+            fetch_branch(&here, url, "b").await.unwrap_err(),
+        ] {
+            assert!(!err.contains("unknown switch"), "{err}");
+        }
     }
 
     #[tokio::test]

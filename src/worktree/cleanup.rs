@@ -276,6 +276,7 @@ fn remove_worktree(repo: &Path, path: &Path) -> Result<(), WorktreeError> {
             "worktree".into(),
             "remove".into(),
             "--force".into(),
+            "--".into(),
             path.display().to_string(),
         ],
     )?;
