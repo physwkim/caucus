@@ -58,7 +58,7 @@ and renders the panels (`ratatui`). tmux and zellij are *not* dependencies —
 they are studied as references for the grid and layout design.
 
 **The main worker drives sub-agents over MCP.** caucus runs an MCP server.
-The main worker gets fifteen caucus tools (see [MCP tools](#mcp-tools) below)
+The main worker gets sixteen caucus tools (see [MCP tools](#mcp-tools) below)
 so a single instruction from you turns into the main worker decomposing the
 task, spawning sub-agent panels, and feeding each one its sub-task as real
 keystrokes.
@@ -152,7 +152,7 @@ pages the pager, exactly as the key does.
 
 ## MCP tools
 
-caucus exposes fifteen tools to the main worker over MCP. The main worker
+caucus exposes sixteen tools to the main worker over MCP. The main worker
 calls them to spawn, drive, observe, and reap sub-agent panels:
 
 | Tool              | What it does                                                              |
@@ -162,10 +162,11 @@ calls them to spawn, drive, observe, and reap sub-agent panels:
 | `broadcast`       | Send the same text to several panels at once — a round's fan-out.         |
 | `ctrl_c`          | Send `Ctrl-C` (interrupt) to a panel.                                     |
 | `read_panel`      | Read a panel's captured output (modes below).                             |
-| `spawn_role`      | Spawn a sub-agent panel. `role` is a free-form label; an inline `prompt` becomes the role's instructions; `worktree` / `model` / `agent_cli` overrides. |
+| `spawn_role`      | Spawn a sub-agent panel. `role` is a free-form label; an inline `prompt` becomes the role's instructions; `worktree` / `model` / `agent_cli` overrides; `host` runs it on a sub-host. |
 | `kill_panel`      | Kill a panel; its worktree (if any) is enqueued for cleanup.              |
 | `restart_panel`   | Restart a panel's agent CLI in place, reusing its role and worktree.      |
 | `list_panels`     | List every live panel with its role and derived state.                   |
+| `list_hosts`      | List this machine and the `hosts.toml` sub-hosts with connection status, panel count and load, for `spawn_role`'s `host`. |
 | `queue_tasks`     | Queue follow-up tasks on one worker and tune its watch (`read_mode`, `fallback_secs`, `selection_hints`). Not needed to hear back: caucus watches every panel it hands a prompt to and pushes each worker's result the moment it finishes. Queued tasks keep an early finisher working until they drain; `selection_hints` let caucus auto-answer that worker's direction menus by option-label keyword. |
 | `collect_workers` | Pull every worker that is ready right now, from inside the main worker's turn; the rest are reported as still working and stay watched. |
 | `stop_watching`   | Stop reporting one worker and drop its queued tasks; the panel itself is untouched, and the next prompt re-arms the watch. |

@@ -16,6 +16,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::load::HostLoad;
 use crate::pty::PtyCommand;
 use crate::session::id::{PanelId, SessionId};
 
@@ -61,6 +62,10 @@ pub struct SpawnSpec {
     pub env: BTreeMap<String, String>,
     pub cols: u16,
     pub rows: u16,
+    /// Pre-grant codex's directory trust for `cwd` in the host's codex config
+    /// (`agent::codex_trust`); main cannot write that file.
+    #[serde(default)]
+    pub trust_codex_cwd: bool,
 }
 
 impl SpawnSpec {
@@ -89,6 +94,7 @@ impl SpawnSpec {
                 .collect(),
             cols,
             rows,
+            trust_codex_cwd: false,
         })
     }
 
@@ -160,10 +166,12 @@ pub struct HostInfo {
 }
 
 /// Daemon → main caucus.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum DaemonFrame {
     Welcome(HostInfo),
+    /// The host's load, sent after the welcome and then periodically.
+    Load(HostLoad),
     /// The daemon now owns `panel` (a failed launch included: its error is in
     /// the output and an `exited` follows).
     Spawned {

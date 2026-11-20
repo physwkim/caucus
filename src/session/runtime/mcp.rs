@@ -1,6 +1,9 @@
+use super::spawn_async::Site;
 use super::*;
 use crate::agent::derive_state::DerivedState;
-use crate::mcp::{McpError, McpToolSurface, PanelSummary, ReadPanelMode};
+use crate::config::hosts::LOCAL_HOST;
+use crate::mcp::protocol::Placement;
+use crate::mcp::{HostSummary, McpError, McpToolSurface, PanelSummary, ReadPanelMode};
 use crate::panel::lifecycle::PanelState;
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
@@ -179,7 +182,7 @@ impl McpToolSurface for Multiplexer {
     fn spawn_role(
         &mut self,
         role: &str,
-        worktree: bool,
+        placement: Placement,
         model: Option<&str>,
         agent_cli: Option<AgentCli>,
         prompt: Option<&str>,
@@ -189,12 +192,12 @@ impl McpToolSurface for Multiplexer {
         // [`Multiplexer::begin_spawn_role_worktree`] / `poll_pending_spawns`);
         // this synchronous trait method — kept for direct callers and tests —
         // creates it inline, then shares the same finish path.
-        let wt_handle = if worktree {
-            Some(self.create_role_worktree(role)?)
-        } else {
-            None
+        let site = match placement {
+            Placement::Here => Site::Here,
+            Placement::Worktree => Site::Worktree(self.create_role_worktree(role)?),
+            Placement::Host(host) => Site::Host(host),
         };
-        self.finish_spawn_role(role, model, agent_cli, prompt, wt_handle)
+        self.finish_spawn_role(role, model, agent_cli, prompt, site)
     }
 
     fn kill_panel(&mut self, panel: PanelId) -> Result<(), McpError> {
@@ -237,6 +240,7 @@ impl McpToolSurface for Multiplexer {
                     role: p.role.clone(),
                     state: state.as_str().to_string(),
                     agent_cli: manifest.map_or(AgentCli::Claude, |m| m.agent_cli),
+                    host: p.pty.host().unwrap_or(LOCAL_HOST).to_string(),
                     // The manifest holds the live worktree path and the model
                     // override; the branch lives in `worktree_branches` (it
                     // outlives the path, which is removed on shutdown).
@@ -255,6 +259,10 @@ impl McpToolSurface for Multiplexer {
                 }
             })
             .collect()
+    }
+
+    fn list_hosts(&self) -> Vec<HostSummary> {
+        self.host_summaries()
     }
 
     fn read_menu(&mut self, panel: PanelId) -> Result<String, McpError> {

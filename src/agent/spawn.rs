@@ -114,6 +114,9 @@ pub struct SpawnRequest {
     /// orchestrator). The codex backend consumes it via `-c mcp_servers.caucus.*`;
     /// the claude backend uses `mcp_config_path` instead. `None` for sub-agents.
     pub caucus_mcp: Option<CaucusMcp>,
+    /// The caucus a codex panel's `notify` runs. `None` is this running binary;
+    /// a sub-host panel names the one on its host.
+    pub caucus_bin: Option<PathBuf>,
 }
 
 impl Default for SpawnRequest {
@@ -141,6 +144,7 @@ impl Default for SpawnRequest {
             resume_session_id: None,
             system_prompt: None,
             caucus_mcp: None,
+            caucus_bin: None,
         }
     }
 }
@@ -264,10 +268,13 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
             // `notify` program, baking in this panel's signal socket / session
             // / panel id. Skipped only when no signal socket is wired (unit
             // tests) — then the panel relies on the round fallback as before.
-            // The notify program is this exact running caucus binary
-            // (`current_exe`, the same path `tui::caucus_bin` resolves).
+            // The notify program is `request.caucus_bin`, by default this
+            // exact running caucus binary (`current_exe`, the same path
+            // `tui::caucus_bin` resolves).
             let notify = request.sock_path.as_ref().map(|sock| CodexNotify {
-                caucus_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caucus")),
+                caucus_bin: request.caucus_bin.clone().unwrap_or_else(|| {
+                    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caucus"))
+                }),
                 signal_sock: sock.clone(),
                 session_id: request.session_id,
                 panel_id,

@@ -23,11 +23,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::config::hosts::LOCAL_HOST;
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
 
 use super::events::PanelEvent;
-use super::{PanelSummary, ReadPanelMode};
+use super::{HostSummary, PanelSummary, ReadPanelMode};
 
 /// Main-supplied hints for auto-answering a watched worker's selection menu
 /// without disturbing the main worker. Attached to a worker's watch via
@@ -68,6 +69,17 @@ pub struct ControlCall {
     pub params: Value,
 }
 
+/// Where `spawn_role` runs a new panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// This machine, in the session's checkout.
+    Here,
+    /// This machine, in a fresh git worktree.
+    Worktree,
+    /// A `hosts.toml` sub-host, in its checkout there.
+    Host(String),
+}
+
 /// One decoded control call ([`ControlRequest::from_call`]), executed by
 /// [`crate::session::Multiplexer::execute_control`].
 #[derive(Debug, Clone, PartialEq)]
@@ -99,14 +111,14 @@ pub enum ControlRequest {
     /// Spawn a new panel for `role`. `role` is a free-form label — a known
     /// preset name (`worker`, `reviewer`, …) reuses that preset's tool
     /// allowlist and permission mode, any other name is an ad-hoc role built on
-    /// the generic `worker` defaults. `worktree` requests an execute-phase
-    /// worktree; `model` / `agent_cli` are main worker overrides; `prompt` is an
+    /// the generic `worker` defaults. `placement` is where the panel runs;
+    /// `model` / `agent_cli` are main worker overrides; `prompt` is an
     /// inline system prompt that, when set, *is* the role's instructions
     /// (replacing the preset's prompt template) — the mechanism by which the
     /// main worker invents a role on the fly.
     SpawnRole {
         role: String,
-        worktree: bool,
+        placement: Placement,
         model: Option<String>,
         agent_cli: Option<AgentCli>,
         prompt: Option<String>,
@@ -120,6 +132,8 @@ pub enum ControlRequest {
     RestartPanel { panel: PanelId },
     /// List every live panel with role + derived state.
     ListPanels,
+    /// List this machine and the sub-hosts with status and load.
+    ListHosts,
     /// Queue follow-up tasks on one worker, and set how caucus watches it.
     ///
     /// caucus already watches every panel it hands a prompt to, so this is not
@@ -308,6 +322,22 @@ impl ControlRequest {
                     .get("worktree")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let host = args
+                    .get("host")
+                    .and_then(Value::as_str)
+                    .filter(|&h| h != LOCAL_HOST);
+                // Worktrees are made on this machine, so a sub-host panel
+                // cannot have one.
+                let placement = match (host, worktree) {
+                    (Some(host), true) => {
+                        return Err(format!(
+                            "worktree=true is available only on this machine, not on host `{host}`"
+                        ));
+                    }
+                    (Some(host), false) => Placement::Host(host.to_string()),
+                    (None, true) => Placement::Worktree,
+                    (None, false) => Placement::Here,
+                };
                 let model = args
                     .get("model")
                     .and_then(Value::as_str)
@@ -325,7 +355,7 @@ impl ControlRequest {
                     .map(str::to_string);
                 Ok(Self::SpawnRole {
                     role,
-                    worktree,
+                    placement,
                     model,
                     agent_cli,
                     prompt,
@@ -338,6 +368,7 @@ impl ControlRequest {
                 panel: panel(args)?,
             }),
             "list_panels" => Ok(Self::ListPanels),
+            "list_hosts" => Ok(Self::ListHosts),
             "queue_tasks" => {
                 let tasks = match args.get("tasks") {
                     Some(v) => {
@@ -446,6 +477,8 @@ pub enum ControlResponse {
     Spawned { panel: PanelId },
     /// `list_panels` succeeded.
     Panels { panels: Vec<PanelSummary> },
+    /// `list_hosts` succeeded.
+    Hosts { hosts: Vec<HostSummary> },
     /// `subscribe_events` succeeded: `panels` are the rows as of event `seq`;
     /// the stream continues at `seq + 1`.
     Subscribed { seq: u64, panels: Vec<PanelSummary> },
@@ -719,7 +752,7 @@ mod tests {
             req,
             ControlRequest::SpawnRole {
                 role: "backend".into(),
-                worktree: true,
+                placement: Placement::Worktree,
                 model: None,
                 agent_cli: Some(AgentCli::Codex),
                 prompt: None,
@@ -745,7 +778,7 @@ mod tests {
             req,
             ControlRequest::SpawnRole {
                 role: "perf-profiler".into(),
-                worktree: false,
+                placement: Placement::Here,
                 model: Some("opus".into()),
                 agent_cli: Some(AgentCli::Codex),
                 prompt: Some("You profile hot paths and report findings.".into()),
@@ -1000,12 +1033,31 @@ mod tests {
             req,
             ControlRequest::SpawnRole {
                 role: "backend".into(),
-                worktree: false,
+                placement: Placement::Here,
                 model: None,
                 agent_cli: None,
                 prompt: None,
             }
         );
+    }
+
+    #[test]
+    fn spawn_role_host_places_the_panel_and_excludes_a_worktree() {
+        let placement = |args| match ControlRequest::from_call("spawn_role", &args) {
+            Ok(ControlRequest::SpawnRole { placement, .. }) => Ok(placement),
+            Ok(other) => panic!("decoded {other:?}"),
+            Err(err) => Err(err),
+        };
+        assert_eq!(
+            placement(json!({"role": "w", "host": "build-1"})),
+            Ok(Placement::Host("build-1".into()))
+        );
+        assert_eq!(
+            placement(json!({"role": "w", "host": "local", "worktree": true})),
+            Ok(Placement::Worktree)
+        );
+        let err = placement(json!({"role": "w", "host": "build-1", "worktree": true})).unwrap_err();
+        assert!(err.contains("build-1"), "{err}");
     }
 
     #[test]

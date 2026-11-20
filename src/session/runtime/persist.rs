@@ -23,6 +23,7 @@ impl Multiplexer {
                     worktree_branch: self.worktree_branches.get(&panel.id).cloned(),
                     claude_session_id: manifest
                         .and_then(|m| m.claude_session_id().map(str::to_string)),
+                    host: panel.pty.host().map(str::to_string),
                 }
             })
             .collect();
@@ -119,7 +120,7 @@ impl Multiplexer {
 
 #[cfg(test)]
 mod tests {
-    use crate::mcp::protocol::{ControlRequest, ControlResponse};
+    use crate::mcp::protocol::{ControlRequest, ControlResponse, Placement};
     use crate::panel::lifecycle::{Panel, PanelState};
     use crate::pty::{Pty, PtyCommand};
     use crate::render::LayoutMode;
@@ -230,7 +231,7 @@ mod tests {
         let mut mux = mux(&tmp);
         let resp = mux.execute_control(ControlRequest::SpawnRole {
             role: "worker".into(),
-            worktree: true,
+            placement: Placement::Worktree,
             model: None,
             agent_cli: None,
             prompt: None,

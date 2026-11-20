@@ -35,6 +35,8 @@ struct SpawnPanelOpts<'a> {
     /// via `-c mcp_servers.caucus.*`; claude uses `mcp_config_path`). `None` for
     /// every sub-agent panel.
     caucus_mcp: Option<CaucusMcp>,
+    /// The `hosts.toml` sub-host the panel runs on; `None` runs it here.
+    host: Option<String>,
 }
 
 /// The worktree a [`Multiplexer::detach_panel`] left behind, for the caller to
@@ -77,6 +79,7 @@ impl Multiplexer {
             resume_session_id: None,
             inline_prompt: None,
             caucus_mcp: None,
+            host: None,
         })?;
         self.persist_record();
         Ok(id)
@@ -145,6 +148,7 @@ impl Multiplexer {
             resume_session_id,
             inline_prompt: None,
             caucus_mcp: Some(caucus_mcp),
+            host: None,
         })?;
         // The main worker panel is caucus's round-delivery target.
         self.main_panel_id = Some(id);
@@ -159,7 +163,8 @@ impl Multiplexer {
     /// `inline_prompt`, when `Some`, becomes the role's system prompt and
     /// replaces the spec's prompt template (`docs/design.md` §6); `None` keeps
     /// the template-resolved prompt. The resume path passes `None` (a restored
-    /// agent keeps its preset role's prompt).
+    /// agent keeps its preset role's prompt). `host` names the sub-host to run
+    /// the panel on (`None`: this machine).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_panel_resume(
         &mut self,
@@ -170,6 +175,7 @@ impl Multiplexer {
         worktree_branch: Option<String>,
         resume_session_id: Option<String>,
         inline_prompt: Option<String>,
+        host: Option<String>,
     ) -> Result<PanelId> {
         self.spawn_panel_inner(SpawnPanelOpts {
             role,
@@ -181,6 +187,7 @@ impl Multiplexer {
             resume_session_id,
             inline_prompt,
             caucus_mcp: None,
+            host,
         })
     }
 
@@ -197,7 +204,19 @@ impl Multiplexer {
             resume_session_id,
             inline_prompt,
             caucus_mcp,
+            host,
         } = opts;
+
+        // A sub-host panel runs in the host's checkout and reaches the
+        // signal socket, session dir and caucus binary of that host's daemon.
+        // Worktrees are created on this machine, so none can be handed over.
+        let remote = host
+            .as_deref()
+            .map(|name| self.remote_target(name))
+            .transpose()?;
+        if remote.is_some() && worktree_path.is_some() {
+            anyhow::bail!("a panel on a sub-host cannot take a worktree");
+        }
 
         // `role` is a free-form label (`docs/design.md` §6): a known preset
         // reuses its spec (tool allowlist + permission mode), any other name is
@@ -232,6 +251,20 @@ impl Multiplexer {
         *count += 1;
         let agent_name = format!("{role}-{count}");
 
+        let (repo_root, session_dir, sock_path, caucus_bin) = match &remote {
+            None => (
+                self.session.repo_path.clone(),
+                self.session.root_dir.clone(),
+                self.sock_path.clone(),
+                None,
+            ),
+            Some(target) => (
+                target.dir.clone(),
+                target.info.session_dir.clone(),
+                target.info.signal_sock.clone(),
+                Some(target.info.caucus_bin.clone()),
+            ),
+        };
         let request = SpawnRequest {
             session_id: self.session.id,
             role: spec,
@@ -239,9 +272,9 @@ impl Multiplexer {
             agent_cli_override: agent_cli,
             model_override: model,
             worktree_path: worktree_path.clone(),
-            repo_root: self.session.repo_path.clone(),
-            session_dir: self.session.root_dir.clone(),
-            sock_path: Some(self.sock_path.clone()),
+            repo_root,
+            session_dir,
+            sock_path: Some(sock_path),
             // Panels are non-interactive for the agent's own prompts; the
             // role allowlist remains the real boundary (`SpawnRequest` doc).
             skip_permissions: true,
@@ -249,6 +282,7 @@ impl Multiplexer {
             resume_session_id,
             system_prompt,
             caucus_mcp,
+            caucus_bin,
         };
 
         // Provisional layout: compute the slot the new panel will occupy so
@@ -256,24 +290,6 @@ impl Multiplexer {
         let mut ids: Vec<PanelId> = self.panels.iter().map(|p| p.id).collect();
         let outcome = crate::agent::spawn::spawn(&request)
             .map_err(|e| anyhow::anyhow!("agent spawn: {e}"))?;
-
-        // codex stalls on its interactive "Do you trust this directory?" gate
-        // the first time it runs in a directory, before the agent turn caucus
-        // drives — nothing answers it and the panel hangs. Pre-grant trust for
-        // the panel's cwd in codex's config (the same entry codex persists on
-        // "Yes"; codex honors only its on-disk config, not a `-c` override).
-        // Best-effort: a failure must not fail the spawn — the panel still
-        // launches and the user can answer the gate by hand.
-        if request.effective_cli() == AgentCli::Codex
-            && let Some(cwd) = outcome.command.cwd.as_deref()
-            && let Err(err) = crate::agent::codex_trust::ensure_trusted(cwd)
-        {
-            warn!(
-                cwd = %cwd.display(),
-                error = %err,
-                "codex directory-trust pre-grant failed; codex may stall on its trust gate"
-            );
-        }
 
         ids.push(outcome.panel_id);
         let provisional = Layout::reflow(&ids, self.area, self.layout_mode);
@@ -286,6 +302,7 @@ impl Multiplexer {
             outcome.manifest.agent_id,
             rect,
             &self.config.settings,
+            remote.as_ref().map(|target| &target.link),
         )?;
         let panel_id = panel.id;
         // Turn-segmented capture spills to `<session>/panels/<panel>.log`
@@ -412,6 +429,17 @@ impl Multiplexer {
         let agent_cli = Some(manifest.agent_cli);
         let model = manifest.model.clone();
         let resume_session_id = manifest.claude_session_id().map(str::to_string);
+        // A restarted panel stays on its host. A host that cannot take the
+        // replacement now refuses the restart before the old panel is torn
+        // down.
+        let host = self
+            .panels
+            .iter()
+            .find(|p| p.id == panel_id)
+            .and_then(|p| p.pty.host().map(str::to_string));
+        if let Some(host) = &host {
+            self.remote_target(host)?;
+        }
 
         // Tear down through the single owner. The worktree it leaves behind is
         // now ownerless and MUST reach a disposition on every exit path below:
@@ -431,6 +459,7 @@ impl Multiplexer {
             // A restarted panel keeps its preset role's prompt; the inline
             // prompt is a live-`spawn_role` concern only.
             None,
+            host,
         ) {
             Ok(id) => id,
             Err(err) => {
@@ -649,7 +678,7 @@ impl Multiplexer {
 
 #[cfg(test)]
 mod tests {
-    use crate::mcp::protocol::{ControlRequest, ControlResponse};
+    use crate::mcp::protocol::{ControlRequest, ControlResponse, Placement};
     use crate::session::id::PanelId;
     use crate::session::runtime::test_support::*;
     use std::collections::HashMap;
@@ -699,7 +728,7 @@ mod tests {
 
         let resp = mux.execute_control(ControlRequest::SpawnRole {
             role: "bad-template".into(),
-            worktree: true,
+            placement: Placement::Worktree,
             model: None,
             agent_cli: None,
             prompt: None,

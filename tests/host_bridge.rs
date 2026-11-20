@@ -58,10 +58,21 @@ impl Bridge {
         stdin.flush().unwrap();
     }
 
-    fn recv(&self) -> DaemonFrame {
+    fn next(&self) -> DaemonFrame {
         self.frames
             .recv_timeout(WAIT)
             .expect("a frame from the bridge")
+    }
+
+    /// The next frame other than the daemon's periodic load reports, which
+    /// interleave with everything else.
+    fn recv(&self) -> DaemonFrame {
+        loop {
+            match self.next() {
+                DaemonFrame::Load(_) => {}
+                frame => return frame,
+            }
+        }
     }
 
     /// Close stdin, as `ssh` does when main goes away; the bridge must exit.
@@ -118,10 +129,15 @@ fn hello(bridge: &mut Bridge, session: SessionId) -> caucus::host::HostInfo {
         proto: PROTO_VERSION,
         session,
     });
-    match bridge.recv() {
+    let info = match bridge.next() {
         DaemonFrame::Welcome(info) => info,
         other => panic!("expected welcome, got {other:?}"),
+    };
+    match bridge.next() {
+        DaemonFrame::Load(load) => assert!(load.cpus >= 1),
+        other => panic!("expected the load after the welcome, got {other:?}"),
     }
+    info
 }
 
 #[test]
@@ -149,6 +165,7 @@ fn a_bridge_starts_the_daemon_once_and_runs_panels_behind_it() {
             env: BTreeMap::new(),
             cols: 80,
             rows: 24,
+            trust_codex_cwd: false,
         },
     });
     first.send(&ClientFrame::Input {

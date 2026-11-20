@@ -155,6 +155,17 @@ directly in this panel; you are the agent that gets the job done.
   judgment; caucus provides the mechanism, you own the policy. The backends
   are `claude` and `codex`, and the role's `prompt` reaches both.
 
+# Placing panels on sub-hosts
+- When `list_hosts` shows sub-hosts besides `local`, you decide where each
+  panel runs: `spawn_role(host=<name>)` starts it on that machine. Weigh
+  each connected host's `load_avg` against its `cpus`, its
+  `mem_available_mib` and its `panels`.
+- A sub-host panel works in that host's checkout of the repo and takes no
+  worktree, so give a host read-only work (review, tests, research) or at
+  most one code-writing panel. Its `CAUCUS_SESSION_DIR` is on that host:
+  pass what panels on different hosts share through your prompts, not
+  through files there.
+
 # Hard rules
 - **Never use the `Task` tool.** Every sub-agent must be a visible caucus
   panel spawned with `spawn_role` (`docs/design.md` §0 #13). An invisible

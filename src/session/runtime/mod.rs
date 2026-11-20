@@ -30,6 +30,7 @@ use crate::signal::server::SignalServer;
 use crate::worktree::cleanup::CleanupQueue;
 
 mod control;
+mod hosts;
 mod input;
 mod layout;
 mod mcp;
@@ -313,6 +314,8 @@ pub struct Multiplexer {
     /// The `subscribe_events` feed: the `list_panels` rows last published and
     /// their `seq` ([`Multiplexer::publish_panel_events`]).
     events: EventFeed,
+    /// Links to the `hosts.toml` sub-hosts ([`Multiplexer::connect_hosts`]).
+    hosts: hosts::Hosts,
 }
 
 /// Whether [`Multiplexer::new`] is opening a brand-new session or reopening a
@@ -458,6 +461,7 @@ impl Multiplexer {
                 pending_clipboard: None,
                 unbound_unclaimed: HashSet::new(),
                 events,
+                hosts: hosts::Hosts::new(),
             },
             signal_server,
             control_server,

@@ -2,9 +2,9 @@
 //! (`docs/design.md` §0 #4, §9).
 //!
 //! The main worker (a Claude Code agent in one panel) drives every sub-agent
-//! panel through fifteen MCP tools: `send_keys`, `send_key`, `broadcast`,
+//! panel through sixteen MCP tools: `send_keys`, `send_key`, `broadcast`,
 //! `ctrl_c`, `read_panel`, `spawn_role`, `kill_panel`, `restart_panel`,
-//! `list_panels`, `queue_tasks`, `collect_workers`, `stop_watching`,
+//! `list_panels`, `list_hosts`, `queue_tasks`, `collect_workers`, `stop_watching`,
 //! `read_menu`, `select_option`, `wait`.
 //!
 //! ## Architecture
@@ -30,7 +30,7 @@
 //! `rmcp` (1.7.0) resolves cleanly but its server surface is macro-driven and
 //! its transport runs an internal loop that resists deterministic unit
 //! testing. The MCP slice caucus needs is small — `initialize` / `tools/list`
-//! / `tools/call`, fifteen tools — so [`jsonrpc`] implements exactly that, with
+//! / `tools/call`, sixteen tools — so [`jsonrpc`] implements exactly that, with
 //! a pure dispatch core. See that module's header for the rationale.
 
 pub mod control_client;
@@ -44,8 +44,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::host::HostLoad;
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
+use protocol::Placement;
 
 use jsonrpc::ToolDef;
 
@@ -79,6 +81,9 @@ pub struct PanelSummary {
     /// [`crate::agent::derive_state::DerivedState::as_str`].
     pub state: String,
     pub agent_cli: AgentCli,
+    /// The host the panel runs on: a `list_hosts` name, `"local"` for this
+    /// machine. Paths in this row are on that host.
+    pub host: String,
     /// Filesystem path of the panel's dedicated git worktree, if it was
     /// spawned with one (`spawn_role(worktree=true)`); `None` for a panel that
     /// shares the main repo checkout. This is the directory the sub-agent's
@@ -108,6 +113,24 @@ pub struct PanelSummary {
     /// signal from tools with no hook channel. `None` until one is seen; the
     /// full history is on the manifest's lane events.
     pub last_notification: Option<String>,
+}
+
+/// One host's row, returned by `list_hosts`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostSummary {
+    /// What `spawn_role`'s `host` takes; `"local"` is this machine.
+    pub name: String,
+    /// `connected`, `connecting` or `closed`. Only a connected host takes new
+    /// panels.
+    pub status: String,
+    /// Why the last connection attempt failed, while `connecting`.
+    pub error: Option<String>,
+    /// The machine's own hostname, once connected.
+    pub hostname: Option<String>,
+    /// This session's live panels on the host.
+    pub panels: usize,
+    /// The host's load; `None` until a connected host reports it.
+    pub load: Option<HostLoad>,
 }
 
 /// Errors surfaced by MCP tool calls.
@@ -145,13 +168,13 @@ pub trait McpToolSurface {
     /// Spawn a new panel for `role`. `role` is a free-form label: a known
     /// preset reuses that preset's tool allowlist and permission mode, any
     /// other name is an ad-hoc role on the generic `worker` defaults.
-    /// `worktree` requests an execute-phase worktree; `model`/`agent_cli` are
-    /// main worker overrides; `prompt`, when set, is the role's system prompt
-    /// (replacing the preset's template) (`docs/design.md` §5, §6).
+    /// `placement` is where it runs; `model`/`agent_cli` are main worker
+    /// overrides; `prompt`, when set, is the role's system prompt (replacing
+    /// the preset's template) (`docs/design.md` §5, §6).
     fn spawn_role(
         &mut self,
         role: &str,
-        worktree: bool,
+        placement: Placement,
         model: Option<&str>,
         agent_cli: Option<AgentCli>,
         prompt: Option<&str>,
@@ -168,6 +191,10 @@ pub trait McpToolSurface {
 
     /// List every live panel with its derived state.
     fn list_panels(&mut self) -> Vec<PanelSummary>;
+
+    /// List this machine and every `hosts.toml` sub-host with its status and
+    /// load.
+    fn list_hosts(&self) -> Vec<HostSummary>;
 
     /// Read the interactive selection menu shown in a panel, if any — the
     /// question, its numbered options, and the highlighted one as readable
@@ -312,7 +339,11 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                           becomes the agent's system prompt (the role's \
                           instructions), so you define the sub-agent's job, model, \
                           and backend yourself. worktree=true gives a dedicated \
-                          git worktree; model and agent_cli override the defaults \
+                          git worktree; host runs the panel on a sub-host from \
+                          list_hosts instead of this machine (no worktree there; \
+                          each host has its own CAUCUS_SESSION_DIR, so panels on \
+                          different hosts share no files through it); model and \
+                          agent_cli override the defaults \
                           (the 'prompt' reaches claude via --append-system-prompt \
                           and codex via -c instructions=...). caucus itself \
                           appends a question contract to every sub-agent prompt \
@@ -342,6 +373,12 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                         "type": "boolean",
                         "description": "Create a dedicated git worktree for the panel.",
                         "default": false
+                    },
+                    "host": {
+                        "type": "string",
+                        "description": "Run the panel on this host from list_hosts. \
+                                        Omit (or \"local\") for this machine. Not \
+                                        combinable with worktree=true.",
                     },
                     "model": { "type": "string", "description": "Model override." },
                     "agent_cli": {
@@ -398,7 +435,21 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                           worktree sub-agent's commits land — the branch name is \
                           generated internally, so this is how you find it to \
                           merge/diff) and its model override, all null for a \
-                          panel without them.",
+                          panel without them, and the host it runs on (\"local\" \
+                          or a list_hosts name; its paths are on that host).",
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        ToolDef {
+            name: "list_hosts",
+            description: "List the machines you can place sub-agent panels on: \
+                          \"local\" (this machine) and every sub-host in \
+                          hosts.toml, each with its connection status, this \
+                          session's panel count there, and its load (load_avg \
+                          over 1/5/15 min, cpus, mem_available_mib / \
+                          mem_total_mib). Pass a connected host's name as \
+                          spawn_role's host to run a panel there. Each host has \
+                          its own CAUCUS_SESSION_DIR: files a panel writes there \
+                          are not visible to panels on other hosts.",
             input_schema: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
@@ -611,6 +662,7 @@ mod tests {
                 "kill_panel",
                 "restart_panel",
                 "list_panels",
+                "list_hosts",
                 "queue_tasks",
                 "collect_workers",
                 "stop_watching",

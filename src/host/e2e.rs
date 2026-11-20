@@ -18,13 +18,13 @@ use crate::signal::{SignalEvent, TurnKind, TurnSignal};
 
 const WAIT: Duration = Duration::from_secs(10);
 
-struct TestDaemon {
+pub(crate) struct TestDaemon {
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl TestDaemon {
-    async fn start(paths: &HostPaths) -> Self {
+    pub(crate) async fn start(paths: &HostPaths) -> Self {
         let lock = daemon::lock(paths).unwrap().expect("no other daemon");
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(daemon::run(paths.clone(), lock, async {
@@ -41,7 +41,7 @@ impl TestDaemon {
         }
     }
 
-    async fn stop(&mut self) {
+    pub(crate) async fn stop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -51,7 +51,7 @@ impl TestDaemon {
     }
 }
 
-fn test_paths(tmp: &tempfile::TempDir) -> HostPaths {
+pub(crate) fn test_paths(tmp: &tempfile::TempDir) -> HostPaths {
     HostPaths {
         state_dir: tmp.path().join("state"),
         control_sock: tmp.path().join("ctl").join("daemon.sock"),
@@ -128,6 +128,7 @@ async fn a_remote_panel_echoes_input_and_hands_over_its_last_output_before_it_ex
             &sh("read line; printf 'last-%s' \"$line\""),
             80,
             24,
+            false,
         )
         .unwrap();
     assert_eq!(pty.host(), "sub-1");
@@ -152,6 +153,31 @@ async fn a_remote_panel_echoes_input_and_hands_over_its_last_output_before_it_ex
     host.stop().await;
 }
 
+/// The daemon reports its load right after the welcome; the link drops the
+/// report with the connection, so a stale load never outlives it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_link_holds_the_hosts_load_only_while_connected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(&tmp);
+    let mut host = TestDaemon::start(&paths).await;
+    let (link, _signals) = link(&paths, SessionId::new());
+    link.wait_connected(WAIT).await.unwrap();
+    let deadline = Instant::now() + WAIT;
+    while link.load().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "no load report after the welcome"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(link.load().unwrap().cpus >= 1);
+
+    host.stop().await;
+    wait_status(&link, |s| matches!(s, LinkStatus::Connecting { .. })).await;
+    assert_eq!(link.load(), None);
+    link.close(WAIT).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn killing_a_remote_panel_kills_its_process_on_the_host() {
     let tmp = tempfile::tempdir().unwrap();
@@ -161,7 +187,13 @@ async fn killing_a_remote_panel_kills_its_process_on_the_host() {
     link.wait_connected(WAIT).await.unwrap();
 
     let mut pty = link
-        .spawn(PanelId::new(), &sh("echo pid=$$; exec sleep 60"), 80, 24)
+        .spawn(
+            PanelId::new(),
+            &sh("echo pid=$$; exec sleep 60"),
+            80,
+            24,
+            false,
+        )
         .unwrap();
     let mut out = String::new();
     read_until(&mut pty, &mut out, "\n").await;
@@ -246,6 +278,7 @@ async fn a_reconnect_replays_exactly_the_output_missed_while_the_link_was_down()
             &sh("echo start; sleep 1; echo during; read x; echo got-$x"),
             80,
             24,
+            false,
         )
         .unwrap();
     let mut out = String::new();
@@ -280,7 +313,7 @@ async fn a_panel_signal_on_the_host_reaches_main() {
     link.wait_connected(WAIT).await.unwrap();
     let panel = PanelId::new();
     let mut pty = link
-        .spawn(panel, &sh("echo ready; exec cat"), 80, 24)
+        .spawn(panel, &sh("echo ready; exec cat"), 80, 24, false)
         .unwrap();
     let mut out = String::new();
     read_until(&mut pty, &mut out, "ready").await;
@@ -317,7 +350,7 @@ async fn a_restarted_host_reports_the_old_panels_gone() {
     let (link, _signals) = link(&paths, SessionId::new());
     link.wait_connected(WAIT).await.unwrap();
     let mut pty = link
-        .spawn(PanelId::new(), &sh("echo up; exec cat"), 80, 24)
+        .spawn(PanelId::new(), &sh("echo up; exec cat"), 80, 24, false)
         .unwrap();
     let mut out = String::new();
     read_until(&mut pty, &mut out, "up").await;

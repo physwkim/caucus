@@ -49,6 +49,9 @@ pub struct PanelRecord {
     /// --resume <id>` continues the conversation on the resume launch path.
     #[serde(default)]
     pub claude_session_id: Option<String>,
+    /// The `hosts.toml` sub-host the panel ran on; `None` for this machine.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 /// The persistent record of one caucus session — written to
@@ -180,6 +183,7 @@ mod tests {
                     is_main: true,
                     worktree_branch: None,
                     claude_session_id: Some("conv-abc".into()),
+                    host: None,
                 },
                 PanelRecord {
                     role: "backend".into(),
@@ -189,6 +193,7 @@ mod tests {
                     is_main: false,
                     worktree_branch: Some("caucus/s1/backend".into()),
                     claude_session_id: None,
+                    host: Some("build-1".into()),
                 },
             ],
             role_counts: std::collections::HashMap::from([("backend".to_string(), 2)]),

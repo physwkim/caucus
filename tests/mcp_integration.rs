@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use caucus::config::Config;
-use caucus::mcp::protocol::{ControlRequest, ControlResponse};
+use caucus::mcp::protocol::{ControlRequest, ControlResponse, Placement};
 use caucus::mcp::{McpToolSurface, ReadPanelMode};
 use caucus::render::Rect;
 use caucus::session::state::Session;
@@ -89,6 +89,7 @@ fn mcp_serve_lists_the_tools_over_stdio() {
             "kill_panel",
             "restart_panel",
             "list_panels",
+            "list_hosts",
             "queue_tasks",
             "collect_workers",
             "stop_watching",
@@ -307,7 +308,7 @@ async fn main_spawns_an_architect_and_three_reviewers() {
     for role in ["architect", "reviewer", "reviewer", "reviewer"] {
         match mux.execute_control(ControlRequest::SpawnRole {
             role: role.to_string(),
-            worktree: false,
+            placement: Placement::Here,
             model: None,
             agent_cli: None,
             prompt: None,

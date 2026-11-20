@@ -89,6 +89,10 @@ fn render_response(resp: ControlResponse) -> ToolOutcome {
             Ok(text) => ToolOutcome::Ok(text),
             Err(err) => ToolOutcome::Err(format!("serialise panel list: {err}")),
         },
+        ControlResponse::Hosts { hosts } => match serde_json::to_string_pretty(&hosts) {
+            Ok(text) => ToolOutcome::Ok(text),
+            Err(err) => ToolOutcome::Err(format!("serialise host list: {err}")),
+        },
         // mcp-serve lists no `subscribe_events` tool, so this is not reached.
         ControlResponse::Subscribed { .. } => {
             ToolOutcome::Err("subscribe_events streams; it is not an MCP tool".to_string())

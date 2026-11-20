@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use super::load::HostLoad;
 use super::proto::{
     Bytes, ClientFrame, DaemonFrame, HostInfo, MAX_FRAME_BYTES, PROTO_VERSION, SpawnSpec, encode,
 };
@@ -137,6 +138,8 @@ struct LinkState {
     panels: HashMap<PanelId, LinkPanel>,
     /// Panels killed but not yet confirmed by the daemon.
     kills: HashSet<PanelId>,
+    /// The host's load as of the current connection's latest report.
+    load: Option<HostLoad>,
     closed: bool,
 }
 
@@ -193,6 +196,11 @@ impl HostLink {
         self.inner.status.borrow().clone()
     }
 
+    /// The host's latest load report; `None` while not connected.
+    pub fn load(&self) -> Option<HostLoad> {
+        self.inner.lock().load.clone()
+    }
+
     /// Wait until the link is connected and return what the host said about
     /// itself.
     pub async fn wait_connected(&self, timeout: Duration) -> Result<HostInfo, LinkError> {
@@ -229,8 +237,12 @@ impl HostLink {
         command: &PtyCommand,
         cols: u16,
         rows: u16,
+        trust_codex_cwd: bool,
     ) -> Result<RemotePty, PtyError> {
-        let spec = SpawnSpec::from_command(command, cols, rows).map_err(PtyError::Spawn)?;
+        let spec = SpawnSpec {
+            trust_codex_cwd,
+            ..SpawnSpec::from_command(command, cols, rows).map_err(PtyError::Spawn)?
+        };
         let (out, rx) = mpsc::channel(PANEL_QUEUE);
         {
             let mut state = self.inner.lock();
@@ -369,6 +381,7 @@ impl Inner {
     async fn on_frame(&self, frame: DaemonFrame, signals: &mpsc::UnboundedSender<RemoteSignal>) {
         match frame {
             DaemonFrame::Welcome(_) => warn!(host = %self.name, "unexpected second welcome"),
+            DaemonFrame::Load(load) => self.lock().load = Some(load),
             DaemonFrame::Spawned { panel } => {
                 if let Some(p) = self.lock().panels.get_mut(&panel) {
                     p.unconfirmed = None;
@@ -464,6 +477,7 @@ async fn supervise(
                 err
             }
         };
+        inner.lock().load = None;
         inner.status.send_replace(LinkStatus::Connecting {
             last_error: Some(last_error),
         });
@@ -476,6 +490,7 @@ async fn supervise(
     let mut state = inner.lock();
     state.closed = true;
     state.kills.clear();
+    state.load = None;
     // Dropping each panel's sender ends its output.
     state.panels.clear();
     drop(state);

@@ -16,8 +16,9 @@
 pub mod bridge;
 pub mod daemon;
 #[cfg(test)]
-mod e2e;
+pub(crate) mod e2e;
 pub mod link;
+pub mod load;
 pub mod proto;
 
 use std::io;
@@ -25,6 +26,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub use link::{HostLink, LinkError, LinkStatus, RemotePty, RemoteSignal, Transport};
+pub use load::HostLoad;
 pub use proto::HostInfo;
 
 /// Where a sub-host daemon keeps its state and listens.

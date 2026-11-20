@@ -13,8 +13,10 @@ use thiserror::Error;
 
 use crate::agent::spawn::SpawnRequest;
 use crate::config::settings::Settings;
+use crate::host::HostLink;
 use crate::pty::{Pty, PtyCommand, PtyError};
 use crate::render::Rect;
+use crate::role::spec::AgentCli;
 use crate::session::id::{AgentId, PanelId};
 use crate::term::{Grid, OutputCapture};
 
@@ -250,6 +252,7 @@ pub(crate) fn transition(panel: &mut Panel, to: PanelState) -> Result<(), Illega
 /// persists; `panel_id` must equal the manifest's `panel_id`. `settings`
 /// supplies the panel's scrollback depth and capture caps (the `[settings]`
 /// tunables), applied at construction so the panel is born fully configured.
+/// `host` is the sub-host whose daemon runs the PTY; `None` runs it here.
 pub(crate) fn spawn(
     request: &SpawnRequest,
     command: PtyCommand,
@@ -257,12 +260,37 @@ pub(crate) fn spawn(
     agent_id: AgentId,
     rect: Rect,
     settings: &Settings,
+    host: Option<&HostLink>,
 ) -> Result<Panel, PanelError> {
     let inner = rect.inner();
     let cols = inner.width.max(MIN_GRID_COLS);
     let rows = inner.height.max(MIN_GRID_ROWS);
 
-    let pty = Pty::spawn(&command, cols, rows).map_err(|e| PanelError::Spawn(e.to_string()))?;
+    // codex stalls on its interactive "Do you trust this directory?" gate the
+    // first time it runs in a directory, before the turn caucus drives. The
+    // trust entry lives in the codex config of the machine the panel runs on,
+    // so a sub-host's daemon writes it there.
+    let trust_codex = request.effective_cli() == AgentCli::Codex;
+    let pty = match host {
+        None => {
+            if trust_codex && let Some(cwd) = command.cwd.as_deref() {
+                // Best-effort: the panel still launches and the gate can be
+                // answered by hand.
+                if let Err(err) = crate::agent::codex_trust::ensure_trusted(cwd) {
+                    tracing::warn!(
+                        cwd = %cwd.display(),
+                        error = %err,
+                        "codex directory-trust pre-grant failed; codex may stall on its trust gate"
+                    );
+                }
+            }
+            Pty::spawn(&command, cols, rows)
+        }
+        Some(link) => link
+            .spawn(panel_id, &command, cols, rows, trust_codex)
+            .map(Pty::Remote),
+    }
+    .map_err(|e| PanelError::Spawn(e.to_string()))?;
     let grid = Grid::with_scrollback(cols as usize, rows as usize, settings.scrollback_lines);
 
     Ok(Panel {

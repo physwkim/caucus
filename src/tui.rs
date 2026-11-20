@@ -347,6 +347,7 @@ pub fn run(
         let _guard = TerminalGuard::enter(config.settings.mouse)?;
         let (terminal, mut mux, signal, control) =
             setup(config, session, prefix, LaunchMode::Fresh)?;
+        mux.connect_hosts();
         spawn_fresh_roster(&mut mux, &roles, main_cli)?;
         event_loop(terminal, mux, signal, control).await
     })
@@ -393,6 +394,7 @@ pub fn run_resumed(
         let _guard = TerminalGuard::enter(config.settings.mouse)?;
         let (terminal, mut mux, signal, control) =
             setup(config, session, prefix, LaunchMode::Resume)?;
+        mux.connect_hosts();
         restore_roster(&mut mux, &record)?;
         event_loop(terminal, mux, signal, control).await
     })
@@ -478,8 +480,8 @@ fn spawn_fresh_roster(
 /// `spawn_main_panel_resume` so its agent reloads the caucus MCP server. Legacy
 /// records without an explicit marker fall back to `order_index == 0`. Worktree
 /// panels re-attach a worktree on their persisted branch; if the branch is gone
-/// the panel spawns fresh (no worktree, no `--resume`). The layout mode is
-/// restored last.
+/// the panel spawns fresh (no worktree, no `--resume`). A panel that ran on
+/// a sub-host is not restored. The layout mode is restored last.
 fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
     let bin = caucus_bin();
     let mut panels = record.panels.clone();
@@ -488,6 +490,13 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
     let mut restored_main = false;
 
     for panel in &panels {
+        if let Some(host) = &panel.host {
+            warn!(
+                role = %panel.role, %host,
+                "skipping a sub-host panel on resume; spawn it again with spawn_role"
+            );
+            continue;
+        }
         let is_main = should_restore_panel_as_main(panel, has_explicit_main, restored_main);
         if is_main {
             restored_main = true;
@@ -549,6 +558,7 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
                 panel.claude_session_id.clone(),
                 // A restored panel keeps its preset role's prompt template; the
                 // inline-prompt path is live `spawn_role` only.
+                None,
                 None,
             )
         };
@@ -771,15 +781,11 @@ async fn event_loop(
         //    agent turn. A note's or lifecycle signal's reply slot is always
         //    `None`; dropping a turn signal's slot answers allow.
         while let Ok((event, reply)) = signal_server.signals().try_recv() {
-            match event {
-                crate::signal::SignalEvent::Turn(signal) => {
-                    mux.handle_signal_with_reply(signal, reply)
-                }
-                crate::signal::SignalEvent::Unbound(sig) => mux.handle_unbound_signal(sig, reply),
-                crate::signal::SignalEvent::Note(note) => mux.handle_note(note),
-                crate::signal::SignalEvent::Lifecycle(sig) => mux.handle_lifecycle(sig),
-            }
+            mux.ingest_signal(event, reply, None);
         }
+        // Sub-host signals are applied after the pump below, which takes in
+        // the output their panels printed before them.
+        let remote_signals = mux.take_remote_signals();
         prof.lap("signals");
 
         // 3. Control jobs — execute the main worker's queued MCP tool calls against
@@ -796,6 +802,7 @@ async fn event_loop(
 
         // 4. PTY pump — drain every panel into its grid + capture, reap exits.
         mux.pump_all();
+        mux.ingest_remote_signals(remote_signals);
         prof.lap("pump_all");
 
         // 4b. Deferred submits — a bracketed paste's submitting Enter is held
@@ -926,6 +933,7 @@ async fn event_loop(
     }
 
     mux.shutdown();
+    mux.close_hosts().await;
     terminal.show_cursor().ok();
     Ok(())
 }
@@ -1071,6 +1079,7 @@ mod tests {
             is_main,
             worktree_branch: None,
             claude_session_id: None,
+            host: None,
         }
     }
 

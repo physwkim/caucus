@@ -1,6 +1,6 @@
 use super::*;
 use crate::mcp::control_server::{ControlJob, ControlServer};
-use crate::mcp::protocol::{ControlRequest, ControlResponse};
+use crate::mcp::protocol::{ControlRequest, ControlResponse, Placement};
 use crate::mcp::{McpToolSurface, PanelSummary};
 use crate::session::id::PanelId;
 
@@ -44,13 +44,13 @@ impl Multiplexer {
             },
             ControlRequest::SpawnRole {
                 role,
-                worktree,
+                placement,
                 model,
                 agent_cli,
                 prompt,
             } => match self.spawn_role(
                 &role,
-                worktree,
+                placement,
                 model.as_deref(),
                 agent_cli,
                 prompt.as_deref(),
@@ -76,6 +76,9 @@ impl Multiplexer {
             }
             ControlRequest::ListPanels => ControlResponse::Panels {
                 panels: self.list_panels(),
+            },
+            ControlRequest::ListHosts => ControlResponse::Hosts {
+                hosts: self.list_hosts(),
             },
             ControlRequest::QueueTasks {
                 panel,
@@ -152,7 +155,7 @@ impl Multiplexer {
                 // moved into the pending entry and answered on completion.
                 ControlRequest::SpawnRole {
                     role,
-                    worktree: true,
+                    placement: Placement::Worktree,
                     model,
                     agent_cli,
                     prompt,

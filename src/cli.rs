@@ -116,7 +116,7 @@ pub enum Command {
     /// by a human.
     #[command(subcommand)]
     Host(HostCommand),
-    /// Stdio MCP server for the main worker panel — forwards the fifteen
+    /// Stdio MCP server for the main worker panel — forwards the sixteen
     /// caucus tools to the main process over the control socket
     /// (`docs/design.md` §0 #4). Spawned by the main worker's Claude Code
     /// instance, not by a human.
@@ -1154,6 +1154,7 @@ mod tests {
                 is_main: true,
                 worktree_branch: None,
                 claude_session_id: Some("conv-1".into()),
+                host: None,
             }],
             role_counts: std::collections::HashMap::new(),
         };

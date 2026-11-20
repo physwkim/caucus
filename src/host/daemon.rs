@@ -51,6 +51,8 @@ const CONNECTION_QUEUE: usize = 64;
 const SIGNAL_BACKLOG: usize = 1024;
 /// How long a fresh connection has to say `hello`.
 const HELLO_WAIT: Duration = Duration::from_secs(10);
+/// How often each connection is sent the host's load.
+const LOAD_EVERY: Duration = Duration::from_secs(5);
 
 /// The daemon's single-instance lock. Holding it is what makes removing a
 /// stale control socket safe, so [`run`] takes it as an argument.
@@ -149,6 +151,8 @@ pub async fn run(
     let mut daemon = Daemon::new(paths.clone());
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut load_tick = tokio::time::interval(LOAD_EVERY);
+    load_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -162,6 +166,7 @@ pub async fn run(
                 daemon.on_signal(&signal);
             }
             _ = tick.tick(), if daemon.wants_tick() => daemon.pump(Instant::now()),
+            _ = load_tick.tick(), if !daemon.clients.is_empty() => daemon.push_load(),
         }
     }
     accept.abort();
@@ -513,7 +518,10 @@ impl Daemon {
             conn,
             tx,
             _kick: kick,
-            queued: VecDeque::from([encode(&first)]),
+            queued: VecDeque::from([
+                encode(&first),
+                encode(&DaemonFrame::Load(super::load::sample())),
+            ]),
         };
         client.flush();
         // Dropping the replaced client kicks its connection.
@@ -524,6 +532,15 @@ impl Daemon {
         for panel in self.panels.values_mut().filter(|p| p.session == session) {
             panel.sent = None;
             panel.exit_sent = false;
+        }
+    }
+
+    /// Send every connection the host's load. A connection that is backed up
+    /// skips this sample; the next one supersedes it.
+    fn push_load(&self) {
+        let line = encode(&DaemonFrame::Load(super::load::sample()));
+        for client in self.clients.values() {
+            let _ = client.tx.try_send(line.clone());
         }
     }
 
@@ -714,7 +731,15 @@ impl Daemon {
 }
 
 fn spawn_panel(session: SessionId, spec: &SpawnSpec) -> DPanel {
-    match LocalPty::spawn(&spec.to_command(), spec.cols, spec.rows) {
+    let mut command = spec.to_command();
+    command.cwd = command.cwd.map(home_relative);
+    if spec.trust_codex_cwd
+        && let Some(cwd) = command.cwd.as_deref()
+        && let Err(err) = crate::agent::codex_trust::ensure_trusted(cwd)
+    {
+        warn!(cwd = %cwd.display(), error = %err, "codex directory-trust pre-grant failed");
+    }
+    match LocalPty::spawn(&command, spec.cols, spec.rows) {
         Ok(pty) => {
             let mut panel = DPanel::new(session, Some(pty));
             panel.sent = Some(0);
@@ -729,6 +754,15 @@ fn spawn_panel(session: SessionId, spec: &SpawnSpec) -> DPanel {
             panel.sent = Some(0);
             panel
         }
+    }
+}
+
+/// Resolve a leading `~` against this host's `$HOME`: main names a host's
+/// checkout without knowing the remote user's home.
+fn home_relative(path: PathBuf) -> PathBuf {
+    match (path.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => path,
     }
 }
 
@@ -749,7 +783,7 @@ fn push_capped(queue: &mut VecDeque<String>, line: String) {
     queue.push_back(line);
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is valid for `buf.len()` bytes; gethostname writes at most
     // that many.
@@ -877,7 +911,7 @@ mod tests {
         });
         assert!(matches!(
             frames(&mut rx).as_slice(),
-            [DaemonFrame::Welcome(_)]
+            [DaemonFrame::Welcome(_), DaemonFrame::Load(_)]
         ));
         assert_eq!(daemon.clients[&session].conn, 2);
         assert!(kicked.try_recv().is_err(), "the new connection stays open");

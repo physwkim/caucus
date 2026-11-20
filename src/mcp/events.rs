@@ -139,6 +139,7 @@ pub(crate) fn test_row(panel_id: PanelId, state: &str) -> PanelSummary {
         role: "worker".into(),
         state: state.into(),
         agent_cli: crate::role::spec::AgentCli::Claude,
+        host: crate::config::hosts::LOCAL_HOST.into(),
         worktree_path: None,
         branch: None,
         model: None,

@@ -8,7 +8,10 @@
 //! 2. `~/.caucus/{roles,settings}.toml` — user-global overrides.
 //! 3. `<repo>/.caucus/{roles,settings}.toml` — project overrides (highest
 //!    precedence).
+//!
+//! `hosts.toml` (the sub-hosts) follows the same two layers ([`hosts`]).
 
+pub mod hosts;
 pub mod roles;
 pub mod settings;
 
@@ -19,6 +22,7 @@ use thiserror::Error;
 use crate::role::registry::RoleRegistry;
 use crate::role::spec::{AgentCli, RoleSpec};
 
+use hosts::{HostConfig, HostsError};
 use roles::{RolesConfig, RolesError};
 use settings::{Settings, SettingsError};
 
@@ -29,6 +33,8 @@ pub enum ConfigError {
     Roles(#[from] RolesError),
     #[error(transparent)]
     Settings(#[from] SettingsError),
+    #[error(transparent)]
+    Hosts(#[from] HostsError),
     #[error("home directory not found")]
     NoHome,
 }
@@ -40,6 +46,8 @@ pub struct Config {
     pub roles: RoleRegistry,
     /// Resolved process-wide tunables (`[settings]`; built-in < global < project).
     pub settings: Settings,
+    /// Sub-hosts main may place panels on (`hosts.toml`).
+    pub hosts: Vec<HostConfig>,
     /// `~/.caucus/` — the global config directory, if `$HOME` was set.
     pub global_dir: Option<PathBuf>,
     /// `<repo>/.caucus/` — the project config directory.
@@ -62,10 +70,12 @@ impl Config {
         merged = merged.override_with(RolesConfig::load(&project_dir.join("roles.toml"))?);
 
         let settings = settings::load(global_dir.as_deref(), &project_dir)?;
+        let hosts = hosts::load(global_dir.as_deref(), &project_dir)?;
 
         Ok(Self {
             roles: RoleRegistry::from_specs(merged.into_specs()),
             settings,
+            hosts,
             global_dir,
             project_dir,
         })

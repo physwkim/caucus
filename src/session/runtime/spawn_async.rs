@@ -21,6 +21,14 @@ use crate::worktree::manager::{WorktreeHandle, create as create_worktree};
 use tokio::sync::oneshot;
 use tracing::warn;
 
+/// Where [`Multiplexer::finish_spawn_role`] launches a panel, its worktree (if
+/// any) already made.
+pub(crate) enum Site {
+    Here,
+    Worktree(WorktreeHandle),
+    Host(String),
+}
+
 /// A `spawn_role(worktree=true)` whose `git worktree add` is running on a worker
 /// thread. Once the worktree result arrives on `rx`, the panel is launched on
 /// the event loop and `reply` answers the deferred MCP tool call.
@@ -49,8 +57,13 @@ impl Multiplexer {
         model: Option<&str>,
         agent_cli: Option<AgentCli>,
         prompt: Option<&str>,
-        wt_handle: Option<WorktreeHandle>,
+        site: Site,
     ) -> Result<PanelId, McpError> {
+        let (wt_handle, host) = match site {
+            Site::Here => (None, None),
+            Site::Worktree(handle) => (Some(handle), None),
+            Site::Host(host) => (None, Some(host)),
+        };
         let worktree_path = wt_handle.as_ref().map(|h| h.path.clone());
         let worktree_branch = wt_handle.as_ref().map(|h| h.branch.clone());
         // `spawn_panel_resume` with no resume id is a plain spawn that also
@@ -65,6 +78,7 @@ impl Multiplexer {
             worktree_branch,
             None,
             prompt.map(str::to_string),
+            host,
         );
         match spawned {
             Ok(id) => {
@@ -145,7 +159,7 @@ impl Multiplexer {
                     pending.model.as_deref(),
                     pending.agent_cli,
                     pending.prompt.as_deref(),
-                    Some(handle),
+                    Site::Worktree(handle),
                 ) {
                     Ok(panel) => ControlResponse::Spawned { panel },
                     Err(err) => ControlResponse::error(err),
