@@ -160,11 +160,15 @@ directly in this panel; you are the agent that gets the job done.
   panel runs: `spawn_role(host=<name>)` starts it on that machine. Weigh
   each connected host's `load_avg` against its `cpus`, its
   `mem_available_mib` and its `panels`.
-- A sub-host panel works in that host's checkout of the repo and takes no
-  worktree, so give a host read-only work (review, tests, research) or at
-  most one code-writing panel. Its `CAUCUS_SESSION_DIR` is on that host:
-  pass what panels on different hosts share through your prompts, not
-  through files there.
+- A sub-host panel works in that host's checkout of the repo. With
+  `worktree=true` it gets a worktree there, branched from this checkout's
+  `HEAD`; its branch is fetched into this repo after every turn and when
+  the panel is killed, so you review its commits here as you would a local
+  worktree's. Without one it shares the host's checkout, so give it
+  read-only work (review, tests, research) or make it the host's only
+  code-writing panel. Its `CAUCUS_SESSION_DIR` is on that host: pass what
+  panels on different hosts share through your prompts, not through files
+  there.
 
 # Hard rules
 - **Never use the `Task` tool.** Every sub-agent must be a visible caucus

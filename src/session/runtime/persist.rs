@@ -1,7 +1,7 @@
+use super::spawn::Orphan;
 use super::*;
 use crate::panel::lifecycle;
 use crate::role::spec::AgentCli;
-use crate::worktree::cleanup::{CleanupJob, WorktreeOwner};
 use tracing::warn;
 
 impl Multiplexer {
@@ -74,40 +74,29 @@ impl Multiplexer {
         // Each worktree is credited to the agent that occupied it, so a panel's
         // timeline records the removal even though the whole session is going
         // away — the manifests outlive the process and are what a later reader
-        // has.
-        let mut worktrees: Vec<PathBuf> = Vec::new();
-        let mut owners: Vec<WorktreeOwner> = Vec::new();
+        // has. Branches are kept — they hold the sub-agents' commits and
+        // merging is the user's call (`docs/design.md` §5).
+        let mut orphans = Vec::new();
         for panel in &mut self.panels {
             if let Err(err) = lifecycle::kill(panel) {
                 warn!(panel = %panel.id, error = %err, "panel kill on shutdown failed");
             }
-            if let Some(wt) = panel.worktree_path.clone() {
-                owners.push(WorktreeOwner {
-                    worktree: wt.clone(),
-                    session_root: self.session.root_dir.clone(),
-                    agent_id: panel.agent_id,
+            if let Some(path) = panel.worktree_path.clone() {
+                orphans.push(Orphan {
+                    host: panel.pty.host().map(str::to_string),
+                    path,
+                    branch: self.worktree_branches.get(&panel.id).cloned(),
+                    owner: Some(panel.agent_id),
                 });
-                worktrees.push(wt);
             }
         }
         self.panels.clear();
         self.manifests.clear();
 
-        // Clean the worktrees synchronously, before the runtime goes away.
-        // Branches are kept (`branches_to_delete` empty) — they hold the
-        // sub-agents' commits and merging is the user's call (`docs/design.md` §5).
-        if !worktrees.is_empty() {
-            let summary = crate::worktree::cleanup::run_blocking(&CleanupJob {
-                repo_root: self.session.repo_path.clone(),
-                worktree_paths: worktrees,
-                branches_to_delete: Vec::new(),
-                owners,
-                done: None,
-            });
-            for (path, msg) in &summary.failed_worktrees {
-                warn!(?path, %msg, "worktree cleanup on shutdown failed");
-            }
-        }
+        // Local worktrees are removed before this returns, sub-host ones by
+        // host tasks that `close_hosts` waits for — both before the runtime
+        // goes away.
+        self.dispose_worktrees(orphans, true);
 
         if self.session.state() == crate::session::state::SessionState::Active {
             let _ = crate::session::state::transition(
@@ -231,7 +220,10 @@ mod tests {
         let mut mux = mux(&tmp);
         let resp = mux.execute_control(ControlRequest::SpawnRole {
             role: "worker".into(),
-            placement: Placement::Worktree,
+            placement: Placement {
+                host: None,
+                worktree: true,
+            },
             model: None,
             agent_cli: None,
             prompt: None,

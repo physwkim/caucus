@@ -340,9 +340,12 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                           instructions), so you define the sub-agent's job, model, \
                           and backend yourself. worktree=true gives a dedicated \
                           git worktree; host runs the panel on a sub-host from \
-                          list_hosts instead of this machine (no worktree there; \
-                          each host has its own CAUCUS_SESSION_DIR, so panels on \
-                          different hosts share no files through it); model and \
+                          list_hosts instead of this machine (with worktree=true \
+                          the worktree is made there from this checkout's HEAD, \
+                          and its branch is fetched back here after every turn \
+                          and when the panel is killed; each host has its own \
+                          CAUCUS_SESSION_DIR, so panels on different hosts share \
+                          no files through it); model and \
                           agent_cli override the defaults \
                           (the 'prompt' reaches claude via --append-system-prompt \
                           and codex via -c instructions=...). caucus itself \
@@ -377,8 +380,7 @@ pub fn tool_catalogue() -> Vec<ToolDef> {
                     "host": {
                         "type": "string",
                         "description": "Run the panel on this host from list_hosts. \
-                                        Omit (or \"local\") for this machine. Not \
-                                        combinable with worktree=true.",
+                                        Omit (or \"local\") for this machine.",
                     },
                     "model": { "type": "string", "description": "Model override." },
                     "agent_cli": {

@@ -15,12 +15,13 @@
 //! Read from `~/.caucus/hosts.toml` and `<repo>/.caucus/hosts.toml`; a project
 //! entry replaces the global entry of the same name.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::host::Transport;
+use crate::host::{Transport, home_relative};
 
 /// The name `list_hosts` gives the machine main runs on.
 pub const LOCAL_HOST: &str = "local";
@@ -29,11 +30,54 @@ pub const LOCAL_HOST: &str = "local";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
     pub name: String,
-    pub transport: Transport,
+    pub reach: HostReach,
     /// Where panels on the host start: its checkout of this repo. `None` means
     /// the path the repo has on this machine. A leading `~` is the remote
     /// user's home.
     pub dir: Option<PathBuf>,
+}
+
+/// How main reaches a host: its daemon, and git to its checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostReach {
+    /// `dest` is an ssh destination (`[user@]host` or `ssh://[user@]host[:port]`).
+    Ssh { dest: String, caucus: String },
+    /// A daemon on this machine, at its control socket.
+    Socket(PathBuf),
+}
+
+impl HostConfig {
+    pub fn transport(&self) -> Transport {
+        match &self.reach {
+            HostReach::Ssh { dest, caucus } => Transport::ssh(dest, caucus),
+            HostReach::Socket(sock) => Transport::Socket(sock.clone()),
+        }
+    }
+
+    /// The git remote for the host's checkout at `dir`. A leading `~` is the
+    /// host user's home: git's ssh transport passes it through to the host's
+    /// `git-receive-pack`/`git-upload-pack`, which expand it there.
+    pub fn git_url(&self, dir: &Path) -> OsString {
+        let mut url = OsString::new();
+        match &self.reach {
+            HostReach::Socket(_) => url.push(home_relative(dir.to_path_buf())),
+            HostReach::Ssh { dest, .. } if dest.contains("://") => {
+                url.push(dest.trim_end_matches('/'));
+                if dir.starts_with("~") {
+                    url.push("/");
+                } else if dir.is_relative() {
+                    url.push("/~/");
+                }
+                url.push(dir);
+            }
+            HostReach::Ssh { dest, .. } => {
+                url.push(dest);
+                url.push(":");
+                url.push(dir);
+            }
+        }
+        url
+    }
 }
 
 #[derive(Debug, Error)]
@@ -88,7 +132,7 @@ impl HostEntry {
                 "host name {LOCAL_HOST:?} is reserved for this machine"
             ));
         }
-        let transport = match (self.socket, self.ssh) {
+        let reach = match (self.socket, self.ssh) {
             (Some(_), Some(_)) => {
                 return Err(format!(
                     "host {}: set `ssh` or `socket`, not both",
@@ -101,15 +145,15 @@ impl HostEntry {
                     self.name
                 ));
             }
-            (Some(socket), None) => Transport::Socket(socket),
-            (None, ssh) => Transport::ssh(
-                ssh.as_deref().unwrap_or(&self.name),
-                self.caucus.as_deref().unwrap_or("caucus"),
-            ),
+            (Some(socket), None) => HostReach::Socket(socket),
+            (None, ssh) => HostReach::Ssh {
+                dest: ssh.unwrap_or_else(|| self.name.clone()),
+                caucus: self.caucus.unwrap_or_else(|| "caucus".to_string()),
+            },
         };
         Ok(HostConfig {
             name: self.name,
-            transport,
+            reach,
             dir: self.dir,
         })
     }
@@ -199,9 +243,12 @@ mod tests {
         );
         let hosts = load(None, tmp.path()).unwrap();
         assert_eq!(hosts[0].name, "build-1");
-        assert_eq!(hosts[0].transport, Transport::ssh("build-1", "caucus"));
+        assert_eq!(hosts[0].transport(), Transport::ssh("build-1", "caucus"));
         assert_eq!(hosts[0].dir, Some(PathBuf::from("~/src/p")));
-        assert_eq!(hosts[1].transport, Transport::Socket("/tmp/d.sock".into()));
+        assert_eq!(
+            hosts[1].transport(),
+            Transport::Socket("/tmp/d.sock".into())
+        );
         assert_eq!(hosts[1].dir, None);
     }
 
@@ -217,7 +264,35 @@ mod tests {
         let hosts = load(Some(&global), tmp.path()).unwrap();
         let names: Vec<_> = hosts.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, ["a", "b"]);
-        assert_eq!(hosts[1].transport, Transport::ssh("new", "caucus"));
+        assert_eq!(hosts[1].transport(), Transport::ssh("new", "caucus"));
+    }
+
+    #[test]
+    fn git_url_names_the_checkout_in_scp_and_url_form() {
+        let ssh = |dest: &str| HostConfig {
+            name: "h".into(),
+            reach: HostReach::Ssh {
+                dest: dest.into(),
+                caucus: "caucus".into(),
+            },
+            dir: None,
+        };
+        for (dest, dir, url) in [
+            ("me@h", "~/src/p", "me@h:~/src/p"),
+            ("me@h", "/srv/p", "me@h:/srv/p"),
+            ("h", "src/p", "h:src/p"),
+            ("ssh://me@h:2222", "~/src/p", "ssh://me@h:2222/~/src/p"),
+            ("ssh://me@h:2222/", "/srv/p", "ssh://me@h:2222/srv/p"),
+            ("ssh://h", "src/p", "ssh://h/~/src/p"),
+        ] {
+            assert_eq!(ssh(dest).git_url(Path::new(dir)), *url, "{dest} {dir}");
+        }
+        let socket = HostConfig {
+            name: "box".into(),
+            reach: HostReach::Socket("/tmp/d.sock".into()),
+            dir: None,
+        };
+        assert_eq!(socket.git_url(Path::new("/srv/p")), "/srv/p");
     }
 
     #[test]

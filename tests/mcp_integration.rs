@@ -308,7 +308,7 @@ async fn main_spawns_an_architect_and_three_reviewers() {
     for role in ["architect", "reviewer", "reviewer", "reviewer"] {
         match mux.execute_control(ControlRequest::SpawnRole {
             role: role.to_string(),
-            placement: Placement::Here,
+            placement: Placement::default(),
             model: None,
             agent_cli: None,
             prompt: None,

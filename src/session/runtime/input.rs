@@ -8,6 +8,7 @@ use crate::signal::{
     AgentNote, CompactTrigger, LifecycleKind, LifecycleSignal, NoteKind, TurnSignal,
 };
 use crate::term::ScreenActivity;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -494,8 +495,7 @@ impl Multiplexer {
         if session_id_changed {
             self.persist_record();
         }
-        self.record_commit_provenance(signal.panel_id);
-        self.record_commit_supersessions(signal.panel_id);
+        self.record_turn_commits(signal.panel_id);
 
         if delivered_by_hook {
             self.reopen_turn_after_hook_delivery(signal.panel_id);
@@ -803,8 +803,38 @@ impl Multiplexer {
         }
     }
 
-    /// Record a `CommitCreated` event when the turn that just ended named a
-    /// commit this agent left on its own branch (`docs/design.md` §5).
+    /// Record what the turn that just ended did on the panel's worktree
+    /// branch. A sub-host lane's branch is fetched here first
+    /// ([`Self::fetch_lane`]), which records the turn once it lands.
+    fn record_turn_commits(&mut self, panel_id: PanelId) {
+        let Some(manifest) = self.manifests.get(&panel_id) else {
+            return;
+        };
+        let Some(worktree) = manifest.worktree_path.clone() else {
+            return;
+        };
+        let message = manifest.last_message().map(str::to_string);
+        let host = self
+            .panels
+            .iter()
+            .find(|p| p.id == panel_id)
+            .and_then(|p| p.pty.host())
+            .map(str::to_string);
+        match host {
+            None => {
+                if let Some(message) = &message {
+                    self.record_commit_provenance(panel_id, &worktree, message);
+                }
+                self.record_commit_supersessions(panel_id, &worktree);
+            }
+            Some(host) => self.fetch_lane(panel_id, &host, message),
+        }
+    }
+
+    /// Record a `CommitCreated` event when a turn whose final message was
+    /// `last_message` named a commit this agent left on its own branch
+    /// (`docs/design.md` §5). `git_dir` is a checkout holding the branch: the
+    /// lane's worktree, or this repo once a sub-host lane's branch is fetched.
     ///
     /// A sub-agent's commits live on its worktree's branch and outlive the panel,
     /// but nothing tied them back to the agent that made them: `git log` on the
@@ -820,20 +850,22 @@ impl Multiplexer {
     /// they commit at all, and a SHA there names no work this panel owns. So are
     /// panels whose branch caucus never learned — with no branch there is no join
     /// to verify, and an unverified join is what this exists to prevent.
-    fn record_commit_provenance(&mut self, panel_id: PanelId) {
+    pub(super) fn record_commit_provenance(
+        &mut self,
+        panel_id: PanelId,
+        git_dir: &Path,
+        last_message: &str,
+    ) {
         let Some(manifest) = self.manifests.get(&panel_id) else {
             return;
         };
-        let (Some(worktree), Some(last_message)) =
-            (manifest.worktree_path.clone(), manifest.last_message())
-        else {
+        let Some(worktree) = manifest.worktree_path.clone() else {
             return;
         };
         let Some(branch) = self.worktree_branches.get(&panel_id).cloned() else {
             return;
         };
-        let Some(commit) = provenance::extract_branch_commit(&worktree, &branch, last_message)
-        else {
+        let Some(commit) = provenance::extract_branch_commit(git_dir, &branch, last_message) else {
             return;
         };
         // An agent that keeps referring to the commit it made ("still working on
@@ -856,7 +888,8 @@ impl Multiplexer {
     }
 
     /// Record a `CommitSuperseded` event for every commit the panel created that
-    /// its branch no longer holds (`docs/design.md` §8.2).
+    /// its branch no longer holds (`docs/design.md` §8.2), as `git_dir` (see
+    /// [`Self::record_commit_provenance`]) sees the branch.
     ///
     /// An agent that amends or rebases leaves the sha it announced last turn
     /// pointing at a commit no branch contains. Without this, the timeline keeps
@@ -875,13 +908,13 @@ impl Multiplexer {
     /// answers for every commit on it, instead of a `merge-base` process per
     /// recorded commit on every single turn signal. The turns that *did* rewrite
     /// history pay the full check; the ordinary ones pay one process.
-    fn record_commit_supersessions(&mut self, panel_id: PanelId) {
+    pub(super) fn record_commit_supersessions(&mut self, panel_id: PanelId, git_dir: &Path) {
         let Some(manifest) = self.manifests.get(&panel_id) else {
             return;
         };
-        let Some(worktree) = manifest.worktree_path.clone() else {
+        if manifest.worktree_path.is_none() {
             return;
-        };
+        }
         let live = manifest.live_commits();
         if live.is_empty() {
             return; // No recorded commit on this lane — nothing can have left it.
@@ -889,7 +922,7 @@ impl Multiplexer {
         let Some(branch) = self.worktree_branches.get(&panel_id).cloned() else {
             return;
         };
-        let Some(tip) = provenance::branch_tip(&worktree, &branch) else {
+        let Some(tip) = provenance::branch_tip(git_dir, &branch) else {
             return; // git cannot say where the branch is; make no claim.
         };
         if self.checked_branch_tips.get(&panel_id) == Some(&tip) {
@@ -899,7 +932,7 @@ impl Multiplexer {
         let retired: Vec<(String, SupersededBy)> = live
             .into_iter()
             .filter_map(|p| {
-                provenance::detect_supersession(&worktree, &p.branch, &p.commit)
+                provenance::detect_supersession(git_dir, &p.branch, &p.commit)
                     .map(|by| (p.commit, by))
             })
             .collect();

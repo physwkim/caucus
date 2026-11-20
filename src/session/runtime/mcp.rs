@@ -192,10 +192,18 @@ impl McpToolSurface for Multiplexer {
         // [`Multiplexer::begin_spawn_role_worktree`] / `poll_pending_spawns`);
         // this synchronous trait method — kept for direct callers and tests —
         // creates it inline, then shares the same finish path.
-        let site = match placement {
-            Placement::Here => Site::Here,
-            Placement::Worktree => Site::Worktree(self.create_role_worktree(role)?),
-            Placement::Host(host) => Site::Host(host),
+        let worktree = match (placement.worktree, &placement.host) {
+            (false, _) => None,
+            (true, None) => Some(self.create_role_worktree(role)?),
+            (true, Some(host)) => {
+                return Err(McpError::Tool(format!(
+                    "spawn_role: a worktree on host {host} is made only on the control socket's deferred path"
+                )));
+            }
+        };
+        let site = Site {
+            host: placement.host,
+            worktree,
         };
         self.finish_spawn_role(role, model, agent_cli, prompt, site)
     }

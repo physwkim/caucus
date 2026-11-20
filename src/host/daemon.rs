@@ -18,7 +18,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::future::Future;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -32,12 +32,14 @@ use super::proto::{
     Bytes, ClientFrame, DaemonFrame, HostInfo, MAX_FRAME_BYTES, OUTPUT_CHUNK, PROTO_VERSION,
     SpawnSpec, encode,
 };
-use super::{HostPaths, private_dir};
+use super::{HostPaths, home_relative, private_dir};
 use crate::line_io::{CappedLine, read_capped_line};
 use crate::pty::LocalPty;
 use crate::session::id::{PanelId, SessionId};
 use crate::signal::SignalEvent;
 use crate::signal::server::SignalServer;
+use crate::worktree::cleanup::{self, CleanupJob};
+use crate::worktree::manager::{self, run_git};
 
 /// Output a panel keeps for a client to re-read after a drop.
 const LOG_CAP: usize = 8 << 20;
@@ -148,7 +150,8 @@ pub async fn run(
 
     let (events_tx, mut events) = mpsc::channel(1024);
     let accept = tokio::spawn(accept_loop(listener, events_tx));
-    let mut daemon = Daemon::new(paths.clone());
+    let (chores_done, mut chore_replies) = mpsc::unbounded_channel();
+    let mut daemon = Daemon::new(paths.clone(), chores_done);
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut load_tick = tokio::time::interval(LOAD_EVERY);
@@ -159,6 +162,7 @@ pub async fn run(
             biased;
             () = &mut shutdown => break,
             Some(event) = events.recv() => daemon.on_event(event),
+            Some((session, frame)) = chore_replies.recv() => daemon.reply(session, &frame),
             Some((signal, reply)) = signals.signals().recv() => {
                 // Main answers a sub-host signal too late to hold a hook, so
                 // the hook is released at once (an empty reply means allow).
@@ -436,6 +440,72 @@ impl DPanel {
     }
 }
 
+/// Blocking work the daemon hands off its loop. One thread runs it in
+/// arrival order, so a worktree removal never starts before the kills of the
+/// panels working there have ended.
+enum Chore {
+    /// `LocalPty::kill` joins threads and waits for the child.
+    Kill(LocalPty),
+    Worktree {
+        session: SessionId,
+        req: u64,
+        op: WorktreeOp,
+    },
+}
+
+enum WorktreeOp {
+    Add {
+        repo: PathBuf,
+        path: PathBuf,
+        branch: String,
+    },
+    Remove {
+        repo: PathBuf,
+        path: PathBuf,
+        delete_branch: Option<String>,
+    },
+}
+
+impl WorktreeOp {
+    fn run(self) -> Result<PathBuf, String> {
+        match self {
+            Self::Add { repo, path, branch } => add_worktree(&repo, &path, &branch),
+            Self::Remove {
+                repo,
+                path,
+                delete_branch,
+            } => remove_worktree(&repo, &path, delete_branch),
+        }
+    }
+}
+
+/// The chore thread and its queue; dropping `tx` lets the thread finish the
+/// queue and exit.
+struct Chores {
+    tx: std::sync::mpsc::Sender<Chore>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Chores {
+    fn start(done: mpsc::UnboundedSender<(SessionId, DaemonFrame)>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Chore>();
+        let thread = std::thread::spawn(move || {
+            for chore in rx {
+                match chore {
+                    Chore::Kill(mut pty) => {
+                        let _ = pty.kill();
+                    }
+                    Chore::Worktree { session, req, op } => {
+                        let result = op.run().map(|path| path.display().to_string());
+                        let _ = done.send((session, DaemonFrame::WorktreeDone { req, result }));
+                    }
+                }
+            }
+        });
+        Self { tx, thread }
+    }
+}
+
 struct Daemon {
     paths: HostPaths,
     hostname: String,
@@ -443,10 +513,14 @@ struct Daemon {
     panels: HashMap<PanelId, DPanel>,
     clients: HashMap<SessionId, Client>,
     last_probe: Instant,
+    /// `None` once shutdown has drained it.
+    chores: Option<Chores>,
 }
 
 impl Daemon {
-    fn new(paths: HostPaths) -> Self {
+    /// A worktree request's answer goes to `chores_done`, for the run loop to
+    /// send to the session's connection.
+    fn new(paths: HostPaths, chores_done: mpsc::UnboundedSender<(SessionId, DaemonFrame)>) -> Self {
         Self {
             paths,
             hostname: hostname(),
@@ -454,6 +528,13 @@ impl Daemon {
             panels: HashMap::new(),
             clients: HashMap::new(),
             last_probe: Instant::now(),
+            chores: Some(Chores::start(chores_done)),
+        }
+    }
+
+    fn chore(&self, chore: Chore) {
+        if let Some(chores) = &self.chores {
+            let _ = chores.tx.send(chore);
         }
     }
 
@@ -552,7 +633,7 @@ impl Daemon {
     }
 
     fn on_frame(&mut self, session: SessionId, frame: ClientFrame) {
-        let panel_id = match &frame {
+        let frame = match frame {
             ClientFrame::Hello { .. } => {
                 self.reply(
                     session,
@@ -562,11 +643,45 @@ impl Daemon {
                 );
                 return;
             }
+            ClientFrame::AddWorktree {
+                req,
+                repo,
+                path,
+                branch,
+            } => {
+                let op = WorktreeOp::Add {
+                    repo: home_relative(repo.into()),
+                    path: home_relative(path.into()),
+                    branch,
+                };
+                self.chore(Chore::Worktree { session, req, op });
+                return;
+            }
+            ClientFrame::RemoveWorktree {
+                req,
+                repo,
+                path,
+                delete_branch,
+            } => {
+                let op = WorktreeOp::Remove {
+                    repo: home_relative(repo.into()),
+                    path: home_relative(path.into()),
+                    delete_branch,
+                };
+                self.chore(Chore::Worktree { session, req, op });
+                return;
+            }
+            frame => frame,
+        };
+        let panel_id = match &frame {
             ClientFrame::Spawn { panel, .. }
             | ClientFrame::Input { panel, .. }
             | ClientFrame::Resize { panel, .. }
             | ClientFrame::Attach { panel, .. }
             | ClientFrame::Kill { panel } => *panel,
+            ClientFrame::Hello { .. }
+            | ClientFrame::AddWorktree { .. }
+            | ClientFrame::RemoveWorktree { .. } => unreachable!("answered above"),
         };
         if self
             .panels
@@ -582,7 +697,9 @@ impl Daemon {
             return;
         }
         match frame {
-            ClientFrame::Hello { .. } => unreachable!("answered above"),
+            ClientFrame::Hello { .. }
+            | ClientFrame::AddWorktree { .. }
+            | ClientFrame::RemoveWorktree { .. } => unreachable!("answered above"),
             ClientFrame::Spawn { panel, spec } => {
                 self.panels
                     .entry(panel)
@@ -625,10 +742,9 @@ impl Daemon {
             },
             ClientFrame::Kill { panel } => {
                 if let Some(mut p) = self.panels.remove(&panel)
-                    && let Some(mut pty) = p.pty.take()
+                    && let Some(pty) = p.pty.take()
                 {
-                    // `LocalPty::kill` joins threads and waits for the child.
-                    tokio::task::spawn_blocking(move || pty.kill());
+                    self.chore(Chore::Kill(pty));
                 }
                 self.reply(
                     session,
@@ -727,6 +843,68 @@ impl Daemon {
         for kill in kills {
             let _ = kill.await;
         }
+        // Let queued kills and worktree requests finish.
+        if let Some(Chores { tx, thread }) = self.chores.take() {
+            drop(tx);
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
+    }
+}
+
+/// Check `branch` out at `path`. A worktree already there on `branch` is the
+/// one an earlier copy of the same request made.
+fn add_worktree(repo: &Path, path: &Path, branch: &str) -> Result<PathBuf, String> {
+    if path.exists() {
+        let head = run_git(
+            path,
+            &["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()],
+        );
+        return match head {
+            Ok(head) if head.trim() == branch => Ok(path.to_path_buf()),
+            _ => Err(format!(
+                "{} already exists and is not a worktree on {branch}",
+                path.display()
+            )),
+        };
+    }
+    manager::attach(repo, path, branch)
+        .map(|handle| handle.path)
+        .map_err(|err| err.to_string())
+}
+
+/// Remove the worktree at `path` through the cleanup owner, which commits its
+/// uncommitted work onto its branch first (Invariant I-8).
+fn remove_worktree(
+    repo: &Path,
+    path: &Path,
+    delete_branch: Option<String>,
+) -> Result<PathBuf, String> {
+    let summary = cleanup::run_blocking(&CleanupJob {
+        repo_root: repo.to_path_buf(),
+        worktree_paths: if path.exists() {
+            vec![path.to_path_buf()]
+        } else {
+            Vec::new()
+        },
+        branches_to_delete: delete_branch.into_iter().collect(),
+        owners: Vec::new(),
+        done: None,
+    });
+    let failed: Vec<String> = summary
+        .failed_worktrees
+        .iter()
+        .map(|(path, msg)| format!("{}: {msg}", path.display()))
+        .chain(
+            summary
+                .failed_branches
+                .iter()
+                .map(|(branch, msg)| format!("{branch}: {msg}")),
+        )
+        .collect();
+    if failed.is_empty() {
+        Ok(path.to_path_buf())
+    } else {
+        Err(failed.join("; "))
     }
 }
 
@@ -754,15 +932,6 @@ fn spawn_panel(session: SessionId, spec: &SpawnSpec) -> DPanel {
             panel.sent = Some(0);
             panel
         }
-    }
-}
-
-/// Resolve a leading `~` against this host's `$HOME`: main names a host's
-/// checkout without knowing the remote user's home.
-fn home_relative(path: PathBuf) -> PathBuf {
-    match (path.strip_prefix("~"), std::env::var_os("HOME")) {
-        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
-        _ => path,
     }
 }
 
@@ -810,11 +979,15 @@ mod tests {
 
     fn daemon_with_client(session: SessionId) -> (Daemon, mpsc::Receiver<String>) {
         let tmp = std::env::temp_dir();
-        let mut daemon = Daemon::new(HostPaths {
-            state_dir: tmp.join(format!("caucus-host-test-{}", SessionId::new())),
-            control_sock: tmp.join("unused.sock"),
-            signal_sock: tmp.join("unused-signal.sock"),
-        });
+        let (chores_done, _) = mpsc::unbounded_channel();
+        let mut daemon = Daemon::new(
+            HostPaths {
+                state_dir: tmp.join(format!("caucus-host-test-{}", SessionId::new())),
+                control_sock: tmp.join("unused.sock"),
+                signal_sock: tmp.join("unused-signal.sock"),
+            },
+            chores_done,
+        );
         let (tx, rx) = mpsc::channel(CONNECTION_QUEUE);
         let (kick, _kicked) = oneshot::channel();
         daemon.clients.insert(
@@ -918,5 +1091,42 @@ mod tests {
         let p = &daemon.panels[&id];
         assert_eq!((p.sent, p.exit_sent), (None, false));
         let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
+    }
+
+    /// A worktree request re-sent after a reconnect gets the answer the first
+    /// one got: the add finds its worktree, the remove finds it gone.
+    #[test]
+    fn worktree_requests_repeat_safely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            run_git(dir, &args).map(|out| out.trim().to_string())
+        };
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@example.com"],
+            &["config", "user.name", "t"],
+            &["commit", "-q", "--allow-empty", "-m", "root"],
+            &["branch", "lane"],
+        ] {
+            git(&repo, args).unwrap();
+        }
+        let path = repo.join(".caucus").join("worktrees").join("lane");
+
+        assert_eq!(add_worktree(&repo, &path, "lane"), Ok(path.clone()));
+        assert_eq!(add_worktree(&repo, &path, "lane"), Ok(path.clone()));
+        let err = add_worktree(&repo, &path, "main").unwrap_err();
+        assert!(err.contains("not a worktree on main"), "{err}");
+
+        for _ in 0..2 {
+            assert_eq!(
+                remove_worktree(&repo, &path, Some("lane".into())),
+                Ok(path.clone())
+            );
+        }
+        assert!(!path.exists());
+        assert!(git(&repo, &["rev-parse", "--verify", "lane"]).is_err());
     }
 }

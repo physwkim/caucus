@@ -101,6 +101,15 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Resolve a leading `~` against this process's `$HOME`: main names a host's
+/// checkout without knowing the remote user's home.
+pub(crate) fn home_relative(path: PathBuf) -> PathBuf {
+    match (path.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => path,
+    }
+}
+
 /// Quote `s` as one POSIX shell word.
 pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))

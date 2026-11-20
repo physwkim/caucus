@@ -70,14 +70,13 @@ pub struct ControlCall {
 }
 
 /// Where `spawn_role` runs a new panel.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Placement {
-    /// This machine, in the session's checkout.
-    Here,
-    /// This machine, in a fresh git worktree.
-    Worktree,
-    /// A `hosts.toml` sub-host, in its checkout there.
-    Host(String),
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Placement {
+    /// The `hosts.toml` sub-host; `None` is this machine.
+    pub host: Option<String>,
+    /// In a fresh git worktree of that machine's checkout instead of the
+    /// checkout itself.
+    pub worktree: bool,
 }
 
 /// One decoded control call ([`ControlRequest::from_call`]), executed by
@@ -325,19 +324,9 @@ impl ControlRequest {
                 let host = args
                     .get("host")
                     .and_then(Value::as_str)
-                    .filter(|&h| h != LOCAL_HOST);
-                // Worktrees are made on this machine, so a sub-host panel
-                // cannot have one.
-                let placement = match (host, worktree) {
-                    (Some(host), true) => {
-                        return Err(format!(
-                            "worktree=true is available only on this machine, not on host `{host}`"
-                        ));
-                    }
-                    (Some(host), false) => Placement::Host(host.to_string()),
-                    (None, true) => Placement::Worktree,
-                    (None, false) => Placement::Here,
-                };
+                    .filter(|&h| h != LOCAL_HOST)
+                    .map(str::to_string);
+                let placement = Placement { host, worktree };
                 let model = args
                     .get("model")
                     .and_then(Value::as_str)
@@ -752,7 +741,10 @@ mod tests {
             req,
             ControlRequest::SpawnRole {
                 role: "backend".into(),
-                placement: Placement::Worktree,
+                placement: Placement {
+                    host: None,
+                    worktree: true,
+                },
                 model: None,
                 agent_cli: Some(AgentCli::Codex),
                 prompt: None,
@@ -778,7 +770,7 @@ mod tests {
             req,
             ControlRequest::SpawnRole {
                 role: "perf-profiler".into(),
-                placement: Placement::Here,
+                placement: Placement::default(),
                 model: Some("opus".into()),
                 agent_cli: Some(AgentCli::Codex),
                 prompt: Some("You profile hot paths and report findings.".into()),
@@ -1033,7 +1025,7 @@ mod tests {
             req,
             ControlRequest::SpawnRole {
                 role: "backend".into(),
-                placement: Placement::Here,
+                placement: Placement::default(),
                 model: None,
                 agent_cli: None,
                 prompt: None,
@@ -1042,22 +1034,30 @@ mod tests {
     }
 
     #[test]
-    fn spawn_role_host_places_the_panel_and_excludes_a_worktree() {
+    fn spawn_role_host_places_the_panel_with_or_without_a_worktree() {
         let placement = |args| match ControlRequest::from_call("spawn_role", &args) {
             Ok(ControlRequest::SpawnRole { placement, .. }) => Ok(placement),
             Ok(other) => panic!("decoded {other:?}"),
             Err(err) => Err(err),
         };
+        let on = |host: Option<&str>, worktree| {
+            Ok(Placement {
+                host: host.map(str::to_string),
+                worktree,
+            })
+        };
         assert_eq!(
             placement(json!({"role": "w", "host": "build-1"})),
-            Ok(Placement::Host("build-1".into()))
+            on(Some("build-1"), false)
+        );
+        assert_eq!(
+            placement(json!({"role": "w", "host": "build-1", "worktree": true})),
+            on(Some("build-1"), true)
         );
         assert_eq!(
             placement(json!({"role": "w", "host": "local", "worktree": true})),
-            Ok(Placement::Worktree)
+            on(None, true)
         );
-        let err = placement(json!({"role": "w", "host": "build-1", "worktree": true})).unwrap_err();
-        assert!(err.contains("build-1"), "{err}");
     }
 
     #[test]

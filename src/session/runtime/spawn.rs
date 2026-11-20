@@ -46,6 +46,8 @@ struct SpawnPanelOpts<'a> {
 /// checkout.
 #[derive(Clone)]
 struct DetachedPanel {
+    /// The sub-host the panel ran on, which its worktree is on.
+    host: Option<String>,
     worktree_path: Option<PathBuf>,
     worktree_branch: Option<String>,
     /// The agent that occupied the panel. Carried out of the detach because the
@@ -53,6 +55,29 @@ struct DetachedPanel {
     /// of the worktree still has to credit its removal to this agent's timeline
     /// (`worktree::cleanup::WorktreeOwner`).
     agent_id: AgentId,
+}
+
+/// A worktree no panel holds any more, for [`Multiplexer::dispose_worktrees`].
+pub(super) struct Orphan {
+    /// The sub-host it is on; `None` is this machine.
+    pub(super) host: Option<String>,
+    pub(super) path: PathBuf,
+    pub(super) branch: Option<String>,
+    /// The agent that worked in it. Its branch holds that agent's commits and
+    /// is kept; with no agent, the branch holds nothing and goes too.
+    pub(super) owner: Option<AgentId>,
+}
+
+impl Orphan {
+    /// A worktree made for a panel that never launched.
+    pub(super) fn unworked(host: Option<String>, handle: WorktreeHandle) -> Self {
+        Self {
+            host,
+            path: handle.path,
+            branch: Some(handle.branch),
+            owner: None,
+        }
+    }
 }
 
 impl Multiplexer {
@@ -207,16 +232,13 @@ impl Multiplexer {
             host,
         } = opts;
 
-        // A sub-host panel runs in the host's checkout and reaches the
-        // signal socket, session dir and caucus binary of that host's daemon.
-        // Worktrees are created on this machine, so none can be handed over.
+        // A sub-host panel runs in the host's checkout (or a worktree made
+        // there) and reaches the signal socket, session dir and caucus binary
+        // of that host's daemon.
         let remote = host
             .as_deref()
             .map(|name| self.remote_target(name))
             .transpose()?;
-        if remote.is_some() && worktree_path.is_some() {
-            anyhow::bail!("a panel on a sub-host cannot take a worktree");
-        }
 
         // `role` is a free-form label (`docs/design.md` §6): a known preset
         // reuses its spec (tool allowlist + permission mode), any other name is
@@ -259,7 +281,7 @@ impl Multiplexer {
                 None,
             ),
             Some(target) => (
-                target.dir.clone(),
+                target.repo.dir.clone(),
                 target.info.session_dir.clone(),
                 target.info.signal_sock.clone(),
                 Some(target.info.caucus_bin.clone()),
@@ -302,7 +324,7 @@ impl Multiplexer {
             outcome.manifest.agent_id,
             rect,
             &self.config.settings,
-            remote.as_ref().map(|target| &target.link),
+            remote.as_ref().map(|target| &target.repo.link),
         )?;
         let panel_id = panel.id;
         // Turn-segmented capture spills to `<session>/panels/<panel>.log`
@@ -364,39 +386,79 @@ impl Multiplexer {
             anyhow::bail!("cannot kill the main worker panel");
         }
         let detached = self.detach_panel(panel_id)?;
-        self.retire_worktree(&detached, panel_id);
+        self.retire_worktree(&detached);
         Ok(())
     }
 
-    /// Retire a detached panel's worktree: enqueue the checked-out directory for
-    /// serial cleanup (Invariant I-3) while KEEPING its branch — the branch
-    /// holds the sub-agent's commits and `caucus resume` re-attaches a fresh
-    /// worktree on it, so only the working copy is reclaimed.
+    /// Retire a detached panel's worktree: reclaim the checked-out directory
+    /// while KEEPING its branch — the branch holds the sub-agent's commits and
+    /// `caucus resume` re-attaches a fresh worktree on it.
     ///
-    /// The single owner of the "reclaim the directory, preserve the branch"
-    /// disposition: every exit path that leaves a worktree ownerless — a
-    /// [`Self::kill_panel`], or a [`Self::restart_panel`] that fails *after* its
-    /// teardown — routes the orphan through here, so none can leak on disk.
-    fn retire_worktree(&mut self, detached: &DetachedPanel, panel_id: PanelId) {
-        let Some(worktree) = detached.worktree_path.clone() else {
+    /// Every exit path that leaves a panel's worktree ownerless — a
+    /// [`Self::kill_panel`], or a [`Self::restart_panel`] that fails *after*
+    /// its teardown — routes the orphan through here, so none can leak on disk.
+    fn retire_worktree(&mut self, detached: &DetachedPanel) {
+        let Some(path) = detached.worktree_path.clone() else {
             return;
         };
-        let job = CleanupJob {
-            repo_root: self.session.repo_path.clone(),
-            worktree_paths: vec![worktree.clone()],
-            branches_to_delete: Vec::new(),
-            // The agent is gone from the live map, so the worker records the
-            // removal on its behalf — from what actually happened, not from this
-            // enqueue (Invariant I-8 can refuse the removal outright).
-            owners: vec![WorktreeOwner {
-                worktree,
-                session_root: self.session.root_dir.clone(),
-                agent_id: detached.agent_id,
+        self.dispose_worktrees(
+            vec![Orphan {
+                host: detached.host.clone(),
+                path,
+                branch: detached.worktree_branch.clone(),
+                owner: Some(detached.agent_id),
             }],
+            false,
+        );
+    }
+
+    /// Remove worktrees no panel holds any more — the one disposition every
+    /// exit path uses (a kill, a failed restart or spawn, an aborted spawn,
+    /// shutdown). Removal goes through the cleanup owner on the worktree's
+    /// own machine (Invariant I-3), which commits uncommitted work onto the
+    /// branch first (Invariant I-8); an [`Orphan::owner`] is credited with
+    /// the removal, and a sub-host lane's branch, salvage commit included, is
+    /// fetched back here.
+    ///
+    /// Local worktrees go on the cleanup queue, or are removed before this
+    /// returns when `now` — on shutdown, whose runtime takes the queue's
+    /// consumer down with it. Sub-host worktrees are removed by their daemon
+    /// from a host task, which [`Self::close_hosts`] waits for.
+    pub(super) fn dispose_worktrees(&mut self, orphans: Vec<Orphan>, now: bool) {
+        let mut local = CleanupJob {
+            repo_root: self.session.repo_path.clone(),
+            worktree_paths: Vec::new(),
+            branches_to_delete: Vec::new(),
+            owners: Vec::new(),
             done: None,
         };
-        if self.cleanup.enqueue(job).is_err() {
-            warn!(panel = %panel_id, "worktree cleanup queue closed");
+        for orphan in orphans {
+            if let Some(host) = orphan.host.clone() {
+                self.dispose_host_worktree(&host, orphan);
+                continue;
+            }
+            match orphan.owner {
+                // The cleanup worker records the removal on the agent's
+                // behalf, from what actually happened (I-8 can refuse it).
+                Some(agent_id) => local.owners.push(WorktreeOwner {
+                    worktree: orphan.path.clone(),
+                    session_root: self.session.root_dir.clone(),
+                    agent_id,
+                }),
+                None => local.branches_to_delete.extend(orphan.branch),
+            }
+            local.worktree_paths.push(orphan.path);
+        }
+        if local.worktree_paths.is_empty() {
+            return;
+        }
+        if now {
+            let summary = crate::worktree::cleanup::run_blocking(&local);
+            for (path, msg) in &summary.failed_worktrees {
+                warn!(?path, %msg, "worktree cleanup failed");
+            }
+        } else if self.cleanup.enqueue(local).is_err() {
+            warn!("worktree cleanup queue closed");
         }
     }
 
@@ -467,7 +529,7 @@ impl Multiplexer {
                 // torn down. Retire the now-ownerless worktree (same disposition
                 // as a kill — directory reclaimed, branch + commits kept), then
                 // surface the spawn failure.
-                self.retire_worktree(&orphan, panel_id);
+                self.retire_worktree(&orphan);
                 return Err(err);
             }
         };
@@ -500,6 +562,7 @@ impl Multiplexer {
         lifecycle::kill(&mut panel)?;
 
         let detached = DetachedPanel {
+            host: panel.pty.host().map(str::to_string),
             worktree_path: panel.worktree_path.clone(),
             worktree_branch: self.worktree_branches.remove(&panel_id),
             agent_id: panel.agent_id,
@@ -507,6 +570,7 @@ impl Multiplexer {
         self.manifests.remove(&panel_id);
         self.screen_scan_cache.remove(&panel_id);
         self.checked_branch_tips.remove(&panel_id);
+        self.hosts.lane_fetches.remove(&panel_id);
         self.local_commands_without_turn.remove(&panel_id);
         self.outstanding_prompts.remove(&panel_id);
         self.lost_turn_probe.remove(&panel_id);
@@ -728,7 +792,10 @@ mod tests {
 
         let resp = mux.execute_control(ControlRequest::SpawnRole {
             role: "bad-template".into(),
-            placement: Placement::Worktree,
+            placement: Placement {
+                host: None,
+                worktree: true,
+            },
             model: None,
             agent_cli: None,
             prompt: None,

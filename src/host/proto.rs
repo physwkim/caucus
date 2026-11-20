@@ -147,6 +147,26 @@ pub enum ClientFrame {
     Kill {
         panel: PanelId,
     },
+    /// Check out the existing `branch` at `path` as a new worktree of the
+    /// repo at `repo` (a leading `~` is the host user's home). Answered by
+    /// [`DaemonFrame::WorktreeDone`] with the worktree's absolute path. A
+    /// request re-sent after a reconnect finds the worktree it made.
+    AddWorktree {
+        req: u64,
+        repo: String,
+        path: String,
+        branch: String,
+    },
+    /// Remove the worktree at `path`, committing its uncommitted work onto its
+    /// branch first, then delete `delete_branch` if given. Runs after every
+    /// kill sent before it, so no panel still writes there. A path already
+    /// gone counts as removed.
+    RemoveWorktree {
+        req: u64,
+        repo: String,
+        path: String,
+        delete_branch: Option<String>,
+    },
 }
 
 /// What the daemon tells a client about itself, in reply to `hello`.
@@ -194,6 +214,12 @@ pub enum DaemonFrame {
     /// re-serialised as the signal server parsed it.
     Signal {
         line: String,
+    },
+    /// The answer to worktree request `req`: the worktree's absolute path on
+    /// the host, or why the request failed.
+    WorktreeDone {
+        req: u64,
+        result: Result<String, String>,
     },
     Error {
         msg: String,

@@ -800,6 +800,11 @@ async fn event_loop(
         mux.poll_pending_spawns();
         prof.lap("poll_pending_spawns");
 
+        // 3c. Sub-host lane fetches — record the commits of each remote
+        //     worktree lane whose branch has just been fetched here.
+        mux.poll_lane_fetches();
+        prof.lap("poll_lane_fetches");
+
         // 4. PTY pump — drain every panel into its grid + capture, reap exits.
         mux.pump_all();
         mux.ingest_remote_signals(remote_signals);

@@ -4,19 +4,20 @@
 //! The link keeps a connection to the host's daemon and opens a new one
 //! whenever it drops. On every new connection it first re-sends what the
 //! daemon may not have — spawns it has not confirmed, kills it has not
-//! confirmed — then re-attaches each panel from the first byte main has not
-//! seen. Frames written while disconnected wait in the outbound queue.
+//! confirmed, worktree requests it has not answered — then re-attaches each
+//! panel from the first byte main has not seen. Frames written while
+//! disconnected wait in the outbound queue.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -138,6 +139,10 @@ struct LinkState {
     panels: HashMap<PanelId, LinkPanel>,
     /// Panels killed but not yet confirmed by the daemon.
     kills: HashSet<PanelId>,
+    /// Worktree requests the daemon has not answered, by id. Dropping one
+    /// (when the link closes) answers its caller with "link closed".
+    requests: BTreeMap<u64, Request>,
+    next_req: u64,
     /// The host's load as of the current connection's latest report.
     load: Option<HostLoad>,
     closed: bool,
@@ -151,6 +156,11 @@ struct LinkPanel {
     size: (u16, u16),
     exited: bool,
     out: mpsc::Sender<Chunk>,
+}
+
+struct Request {
+    frame: ClientFrame,
+    done: oneshot::Sender<Result<String, String>>,
 }
 
 /// What the link hands a [`RemotePty`], in order.
@@ -308,13 +318,91 @@ impl HostLink {
         let _ = self.send(ClientFrame::Kill { panel });
     }
 
-    /// Send what is queued (kills included) for up to `timeout`, then stop.
-    /// Panels still on the link see their output end.
+    /// Check out the existing `branch` at `path` as a worktree of the host's
+    /// repo at `repo` (both may start with `~`, the host user's home) and
+    /// return its absolute path there. Waits through reconnects; fails only
+    /// on the host's answer or when the link closes.
+    pub async fn add_worktree(
+        &self,
+        repo: &Path,
+        path: &Path,
+        branch: &str,
+    ) -> Result<PathBuf, String> {
+        let (repo, path) = (utf8_path(repo)?, utf8_path(path)?);
+        let branch = branch.to_string();
+        self.request(|req| ClientFrame::AddWorktree {
+            req,
+            repo,
+            path,
+            branch,
+        })
+        .await
+        .map(PathBuf::from)
+    }
+
+    /// Remove the host's worktree at `path` (its uncommitted work committed
+    /// onto its branch first), then delete `delete_branch` if given. Runs on
+    /// the host after every kill sent before it.
+    pub async fn remove_worktree(
+        &self,
+        repo: &Path,
+        path: &Path,
+        delete_branch: Option<&str>,
+    ) -> Result<(), String> {
+        let (repo, path) = (utf8_path(repo)?, utf8_path(path)?);
+        let delete_branch = delete_branch.map(str::to_string);
+        self.request(|req| ClientFrame::RemoveWorktree {
+            req,
+            repo,
+            path,
+            delete_branch,
+        })
+        .await
+        .map(drop)
+    }
+
+    async fn request(&self, frame: impl FnOnce(u64) -> ClientFrame) -> Result<String, String> {
+        let (done, answer) = oneshot::channel();
+        let (frame, kills) = {
+            let mut state = self.inner.lock();
+            if state.closed {
+                return Err(self.closed().to_string());
+            }
+            let req = state.next_req;
+            state.next_req += 1;
+            let frame = frame(req);
+            state.requests.insert(
+                req,
+                Request {
+                    frame: frame.clone(),
+                    done,
+                },
+            );
+            (frame, state.kills.iter().copied().collect::<Vec<_>>())
+        };
+        // A kill the full queue refused waits for the next connection; queue a
+        // copy ahead of the request so the host never works in a worktree a
+        // panel it has yet to kill still writes to. Waiting for room here,
+        // unlike `send`, drops nothing.
+        for panel in kills {
+            let _ = self.inner.outbound.send(ClientFrame::Kill { panel }).await;
+        }
+        let _ = self.inner.outbound.send(frame).await;
+        answer
+            .await
+            .unwrap_or_else(|_| Err(self.closed().to_string()))
+    }
+
+    /// Send what is queued (kills and worktree requests included) for up to
+    /// `timeout`, then stop. Panels still on the link see their output end,
+    /// and unanswered requests fail.
     pub async fn close(&self, timeout: Duration) {
         let drained = async {
             loop {
-                let idle = self.inner.outbound.capacity() == OUTBOUND_QUEUE
-                    && self.inner.lock().kills.is_empty();
+                let idle = self.inner.outbound.capacity() == OUTBOUND_QUEUE && {
+                    let state = self.inner.lock();
+                    state.kills.is_empty() && state.requests.is_empty()
+                };
                 if idle || *self.inner.stop.borrow() {
                     return;
                 }
@@ -362,11 +450,13 @@ impl Inner {
             });
         }
         frames.extend(state.kills.iter().map(|&panel| ClientFrame::Kill { panel }));
+        frames.extend(state.requests.values().map(|r| r.frame.clone()));
         frames
     }
 
     /// Whether a queued frame still means anything. A spawn queued before a
-    /// drop and confirmed (or killed) since must not start the panel again.
+    /// drop and confirmed (or killed) since must not start the panel again,
+    /// and an answered worktree request must not run again.
     fn still_wanted(&self, frame: &ClientFrame) -> bool {
         match frame {
             ClientFrame::Spawn { panel, .. } => self
@@ -374,6 +464,9 @@ impl Inner {
                 .panels
                 .get(panel)
                 .is_some_and(|p| p.unconfirmed.is_some()),
+            ClientFrame::AddWorktree { req, .. } | ClientFrame::RemoveWorktree { req, .. } => {
+                self.lock().requests.contains_key(req)
+            }
             _ => true,
         }
     }
@@ -434,6 +527,11 @@ impl Inner {
                     line,
                 });
             }
+            DaemonFrame::WorktreeDone { req, result } => {
+                if let Some(request) = self.lock().requests.remove(&req) {
+                    let _ = request.done.send(result);
+                }
+            }
             DaemonFrame::Error { msg } => {
                 warn!(host = %self.name, %msg, "sub-host reported an error")
             }
@@ -490,6 +588,7 @@ async fn supervise(
     let mut state = inner.lock();
     state.closed = true;
     state.kills.clear();
+    state.requests.clear();
     state.load = None;
     // Dropping each panel's sender ends its output.
     state.panels.clear();
@@ -682,6 +781,12 @@ async fn write_frames<W: AsyncWrite + Unpin>(
             return;
         }
     }
+}
+
+fn utf8_path(path: &Path) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("not valid UTF-8: {}", path.display()))
 }
 
 /// A panel's terminal on a sub-host, driven through its host's [`HostLink`].

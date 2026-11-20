@@ -137,8 +137,9 @@ impl Multiplexer {
     ///
     /// Most requests are answered immediately via
     /// [`Multiplexer::execute_control`]. Two are deferred.
-    /// `spawn_role(worktree=true)`: its `git worktree add` is slow enough to
-    /// freeze the single-threaded loop, so it is deferred off-thread
+    /// `spawn_role(worktree=true)`: its `git worktree add` (on a sub-host, the
+    /// push and the daemon's checkout) is slow enough to freeze the
+    /// single-threaded loop, so it is deferred off the loop
     /// (`Multiplexer::begin_spawn_role_worktree`) and its reply is sent later
     /// from `Multiplexer::poll_pending_spawns`. `wait` on a busy panel is
     /// parked (`Multiplexer::begin_wait`) and answered from
@@ -155,12 +156,16 @@ impl Multiplexer {
                 // moved into the pending entry and answered on completion.
                 ControlRequest::SpawnRole {
                     role,
-                    placement: Placement::Worktree,
+                    placement:
+                        Placement {
+                            host,
+                            worktree: true,
+                        },
                     model,
                     agent_cli,
                     prompt,
                 } => {
-                    self.begin_spawn_role_worktree(role, model, agent_cli, prompt, reply);
+                    self.begin_spawn_role_worktree(role, host, model, agent_cli, prompt, reply);
                 }
                 ControlRequest::Wait {
                     panel,

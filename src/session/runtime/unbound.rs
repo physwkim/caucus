@@ -222,15 +222,17 @@ impl Multiplexer {
             .map(|(&id, _)| id)
     }
 
-    /// Whether `cwd` could belong to one of this session's panels: inside the
-    /// session repo, or inside any panel's worktree (worktrees live *outside*
-    /// the repo checkout).
+    /// Whether `cwd` could belong to one of this machine's panels: inside the
+    /// session repo, or inside any of their worktrees (worktrees live
+    /// *outside* the repo checkout). A sub-host panel's worktree path names a
+    /// directory on that host.
     fn unbound_cwd_plausible(&self, cwd: &Path) -> bool {
         cwd.starts_with(&self.session.repo_path)
             || self
                 .manifests
-                .values()
-                .filter_map(|m| m.worktree_path.as_deref())
+                .iter()
+                .filter(|&(&id, _)| self.panel_runs_on(id, None))
+                .filter_map(|(_, m)| m.worktree_path.as_deref())
                 .any(|wt| cwd.starts_with(wt))
     }
 }
