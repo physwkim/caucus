@@ -1284,14 +1284,15 @@ mod tests {
         }
     }
 
-    fn daemon_with_client(link: Link) -> (Daemon, mpsc::Receiver<String>) {
-        let tmp = std::env::temp_dir();
+    /// The daemon's state lives in the returned dir, removed when it drops.
+    fn daemon_with_client(link: Link) -> (Daemon, mpsc::Receiver<String>, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
         let (chores_done, _) = mpsc::unbounded_channel();
         let mut daemon = Daemon::new(
             HostPaths {
-                state_dir: tmp.join(format!("caucus-host-test-{}", SessionId::new())),
-                control_sock: tmp.join("unused.sock"),
-                signal_sock: tmp.join("unused-signal.sock"),
+                state_dir: tmp.path().join("state"),
+                control_sock: tmp.path().join("unused.sock"),
+                signal_sock: tmp.path().join("unused-signal.sock"),
             },
             chores_done,
         );
@@ -1309,7 +1310,7 @@ mod tests {
                 signals: SignalLog::default(),
             },
         );
-        (daemon, rx)
+        (daemon, rx, tmp)
     }
 
     /// A panel's turn signal goes out only after the output in front of it,
@@ -1317,7 +1318,7 @@ mod tests {
     #[test]
     fn a_panel_signal_waits_for_the_panel_output() {
         let session = SessionId::new();
-        let (mut daemon, mut rx) = daemon_with_client(link(session, "sub-1"));
+        let (mut daemon, mut rx, _state) = daemon_with_client(link(session, "sub-1"));
         let id = PanelId::new();
         let mut panel = DPanel::new(link(session, "sub-1"), None);
         let big = vec![b'x'; OUTPUT_CHUNK * (CONNECTION_QUEUE + 3)];
@@ -1378,7 +1379,7 @@ mod tests {
     #[test]
     fn a_client_behind_the_ring_gets_the_modes_it_missed() {
         let ours = link(SessionId::new(), "sub-1");
-        let (mut daemon, mut rx) = daemon_with_client(ours.clone());
+        let (mut daemon, mut rx, _state) = daemon_with_client(ours.clone());
         let id = PanelId::new();
         let mut panel = DPanel::new(ours, None);
         panel.append(b"\x1b[?1049h\x1b[?2004h\x1b[?10");
@@ -1399,7 +1400,6 @@ mod tests {
             }
         );
         assert!(matches!(sent[1], DaemonFrame::Output { offset, .. } if offset == base));
-        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 
     /// A hello for a link that already has a connection replaces it and
@@ -1407,7 +1407,7 @@ mod tests {
     #[test]
     fn a_second_hello_replaces_the_connection_and_pauses_streaming() {
         let ours = link(SessionId::new(), "sub-1");
-        let (mut daemon, _old) = daemon_with_client(ours.clone());
+        let (mut daemon, _old, _state) = daemon_with_client(ours.clone());
         let id = PanelId::new();
         let mut panel = DPanel::new(ours.clone(), None);
         panel.append(b"before");
@@ -1431,7 +1431,6 @@ mod tests {
         assert!(kicked.try_recv().is_err(), "the new connection stays open");
         let p = &daemon.panels[&id];
         assert_eq!((p.sent, p.exit_sent), (None, false));
-        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 
     /// The welcome lists every panel of the link, an exited one marked so,
@@ -1439,7 +1438,7 @@ mod tests {
     #[test]
     fn the_welcome_lists_the_links_exited_panels_too() {
         let ours = link(SessionId::new(), "sub-1");
-        let (mut daemon, _old) = daemon_with_client(ours.clone());
+        let (mut daemon, _old, _state) = daemon_with_client(ours.clone());
         let (running, exited) = (PanelId::new(), PanelId::new());
         daemon
             .panels
@@ -1465,7 +1464,6 @@ mod tests {
         let mut want = vec![(running, false), (exited, true)];
         want.sort();
         assert_eq!(listed, want);
-        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 
     /// A signal for the link itself goes out again on each new connection
@@ -1475,7 +1473,7 @@ mod tests {
     fn a_link_signal_is_sent_again_until_confirmed() {
         let session = SessionId::new();
         let ours = link(session, "sub-1");
-        let (mut daemon, _old) = daemon_with_client(ours.clone());
+        let (mut daemon, _old, _state) = daemon_with_client(ours.clone());
         let hello = |daemon: &mut Daemon, conn| {
             let (tx, rx) = mpsc::channel(CONNECTION_QUEUE);
             let (kick, _kicked) = oneshot::channel::<()>();
@@ -1531,7 +1529,6 @@ mod tests {
         daemon.panels.remove(&id);
         daemon.on_event(ConnEvent::Closed { conn: 4 });
         assert!(!daemon.links.contains_key(&ours));
-        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 
     /// A link without a connection keeps its panels and signals until
@@ -1540,7 +1537,7 @@ mod tests {
     #[test]
     fn a_link_without_a_connection_is_forgotten_after_forget_after() {
         let left = link(SessionId::new(), "sub-1");
-        let (mut daemon, _left_rx) = daemon_with_client(left.clone());
+        let (mut daemon, _left_rx, _state) = daemon_with_client(left.clone());
         let held = link(SessionId::new(), "sub-1");
         let (tx, _held_rx) = mpsc::channel(CONNECTION_QUEUE);
         let (kick, _kicked) = oneshot::channel::<()>();
@@ -1571,7 +1568,6 @@ mod tests {
         assert!(!daemon.links.contains_key(&left));
         assert!(daemon.panels.contains_key(&held_panel));
         assert!(daemon.links.contains_key(&held));
-        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 
     /// A hello for a detached link connects it again, so the time it spent
@@ -1579,7 +1575,7 @@ mod tests {
     #[test]
     fn a_reconnected_link_is_not_forgotten() {
         let ours = link(SessionId::new(), "sub-1");
-        let (mut daemon, _old) = daemon_with_client(ours.clone());
+        let (mut daemon, _old, _state) = daemon_with_client(ours.clone());
         let id = PanelId::new();
         daemon.panels.insert(id, DPanel::new(ours.clone(), None));
         daemon.on_event(ConnEvent::Closed { conn: 1 });
@@ -1594,7 +1590,6 @@ mod tests {
         daemon.forget_idle(Instant::now() + FORGET_AFTER);
         assert!(daemon.panels.contains_key(&id));
         assert_eq!(daemon.client_mut(&ours).unwrap().conn, 2);
-        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 
     /// A session reaching the daemon through two host entries holds two
@@ -1603,7 +1598,7 @@ mod tests {
     fn two_hosts_of_one_session_are_two_links() {
         let session = SessionId::new();
         let (a, b) = (link(session, "gpu-a"), link(session, "gpu-b"));
-        let (mut daemon, mut a_rx) = daemon_with_client(a.clone());
+        let (mut daemon, mut a_rx, _state) = daemon_with_client(a.clone());
         let id = PanelId::new();
         let mut panel = DPanel::new(a.clone(), None);
         panel.append(b"a's output");
@@ -1660,7 +1655,6 @@ mod tests {
             frames(&mut b_rx).is_empty(),
             "a's reply and output stay on a"
         );
-        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 
     /// A worktree request re-sent after a reconnect gets the answer the first
