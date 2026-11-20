@@ -1,7 +1,7 @@
 //! A daemon and a link in one process, over real sockets and real PTYs.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -384,6 +384,7 @@ async fn the_daemon_refuses_another_protocol_version() {
     let hello = ClientFrame::Hello {
         proto: PROTO_VERSION + 1,
         session: SessionId::new(),
+        host: "sub-1".into(),
     };
     stream.write_all(encode(&hello).as_bytes()).await.unwrap();
     let mut line = String::new();
@@ -393,6 +394,19 @@ async fn the_daemon_refuses_another_protocol_version() {
         DaemonFrame::Error { msg } if msg.contains("protocol")
     ));
     host.stop().await;
+}
+
+/// The welcome a fake host answers a hello with.
+fn fake_welcome() -> String {
+    encode(&DaemonFrame::Welcome(HostInfo {
+        proto: PROTO_VERSION,
+        version: "test".into(),
+        hostname: "fake".into(),
+        caucus_bin: "caucus".into(),
+        signal_sock: "/nonexistent".into(),
+        session_dir: "/nonexistent".into(),
+        panels: Vec::new(),
+    }))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -408,16 +422,7 @@ async fn a_kill_made_while_the_queue_is_full_still_reaches_the_host() {
     let mut read = BufReader::new(read);
     let mut line = String::new();
     read.read_line(&mut line).await.unwrap();
-    let welcome = DaemonFrame::Welcome(HostInfo {
-        proto: PROTO_VERSION,
-        version: "test".into(),
-        hostname: "stalled".into(),
-        caucus_bin: "caucus".into(),
-        signal_sock: "/nonexistent".into(),
-        session_dir: "/nonexistent".into(),
-        panels: Vec::new(),
-    });
-    write.write_all(encode(&welcome).as_bytes()).await.unwrap();
+    write.write_all(fake_welcome().as_bytes()).await.unwrap();
     link.wait_connected(WAIT).await.unwrap();
 
     let panel = PanelId::new();
@@ -447,4 +452,84 @@ async fn a_kill_made_while_the_queue_is_full_still_reaches_the_host() {
     tokio::time::timeout(WAIT, kill_arrives)
         .await
         .expect("the kill never reached the host");
+}
+
+/// Two host entries reaching one daemon are two links: neither's connection
+/// replaces the other's, and each panel answers through its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_hosts_on_one_daemon_stay_connected_side_by_side() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(&tmp);
+    let mut host = TestDaemon::start(&paths).await;
+    let session = SessionId::new();
+    let (tx, _signals) = mpsc::unbounded_channel();
+    let links = ["gpu-a", "gpu-b"].map(|name| {
+        let transport = Transport::Socket(paths.control_sock.clone());
+        HostLink::connect(name, session, transport, tx.clone())
+    });
+    for link in &links {
+        link.wait_connected(WAIT).await.unwrap();
+    }
+    let mut ptys = Vec::new();
+    for link in &links {
+        let script = format!("read line; echo {}-$line; exec cat", link.name());
+        ptys.push(
+            link.spawn(PanelId::new(), &sh(&script), 80, 24, false)
+                .unwrap(),
+        );
+    }
+
+    let watch_until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < watch_until {
+        for link in &links {
+            assert!(
+                matches!(link.status(), LinkStatus::Connected(_)),
+                "{} lost its connection: {:?}",
+                link.name(),
+                link.status()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for (link, pty) in links.iter().zip(&mut ptys) {
+        pty.write(b"ping\n").unwrap();
+        read_until(pty, &mut String::new(), &format!("{}-ping", link.name())).await;
+    }
+
+    for link in &links {
+        link.close(WAIT).await;
+    }
+    host.stop().await;
+}
+
+/// A host that hangs up right after every welcome is redialled ever more
+/// slowly, not every MIN_BACKOFF.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_hangs_up_after_its_welcome_is_redialled_ever_more_slowly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("host.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let host = tokio::spawn({
+        let dials = Arc::clone(&dials);
+        async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                dials.fetch_add(1, Ordering::SeqCst);
+                let (read, mut write) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(read).read_line(&mut line).await.unwrap();
+                write.write_all(fake_welcome().as_bytes()).await.unwrap();
+            }
+        }
+    });
+    let (tx, _signals) = mpsc::unbounded_channel();
+    let link = HostLink::connect("flaky", SessionId::new(), Transport::Socket(sock), tx);
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let dials = dials.load(Ordering::SeqCst);
+    // Backing off 250, 500, 1000 ms dials 3 times in 1.6 s; redialling
+    // every 250 ms dials 7.
+    assert!((2..=4).contains(&dials), "dialled {dials} times in 1.6 s");
+    host.abort();
+    link.close(WAIT).await;
 }

@@ -116,12 +116,14 @@ impl SpawnSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientFrame {
-    /// First frame on every connection. Binds the connection to `session`; a
-    /// newer connection for the same session replaces an older one, and every
-    /// panel of the session stops streaming until the client attaches it.
+    /// First frame on every connection. Binds the connection to the link
+    /// `session` holds to the host it calls `host`; a newer connection for the
+    /// same link replaces an older one, and every panel of the link stops
+    /// streaming until the client attaches it.
     Hello {
         proto: u32,
         session: SessionId,
+        host: String,
     },
     /// Start `spec` as `panel`. Idempotent per panel id: a client that resends
     /// an unconfirmed spawn after a reconnect gets the existing panel.

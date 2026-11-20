@@ -13,7 +13,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -39,6 +39,8 @@ const PANEL_QUEUE: usize = 1024;
 const HANDSHAKE_WAIT: Duration = Duration::from_secs(15);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
+/// How long a connection stays up before its drop restarts the backoff.
+const STABLE_LINK: Duration = Duration::from_secs(10);
 
 /// How the link reaches the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,8 +621,12 @@ async fn supervise(
             _ = stop.wait_for(|stop| *stop) => break,
         };
         let last_error = match ended {
-            Ended::Dropped => {
-                backoff = MIN_BACKOFF;
+            Ended::Dropped { connected } => {
+                // A host that hangs up soon after its welcome is failing, and
+                // redialling it every MIN_BACKOFF would never settle.
+                if connected.elapsed() >= STABLE_LINK {
+                    backoff = MIN_BACKOFF;
+                }
                 info!(host = %inner.name, "sub-host link dropped; reconnecting");
                 "link dropped".to_string()
             }
@@ -651,8 +657,8 @@ async fn supervise(
 }
 
 enum Ended {
-    /// Connected, then lost the connection.
-    Dropped,
+    /// Got a welcome at `connected`, then lost the connection.
+    Dropped { connected: Instant },
     /// Never got a welcome.
     Failed(String),
 }
@@ -725,7 +731,8 @@ async fn connection(
         Ok(conn) => conn,
         Err(err) => return Ended::Failed(err.to_string()),
     };
-    let info = match tokio::time::timeout(HANDSHAKE_WAIT, handshake(&mut conn, session)).await {
+    let hello = handshake(&mut conn, session, &inner.name);
+    let info = match tokio::time::timeout(HANDSHAKE_WAIT, hello).await {
         Ok(Ok(info)) => info,
         Ok(Err(err)) => {
             // Let a failing transport finish printing why.
@@ -738,6 +745,7 @@ async fn connection(
         }
         Err(_) => return Ended::Failed(format!("no welcome within {HANDSHAKE_WAIT:?}")),
     };
+    let connected = Instant::now();
     info!(host = %inner.name, hostname = %info.hostname, version = %info.version, "sub-host connected");
     inner.status.send_replace(LinkStatus::Connected(info));
 
@@ -750,24 +758,25 @@ async fn connection(
             .await
             .is_err()
         {
-            return Ended::Dropped;
+            return Ended::Dropped { connected };
         }
     }
     if conn.writer.flush().await.is_err() {
-        return Ended::Dropped;
+        return Ended::Dropped { connected };
     }
     let Conn { reader, writer, .. } = &mut conn;
     tokio::select! {
         () = read_frames(inner, reader, signals) => {}
         () = write_frames(inner, writer, outbound, retry) => {}
     }
-    Ended::Dropped
+    Ended::Dropped { connected }
 }
 
-async fn handshake(conn: &mut Conn, session: SessionId) -> Result<HostInfo, String> {
+async fn handshake(conn: &mut Conn, session: SessionId, host: &str) -> Result<HostInfo, String> {
     let hello = encode(&ClientFrame::Hello {
         proto: PROTO_VERSION,
         session,
+        host: host.to_string(),
     });
     conn.writer
         .write_all(hello.as_bytes())

@@ -5,8 +5,10 @@
 //! ring of the last 8 MiB, so a main caucus that lost its link
 //! re-attaches from the first byte it has not seen.
 //!
-//! Each connection belongs to one session (its `hello`); a newer connection
-//! for the same session replaces the older one. A connection streams only the
+//! Each connection belongs to one link, named by its `hello`: a session and
+//! the name that session's `hosts.toml` gives this host. A newer connection
+//! for the same link replaces the older one; a session reaching the daemon
+//! through two host entries holds two links. A connection streams only the
 //! panels it attached, and only as fast as it reads: output goes out through
 //! a bounded queue and waits in the ring while the queue is full.
 //!
@@ -162,7 +164,7 @@ pub async fn run(
             biased;
             () = &mut shutdown => break,
             Some(event) = events.recv() => daemon.on_event(event),
-            Some((session, frame)) = chore_replies.recv() => daemon.reply(session, &frame),
+            Some((link, frame)) = chore_replies.recv() => daemon.reply(&link, &frame),
             Some((signal, reply)) = signals.signals().recv() => {
                 // Main answers a sub-host signal too late to hold a hook, so
                 // the hook is released at once (an empty reply means allow).
@@ -180,11 +182,20 @@ pub async fn run(
     Ok(())
 }
 
+/// One main caucus's link to this daemon: its session and the name its
+/// `hosts.toml` gives this host. Panels, connections and replies belong to a
+/// link, so two host entries reaching one daemon never stand in for each other.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Link {
+    session: SessionId,
+    host: String,
+}
+
 /// What a connection task tells the daemon.
 enum ConnEvent {
     Hello {
         conn: u64,
-        session: SessionId,
+        link: Link,
         tx: mpsc::Sender<String>,
         /// Dropping this ends the connection.
         kick: oneshot::Sender<()>,
@@ -227,8 +238,12 @@ async fn connection(conn: u64, stream: UnixStream, events: mpsc::Sender<ConnEven
     if !matches!(hello, Ok(Ok(CappedLine::Line))) {
         return;
     }
-    let session = match serde_json::from_str::<ClientFrame>(&line) {
-        Ok(ClientFrame::Hello { proto, session }) if proto == PROTO_VERSION => session,
+    let link = match serde_json::from_str::<ClientFrame>(&line) {
+        Ok(ClientFrame::Hello {
+            proto,
+            session,
+            host,
+        }) if proto == PROTO_VERSION => Link { session, host },
         Ok(ClientFrame::Hello { proto, .. }) => {
             refuse(
                 write,
@@ -247,7 +262,7 @@ async fn connection(conn: u64, stream: UnixStream, events: mpsc::Sender<ConnEven
     tokio::spawn(write_loop(write, rx));
     let hello = ConnEvent::Hello {
         conn,
-        session,
+        link,
         tx,
         kick,
     };
@@ -301,7 +316,7 @@ async fn write_loop(write: OwnedWriteHalf, mut rx: mpsc::Receiver<String>) {
     let _ = out.shutdown().await;
 }
 
-/// The connection currently serving one session.
+/// The connection currently serving one link.
 struct Client {
     conn: u64,
     tx: mpsc::Sender<String>,
@@ -348,14 +363,14 @@ enum Life {
 }
 
 struct DPanel {
-    session: SessionId,
+    link: Link,
     /// `None` when the launch failed; the error is in the output.
     pty: Option<LocalPty>,
     /// The last [`LOG_CAP`] output bytes; `log[0]` is byte `base`.
     log: VecDeque<u8>,
     base: u64,
-    /// Next byte to send, while the session's connection has attached the
-    /// panel. `None` until it attaches.
+    /// Next byte to send, while the link's connection has attached the panel.
+    /// `None` until it attaches.
     sent: Option<u64>,
     life: Life,
     /// Whether this connection has been told about the exit.
@@ -365,9 +380,9 @@ struct DPanel {
 }
 
 impl DPanel {
-    fn new(session: SessionId, pty: Option<LocalPty>) -> Self {
+    fn new(link: Link, pty: Option<LocalPty>) -> Self {
         Self {
-            session,
+            link,
             pty,
             log: VecDeque::new(),
             base: 0,
@@ -447,7 +462,7 @@ enum Chore {
     /// `LocalPty::kill` joins threads and waits for the child.
     Kill(LocalPty),
     Worktree {
-        session: SessionId,
+        link: Link,
         req: u64,
         op: WorktreeOp,
     },
@@ -487,7 +502,7 @@ struct Chores {
 }
 
 impl Chores {
-    fn start(done: mpsc::UnboundedSender<(SessionId, DaemonFrame)>) -> Self {
+    fn start(done: mpsc::UnboundedSender<(Link, DaemonFrame)>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<Chore>();
         let thread = std::thread::spawn(move || {
             for chore in rx {
@@ -495,9 +510,9 @@ impl Chores {
                     Chore::Kill(mut pty) => {
                         let _ = pty.kill();
                     }
-                    Chore::Worktree { session, req, op } => {
+                    Chore::Worktree { link, req, op } => {
                         let result = op.run().map(|path| path.display().to_string());
-                        let _ = done.send((session, DaemonFrame::WorktreeDone { req, result }));
+                        let _ = done.send((link, DaemonFrame::WorktreeDone { req, result }));
                     }
                 }
             }
@@ -511,7 +526,7 @@ struct Daemon {
     hostname: String,
     caucus_bin: PathBuf,
     panels: HashMap<PanelId, DPanel>,
-    clients: HashMap<SessionId, Client>,
+    clients: HashMap<Link, Client>,
     last_probe: Instant,
     /// `None` once shutdown has drained it.
     chores: Option<Chores>,
@@ -519,8 +534,8 @@ struct Daemon {
 
 impl Daemon {
     /// A worktree request's answer goes to `chores_done`, for the run loop to
-    /// send to the session's connection.
-    fn new(paths: HostPaths, chores_done: mpsc::UnboundedSender<(SessionId, DaemonFrame)>) -> Self {
+    /// send to the link's connection.
+    fn new(paths: HostPaths, chores_done: mpsc::UnboundedSender<(Link, DaemonFrame)>) -> Self {
         Self {
             paths,
             hostname: hostname(),
@@ -546,20 +561,20 @@ impl Daemon {
         match event {
             ConnEvent::Hello {
                 conn,
-                session,
+                link,
                 tx,
                 kick,
-            } => self.on_hello(conn, session, tx, kick),
+            } => self.on_hello(conn, link, tx, kick),
             ConnEvent::Frame { conn, frame } => {
                 // A replaced connection's last frames are dropped.
-                let Some(session) = self
+                let Some(link) = self
                     .clients
                     .iter()
-                    .find_map(|(s, c)| (c.conn == conn).then_some(*s))
+                    .find_map(|(l, c)| (c.conn == conn).then(|| l.clone()))
                 else {
                     return;
                 };
-                self.on_frame(session, frame);
+                self.on_frame(link, frame);
             }
             ConnEvent::Closed { conn } => {
                 self.clients.retain(|_, c| c.conn != conn);
@@ -570,7 +585,7 @@ impl Daemon {
     fn on_hello(
         &mut self,
         conn: u64,
-        session: SessionId,
+        link: Link,
         tx: mpsc::Sender<String>,
         kick: oneshot::Sender<()>,
     ) {
@@ -578,7 +593,7 @@ impl Daemon {
             .paths
             .state_dir
             .join("sessions")
-            .join(session.to_string());
+            .join(link.session.to_string());
         let first = match std::fs::create_dir_all(&session_dir) {
             Ok(()) => DaemonFrame::Welcome(HostInfo {
                 proto: PROTO_VERSION,
@@ -590,7 +605,7 @@ impl Daemon {
                 panels: self
                     .panels
                     .iter()
-                    .filter(|(_, p)| p.session == session && !matches!(p.life, Life::Exited(_)))
+                    .filter(|(_, p)| p.link == link && !matches!(p.life, Life::Exited(_)))
                     .map(|(&id, _)| id)
                     .collect(),
             }),
@@ -612,11 +627,11 @@ impl Daemon {
         };
         client.flush();
         // Dropping the replaced client kicks its connection.
-        if self.clients.insert(session, client).is_some() {
-            info!(%session, "session reconnected; replacing its old connection");
+        if self.clients.insert(link.clone(), client).is_some() {
+            info!(session = %link.session, host = %link.host, "link reconnected; replacing its old connection");
         }
         // Nothing streams until the new connection says where it left off.
-        for panel in self.panels.values_mut().filter(|p| p.session == session) {
+        for panel in self.panels.values_mut().filter(|p| p.link == link) {
             panel.sent = None;
             panel.exit_sent = false;
         }
@@ -631,18 +646,18 @@ impl Daemon {
         }
     }
 
-    fn reply(&mut self, session: SessionId, frame: &DaemonFrame) {
-        if let Some(client) = self.clients.get_mut(&session) {
+    fn reply(&mut self, link: &Link, frame: &DaemonFrame) {
+        if let Some(client) = self.clients.get_mut(link) {
             client.queued.push_back(encode(frame));
             client.flush();
         }
     }
 
-    fn on_frame(&mut self, session: SessionId, frame: ClientFrame) {
+    fn on_frame(&mut self, link: Link, frame: ClientFrame) {
         let frame = match frame {
             ClientFrame::Hello { .. } => {
                 self.reply(
-                    session,
+                    &link,
                     &DaemonFrame::Error {
                         msg: "hello sent twice".into(),
                     },
@@ -660,7 +675,7 @@ impl Daemon {
                     path: home_relative(path.into()),
                     branch,
                 };
-                self.chore(Chore::Worktree { session, req, op });
+                self.chore(Chore::Worktree { link, req, op });
                 return;
             }
             ClientFrame::RemoveWorktree {
@@ -674,7 +689,7 @@ impl Daemon {
                     path: home_relative(path.into()),
                     delete_branch,
                 };
-                self.chore(Chore::Worktree { session, req, op });
+                self.chore(Chore::Worktree { link, req, op });
                 return;
             }
             frame => frame,
@@ -689,15 +704,11 @@ impl Daemon {
             | ClientFrame::AddWorktree { .. }
             | ClientFrame::RemoveWorktree { .. } => unreachable!("answered above"),
         };
-        if self
-            .panels
-            .get(&panel_id)
-            .is_some_and(|p| p.session != session)
-        {
+        if self.panels.get(&panel_id).is_some_and(|p| p.link != link) {
             self.reply(
-                session,
+                &link,
                 &DaemonFrame::Error {
-                    msg: format!("panel {panel_id} belongs to another session"),
+                    msg: format!("panel {panel_id} belongs to another session or host"),
                 },
             );
             return;
@@ -709,8 +720,8 @@ impl Daemon {
             ClientFrame::Spawn { panel, spec } => {
                 self.panels
                     .entry(panel)
-                    .or_insert_with(|| spawn_panel(session, &spec));
-                self.reply(session, &DaemonFrame::Spawned { panel });
+                    .or_insert_with(|| spawn_panel(link.clone(), &spec));
+                self.reply(&link, &DaemonFrame::Spawned { panel });
             }
             ClientFrame::Input { panel, data } => {
                 if let Some(pty) = self.panels.get_mut(&panel).and_then(|p| p.pty.as_mut())
@@ -739,7 +750,7 @@ impl Daemon {
                     p.exit_sent = false;
                 }
                 None => self.reply(
-                    session,
+                    &link,
                     &DaemonFrame::Exited {
                         panel,
                         reason: Some("no such panel on this host (daemon restarted?)".into()),
@@ -753,7 +764,7 @@ impl Daemon {
                     self.chore(Chore::Kill(pty));
                 }
                 self.reply(
-                    session,
+                    &link,
                     &DaemonFrame::Exited {
                         panel,
                         reason: Some("killed".into()),
@@ -763,7 +774,7 @@ impl Daemon {
         }
     }
 
-    /// Route a signal posted on this host to the connection of its session.
+    /// Route a signal posted on this host to the connections of its session.
     fn on_signal(&mut self, event: &SignalEvent) {
         let line = match serde_json::to_string(event) {
             Ok(line) => encode(&DaemonFrame::Signal { line }),
@@ -781,15 +792,23 @@ impl Daemon {
         match target {
             Some((session, panel)) => {
                 if let Some(p) = self.panels.get_mut(&panel)
-                    && p.session == session
+                    && p.link.session == session
                 {
                     push_capped(&mut p.signals, line);
-                } else if let Some(client) = self.clients.get_mut(&session) {
-                    push_capped(&mut client.queued, line);
-                    client.flush();
+                } else {
+                    // Main takes a panel's signal only through the host the
+                    // panel runs on, so each of the session's links gets it.
+                    for (_, client) in self
+                        .clients
+                        .iter_mut()
+                        .filter(|(link, _)| link.session == session)
+                    {
+                        push_capped(&mut client.queued, line.clone());
+                        client.flush();
+                    }
                 }
             }
-            // An unbound hook names no session; each session decides whether
+            // An unbound hook names no session; each link decides whether
             // the conversation is one of its panels' sub-agents.
             None => {
                 for client in self.clients.values_mut() {
@@ -827,12 +846,12 @@ impl Daemon {
     }
 
     fn stream(&mut self) {
-        for (session, client) in &mut self.clients {
+        for (link, client) in &mut self.clients {
             if !client.flush() {
                 continue;
             }
             for (id, panel) in self.panels.iter_mut() {
-                if panel.session == *session && !panel.stream(*id, client) {
+                if panel.link == *link && !panel.stream(*id, client) {
                     break;
                 }
             }
@@ -914,7 +933,7 @@ fn remove_worktree(
     }
 }
 
-fn spawn_panel(session: SessionId, spec: &SpawnSpec) -> DPanel {
+fn spawn_panel(link: Link, spec: &SpawnSpec) -> DPanel {
     let mut command = spec.to_command();
     command.cwd = command.cwd.map(home_relative);
     if spec.trust_codex_cwd
@@ -925,12 +944,12 @@ fn spawn_panel(session: SessionId, spec: &SpawnSpec) -> DPanel {
     }
     match LocalPty::spawn(&command, spec.cols, spec.rows) {
         Ok(pty) => {
-            let mut panel = DPanel::new(session, Some(pty));
+            let mut panel = DPanel::new(link, Some(pty));
             panel.sent = Some(0);
             panel
         }
         Err(err) => {
-            let mut panel = DPanel::new(session, None);
+            let mut panel = DPanel::new(link, None);
             panel.append(
                 format!("caucus host: cannot start {}: {err}\r\n", spec.program).as_bytes(),
             );
@@ -983,7 +1002,14 @@ mod tests {
         out
     }
 
-    fn daemon_with_client(session: SessionId) -> (Daemon, mpsc::Receiver<String>) {
+    fn link(session: SessionId, host: &str) -> Link {
+        Link {
+            session,
+            host: host.into(),
+        }
+    }
+
+    fn daemon_with_client(link: Link) -> (Daemon, mpsc::Receiver<String>) {
         let tmp = std::env::temp_dir();
         let (chores_done, _) = mpsc::unbounded_channel();
         let mut daemon = Daemon::new(
@@ -997,7 +1023,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(CONNECTION_QUEUE);
         let (kick, _kicked) = oneshot::channel();
         daemon.clients.insert(
-            session,
+            link,
             Client {
                 conn: 1,
                 tx,
@@ -1013,9 +1039,9 @@ mod tests {
     #[test]
     fn a_panel_signal_waits_for_the_panel_output() {
         let session = SessionId::new();
-        let (mut daemon, mut rx) = daemon_with_client(session);
+        let (mut daemon, mut rx) = daemon_with_client(link(session, "sub-1"));
         let id = PanelId::new();
-        let mut panel = DPanel::new(session, None);
+        let mut panel = DPanel::new(link(session, "sub-1"), None);
         let big = vec![b'x'; OUTPUT_CHUNK * (CONNECTION_QUEUE + 3)];
         panel.append(&big);
         panel.sent = Some(0);
@@ -1058,7 +1084,7 @@ mod tests {
     /// The ring keeps the newest bytes and advances `base` past what it drops.
     #[test]
     fn the_output_ring_keeps_the_newest_bytes() {
-        let mut panel = DPanel::new(SessionId::new(), None);
+        let mut panel = DPanel::new(link(SessionId::new(), "sub-1"), None);
         panel.append(&vec![b'a'; LOG_CAP]);
         panel.append(b"tail");
         assert_eq!(panel.log.len(), LOG_CAP);
@@ -1067,14 +1093,14 @@ mod tests {
         assert!(panel.log.iter().rev().take(4).eq(b"liat".iter()));
     }
 
-    /// A hello for a session that already has a connection replaces it and
-    /// stops every panel of the session from streaming until it re-attaches.
+    /// A hello for a link that already has a connection replaces it and
+    /// stops every panel of the link from streaming until it re-attaches.
     #[test]
     fn a_second_hello_replaces_the_connection_and_pauses_streaming() {
-        let session = SessionId::new();
-        let (mut daemon, _old) = daemon_with_client(session);
+        let ours = link(SessionId::new(), "sub-1");
+        let (mut daemon, _old) = daemon_with_client(ours.clone());
         let id = PanelId::new();
-        let mut panel = DPanel::new(session, None);
+        let mut panel = DPanel::new(ours.clone(), None);
         panel.append(b"before");
         panel.sent = Some(6);
         panel.exit_sent = true;
@@ -1084,7 +1110,7 @@ mod tests {
         let (kick, mut kicked) = oneshot::channel::<()>();
         daemon.on_event(ConnEvent::Hello {
             conn: 2,
-            session,
+            link: ours.clone(),
             tx,
             kick,
         });
@@ -1092,10 +1118,72 @@ mod tests {
             frames(&mut rx).as_slice(),
             [DaemonFrame::Welcome(_), DaemonFrame::Load(_)]
         ));
-        assert_eq!(daemon.clients[&session].conn, 2);
+        assert_eq!(daemon.clients[&ours].conn, 2);
         assert!(kicked.try_recv().is_err(), "the new connection stays open");
         let p = &daemon.panels[&id];
         assert_eq!((p.sent, p.exit_sent), (None, false));
+        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
+    }
+
+    /// A session reaching the daemon through two host entries holds two
+    /// links: either one's hello, frames and replies leave the other alone.
+    #[test]
+    fn two_hosts_of_one_session_are_two_links() {
+        let session = SessionId::new();
+        let (a, b) = (link(session, "gpu-a"), link(session, "gpu-b"));
+        let (mut daemon, mut a_rx) = daemon_with_client(a.clone());
+        let id = PanelId::new();
+        let mut panel = DPanel::new(a.clone(), None);
+        panel.append(b"a's output");
+        panel.sent = Some(0);
+        daemon.panels.insert(id, panel);
+
+        let (tx, mut b_rx) = mpsc::channel(CONNECTION_QUEUE);
+        let (kick, _b_kicked) = oneshot::channel::<()>();
+        daemon.on_event(ConnEvent::Hello {
+            conn: 2,
+            link: b.clone(),
+            tx,
+            kick,
+        });
+        let welcome = frames(&mut b_rx);
+        let [DaemonFrame::Welcome(info), DaemonFrame::Load(_)] = welcome.as_slice() else {
+            panic!("expected welcome and load, got {welcome:?}");
+        };
+        assert!(info.panels.is_empty(), "b is not offered a's panel");
+        assert_eq!(daemon.clients[&a].conn, 1, "b's hello left a connected");
+        assert_eq!(daemon.panels[&id].sent, Some(0), "a's panel still streams");
+
+        daemon.on_event(ConnEvent::Frame {
+            conn: 2,
+            frame: ClientFrame::Kill { panel: id },
+        });
+        assert!(daemon.panels.contains_key(&id), "b cannot kill a's panel");
+        assert!(matches!(
+            frames(&mut b_rx).as_slice(),
+            [DaemonFrame::Error { msg }] if msg.contains("another session or host")
+        ));
+
+        daemon.reply(
+            &a,
+            &DaemonFrame::WorktreeDone {
+                req: 0,
+                result: Ok("/a".into()),
+            },
+        );
+        daemon.pump(Instant::now());
+        let to_a = frames(&mut a_rx);
+        assert!(
+            matches!(
+                to_a.as_slice(),
+                [DaemonFrame::WorktreeDone { .. }, DaemonFrame::Output { .. }]
+            ),
+            "{to_a:?}"
+        );
+        assert!(
+            frames(&mut b_rx).is_empty(),
+            "a's reply and output stay on a"
+        );
         let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 

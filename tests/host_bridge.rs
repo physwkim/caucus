@@ -134,6 +134,7 @@ fn hello(bridge: &mut Bridge, session: SessionId) -> caucus::host::HostInfo {
     bridge.send(&ClientFrame::Hello {
         proto: PROTO_VERSION,
         session,
+        host: "sub-1".into(),
     });
     let info = match bridge.next() {
         DaemonFrame::Welcome(info) => info,
