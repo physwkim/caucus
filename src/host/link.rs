@@ -60,29 +60,35 @@ pub enum Transport {
 }
 
 impl Transport {
-    /// `ssh <destination>` running `<caucus> host bridge` in the remote user's
-    /// login shell, so `caucus` resolves on the PATH their profile sets.
+    /// `ssh <destination>` running `<caucus> host bridge` ([`ssh_args`]).
     pub fn ssh(destination: &str, caucus: &str) -> Self {
-        let bridge = format!("exec {} host bridge", sh_quote_path(caucus));
-        let login = format!("exec \"${{SHELL:-/bin/sh}}\" -lc {}", sh_quote(&bridge));
-        let remote = format!("sh -c {}", sh_quote(&login));
-        let args = [
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ServerAliveInterval=10",
-            "-o",
-            "ServerAliveCountMax=3",
-            "--",
-            destination,
-            &remote,
-        ];
         Self::Command {
             program: "ssh".into(),
-            args: args.into_iter().map(OsString::from).collect(),
+            args: ssh_args(destination, caucus, "host bridge"),
         }
     }
+}
+
+/// `ssh`'s arguments for running `<caucus> <subcommand>` on `destination`, in
+/// the remote user's login shell so `caucus` resolves on the PATH their
+/// profile sets.
+pub fn ssh_args(destination: &str, caucus: &str, subcommand: &str) -> Vec<OsString> {
+    let run = format!("exec {} {subcommand}", sh_quote_path(caucus));
+    let login = format!("exec \"${{SHELL:-/bin/sh}}\" -lc {}", sh_quote(&run));
+    let remote = format!("sh -c {}", sh_quote(&login));
+    let args = [
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=3",
+        "--",
+        destination,
+        &remote,
+    ];
+    args.into_iter().map(OsString::from).collect()
 }
 
 /// Where the link is.

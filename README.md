@@ -202,7 +202,7 @@ caucus --agent-cli codex            # run the main worker on codex instead of
 caucus init [--install-hook]        # create .caucus/; --install-hook writes the
                                     # machine-wide turn-signal script and merges
                                     # the Claude Stop hook
-caucus doctor                       # check caucus version, git + repo, agent CLIs, hook, role allowlists
+caucus doctor                       # check caucus version, git + repo, agent CLIs, hook, role allowlists, sub-hosts
 caucus role list                    # list known roles
 caucus role show <name>             # show one role's full spec
 caucus sessions [--format json]     # list resumable sessions, newest first
@@ -286,6 +286,9 @@ On every host:
 - keep `caucus` on the login shell's `PATH`, since the hook runs it by bare
   name; the `caucus` key only tells main how to start the bridge;
 - install the agent CLIs the roles placed there use.
+
+`caucus doctor` checks each ssh host for these in the login shell the bridge
+starts its daemon from, including a live test of the host's hook.
 
 On `caucus resume`, a panel its host still runs is adopted again with its
 output replayed; any other starts again on its host, resuming its

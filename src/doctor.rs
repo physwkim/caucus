@@ -7,13 +7,26 @@
 //! chain (present in settings, its command runnable on this machine, and a
 //! live end-to-end signal delivery), and every role's `allowed_tools` for the
 //! forbidden `Task` tool (Invariant I-7).
+//!
+//! Each ssh sub-host in `hosts.toml` runs the machine checks itself
+//! (`caucus host doctor`, in the login shell the bridge starts its daemon
+//! from, so its panels' hooks see the same `PATH`), and its protocol version
+//! is compared with this caucus's.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::config::hosts::{HostConfig, HostReach};
+use crate::host::proto::PROTO_VERSION;
+use crate::host::ssh_args;
 
 /// Severity of a single check result.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// Everything is fine.
     Ok,
@@ -24,7 +37,7 @@ pub enum Severity {
 }
 
 /// The outcome of one doctor check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Check {
     /// Short name, e.g. `git` or `role:reviewer`.
     pub name: String,
@@ -59,44 +72,18 @@ impl Report {
 /// Reports the running caucus version (that `caucus` is on `PATH` for the
 /// turn-signal hook, and that the PATH build's version matches the running
 /// one), probes `git` and the agent CLIs (`claude` / `codex`) on
-/// `PATH`, confirms `repo` is a git repository, verifies the Claude `Stop` hook
-/// is installed in `~/.claude/settings.json`, and audits every role's
-/// `allowed_tools` for the forbidden `Task` tool (Invariant I-7).
+/// `PATH`, verifies the Claude `Stop` hook is installed in
+/// `~/.claude/settings.json`, confirms `repo` is a git repository, audits
+/// every role's `allowed_tools` for the forbidden `Task` tool (Invariant
+/// I-7), and checks every sub-host.
 pub fn run(repo: &Path, config: &Config) -> Report {
-    let mut report = Report::default();
+    let mut report = Report {
+        checks: machine_checks(),
+    };
 
-    // Identify the running build first — and confirm `caucus` is on PATH, since
-    // the turn-signal hook script execs it by bare name.
-    report.checks.push(caucus_check());
-
-    // `git` is mandatory — worktree creation/cleanup shell out to it.
-    report.checks.push(binary_check(
-        "git",
-        Severity::Error,
-        "required for worktree creation and commit provenance",
-    ));
-
-    // ...and the cwd must actually be a git repository, or those shell-outs
-    // fail later, confusingly, at the first role spawn.
+    // The cwd must actually be a git repository, or git's shell-outs fail
+    // later, confusingly, at the first role spawn.
     report.checks.push(git_repo_check(repo));
-
-    // The agent CLIs: a missing one is a warning, not fatal — a session may
-    // only use a subset (e.g. claude-only). `caucus` itself still runs.
-    report.checks.push(binary_check(
-        "claude",
-        Severity::Warn,
-        "the default agent backend; required unless every role overrides it",
-    ));
-    report.checks.push(binary_check(
-        "codex",
-        Severity::Warn,
-        "needed for roles with `agent_cli = \"codex\"` (e.g. serious-reviewer)",
-    ));
-
-    // Claude Stop hook — turn-completion signals depend on it (§7). Presence
-    // in settings.json, then the hook command's existence on *this* machine,
-    // then a live end-to-end delivery test.
-    report.checks.extend(stop_hook_checks());
 
     // Role allowlist audit — Invariant I-7: no role may grant `Task`.
     for spec in config.roles.specs() {
@@ -113,7 +100,177 @@ pub fn run(repo: &Path, config: &Config) -> Report {
         }
     }
 
+    report.checks.extend(sub_host_checks(&config.hosts));
     report
+}
+
+/// The checks of this machine as a place panels run: here, and on a sub-host
+/// through [`host_report`].
+fn machine_checks() -> Vec<Check> {
+    let mut checks = vec![
+        // Identify the running build first — and confirm `caucus` is on PATH,
+        // since the turn-signal hook script execs it by bare name.
+        caucus_check(),
+        // `git` is mandatory — worktree creation/cleanup shell out to it.
+        binary_check(
+            "git",
+            Severity::Error,
+            "required for worktree creation and commit provenance",
+        ),
+        // The agent CLIs: a missing one is a warning, not fatal — a session
+        // may only use a subset (e.g. claude-only). `caucus` itself still runs.
+        binary_check(
+            "claude",
+            Severity::Warn,
+            "the default agent backend; required unless every role overrides it",
+        ),
+        binary_check(
+            "codex",
+            Severity::Warn,
+            "needed for roles with `agent_cli = \"codex\"` (e.g. serious-reviewer)",
+        ),
+    ];
+    // Claude Stop hook — turn-completion signals depend on it (§7). Presence
+    // in settings.json, then the hook command's existence on *this* machine,
+    // then a live end-to-end delivery test.
+    checks.extend(stop_hook_checks());
+    checks
+}
+
+/// What `caucus host doctor` prints for a main's `caucus doctor`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HostReport {
+    pub proto: u32,
+    pub version: String,
+    pub checks: Vec<Check>,
+}
+
+/// This machine's checks as a sub-host.
+pub fn host_report() -> HostReport {
+    HostReport {
+        proto: PROTO_VERSION,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        checks: machine_checks(),
+    }
+}
+
+/// How long a sub-host has to answer: an ssh login, then the hook's live
+/// self-test there.
+const SUB_HOST_WAIT: Duration = Duration::from_secs(20);
+
+/// Every sub-host's checks, the hosts asked side by side.
+fn sub_host_checks(hosts: &[HostConfig]) -> Vec<Check> {
+    std::thread::scope(|scope| {
+        let asked: Vec<_> = hosts
+            .iter()
+            .map(|host| scope.spawn(move || sub_host_check(host)))
+            .collect();
+        asked
+            .into_iter()
+            .flat_map(|asked| asked.join().expect("sub-host check panicked"))
+            .collect()
+    })
+}
+
+fn sub_host_check(host: &HostConfig) -> Vec<Check> {
+    match &host.reach {
+        HostReach::Socket(_) => vec![Check {
+            name: format!("host:{}", host.name),
+            severity: Severity::Ok,
+            detail: "a daemon on this machine; its panels run the hook checked above".into(),
+        }],
+        HostReach::Ssh { dest, caucus } => {
+            let mut command = Command::new("ssh");
+            command.args(ssh_args(dest, caucus, "host doctor"));
+            sub_host_report(&host.name, output_within(&mut command, SUB_HOST_WAIT))
+        }
+    }
+}
+
+/// Run `command` to its end, or kill it once `wait` has passed.
+fn output_within(command: &mut Command, wait: Duration) -> Result<Output, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run {:?}: {e}", command.get_program()))?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("no answer within {wait:?}"));
+            }
+            Err(e) => return Err(format!("cannot wait for {:?}: {e}", command.get_program())),
+        }
+    }
+    child.wait_with_output().map_err(|e| e.to_string())
+}
+
+/// `host`'s answer to `caucus host doctor`: a check of the host itself, then
+/// the host's own checks named under it.
+fn sub_host_report(host: &str, answer: Result<Output, String>) -> Vec<Check> {
+    let name = format!("host:{host}");
+    let unchecked = |detail| {
+        vec![Check {
+            name: name.clone(),
+            severity: Severity::Warn,
+            detail,
+        }]
+    };
+    let out = match answer {
+        Ok(out) => out,
+        Err(err) => return unchecked(format!("not checked: {err}")),
+    };
+    // The host user's login profile may print ahead of the report.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let Some(report) = stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<HostReport>(line).ok())
+    else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let why = stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("no output");
+        return unchecked(format!(
+            "`caucus host doctor` there did not report ({}): {why}",
+            out.status
+        ));
+    };
+    let itself = if report.proto == PROTO_VERSION {
+        Check {
+            name: name.clone(),
+            severity: Severity::Ok,
+            detail: format!("caucus v{} there, protocol {PROTO_VERSION}", report.version),
+        }
+    } else {
+        Check {
+            name: name.clone(),
+            severity: Severity::Warn,
+            detail: format!(
+                "caucus v{} there speaks protocol {}, this caucus {PROTO_VERSION}, so the \
+                 host will not connect; install a matching caucus there and stop its old \
+                 daemon",
+                report.version, report.proto
+            ),
+        }
+    };
+    std::iter::once(itself)
+        .chain(report.checks.into_iter().map(|check| Check {
+            name: format!("{name}:{}", check.name),
+            ..check
+        }))
+        .collect()
 }
 
 /// Whether `bin` is resolvable on `PATH`. A bare `which`-style probe walking
@@ -574,7 +731,9 @@ mod tests {
     #[test]
     fn clean_config_has_no_task_warnings() {
         let tmp = TempDir::new().unwrap();
-        let config = Config::load(tmp.path()).unwrap();
+        let mut config = Config::load(tmp.path()).unwrap();
+        // The global hosts.toml would have the test reach real hosts.
+        config.hosts.clear();
         let report = run(tmp.path(), &config);
         assert!(report.checks.iter().all(|c| !c.name.starts_with("role:")));
     }
@@ -621,7 +780,12 @@ mod tests {
     #[test]
     fn run_includes_binary_and_hook_checks() {
         let tmp = TempDir::new().unwrap();
-        let config = Config::load(tmp.path()).unwrap();
+        let mut config = Config::load(tmp.path()).unwrap();
+        config.hosts = vec![HostConfig {
+            name: "box".into(),
+            reach: HostReach::Socket(tmp.path().join("daemon.sock")),
+            dir: tmp.path().join("box"),
+        }];
         let report = run(tmp.path(), &config);
         for expected in [
             "caucus",
@@ -630,6 +794,7 @@ mod tests {
             "claude",
             "codex",
             "claude-stop-hook",
+            "host:box",
         ] {
             assert!(
                 report.checks.iter().any(|c| c.name == expected),
@@ -747,6 +912,92 @@ mod tests {
         assert!(ok, "git init failed in test setup");
         let check = git_repo_check(tmp.path());
         assert_eq!(check.severity, Severity::Ok, "{}", check.detail);
+    }
+
+    fn answer(stdout: &str, stderr: &str, code: i32) -> Result<Output, String> {
+        use std::os::unix::process::ExitStatusExt;
+        Ok(Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        })
+    }
+
+    fn report_line(proto: u32) -> String {
+        serde_json::to_string(&HostReport {
+            proto,
+            version: "9.9.9".into(),
+            checks: vec![
+                Check {
+                    name: "caucus".into(),
+                    severity: Severity::Ok,
+                    detail: "v9.9.9".into(),
+                },
+                Check {
+                    name: "claude-stop-hook".into(),
+                    severity: Severity::Warn,
+                    detail: "no `Stop` hook".into(),
+                },
+            ],
+        })
+        .unwrap()
+    }
+
+    fn summary(checks: &[Check]) -> Vec<(&str, Severity)> {
+        checks
+            .iter()
+            .map(|c| (c.name.as_str(), c.severity))
+            .collect()
+    }
+
+    #[test]
+    fn a_sub_host_report_after_profile_output_names_its_checks_under_the_host() {
+        let stdout = format!("welcome to build-1\n\n{}\n", report_line(PROTO_VERSION));
+        let checks = sub_host_report("build-1", answer(&stdout, "", 0));
+        assert_eq!(
+            summary(&checks),
+            [
+                ("host:build-1", Severity::Ok),
+                ("host:build-1:caucus", Severity::Ok),
+                ("host:build-1:claude-stop-hook", Severity::Warn),
+            ]
+        );
+        assert!(checks[0].detail.contains("v9.9.9"), "{}", checks[0].detail);
+    }
+
+    #[test]
+    fn a_sub_host_on_another_protocol_is_a_warning() {
+        let checks = sub_host_report("build-1", answer(&report_line(PROTO_VERSION + 1), "", 0));
+        assert_eq!(checks[0].severity, Severity::Warn);
+        assert!(
+            checks[0].detail.contains("protocol"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn a_sub_host_without_a_report_says_why() {
+        let checks = sub_host_report(
+            "old",
+            answer(
+                "",
+                "error: unrecognized subcommand 'doctor'\n\nFor more information, try '--help'.\n",
+                2,
+            ),
+        );
+        assert_eq!(summary(&checks), [("host:old", Severity::Warn)]);
+        assert!(checks[0].detail.contains("--help"), "{}", checks[0].detail);
+        let checks = sub_host_report("gone", Err("no answer within 20s".into()));
+        assert_eq!(summary(&checks), [("host:gone", Severity::Warn)]);
+    }
+
+    #[test]
+    fn a_command_past_its_wait_is_killed() {
+        let started = Instant::now();
+        let out = output_within(Command::new("sleep").arg("10"), Duration::from_millis(100));
+        assert!(out.is_err_and(|e| e.contains("within")));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

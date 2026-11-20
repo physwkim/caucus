@@ -25,7 +25,7 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub use link::{HostLink, LinkError, LinkStatus, RemotePty, RemoteSignal, Transport};
+pub use link::{HostLink, LinkError, LinkStatus, RemotePty, RemoteSignal, Transport, ssh_args};
 pub use load::HostLoad;
 pub use proto::{HostInfo, HostPanel};
 

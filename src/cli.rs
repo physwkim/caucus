@@ -317,6 +317,9 @@ pub enum HostCommand {
     Serve(HostPathArgs),
     /// Join stdin/stdout to the daemon, starting it first if none is running.
     Bridge(HostPathArgs),
+    /// Check this host for a main's `caucus doctor`; the report is one JSON
+    /// line.
+    Doctor,
 }
 
 /// Overrides for where the sub-host daemon keeps state and listens.
@@ -384,6 +387,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Some(Command::Host(HostCommand::Bridge(args))) => {
             crate::host::bridge::run(&args.resolve()?)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Host(HostCommand::Doctor)) => {
+            // The leading newline ends a line the login profile printed
+            // without one, as the bridge's does.
+            println!("\n{}", serde_json::to_string(&doctor::host_report())?);
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::McpServe { control_sock }) => run_mcp_serve(&control_sock),
