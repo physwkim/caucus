@@ -656,6 +656,7 @@ impl Inner {
     async fn on_frame(&self, frame: DaemonFrame, signals: &mpsc::UnboundedSender<RemoteSignal>) {
         match frame {
             DaemonFrame::Welcome(_) => warn!(host = %self.name, "unexpected second welcome"),
+            DaemonFrame::Report(_) => warn!(host = %self.name, "unasked doctor report"),
             DaemonFrame::Load(load) => self.lock().load = Some(load),
             DaemonFrame::Spawned { panel } => {
                 if let Some(p) = self.lock().panels.get_mut(&panel) {

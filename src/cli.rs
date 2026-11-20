@@ -317,8 +317,8 @@ pub enum HostCommand {
     Serve(HostPathArgs),
     /// Join stdin/stdout to the daemon, starting it first if none is running.
     Bridge(HostPathArgs),
-    /// Check this host for a main's `caucus doctor`; the report is one JSON
-    /// line.
+    /// Check this host for a main's `caucus doctor`: the running daemon's
+    /// checks, or this process's when none runs; the report is one JSON line.
     Doctor,
 }
 
@@ -392,7 +392,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Some(Command::Host(HostCommand::Doctor)) => {
             // The leading newline ends a line the login profile printed
             // without one, as the bridge's does.
-            println!("\n{}", serde_json::to_string(&doctor::host_report())?);
+            let paths = crate::host::HostPaths::resolve(None, None, None)
+                .context("resolve caucus host paths")?;
+            let report = doctor::host_doctor(&paths).map_err(anyhow::Error::msg)?;
+            println!("\n{}", serde_json::to_string(&report)?);
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::McpServe { control_sock }) => run_mcp_serve(&control_sock),

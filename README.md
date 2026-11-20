@@ -289,8 +289,10 @@ On every host:
   name; the `caucus` key only tells main how to start the bridge;
 - install the agent CLIs the roles placed there use.
 
-`caucus doctor` checks each ssh host for these in the login shell the bridge
-starts its daemon from, including a live test of the host's hook.
+`caucus doctor` has each host's daemon check these in its own environment,
+the one its panels inherit, including a live test of the host's hook; on an
+ssh host with no daemon running yet, `caucus host doctor` checks the login
+shell the bridge would start one from.
 
 On `caucus resume`, a panel its host still runs is adopted again with its
 output replayed; any other starts again on its host, resuming its

@@ -8,11 +8,14 @@
 //! live end-to-end signal delivery), and every role's `allowed_tools` for the
 //! forbidden `Task` tool (Invariant I-7).
 //!
-//! Each ssh sub-host in `hosts.toml` runs the machine checks itself
-//! (`caucus host doctor`, in the login shell the bridge starts its daemon
-//! from, so its panels' hooks see the same `PATH`), and its protocol version
-//! is compared with this caucus's.
+//! Each sub-host in `hosts.toml` has its daemon run the machine checks, in
+//! the environment its panels inherit: a socket host's daemon is asked over
+//! its socket, an ssh host's by `caucus host doctor` there, which runs them
+//! itself when no daemon runs yet, in the login shell a bridge would start
+//! one from. The host's protocol version is compared with this caucus's.
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -21,8 +24,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::config::hosts::{HostConfig, HostReach};
-use crate::host::proto::PROTO_VERSION;
-use crate::host::ssh_args;
+use crate::host::proto::{ClientFrame, DaemonFrame, PROTO_VERSION, encode};
+use crate::host::{HostPaths, ssh_args};
 
 /// Severity of a single check result.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -37,7 +40,7 @@ pub enum Severity {
 }
 
 /// The outcome of one doctor check.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Check {
     /// Short name, e.g. `git` or `role:reviewer`.
     pub name: String,
@@ -137,8 +140,9 @@ fn machine_checks() -> Vec<Check> {
     checks
 }
 
-/// What `caucus host doctor` prints for a main's `caucus doctor`.
-#[derive(Debug, Serialize, Deserialize)]
+/// A sub-host daemon's answer to a doctor request, which `caucus host
+/// doctor` prints for a main's `caucus doctor`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostReport {
     pub proto: u32,
     pub version: String,
@@ -173,17 +177,63 @@ fn sub_host_checks(hosts: &[HostConfig]) -> Vec<Check> {
 }
 
 fn sub_host_check(host: &HostConfig) -> Vec<Check> {
-    match &host.reach {
-        HostReach::Socket(_) => vec![Check {
-            name: format!("host:{}", host.name),
-            severity: Severity::Ok,
-            detail: "a daemon on this machine; its panels run the hook checked above".into(),
-        }],
+    let report = match &host.reach {
+        HostReach::Socket(sock) => UnixStream::connect(sock)
+            .map_err(|e| format!("not checked: no daemon at {}: {e}", sock.display()))
+            .and_then(ask_daemon),
         HostReach::Ssh { dest, caucus } => {
             let mut command = Command::new("ssh");
             command.args(ssh_args(dest, caucus, "host doctor"));
-            sub_host_report(&host.name, output_within(&mut command, SUB_HOST_WAIT))
+            output_within(&mut command, SUB_HOST_WAIT)
+                .map_err(|e| format!("not checked: {e}"))
+                .and_then(printed_report)
         }
+    };
+    sub_host_report(&host.name, report)
+}
+
+/// What `caucus host doctor` prints: the report of the daemon a bridge
+/// reaches through `paths`, or with none running this process's, the binary
+/// and environment the bridge would start one with.
+pub fn host_doctor(paths: &HostPaths) -> Result<HostReport, String> {
+    match UnixStream::connect(&paths.control_sock) {
+        Ok(stream) => ask_daemon(stream),
+        Err(_) => Ok(host_report()),
+    }
+}
+
+/// Send a doctor request on `stream`, a connection to a daemon's control
+/// socket, and read the daemon's report.
+fn ask_daemon(mut stream: UnixStream) -> Result<HostReport, String> {
+    let failed = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            format!("the daemon gave no report within {SUB_HOST_WAIT:?}")
+        }
+        _ => format!("doctor request to the daemon failed: {e}"),
+    };
+    stream
+        .set_read_timeout(Some(SUB_HOST_WAIT))
+        .map_err(failed)?;
+    stream
+        .set_write_timeout(Some(SUB_HOST_WAIT))
+        .map_err(failed)?;
+    stream
+        .write_all(encode(&ClientFrame::Doctor).as_bytes())
+        .map_err(failed)?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(failed)?;
+    match serde_json::from_str::<DaemonFrame>(&line) {
+        Ok(DaemonFrame::Report(report)) => Ok(report),
+        Ok(DaemonFrame::Error { msg }) => {
+            Err(format!("the daemon refused a doctor request: {msg}"))
+        }
+        Ok(other) => Err(format!(
+            "the daemon answered a doctor request with {other:?}"
+        )),
+        Err(_) if line.is_empty() => Err("the daemon closed without a report".into()),
+        Err(e) => Err(format!("unreadable report from the daemon: {e}")),
     }
 }
 
@@ -234,39 +284,43 @@ fn read_back(pipe: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
     pipe.and_then(|pipe| pipe.join().ok()).unwrap_or_default()
 }
 
-/// `host`'s answer to `caucus host doctor`: a check of the host itself, then
-/// the host's own checks named under it.
-fn sub_host_report(host: &str, answer: Result<Output, String>) -> Vec<Check> {
-    let name = format!("host:{host}");
-    let unchecked = |detail| {
-        vec![Check {
-            name: name.clone(),
-            severity: Severity::Warn,
-            detail,
-        }]
-    };
-    let out = match answer {
-        Ok(out) => out,
-        Err(err) => return unchecked(format!("not checked: {err}")),
-    };
-    // The host user's login profile may print ahead of the report.
+/// The report `caucus host doctor` printed in `out`, after anything the host
+/// user's login profile printed ahead of it.
+fn printed_report(out: Output) -> Result<HostReport, String> {
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let Some(report) = stdout
+    if let Some(report) = stdout
         .lines()
         .rev()
         .find_map(|line| serde_json::from_str::<HostReport>(line).ok())
-    else {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let why = stderr
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("no output");
-        return unchecked(format!(
-            "`caucus host doctor` there did not report ({}): {why}",
-            out.status
-        ));
+    {
+        return Ok(report);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let why = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no output");
+    Err(format!(
+        "`caucus host doctor` there did not report ({}): {why}",
+        out.status
+    ))
+}
+
+/// `host`'s daemon's report: a check of the host itself, then the host's own
+/// checks named under it; or why there is none.
+fn sub_host_report(host: &str, report: Result<HostReport, String>) -> Vec<Check> {
+    let name = format!("host:{host}");
+    let report = match report {
+        Ok(report) => report,
+        Err(detail) => {
+            return vec![Check {
+                name,
+                severity: Severity::Warn,
+                detail,
+            }];
+        }
     };
     let itself = if report.proto == PROTO_VERSION {
         Check {
@@ -990,7 +1044,7 @@ mod tests {
     #[test]
     fn a_sub_host_report_after_profile_output_names_its_checks_under_the_host() {
         let stdout = format!("welcome to build-1\n\n{}\n", report_line(PROTO_VERSION));
-        let checks = sub_host_report("build-1", answer(&stdout, "", 0));
+        let checks = sub_host_report("build-1", answer(&stdout, "", 0).and_then(printed_report));
         assert_eq!(
             summary(&checks),
             [
@@ -1004,7 +1058,10 @@ mod tests {
 
     #[test]
     fn a_sub_host_on_another_protocol_is_a_warning() {
-        let checks = sub_host_report("build-1", answer(&report_line(PROTO_VERSION + 1), "", 0));
+        let checks = sub_host_report(
+            "build-1",
+            answer(&report_line(PROTO_VERSION + 1), "", 0).and_then(printed_report),
+        );
         assert_eq!(checks[0].severity, Severity::Warn);
         assert!(
             checks[0].detail.contains("protocol"),
@@ -1021,7 +1078,8 @@ mod tests {
                 "",
                 "error: unrecognized subcommand 'doctor'\n\nFor more information, try '--help'.\n",
                 2,
-            ),
+            )
+            .and_then(printed_report),
         );
         assert_eq!(summary(&checks), [("host:old", Severity::Warn)]);
         assert!(checks[0].detail.contains("--help"), "{}", checks[0].detail);

@@ -252,8 +252,12 @@ async fn connection(conn: u64, stream: UnixStream, events: mpsc::Sender<ConnEven
             .await;
             return;
         }
+        Ok(ClientFrame::Doctor) => {
+            report(write).await;
+            return;
+        }
         _ => {
-            refuse(write, "first frame must be hello".into()).await;
+            refuse(write, "first frame must be hello or doctor".into()).await;
             return;
         }
     };
@@ -291,6 +295,17 @@ async fn connection(conn: u64, stream: UnixStream, events: mpsc::Sender<ConnEven
         }
     }
     let _ = events.send(ConnEvent::Closed { conn }).await;
+}
+
+/// Answer a doctor request with checks run in this process, whose
+/// environment every panel the daemon spawns inherits.
+async fn report(mut write: OwnedWriteHalf) {
+    let Ok(report) = tokio::task::spawn_blocking(crate::doctor::host_report).await else {
+        return;
+    };
+    let _ = write
+        .write_all(encode(&DaemonFrame::Report(report)).as_bytes())
+        .await;
 }
 
 async fn refuse(mut write: OwnedWriteHalf, msg: String) {
@@ -814,6 +829,15 @@ impl Daemon {
                 );
                 return;
             }
+            ClientFrame::Doctor => {
+                self.reply(
+                    &link,
+                    &DaemonFrame::Error {
+                        msg: "doctor is only a connection's first frame".into(),
+                    },
+                );
+                return;
+            }
             ClientFrame::AddWorktree {
                 req,
                 repo,
@@ -860,6 +884,7 @@ impl Daemon {
                 panel: Some(panel), ..
             } => *panel,
             ClientFrame::Hello { .. }
+            | ClientFrame::Doctor
             | ClientFrame::AddWorktree { .. }
             | ClientFrame::RemoveWorktree { .. }
             | ClientFrame::SignalsSeen { panel: None, .. } => unreachable!("answered above"),
@@ -875,6 +900,7 @@ impl Daemon {
         }
         match frame {
             ClientFrame::Hello { .. }
+            | ClientFrame::Doctor
             | ClientFrame::AddWorktree { .. }
             | ClientFrame::RemoveWorktree { .. }
             | ClientFrame::SignalsSeen { panel: None, .. } => unreachable!("answered above"),

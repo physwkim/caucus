@@ -25,6 +25,7 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::load::HostLoad;
+use crate::doctor::HostReport;
 use crate::pty::PtyCommand;
 use crate::session::id::{PanelId, SessionId};
 
@@ -133,6 +134,11 @@ pub enum ClientFrame {
         session: SessionId,
         host: String,
     },
+    /// In place of hello: ask for the daemon's checks, run in the
+    /// environment its panels inherit. The daemon answers with a report and
+    /// closes the connection. It carries no protocol, so the report can tell
+    /// a main the daemon's.
+    Doctor,
     /// Start `spec` as `panel`. Idempotent per panel id: a client that resends
     /// an unconfirmed spawn after a reconnect gets the existing panel.
     Spawn { panel: PanelId, spec: SpawnSpec },
@@ -216,6 +222,8 @@ pub struct HostPanel {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum DaemonFrame {
     Welcome(HostInfo),
+    /// The answer to a doctor request.
+    Report(HostReport),
     /// The host's load, sent after the welcome and then periodically.
     Load(HostLoad),
     /// The daemon now owns `panel` (a failed launch included: its error is in
