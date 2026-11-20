@@ -21,6 +21,11 @@ const DAEMON_START_WAIT: Duration = Duration::from_secs(5);
 /// Connect to the daemon (starting it if needed) and copy bytes both ways
 /// until either side closes.
 pub fn run(paths: &HostPaths) -> Result<()> {
+    // Ends a line the login profile printed without one, so the daemon's
+    // first frame starts a line of its own.
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
     let stream = connect_or_start(paths)?;
     let mut to_daemon = stream.try_clone().context("clone daemon socket")?;
     let mut from_daemon = stream;
@@ -29,7 +34,7 @@ pub fn run(paths: &HostPaths) -> Result<()> {
         // Main went away: tell the daemon this connection is done.
         let _ = to_daemon.shutdown(std::net::Shutdown::Write);
     });
-    copy_flushing(&mut from_daemon, &mut io::stdout().lock())?;
+    copy_flushing(&mut from_daemon, &mut stdout)?;
     Ok(())
 }
 

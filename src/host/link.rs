@@ -755,21 +755,37 @@ async fn handshake(conn: &mut Conn, session: SessionId) -> Result<HostInfo, Stri
         .flush()
         .await
         .map_err(|e| format!("send hello: {e}"))?;
+    // The host user's login profile may print ahead of the bridge; whatever
+    // is not a frame before the welcome is its output, skipped.
     let mut line = String::new();
-    match read_capped_line(&mut conn.reader, &mut line, MAX_FRAME_BYTES).await {
-        Ok(CappedLine::Line) => {}
-        Ok(_) => return Err("closed before welcome".into()),
-        Err(err) => return Err(format!("read welcome: {err}")),
-    }
-    match serde_json::from_str::<DaemonFrame>(&line) {
-        Ok(DaemonFrame::Welcome(info)) if info.proto == PROTO_VERSION => Ok(info),
-        Ok(DaemonFrame::Welcome(info)) => Err(format!(
+    let mut printed = None;
+    let frame = loop {
+        match read_capped_line(&mut conn.reader, &mut line, MAX_FRAME_BYTES).await {
+            Ok(CappedLine::Line) => {}
+            Ok(CappedLine::TooLong) => continue,
+            Ok(CappedLine::Eof) => {
+                return Err(match printed {
+                    Some(printed) => format!("closed before welcome, after printing {printed:?}"),
+                    None => "closed before welcome".into(),
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(err) => return Err(format!("read welcome: {err}")),
+        }
+        match serde_json::from_str::<DaemonFrame>(&line) {
+            Ok(frame) => break frame,
+            Err(_) if line.trim().is_empty() => {}
+            Err(_) => printed = Some(std::mem::take(&mut line)),
+        }
+    };
+    match frame {
+        DaemonFrame::Welcome(info) if info.proto == PROTO_VERSION => Ok(info),
+        DaemonFrame::Welcome(info) => Err(format!(
             "host speaks protocol {}, this caucus {PROTO_VERSION}",
             info.proto
         )),
-        Ok(DaemonFrame::Error { msg }) => Err(msg),
-        Ok(other) => Err(format!("expected welcome, got {other:?}")),
-        Err(err) => Err(format!("unreadable welcome: {err}")),
+        DaemonFrame::Error { msg } => Err(msg),
+        other => Err(format!("expected welcome, got {other:?}")),
     }
 }
 

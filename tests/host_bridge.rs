@@ -10,6 +10,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use caucus::host::proto::{Bytes, ClientFrame, DaemonFrame, PROTO_VERSION, SpawnSpec};
+use caucus::host::{HostLink, Transport};
 use caucus::session::id::{PanelId, SessionId};
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -37,7 +38,12 @@ impl Bridge {
         let (tx, frames) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
-                let frame = serde_json::from_str(&line.unwrap()).unwrap();
+                let line = line.unwrap();
+                // The bridge starts with an empty line (see `bridge::run`).
+                if line.is_empty() {
+                    continue;
+                }
+                let frame = serde_json::from_str(&line).unwrap();
                 if tx.send(frame).is_err() {
                     return;
                 }
@@ -205,4 +211,32 @@ fn a_bridge_starts_the_daemon_once_and_runs_panels_behind_it() {
         assert!(Instant::now() < deadline, "SIGTERM did not stop the daemon");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A login profile that prints ahead of the bridge, a last line without its
+/// newline included, does not keep main from connecting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_login_profile_printing_before_the_bridge_does_not_stop_the_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _daemon = DaemonGuard {
+        lock: tmp.path().join("state").join("daemon.lock"),
+    };
+    let profile_then_bridge = "printf 'Agent pid 1\\npartial'; \
+        exec \"$0\" host bridge --state-dir \"$1\" --control-sock \"$2\" --signal-sock \"$3\"";
+    let transport = Transport::Command {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            profile_then_bridge.into(),
+            env!("CARGO_BIN_EXE_caucus").into(),
+            tmp.path().join("state").into(),
+            tmp.path().join("ctl").join("daemon.sock").into(),
+            tmp.path().join("signal.sock").into(),
+        ],
+    };
+    let (tx, _signals) = tokio::sync::mpsc::unbounded_channel();
+    let link = HostLink::connect("chatty", SessionId::new(), transport, tx);
+    let connected = link.wait_connected(WAIT).await;
+    link.close(WAIT).await;
+    connected.unwrap();
 }
