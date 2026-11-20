@@ -428,6 +428,8 @@ struct DPanel {
     /// The last [`LOG_CAP`] output bytes; `log[0]` is byte `base`.
     log: VecDeque<u8>,
     base: u64,
+    /// The modes the bytes before `base` set.
+    dropped: PrivateModes,
     /// Next byte to send, while the link's connection has attached the panel.
     /// `None` until it attaches.
     sent: Option<u64>,
@@ -447,6 +449,7 @@ impl DPanel {
             pty,
             log: VecDeque::new(),
             base: 0,
+            dropped: PrivateModes::default(),
             sent: None,
             life: Life::Running,
             exit_sent: false,
@@ -463,6 +466,10 @@ impl DPanel {
         self.log.extend(bytes);
         let over = self.log.len().saturating_sub(LOG_CAP);
         if over > 0 {
+            let (front, back) = self.log.as_slices();
+            let in_front = over.min(front.len());
+            self.dropped.advance(&front[..in_front]);
+            self.dropped.advance(&back[..over - in_front]);
             self.log.drain(..over);
             self.base += over as u64;
         }
@@ -475,7 +482,19 @@ impl DPanel {
             return true;
         };
         if sent < self.base {
-            warn!(panel = %id, lost = self.base - sent, "client fell behind the output ring");
+            if !client.has_room() {
+                return false;
+            }
+            // The client's grid misses bytes it can never get back: it is
+            // told the modes they set, and a size change makes the agent
+            // repaint its screen.
+            warn!(panel = %id, lost = self.base - sent, "client missed output the ring dropped");
+            client.send_now(&DaemonFrame::Skipped {
+                panel: id,
+                to: self.base,
+                modes: self.dropped.set.clone(),
+            });
+            jiggle(self);
             sent = self.base;
         }
         while sent < self.end() {
@@ -529,6 +548,36 @@ impl DPanel {
             && let Err(err) = pty.write(&data[skip..])
         {
             warn!(panel = %id, error = %err, "input to a sub-host panel was dropped");
+        }
+    }
+}
+
+/// The DEC private modes (`CSI ? Pn h` / `l`) a byte stream set, read as a
+/// panel's grid reads them.
+#[derive(Default)]
+struct PrivateModes {
+    parser: vte::Parser,
+    /// Each mode's last setting, in the order made: replayed in this order,
+    /// modes that act on one another (the alternate screens) end as they did.
+    set: Vec<(u16, bool)>,
+}
+
+impl PrivateModes {
+    fn advance(&mut self, bytes: &[u8]) {
+        self.parser.advance(&mut ModeSettings(&mut self.set), bytes);
+    }
+}
+
+struct ModeSettings<'a>(&'a mut Vec<(u16, bool)>);
+
+impl vte::Perform for ModeSettings<'_> {
+    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], _: bool, action: char) {
+        if intermediates.first() != Some(&b'?') || !matches!(action, 'h' | 'l') {
+            return;
+        }
+        for &mode in params.iter().flatten() {
+            self.0.retain(|&(set, _)| set != mode);
+            self.0.push((mode, action == 'h'));
         }
     }
 }
@@ -848,14 +897,7 @@ impl Daemon {
             }
             ClientFrame::Attach { panel, from } => match self.panels.get_mut(&panel) {
                 Some(p) => {
-                    let from = from.min(p.end());
-                    if from < p.base {
-                        // The client's grid lost bytes it can never get back;
-                        // a size change makes the agent repaint its screen.
-                        warn!(%panel, lost = p.base - from, "re-attach past the output ring");
-                        jiggle(p);
-                    }
-                    p.sent = Some(from.max(p.base));
+                    p.sent = Some(from.min(p.end()));
                     p.exit_sent = false;
                     p.signals.rewind();
                 }
@@ -1205,6 +1247,36 @@ mod tests {
         assert_eq!(panel.base, 4);
         assert_eq!(panel.end(), LOG_CAP as u64 + 4);
         assert!(panel.log.iter().rev().take(4).eq(b"liat".iter()));
+    }
+
+    /// A client behind the ring is told what it missed before the output
+    /// goes on: where, and the modes the dropped bytes set, in the order set,
+    /// a sequence split across writes included.
+    #[test]
+    fn a_client_behind_the_ring_gets_the_modes_it_missed() {
+        let ours = link(SessionId::new(), "sub-1");
+        let (mut daemon, mut rx) = daemon_with_client(ours.clone());
+        let id = PanelId::new();
+        let mut panel = DPanel::new(ours, None);
+        panel.append(b"\x1b[?1049h\x1b[?2004h\x1b[?10");
+        panel.append(b"49l\x1b[?47h");
+        panel.append(&vec![b'x'; LOG_CAP]);
+        panel.sent = Some(0);
+        let base = panel.base;
+        daemon.panels.insert(id, panel);
+
+        daemon.pump(Instant::now());
+        let sent = frames(&mut rx);
+        assert_eq!(
+            sent[0],
+            DaemonFrame::Skipped {
+                panel: id,
+                to: base,
+                modes: vec![(2004, true), (1049, false), (47, true)],
+            }
+        );
+        assert!(matches!(sent[1], DaemonFrame::Output { offset, .. } if offset == base));
+        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
     }
 
     /// A hello for a link that already has a connection replaces it and

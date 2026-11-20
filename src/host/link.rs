@@ -645,6 +645,27 @@ impl Inner {
                 bytes.drain(..skip);
                 let _ = out.send(Chunk::Data(bytes)).await;
             }
+            DaemonFrame::Skipped { panel, to, modes } => {
+                let out = {
+                    let mut state = self.lock();
+                    let Some(p) = state.panels.get_mut(&panel) else {
+                        return;
+                    };
+                    if to <= p.next {
+                        return;
+                    }
+                    warn!(host = %self.name, %panel, lost = to - p.next, "sub-host output dropped unread");
+                    p.next = to;
+                    p.out.clone()
+                };
+                // The grid takes the modes as the dropped bytes would have
+                // set them.
+                let replay: String = modes
+                    .iter()
+                    .map(|&(mode, on)| format!("\x1b[?{mode}{}", if on { 'h' } else { 'l' }))
+                    .collect();
+                let _ = out.send(Chunk::Data(replay.into_bytes())).await;
+            }
             DaemonFrame::Exited { panel, reason } => {
                 let out = {
                     let mut state = self.lock();

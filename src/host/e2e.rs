@@ -791,6 +791,67 @@ async fn an_adopted_panel_takes_input_after_what_it_took_before() {
     host.stop().await;
 }
 
+/// A panel adopted after its first output left the host's ring still holds
+/// the terminal modes that output set: bracketed paste, which marks an agent
+/// ready for a prompt, and the alternate screen.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_adopted_panel_keeps_the_modes_its_dropped_output_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(&tmp);
+    let mut host = TestDaemon::start(&paths).await;
+    let session = SessionId::new();
+    let (before, _signals) = link(&paths, session);
+    before.wait_connected(WAIT).await.unwrap();
+    let flooded = tmp.path().join("flooded");
+    let panel = PanelId::new();
+    let _unread = before
+        .spawn(
+            panel,
+            &sh(&format!(
+                "printf '\\033[?2004h\\033[?1049h'; head -c 9000000 /dev/zero | tr '\\0' x; \
+                 touch {}; printf flooded; sleep 60",
+                flooded.display()
+            )),
+            80,
+            24,
+            false,
+        )
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while !flooded.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the panel never flooded its ring"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    before.close(WAIT).await;
+
+    let (after, _signals) = link(&paths, session);
+    after.wait_connected(WAIT).await.unwrap();
+    let mut pty = after.adopt(panel, 80, 24).unwrap();
+    let mut grid = crate::term::grid::Grid::new(80, 24);
+    let mut tail = Vec::new();
+    let deadline = Instant::now() + WAIT;
+    while !tail.ends_with(b"flooded") {
+        assert!(
+            Instant::now() < deadline,
+            "the adopted panel never replayed its tail"
+        );
+        let bytes = pty.read().unwrap();
+        grid.advance(&bytes);
+        tail.extend(bytes);
+        let keep = tail.len().saturating_sub(16);
+        tail.drain(..keep);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(grid.bracketed_paste());
+    assert!(grid.on_alt_screen());
+
+    after.close(WAIT).await;
+    host.stop().await;
+}
+
 /// Two host entries reaching one daemon are two links: neither's connection
 /// replaces the other's, and each panel answers through its own.
 #[tokio::test(flavor = "multi_thread")]

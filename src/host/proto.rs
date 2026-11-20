@@ -5,7 +5,9 @@
 //! frame carries its starting offset, and a client that lost its link asks
 //! for the stream again from the first byte it has not seen
 //! ([`ClientFrame::Attach`]), so a reconnect replays exactly the missing
-//! bytes into the panel's grid.
+//! bytes into the panel's grid. Bytes the daemon dropped before the client
+//! saw them are named in a [`DaemonFrame::Skipped`], with the terminal modes
+//! they set.
 //!
 //! Input and signals cross the same way: main numbers a panel's input bytes
 //! from its spawn and re-sends from the first byte the welcome says the host
@@ -28,7 +30,7 @@ use crate::session::id::{PanelId, SessionId};
 
 /// Bumped on any incompatible frame change; a daemon refuses a client
 /// speaking another version instead of misreading its frames.
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 
 /// Longest line either side reads. Input frames carry whole pastes and spawn
 /// frames carry the role prompt, so this sits well above the signal socket's
@@ -214,13 +216,20 @@ pub enum DaemonFrame {
     Spawned {
         panel: PanelId,
     },
-    /// `data` is the panel's output starting at byte `offset`. An offset past
-    /// the client's next expected byte means the daemon no longer holds the
-    /// bytes in between.
+    /// `data` is the panel's output starting at byte `offset`.
     Output {
         panel: PanelId,
         offset: u64,
         data: Bytes,
+    },
+    /// The daemon dropped `panel`'s output before byte `to` that the client
+    /// had not seen; output goes on from `to`. `modes` is each DEC private
+    /// mode (`CSI ? Pn h` / `l`) the dropped bytes set, at its last setting,
+    /// in the order the settings were made.
+    Skipped {
+        panel: PanelId,
+        to: u64,
+        modes: Vec<(u16, bool)>,
     },
     /// The panel's process is gone. Sent once all of its output was sent.
     Exited {
