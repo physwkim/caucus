@@ -33,7 +33,7 @@ use crate::mcp::HostSummary;
 use crate::session::id::AgentId;
 use crate::signal::{SignalEvent, StopDirective};
 use crate::worktree::cleanup::{WorktreeOwner, record_removal};
-use crate::worktree::remote::fetch_branch;
+use crate::worktree::remote::LocalBranch;
 
 /// How long shutdown waits for each host to take its panels' kills.
 const HOST_CLOSE_WAIT: Duration = Duration::from_secs(3);
@@ -142,7 +142,9 @@ async fn fetch_left_lane(
     agent_id: AgentId,
     turns: Vec<Option<String>>,
 ) {
-    if let Err(err) = within(fetch_branch(&here, url, &branch)).await {
+    // Held until the turns are recorded against what this fetch landed.
+    let local = LocalBranch::hold(&here, &branch).await;
+    if let Err(err) = within(local.fetch(url)).await {
         warn!(%host, %branch, unrecorded_turns = turns.len(), error = %err, "sub-host lane branch not fetched");
         return;
     }
@@ -372,7 +374,8 @@ impl Multiplexer {
         let here = self.session.repo_path.clone();
         let (tx, rx) = oneshot::channel();
         self.spawn_host_task(async move {
-            let _ = tx.send(within(fetch_branch(&here, &repo.url, &branch)).await);
+            let local = LocalBranch::hold(&here, &branch).await;
+            let _ = tx.send(within(local.fetch(&repo.url)).await);
         });
         if let Some(lane) = self.hosts.lane_fetches.get_mut(&panel_id) {
             lane.running = Some(RunningFetch {

@@ -6,10 +6,14 @@
 //! on: an ssh password or host-key prompt fails the push or fetch instead of
 //! writing over the TUI and waiting for input it can never get.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
+
+use tokio::sync::OwnedMutexGuard;
 
 /// Create `branch` in the repo at `url` at this repo's `HEAD`. Refused if the
 /// host already has `branch` somewhere else.
@@ -28,21 +32,57 @@ pub(crate) async fn push_head(repo: &Path, url: &OsStr, branch: &str) -> Result<
     .await
 }
 
-/// Set this repo's `branch` to the host's `branch`, whatever it was here.
-pub(crate) async fn fetch_branch(repo: &Path, url: &OsStr, branch: &str) -> Result<(), String> {
-    git(
-        repo,
-        [
-            OsStr::new("fetch"),
-            OsStr::new("--quiet"),
-            OsStr::new("--no-tags"),
-            OsStr::new("--no-write-fetch-head"),
-            OsStr::new("--"),
-            url,
-            OsStr::new(&format!("+refs/heads/{branch}:refs/heads/{branch}")),
-        ],
-    )
-    .await
+/// A branch of this repo, held so that no other fetch into it runs
+/// meanwhile: two at once fight over the ref, and the loser fails.
+pub(crate) struct LocalBranch {
+    repo: PathBuf,
+    branch: String,
+    _held: OwnedMutexGuard<()>,
+}
+
+impl LocalBranch {
+    /// Hold `repo`'s `branch` once every earlier holder lets go.
+    pub(crate) async fn hold(repo: &Path, branch: &str) -> Self {
+        type Held = HashMap<(PathBuf, String), Weak<tokio::sync::Mutex<()>>>;
+        static HELD: LazyLock<Mutex<Held>> = LazyLock::new(Mutex::default);
+        let key = (repo.to_path_buf(), branch.to_string());
+        let lock = {
+            let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+            held.retain(|_, lock| lock.strong_count() > 0);
+            match held.get(&key).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    held.insert(key, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        Self {
+            repo: repo.to_path_buf(),
+            branch: branch.to_string(),
+            _held: lock.lock_owned().await,
+        }
+    }
+
+    /// Set this branch to the host's branch of the same name, whatever it
+    /// was here.
+    pub(crate) async fn fetch(&self, url: &OsStr) -> Result<(), String> {
+        let branch = &self.branch;
+        git(
+            &self.repo,
+            [
+                OsStr::new("fetch"),
+                OsStr::new("--quiet"),
+                OsStr::new("--no-tags"),
+                OsStr::new("--no-write-fetch-head"),
+                OsStr::new("--"),
+                url,
+                OsStr::new(&format!("+refs/heads/{branch}:refs/heads/{branch}")),
+            ],
+        )
+        .await
+    }
 }
 
 async fn git<'a>(repo: &Path, args: impl IntoIterator<Item = &'a OsStr>) -> Result<(), String> {
@@ -115,7 +155,11 @@ mod tests {
         let url = OsStr::new("-x");
         for err in [
             push_head(&here, url, "b").await.unwrap_err(),
-            fetch_branch(&here, url, "b").await.unwrap_err(),
+            LocalBranch::hold(&here, "b")
+                .await
+                .fetch(url)
+                .await
+                .unwrap_err(),
         ] {
             assert!(!err.contains("unknown switch"), "{err}");
         }
@@ -153,12 +197,46 @@ mod tests {
             ],
         )
         .unwrap();
-        fetch_branch(&here, url, "caucus/x/lane-1").await.unwrap();
+        let lane = LocalBranch::hold(&here, "caucus/x/lane-1").await;
+        lane.fetch(url).await.unwrap();
         assert_eq!(rev(&here, "caucus/x/lane-1"), rev(&there, "main"));
 
-        let err = fetch_branch(&here, url, "caucus/x/absent")
+        let err = LocalBranch::hold(&here, "caucus/x/absent")
+            .await
+            .fetch(url)
             .await
             .unwrap_err();
         assert!(err.starts_with("git fetch failed"), "{err}");
+    }
+
+    /// A lane's branch fetched twice at once, as when a panel goes while its
+    /// last turn's fetch still runs and the disposer fetches again: both
+    /// land, whichever starts first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetches_of_one_branch_at_once_both_land() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (here, there) = (tmp.path().join("here"), tmp.path().join("there"));
+        git_init(&here);
+        git_init(&there);
+        run_git(&here, &["checkout".into(), "-q".into(), "--detach".into()]).unwrap();
+        let url = there.as_os_str();
+        for turn in 0..10 {
+            run_git(
+                &there,
+                &[
+                    "commit".into(),
+                    "-q".into(),
+                    "--allow-empty".into(),
+                    "-m".into(),
+                    format!("turn {turn}"),
+                ],
+            )
+            .unwrap();
+            let fetch = || async { LocalBranch::hold(&here, "main").await.fetch(url).await };
+            let (a, b) = tokio::join!(fetch(), fetch());
+            a.unwrap();
+            b.unwrap();
+            assert_eq!(rev(&here, "refs/heads/main"), rev(&there, "main"));
+        }
     }
 }
