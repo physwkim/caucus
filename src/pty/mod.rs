@@ -1,17 +1,22 @@
 //! PTY layer: a thin wrapper over `portable-pty` — one PTY per panel.
 //! See `docs/design.md` §0 #3, §9.
 //!
-//! **Invariant I-5** (`docs/design.md` §12): PTYs are created and destroyed
-//! only by `Pty::spawn` / `Pty::kill`. No module calls `openpty`/`fork`
-//! directly.
+//! A panel holds a [`Pty`], which is either a [`LocalPty`] on this machine or
+//! a [`RemotePty`](crate::host::RemotePty) whose [`LocalPty`] lives in a
+//! sub-host's `caucus host serve` daemon. Both answer the same calls, so the
+//! panel, grid and capture code never branch on where the agent runs.
 //!
-//! Layout: `Pty::spawn` opens a PTY pair, spawns the child on the slave,
+//! **Invariant I-5** (`docs/design.md` §12): PTYs are created and destroyed
+//! only by `LocalPty::spawn` / `LocalPty::kill`, on whichever host runs them.
+//! No module calls `openpty`/`fork` directly.
+//!
+//! Layout: `LocalPty::spawn` opens a PTY pair, spawns the child on the slave,
 //! drops the slave, and starts two threads: a *reader* thread draining the
 //! master reader into an `mpsc` channel, and a *writer* thread draining a
-//! second `mpsc` channel into the master writer. `Pty::read` non-blockingly
-//! drains the reader channel; `Pty::write` non-blockingly *enqueues* onto the
+//! second `mpsc` channel into the master writer. `read` non-blockingly
+//! drains the reader channel; `write` non-blockingly *enqueues* onto the
 //! writer channel (`docs/design.md` §0 #11, the fully bidirectional input
-//! path); `Pty::kill` kills the child and joins both threads so no fd or
+//! path); `kill` kills the child and joins both threads so no fd or
 //! thread leaks.
 //!
 //! The writer thread exists so the blocking `write_all` to the PTY master
@@ -133,7 +138,7 @@ pub enum PtyError {
 
 /// One pseudo-terminal owning a child agent process (`docs/design.md` §9.1,
 /// Invariant I-5).
-pub struct Pty {
+pub struct LocalPty {
     size: PtySize,
     /// Master side of the PTY pair. Owns the master fd; used for `resize`.
     /// `None` after `kill` drops it. Held as an `Option` so `kill` can close it
@@ -165,7 +170,7 @@ pub struct Pty {
     writer: Option<JoinHandle<()>>,
 }
 
-impl Pty {
+impl LocalPty {
     /// Max chunks buffered between the reader thread and the event loop before
     /// back-pressure kicks in. The event loop drains the whole queue every tick
     /// (~4 ms), so this only fills when the loop stalls; at 8 KiB/chunk it caps
@@ -433,11 +438,76 @@ impl Pty {
     }
 }
 
-impl Drop for Pty {
-    /// Backstop teardown: if a `Pty` is dropped without an explicit `kill`,
-    /// still kill the child and join the reader thread so nothing leaks.
+impl Drop for LocalPty {
+    /// Backstop teardown: if a `LocalPty` is dropped without an explicit
+    /// `kill`, still kill the child and join the reader thread so nothing leaks.
     fn drop(&mut self) {
         let _ = self.kill();
+    }
+}
+
+/// A panel's terminal: a PTY on this machine, or one owned by a sub-host
+/// daemon and reached over its [`HostLink`](crate::host::HostLink).
+pub enum Pty {
+    Local(LocalPty),
+    Remote(crate::host::RemotePty),
+}
+
+impl Pty {
+    /// Spawn `command` in a local PTY sized `cols x rows`.
+    pub(crate) fn spawn(command: &PtyCommand, cols: u16, rows: u16) -> Result<Self, PtyError> {
+        LocalPty::spawn(command, cols, rows).map(Pty::Local)
+    }
+
+    /// The sub-host this PTY runs on, or `None` for a local one.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Pty::Local(_) => None,
+            Pty::Remote(remote) => Some(remote.host()),
+        }
+    }
+
+    /// Current PTY size, `(cols, rows)`.
+    pub fn size(&self) -> (u16, u16) {
+        match self {
+            Pty::Local(local) => local.size(),
+            Pty::Remote(remote) => remote.size(),
+        }
+    }
+
+    pub(crate) fn read(&mut self) -> Result<Vec<u8>, PtyError> {
+        match self {
+            Pty::Local(local) => local.read(),
+            Pty::Remote(remote) => remote.read(),
+        }
+    }
+
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
+        match self {
+            Pty::Local(local) => local.write(bytes),
+            Pty::Remote(remote) => remote.write(bytes),
+        }
+    }
+
+    pub(crate) fn is_alive(&mut self) -> bool {
+        match self {
+            Pty::Local(local) => local.is_alive(),
+            Pty::Remote(remote) => remote.is_alive(),
+        }
+    }
+
+    pub(crate) fn resize(&mut self, cols: u16, rows: u16) -> Result<(), PtyError> {
+        match self {
+            Pty::Local(local) => local.resize(cols, rows),
+            Pty::Remote(remote) => remote.resize(cols, rows),
+        }
+    }
+
+    pub(crate) fn kill(&mut self) -> Result<(), PtyError> {
+        match self {
+            Pty::Local(local) => local.kill(),
+            Pty::Remote(remote) => remote.kill(),
+        }
     }
 }
 
@@ -651,7 +721,7 @@ mod tests {
         // wedges almost immediately and stops draining the channel.
         let chunk = vec![b'x'; 8192];
         let mut full_at = None;
-        let ceiling = Pty::WRITER_CHANNEL_BOUND + 256;
+        let ceiling = LocalPty::WRITER_CHANNEL_BOUND + 256;
         for i in 0..ceiling {
             let start = Instant::now();
             let result = pty.write(&chunk);

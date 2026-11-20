@@ -112,6 +112,10 @@ pub enum Command {
     /// Inspect role definitions.
     #[command(subcommand)]
     Role(RoleCommand),
+    /// Sub-host side of remote panels. Run by a main caucus over `ssh`, not
+    /// by a human.
+    #[command(subcommand)]
+    Host(HostCommand),
     /// Stdio MCP server for the main worker panel — forwards the fifteen
     /// caucus tools to the main process over the control socket
     /// (`docs/design.md` §0 #4). Spawned by the main worker's Claude Code
@@ -305,6 +309,39 @@ impl From<NoteKindArg> for NoteKind {
     }
 }
 
+/// `caucus host ...` — the sub-host daemon and the bridge `ssh` runs.
+#[derive(Debug, Subcommand)]
+pub enum HostCommand {
+    /// Run the daemon that owns this host's remote panels. Exits at once when
+    /// one is already running.
+    Serve(HostPathArgs),
+    /// Join stdin/stdout to the daemon, starting it first if none is running.
+    Bridge(HostPathArgs),
+}
+
+/// Overrides for where the sub-host daemon keeps state and listens.
+#[derive(Debug, clap::Args)]
+pub struct HostPathArgs {
+    /// State directory (lock, log, session directories). Default
+    /// `~/.caucus/host`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Control socket. Default `<tmp>/caucus-host-<uid>/daemon.sock`.
+    #[arg(long)]
+    control_sock: Option<PathBuf>,
+    /// Turn-signal socket for panels on this host. Default
+    /// `<tmp>/caucus-host-<uid>.sock`.
+    #[arg(long)]
+    signal_sock: Option<PathBuf>,
+}
+
+impl HostPathArgs {
+    fn resolve(self) -> Result<crate::host::HostPaths> {
+        crate::host::HostPaths::resolve(self.state_dir, self.control_sock, self.signal_sock)
+            .context("resolve caucus host paths")
+    }
+}
+
 /// `caucus role ...` — role inspection.
 #[derive(Debug, Subcommand)]
 pub enum RoleCommand {
@@ -341,6 +378,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Some(Command::Doctor) => run_doctor(),
         Some(Command::Signal(cmd)) => run_signal(cmd),
         Some(Command::Role(cmd)) => run_role(cmd),
+        Some(Command::Host(HostCommand::Serve(args))) => {
+            crate::host::daemon::serve(args.resolve()?)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Host(HostCommand::Bridge(args))) => {
+            crate::host::bridge::run(&args.resolve()?)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Command::McpServe { control_sock }) => run_mcp_serve(&control_sock),
         Some(Command::Ctl {
             sock,
