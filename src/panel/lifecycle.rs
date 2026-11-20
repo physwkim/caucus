@@ -114,6 +114,14 @@ impl Panel {
         &self.grid
     }
 
+    /// The grid generation as evidence of what the panel is doing; `None`
+    /// while its output cannot reach us (its sub-host link is down), when a
+    /// screen holding still says nothing. Silence clocks read this, not
+    /// [`Grid::generation`].
+    pub fn live_generation(&self) -> Option<u64> {
+        self.pty.feed_live().then(|| self.grid.generation())
+    }
+
     /// Read-only view of the panel's output capture.
     pub fn capture(&self) -> &OutputCapture {
         &self.capture

@@ -429,6 +429,14 @@ impl WorkerWatch {
         self.stall = StallClock::Armed(Instant::now() + self.fallback_budget);
     }
 
+    /// The panel's output cannot reach us: push an armed window out, so the
+    /// time without a feed is not counted as silence.
+    fn hold_stall(&mut self) {
+        if matches!(self.stall, StallClock::Armed(_)) {
+            self.rearm_stall();
+        }
+    }
+
     /// Whether the panel's screen has been silent for the whole window and
     /// main has not been told about this silence yet.
     fn stall_due(&self, now: Instant) -> bool {
@@ -1242,15 +1250,19 @@ impl Multiplexer {
             .panels
             .iter()
             .find(|p| p.id == w.panel)
-            .map(|p| (p.state(), p.grid().generation()))
+            .map(|p| (p.state(), p.live_generation()))
         else {
             return false;
         };
-        // A screen change is the panel showing life: restart the silence
-        // window, and let a later silence raise a fresh alarm.
-        if generation != w.seen_generation {
-            w.seen_generation = generation;
-            w.rearm_stall();
+        match generation {
+            // A screen change is the panel showing life: restart the silence
+            // window, and let a later silence raise a fresh alarm.
+            Some(generation) if generation != w.seen_generation => {
+                w.seen_generation = generation;
+                w.rearm_stall();
+            }
+            Some(_) => {}
+            None => w.hold_stall(),
         }
         if matches!(state, PanelState::Working | PanelState::Spawning) {
             return false;
@@ -4452,6 +4464,42 @@ mod tests {
             "{:?}",
             w.stall
         );
+
+        mux.shutdown();
+    }
+
+    /// While a sub-host link is down the panel's screen cannot change here,
+    /// so an armed silence window is pushed out instead of raising an alarm.
+    #[tokio::test]
+    async fn a_cut_feed_holds_the_stall_clock() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let sub = silent_working_worker(&mut mux);
+        crate::session::runtime::test_support::cut_feed(&mut mux, sub, &tmp);
+
+        assert!(mux.take_ready_round_deliveries().is_empty());
+        let w = &mux.watches[watch_of(&mux, sub)];
+        assert!(
+            matches!(w.stall, StallClock::Armed(d) if d > Instant::now()),
+            "{:?}",
+            w.stall
+        );
+
+        mux.shutdown();
+    }
+
+    /// A link going down after an alarm leaves the alarm standing, so the
+    /// silence it reported is not reported again once the link is back.
+    #[tokio::test]
+    async fn a_cut_feed_keeps_a_raised_stall_alarm() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let sub = silent_working_worker(&mut mux);
+        assert_eq!(mux.take_ready_round_deliveries().len(), 1);
+        crate::session::runtime::test_support::cut_feed(&mut mux, sub, &tmp);
+
+        assert!(mux.take_ready_round_deliveries().is_empty());
+        assert_eq!(mux.watches[watch_of(&mux, sub)].stall, StallClock::Alarmed);
 
         mux.shutdown();
     }

@@ -294,6 +294,11 @@ impl HostLink {
         self.inner.status.borrow().clone()
     }
 
+    /// Whether the link is up, the only time its panels' output reaches main.
+    pub fn connected(&self) -> bool {
+        matches!(*self.inner.status.borrow(), LinkStatus::Connected(_))
+    }
+
     /// The host's latest load report; `None` while not connected.
     pub fn load(&self) -> Option<HostLoad> {
         self.inner.lock().load.clone()
@@ -1112,6 +1117,11 @@ impl RemotePty {
 
     pub fn size(&self) -> (u16, u16) {
         self.size
+    }
+
+    /// Whether output the panel makes now reaches main.
+    pub(crate) fn feed_live(&self) -> bool {
+        self.link.connected()
     }
 
     pub(crate) fn read(&mut self) -> Result<Vec<u8>, PtyError> {

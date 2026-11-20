@@ -467,6 +467,15 @@ impl Pty {
         }
     }
 
+    /// Whether output the panel makes now reaches this process: always for a
+    /// local PTY, only while its host link is up for a remote one.
+    pub(crate) fn feed_live(&self) -> bool {
+        match self {
+            Pty::Local(_) => true,
+            Pty::Remote(remote) => remote.feed_live(),
+        }
+    }
+
     /// Current PTY size, `(cols, rows)`.
     pub fn size(&self) -> (u16, u16) {
         match self {

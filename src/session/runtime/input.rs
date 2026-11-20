@@ -100,6 +100,18 @@ impl LostTurnProbe {
         }
     }
 
+    /// The panel's output cannot reach us this tick: restart every clock at
+    /// `now`, so no time without a feed counts as silence or as a prompt's
+    /// wait.
+    fn hold(&mut self, now: Instant) {
+        self.since = now;
+        self.screen = match self.screen {
+            ScreenTrack::AwaitingEffect(_) => ScreenTrack::AwaitingEffect(now),
+            ScreenTrack::IdleSince(_) => ScreenTrack::IdleSince(now),
+            track => track,
+        };
+    }
+
     /// Fold one tick's observation in. Returns the loss once the turn is
     /// lost: a submit followed by [`PROMPT_EFFECT_TIMEOUT`] of no live
     /// indicator ending on the idle prompt stalled; otherwise the grid has
@@ -657,14 +669,20 @@ impl Multiplexer {
     /// workers alike.
     pub fn poll_lost_turns(&mut self) {
         let now = Instant::now();
-        let working: Vec<(PanelId, u64)> = self
+        let working: Vec<(PanelId, Option<u64>)> = self
             .panels
             .iter()
             .filter(|p| p.state() == PanelState::Working)
-            .map(|p| (p.id, p.grid().generation()))
+            .map(|p| (p.id, p.live_generation()))
             .collect();
         let mut due: Vec<(PanelId, LostTurn)> = Vec::new();
         for (id, generation) in working {
+            let Some(generation) = generation else {
+                if let Some(probe) = self.lost_turn_probe.get_mut(&id) {
+                    probe.hold(now);
+                }
+                continue;
+            };
             // This runs every tick, so only through the generation cache.
             let Some(scan) = self.panel_screen_cached(id, generation) else {
                 continue;
@@ -1658,6 +1676,60 @@ mod tests {
             .get_mut(&id)
             .unwrap()
             .age_out_quiescence();
+    }
+
+    /// Holding a probe restarts each clock it runs and leaves a screen state
+    /// that runs none alone.
+    #[test]
+    fn hold_restarts_every_probe_clock() {
+        let old = Instant::now() - Duration::from_secs(60);
+        let now = Instant::now();
+        for (screen, held) in [
+            (
+                ScreenTrack::AwaitingEffect(old),
+                ScreenTrack::AwaitingEffect(now),
+            ),
+            (ScreenTrack::IdleSince(old), ScreenTrack::IdleSince(now)),
+            (ScreenTrack::AwaitingSubmit, ScreenTrack::AwaitingSubmit),
+            (ScreenTrack::Unconfirmed, ScreenTrack::Unconfirmed),
+            (ScreenTrack::Live, ScreenTrack::Live),
+        ] {
+            let mut probe = LostTurnProbe::new(0, old, screen);
+            probe.hold(now);
+            assert_eq!((probe.since, probe.screen), (now, held));
+        }
+    }
+
+    /// A sub-host panel's screen holds still while its link is down because
+    /// its output cannot reach main, not because it went quiet: every probe
+    /// clock restarts instead of the turn being reconciled or the prompt
+    /// called stalled.
+    #[tokio::test]
+    async fn poll_lost_turns_holds_a_panel_whose_feed_is_cut() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let (id, agent_id) = working_panel_with_manifest(&mut mux);
+        crate::session::runtime::test_support::cut_feed(&mut mux, id, &tmp);
+        mux.poll_lost_turns();
+        age_out_lost_turn_probe(&mut mux, id);
+        mux.age_out_prompt_effect(id);
+
+        let before = Instant::now();
+        mux.poll_lost_turns();
+
+        assert_eq!(panel_state(&mux, id), PanelState::Working);
+        let probe = &mux.lost_turn_probe[&id];
+        assert!(probe.since >= before);
+        assert!(matches!(probe.screen, ScreenTrack::AwaitingEffect(t) if t >= before));
+        let on_disk = crate::agent::manifest::read(&mux.session.root_dir, agent_id).unwrap();
+        assert!(
+            !on_disk.lane_events().iter().any(|e| matches!(
+                &e.kind,
+                LaneEventKind::TurnReconciled | LaneEventKind::PromptStalled
+            )),
+            "{:?}",
+            on_disk.lane_events()
+        );
     }
 
     /// The core recovery: a panel wedged `Working` with no Stop coming — a

@@ -21,6 +21,27 @@ pub(crate) fn mux(tmp: &TempDir) -> Multiplexer {
     mux
 }
 
+/// Put `panel` on a sub-host link that never comes up, so none of its output
+/// can reach main.
+pub(crate) fn cut_feed(mux: &mut Multiplexer, panel: PanelId, tmp: &TempDir) {
+    use crate::host::{HostLink, Transport};
+    let (signals, _) = tokio::sync::mpsc::unbounded_channel();
+    let socket = Transport::Socket(tmp.path().join("no-daemon.sock"));
+    let link = HostLink::connect(
+        "box",
+        mux.session.id,
+        socket,
+        signals,
+        Default::default(),
+        None,
+    );
+    let cat = crate::pty::PtyCommand::new("/bin/cat");
+    let remote = link.spawn(panel, &cat, 80, 24, false).unwrap();
+    assert!(!link.connected());
+    let p = mux.panels.iter_mut().find(|p| p.id == panel).unwrap();
+    p.pty = crate::pty::Pty::Remote(remote);
+}
+
 /// Build a two-option menu with the given question, labels, and cursor.
 pub(crate) fn menu_of(question: &str, labels: [&str; 2], cursor: usize) -> crate::term::Menu {
     crate::term::Menu {
