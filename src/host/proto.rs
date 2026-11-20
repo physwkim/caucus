@@ -183,6 +183,9 @@ pub struct HostInfo {
     /// This session's shared directory on the sub-host — `CAUCUS_SESSION_DIR`
     /// for panels here. Not shared with the main host or other sub-hosts.
     pub session_dir: PathBuf,
+    /// This session's panels still running here, which a resumed main
+    /// re-adopts instead of starting again.
+    pub panels: Vec<PanelId>,
 }
 
 /// Daemon → main caucus.

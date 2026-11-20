@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::warn;
 
+use super::host_restore::HostRestore;
 use super::spawn::Orphan;
 use super::*;
 use crate::config::hosts::{HostConfig, LOCAL_HOST};
@@ -50,6 +51,8 @@ pub(super) struct Hosts {
     /// The lane fetch of each sub-host worktree panel that has one running or
     /// owed ([`Multiplexer::poll_lane_fetches`]).
     pub(super) lane_fetches: HashMap<PanelId, LaneFetch>,
+    /// Recorded panels waiting for their host to come back on resume.
+    pub(super) restores: Vec<HostRestore>,
 }
 
 struct Linked {
@@ -106,6 +109,7 @@ impl Hosts {
             signals_rx,
             tasks: JoinSet::new(),
             lane_fetches: HashMap::new(),
+            restores: Vec::new(),
         }
     }
 }
@@ -472,7 +476,8 @@ mod tests {
     use crate::panel::lifecycle::{Panel, PanelState};
     use crate::pty::{Pty, PtyCommand};
     use crate::role::spec::AgentCli;
-    use crate::session::record::SessionRecord;
+    use crate::session::id::AgentId;
+    use crate::session::record::{PanelRecord, SessionRecord};
     use crate::session::runtime::test_support::*;
     use crate::signal::{TurnKind, TurnSignal, UnboundSignal};
     use crate::term::{Grid, OutputCapture};
@@ -625,6 +630,26 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    fn shows(mux: &Multiplexer, panel: PanelId, text: &str) -> bool {
+        let grid = mux.panels.iter().find(|p| p.id == panel).unwrap().grid();
+        (0..grid.size().1).any(|row| grid.row_text(row).contains(text))
+    }
+
+    /// `gone`'s session, resumed by a new caucus.
+    fn resume(gone: Multiplexer, tmp: &TempDir) -> (Multiplexer, SessionRecord) {
+        let record = SessionRecord::read(&gone.session.root_dir).unwrap();
+        drop(gone);
+        let (mux, _signal, _control) = Multiplexer::new(
+            Session::from_record(&record),
+            Config::load(tmp.path()).unwrap(),
+            area(),
+            'a',
+            LaunchMode::Resume,
+        )
+        .unwrap();
+        (mux, record)
     }
 
     fn error_of(resp: ControlResponse) -> String {
@@ -868,5 +893,157 @@ mod tests {
         assert_eq!(lanes_in(&there), nothing);
         assert_eq!(lanes_in(tmp.path()), nothing);
         daemon.stop().await;
+    }
+
+    /// A sub-host panel still running when its caucus went away comes back
+    /// on resume as the same panel and agent, its output replayed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_re_adopts_a_sub_host_panel_still_running() {
+        let tmp = TempDir::new().unwrap();
+        let host_tmp = TempDir::new().unwrap();
+        let paths = test_paths(&host_tmp);
+        let mut daemon = TestDaemon::start(&paths).await;
+        let host = socket_host("box", paths.control_sock.clone());
+        let mut gone = mux(&tmp);
+        gone.connect_host(host.clone());
+        until("box to connect", || gone.remote_target("box").is_ok()).await;
+        let id = push_remote_panel(&mut gone, "box");
+        let agent = gone.manifests[&id].agent_id;
+        gone.panels[0].write_input(b"still here\n").unwrap();
+        until("the echo", || {
+            gone.pump_all();
+            shows(&gone, id, "still here")
+        })
+        .await;
+        gone.persist_record();
+        // Gone without a kill: the links close before the panels drop.
+        gone.close_hosts().await;
+
+        let (mut back, record) = resume(gone, &tmp);
+        back.connect_host(host);
+        back.restore_host_panel("box".into(), record.panels[0].clone());
+        until("the panel to be re-adopted", || {
+            back.poll_host_restores();
+            !back.panels.is_empty()
+        })
+        .await;
+        assert_eq!((back.panels[0].id, back.panels[0].agent_id), (id, agent));
+        until("its output to replay", || {
+            back.pump_all();
+            shows(&back, id, "still here")
+        })
+        .await;
+        back.panels[0].write_input(b"and back\n").unwrap();
+        until("it to answer", || {
+            back.pump_all();
+            shows(&back, id, "and back")
+        })
+        .await;
+        let recorded = SessionRecord::read(&back.session.root_dir).unwrap();
+        assert_eq!(recorded.panels[0].agent_id, Some(agent));
+
+        back.shutdown();
+        back.close_hosts().await;
+        daemon.stop().await;
+    }
+
+    /// A sub-host lane its caucus shut down starts again on resume in its
+    /// old worktree, checked out again on the branch the host kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_restarts_a_sub_host_lane_on_its_kept_branch() {
+        let tmp = TempDir::new().unwrap();
+        let host_tmp = TempDir::new().unwrap();
+        let (mut gone, mut daemon, there) = with_host_checkout(&tmp, &host_tmp).await;
+        let host = gone.hosts.links[0].host.clone();
+        let req = gone.role_worktree_request("reviewer");
+        let repo = gone.host_repo("box").unwrap();
+        let made = gone.make_host_worktree("box", repo, req);
+        let handle = tokio::time::timeout(WAIT, made)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (path, branch) = (handle.path.clone(), handle.branch.clone());
+        let old = push_remote_lane(&mut gone, "box", Some((path.clone(), branch.clone())));
+        std::fs::write(path.join("a.txt"), "lane").unwrap();
+        git(&path, &["add", "a.txt"]).unwrap();
+        git(&path, &["commit", "-q", "-m", "lane work"]).unwrap();
+        let sha = git(&path, &["rev-parse", "HEAD"]).unwrap();
+        gone.shutdown();
+        gone.close_hosts().await;
+        assert!(!path.exists());
+
+        let (mut back, record) = resume(gone, &tmp);
+        back.connect_host(host);
+        back.restore_host_panel("box".into(), record.panels[0].clone());
+        until("the lane to start again", || {
+            back.poll_host_restores();
+            back.hosts.restores.is_empty()
+        })
+        .await;
+        let panel = &back.panels[0];
+        assert_ne!(panel.id, old);
+        assert_eq!(panel.pty.host(), Some("box"));
+        assert_eq!(panel.worktree_path.as_deref(), Some(path.as_path()));
+        assert_eq!(back.worktree_branches[&panel.id], branch);
+        assert_eq!(
+            git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
+            branch
+        );
+        assert_eq!(git(&path, &["rev-parse", "HEAD"]).unwrap(), sha);
+        let recorded = SessionRecord::read(&back.session.root_dir).unwrap();
+        assert_eq!(
+            recorded.panels[0].worktree_branch.as_deref(),
+            Some(branch.as_str())
+        );
+
+        back.shutdown();
+        back.close_hosts().await;
+        assert!(!path.exists());
+        assert!(
+            git(&there, &["rev-parse", &branch]).is_ok(),
+            "the host keeps the branch"
+        );
+        daemon.stop().await;
+    }
+
+    /// A sub-host panel whose host is not back by shutdown stays in the
+    /// session record for the next resume; one whose host left `hosts.toml`
+    /// does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sub_host_panel_waiting_for_its_host_stays_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        mux.connect_host(socket_host("box", tmp.path().join("absent.sock")));
+        let waiting = PanelRecord {
+            role: "reviewer".into(),
+            agent_cli: AgentCli::Claude,
+            model: None,
+            order_index: 3,
+            is_main: false,
+            worktree_branch: Some("caucus/x/reviewer-1".into()),
+            claude_session_id: Some("conv-1".into()),
+            host: Some("box".into()),
+            agent_id: Some(AgentId::new()),
+        };
+        mux.restore_host_panel("box".into(), waiting.clone());
+        mux.restore_host_panel(
+            "gone".into(),
+            PanelRecord {
+                host: Some("gone".into()),
+                ..waiting.clone()
+            },
+        );
+        mux.poll_host_restores();
+        mux.shutdown();
+        let record = SessionRecord::read(&mux.session.root_dir).unwrap();
+        assert_eq!(
+            record.panels,
+            vec![PanelRecord {
+                order_index: 0,
+                ..waiting
+            }]
+        );
+        mux.close_hosts().await;
     }
 }

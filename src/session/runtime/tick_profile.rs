@@ -23,10 +23,11 @@ type Pass = (&'static str, fn(&mut Multiplexer));
 
 /// The argument-free passes of one `tui::run` loop turn, in its order, and
 /// the redraw gate's signature.
-fn passes() -> [Pass; 13] {
+fn passes() -> [Pass; 14] {
     [
         ("poll_pending_spawns", Multiplexer::poll_pending_spawns),
         ("poll_lane_fetches", Multiplexer::poll_lane_fetches),
+        ("poll_host_restores", Multiplexer::poll_host_restores),
         ("pump_all", Multiplexer::pump_all),
         ("poll_pending_submits", Multiplexer::poll_pending_submits),
         ("poll_resume_notice", Multiplexer::poll_resume_notice),

@@ -481,7 +481,8 @@ fn spawn_fresh_roster(
 /// records without an explicit marker fall back to `order_index == 0`. Worktree
 /// panels re-attach a worktree on their persisted branch; if the branch is gone
 /// the panel spawns fresh (no worktree, no `--resume`). A panel that ran on
-/// a sub-host is not restored. The layout mode is restored last.
+/// a sub-host comes back once its host connects. The layout mode is restored
+/// last.
 fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
     let bin = caucus_bin();
     let mut panels = record.panels.clone();
@@ -491,10 +492,7 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
 
     for panel in &panels {
         if let Some(host) = &panel.host {
-            warn!(
-                role = %panel.role, %host,
-                "skipping a sub-host panel on resume; spawn it again with spawn_role"
-            );
+            mux.restore_host_panel(host.clone(), panel.clone());
             continue;
         }
         let is_main = should_restore_panel_as_main(panel, has_explicit_main, restored_main);
@@ -515,7 +513,7 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
         // even that fails is the panel skipped, never run un-isolated.
         let worktree_path = match &panel.worktree_branch {
             Some(branch) => {
-                let path = resume_worktree_path(&record.repo_path, record.id, panel);
+                let path = panel.resume_worktree_path(&record.repo_path, record.id);
                 crate::worktree::manager::reconcile_stale(&record.repo_path, branch);
                 match crate::worktree::manager::attach(&record.repo_path, &path, branch) {
                     Ok(handle) => Some((handle.path, handle.branch)),
@@ -602,29 +600,6 @@ fn should_restore_panel_as_main(
         } else {
             panel.order_index == 0
         }
-}
-
-/// Worktree directory for a resumed panel under `<repo>/.caucus/worktrees/`.
-/// A fresh, collision-safe leaf — the prior directory was cleaned on shutdown.
-fn resume_worktree_path(
-    repo: &std::path::Path,
-    session_id: crate::session::SessionId,
-    panel: &crate::session::record::PanelRecord,
-) -> std::path::PathBuf {
-    let id = session_id.to_string();
-    let suffix: String = id
-        .chars()
-        .rev()
-        .take(8)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    repo.join(".caucus").join("worktrees").join(format!(
-        "{suffix}-{}-resume{}",
-        crate::worktree::manager::role_slug(&panel.role),
-        panel.order_index
-    ))
 }
 
 /// The shared event loop: input → signals → control → pump → redraw, until
@@ -804,6 +779,11 @@ async fn event_loop(
         //     worktree lane whose branch has just been fetched here.
         mux.poll_lane_fetches();
         prof.lap("poll_lane_fetches");
+
+        // 3d. Sub-host panels of a resumed session — bring each back once its
+        //     host connects.
+        mux.poll_host_restores();
+        prof.lap("poll_host_restores");
 
         // 4. PTY pump — drain every panel into its grid + capture, reap exits.
         mux.pump_all();
@@ -1085,6 +1065,7 @@ mod tests {
             worktree_branch: None,
             claude_session_id: None,
             host: None,
+            agent_id: None,
         }
     }
 

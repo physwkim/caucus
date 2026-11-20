@@ -587,6 +587,12 @@ impl Daemon {
                 caucus_bin: self.caucus_bin.clone(),
                 signal_sock: self.paths.signal_sock.clone(),
                 session_dir,
+                panels: self
+                    .panels
+                    .iter()
+                    .filter(|(_, p)| p.session == session && !matches!(p.life, Life::Exited(_)))
+                    .map(|(&id, _)| id)
+                    .collect(),
             }),
             Err(err) => {
                 let _ = tx.try_send(encode(&DaemonFrame::Error {

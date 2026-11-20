@@ -4,7 +4,8 @@
 //! area. The real lifecycle lives here, at the panel level.
 //!
 //! **Invariant I-5** (`docs/design.md` §12): panels are created/destroyed only
-//! by `spawn` / `kill`, and panel state transitions only by `transition`.
+//! by `spawn` (or `adopt`, for a sub-host panel that outlived its caucus) /
+//! `kill`, and panel state transitions only by `transition`.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -262,9 +263,7 @@ pub(crate) fn spawn(
     settings: &Settings,
     host: Option<&HostLink>,
 ) -> Result<Panel, PanelError> {
-    let inner = rect.inner();
-    let cols = inner.width.max(MIN_GRID_COLS);
-    let rows = inner.height.max(MIN_GRID_ROWS);
+    let (cols, rows) = grid_size(rect);
 
     // codex stalls on its interactive "Do you trust this directory?" gate the
     // first time it runs in a directory, before the turn caucus drives. The
@@ -291,21 +290,69 @@ pub(crate) fn spawn(
             .map(Pty::Remote),
     }
     .map_err(|e| PanelError::Spawn(e.to_string()))?;
-    let grid = Grid::with_scrollback(cols as usize, rows as usize, settings.scrollback_lines);
+    Ok(assemble(
+        panel_id,
+        request.role.name.clone(),
+        agent_id,
+        request.worktree_path.clone(),
+        pty,
+        settings,
+    ))
+}
 
-    Ok(Panel {
-        id: panel_id,
-        role: request.role.name.clone(),
+/// The other creation path (Invariant I-5): a panel for `manifest`'s agent,
+/// which `host` still runs from before this caucus started. It starts in
+/// `Spawning` like a new one; the replayed output settles it.
+pub(crate) fn adopt(
+    manifest: &crate::agent::AgentManifest,
+    rect: Rect,
+    settings: &Settings,
+    host: &HostLink,
+) -> Result<Panel, PanelError> {
+    let (cols, rows) = grid_size(rect);
+    let pty = host
+        .adopt(manifest.panel_id, cols, rows)
+        .map_err(|e| PanelError::Spawn(e.to_string()))?;
+    Ok(assemble(
+        manifest.panel_id,
+        manifest.role.clone(),
+        manifest.agent_id,
+        manifest.worktree_path.clone(),
+        Pty::Remote(pty),
+        settings,
+    ))
+}
+
+fn grid_size(rect: Rect) -> (u16, u16) {
+    let inner = rect.inner();
+    (
+        inner.width.max(MIN_GRID_COLS),
+        inner.height.max(MIN_GRID_ROWS),
+    )
+}
+
+fn assemble(
+    id: PanelId,
+    role: String,
+    agent_id: AgentId,
+    worktree_path: Option<PathBuf>,
+    pty: Pty,
+    settings: &Settings,
+) -> Panel {
+    let (cols, rows) = pty.size();
+    Panel {
+        id,
+        role,
         agent_id,
         state: PanelState::Spawning,
-        worktree_path: request.worktree_path.clone(),
+        worktree_path,
         pty,
-        grid,
+        grid: Grid::with_scrollback(cols as usize, rows as usize, settings.scrollback_lines),
         capture: OutputCapture::with_limits(
             settings.capture_turn_limit,
             settings.capture_open_turn_bytes,
         ),
-    })
+    }
 }
 
 /// Single owner of panel destruction (Invariant I-5).

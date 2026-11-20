@@ -253,6 +253,36 @@ impl HostLink {
             trust_codex_cwd,
             ..SpawnSpec::from_command(command, cols, rows).map_err(PtyError::Spawn)?
         };
+        self.open(
+            panel,
+            (cols, rows),
+            Some(spec.clone()),
+            [ClientFrame::Spawn { panel, spec }],
+        )
+    }
+
+    /// Take over `panel`, which the host still runs for this session from
+    /// before main restarted, replaying its output from the first byte the
+    /// host kept.
+    pub fn adopt(&self, panel: PanelId, cols: u16, rows: u16) -> Result<RemotePty, PtyError> {
+        self.open(
+            panel,
+            (cols, rows),
+            None,
+            [
+                ClientFrame::Attach { panel, from: 0 },
+                ClientFrame::Resize { panel, cols, rows },
+            ],
+        )
+    }
+
+    fn open<const N: usize>(
+        &self,
+        panel: PanelId,
+        size: (u16, u16),
+        unconfirmed: Option<SpawnSpec>,
+        frames: [ClientFrame; N],
+    ) -> Result<RemotePty, PtyError> {
         let (out, rx) = mpsc::channel(PANEL_QUEUE);
         {
             let mut state = self.inner.lock();
@@ -265,23 +295,25 @@ impl HostLink {
             state.panels.insert(
                 panel,
                 LinkPanel {
-                    unconfirmed: Some(spec.clone()),
+                    unconfirmed,
                     next: 0,
-                    size: (cols, rows),
+                    size,
                     exited: false,
                     out,
                 },
             );
         }
-        if let Err(err) = self.send(ClientFrame::Spawn { panel, spec }) {
-            self.inner.lock().panels.remove(&panel);
-            return Err(err);
+        for frame in frames {
+            if let Err(err) = self.send(frame) {
+                self.inner.lock().panels.remove(&panel);
+                return Err(err);
+            }
         }
         Ok(RemotePty {
             link: self.clone(),
             panel,
             rx,
-            size: (cols, rows),
+            size,
             exited: false,
             killed: false,
         })
@@ -306,7 +338,7 @@ impl HostLink {
 
     /// Kill `panel` on the host. Re-sent on every reconnect until the daemon
     /// confirms it, so a drop cannot leave the panel running there.
-    fn kill(&self, panel: PanelId) {
+    pub(crate) fn kill(&self, panel: PanelId) {
         {
             let mut state = self.inner.lock();
             state.panels.remove(&panel);

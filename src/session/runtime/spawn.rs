@@ -317,7 +317,7 @@ impl Multiplexer {
         let provisional = Layout::reflow(&ids, self.area, self.layout_mode);
         let rect = provisional.rect_of(outcome.panel_id).unwrap_or(self.area);
 
-        let mut panel = lifecycle::spawn(
+        let panel = lifecycle::spawn(
             &request,
             outcome.command,
             outcome.panel_id,
@@ -327,14 +327,6 @@ impl Multiplexer {
             remote.as_ref().map(|target| &target.repo.link),
         )?;
         let panel_id = panel.id;
-        // Turn-segmented capture spills to `<session>/panels/<panel>.log`
-        // (`docs/design.md` §8.5).
-        panel.set_capture_log_path(
-            self.session
-                .root_dir
-                .join("panels")
-                .join(format!("{panel_id}.log")),
-        );
 
         // Persist the manifest (Invariant I-2). A worktree panel opens its
         // timeline with the worktree it owns: the directory already exists by
@@ -350,7 +342,48 @@ impl Multiplexer {
         if let Err(err) = manifest::write(&mut mf, &self.session.root_dir, created) {
             warn!(panel = %panel_id, error = %err, "manifest write failed");
         }
-        self.manifests.insert(panel_id, mf);
+        self.install_panel(panel, mf, worktree_branch);
+        Ok(panel_id)
+    }
+
+    /// Take over `manifest`'s panel, which `link`'s host still runs for this
+    /// session from before this caucus started (`caucus resume`). The agent
+    /// keeps its manifest, its panel id and its worktree.
+    pub(super) fn adopt_panel(
+        &mut self,
+        link: &crate::host::HostLink,
+        manifest: AgentManifest,
+        worktree_branch: Option<String>,
+    ) -> Result<PanelId> {
+        let mut ids: Vec<PanelId> = self.panels.iter().map(|p| p.id).collect();
+        ids.push(manifest.panel_id);
+        let rect = Layout::reflow(&ids, self.area, self.layout_mode)
+            .rect_of(manifest.panel_id)
+            .unwrap_or(self.area);
+        let panel = lifecycle::adopt(&manifest, rect, &self.config.settings, link)?;
+        let panel_id = panel.id;
+        self.install_panel(panel, manifest, worktree_branch);
+        Ok(panel_id)
+    }
+
+    /// Put a panel just created by `panel::lifecycle` on screen, with its
+    /// agent's manifest.
+    fn install_panel(
+        &mut self,
+        mut panel: Panel,
+        manifest: AgentManifest,
+        worktree_branch: Option<String>,
+    ) {
+        let panel_id = panel.id;
+        // Turn-segmented capture spills to `<session>/panels/<panel>.log`
+        // (`docs/design.md` §8.5).
+        panel.set_capture_log_path(
+            self.session
+                .root_dir
+                .join("panels")
+                .join(format!("{panel_id}.log")),
+        );
+        self.manifests.insert(panel_id, manifest);
 
         // Remember the worktree branch — the branch persists across shutdown
         // and is what `caucus resume` re-attaches a worktree on.
@@ -363,7 +396,6 @@ impl Multiplexer {
             self.focus.set_focus(Some(panel_id));
         }
         self.rebuild_layout_tree();
-        Ok(panel_id)
     }
 
     /// Kill a panel: tear down the PTY, drop it from the registry, enqueue any

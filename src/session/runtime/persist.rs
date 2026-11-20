@@ -8,7 +8,7 @@ impl Multiplexer {
     /// Build a [`SessionRecord`](crate::session::record::SessionRecord) from the live panels + manifests.
     fn build_record(&self) -> crate::session::record::SessionRecord {
         use crate::session::record::{PanelRecord, SessionRecord};
-        let panels = self
+        let mut panels: Vec<PanelRecord> = self
             .panels
             .iter()
             .enumerate()
@@ -24,9 +24,17 @@ impl Multiplexer {
                     claude_session_id: manifest
                         .and_then(|m| m.claude_session_id().map(str::to_string)),
                     host: panel.pty.host().map(str::to_string),
+                    agent_id: Some(panel.agent_id),
                 }
             })
             .collect();
+        // Sub-host panels not back yet keep their places for the next resume.
+        for restore in &self.hosts.restores {
+            panels.push(PanelRecord {
+                order_index: panels.len(),
+                ..restore.record.clone()
+            });
+        }
         SessionRecord {
             id: self.session.id,
             topic: self.session.topic.clone(),
@@ -66,6 +74,7 @@ impl Multiplexer {
         // record `caucus resume` reads. Worktree directories are removed
         // below, but their branches persist, so the record stays resumable.
         self.persist_record();
+        self.abort_host_restores();
 
         // Kill every panel's PTY and collect its worktree. `kill_panel` is
         // avoided here: it enqueues worktree cleanup onto the async queue,

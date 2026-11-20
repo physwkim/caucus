@@ -30,6 +30,7 @@ use crate::signal::server::SignalServer;
 use crate::worktree::cleanup::CleanupQueue;
 
 mod control;
+mod host_restore;
 mod hosts;
 mod input;
 mod layout;

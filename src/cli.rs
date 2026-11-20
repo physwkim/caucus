@@ -1155,6 +1155,7 @@ mod tests {
                 worktree_branch: None,
                 claude_session_id: Some("conv-1".into()),
                 host: None,
+                agent_id: None,
             }],
             role_counts: std::collections::HashMap::new(),
         };
