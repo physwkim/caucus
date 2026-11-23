@@ -404,3 +404,158 @@ async fn a_copy_that_disowns_its_build_is_copied_once() {
         "the install's check and the one connect after it"
     );
 }
+
+/// A daemon run from its own copy of caucus, killed when dropped.
+struct CopiedDaemon {
+    child: Child,
+    bin: PathBuf,
+    paths: HostPaths,
+}
+
+impl CopiedDaemon {
+    fn start(dir: &Path) -> Self {
+        let bin = dir.join("bin").join("caucus");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::copy(env!("CARGO_BIN_EXE_caucus"), &bin).unwrap();
+        let paths = HostPaths {
+            state_dir: dir.join("state"),
+            control_sock: dir.join("ctl").join("daemon.sock"),
+            signal_sock: dir.join("signal.sock"),
+        };
+        let child = Command::new(&bin)
+            .args(["host", "serve", "--state-dir"])
+            .arg(&paths.state_dir)
+            .arg("--control-sock")
+            .arg(&paths.control_sock)
+            .arg("--signal-sock")
+            .arg(&paths.signal_sock)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + WAIT;
+        while std::os::unix::net::UnixStream::connect(&paths.control_sock).is_err() {
+            assert!(Instant::now() < deadline, "the daemon did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Self { child, bin, paths }
+    }
+
+    /// Put another build where the daemon's caucus was, as an upgrade does.
+    fn upgrade_its_caucus(&self) {
+        let next = self.bin.with_file_name("caucus.next");
+        script(&next, "echo next-build");
+        std::fs::rename(&next, &self.bin).unwrap();
+    }
+
+    /// A connection that said hello in `proto`, and its first frame.
+    fn hello(&self, proto: u32) -> (Connection, DaemonFrame) {
+        let stream = std::os::unix::net::UnixStream::connect(&self.paths.control_sock).unwrap();
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        let mut conn = Connection {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+        };
+        conn.send(&ClientFrame::Hello {
+            proto,
+            session: SessionId::new(),
+            host: "sub-1".into(),
+        });
+        let first = conn.recv();
+        (conn, first)
+    }
+
+    fn lock_is_free(&self) -> bool {
+        let lock = std::fs::File::open(self.paths.state_dir.join("daemon.lock")).unwrap();
+        lock.try_lock().is_ok()
+    }
+}
+
+impl Drop for CopiedDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+struct Connection {
+    stream: std::os::unix::net::UnixStream,
+    reader: BufReader<std::os::unix::net::UnixStream>,
+}
+
+impl Connection {
+    fn send(&mut self, frame: &ClientFrame) {
+        let mut line = serde_json::to_string(frame).unwrap();
+        line.push('\n');
+        self.stream.write_all(line.as_bytes()).unwrap();
+    }
+
+    /// The next frame other than a load report.
+    fn recv(&mut self) -> DaemonFrame {
+        loop {
+            let mut line = String::new();
+            self.reader.read_line(&mut line).unwrap();
+            match serde_json::from_str(&line).unwrap() {
+                DaemonFrame::Load(_) => {}
+                frame => return frame,
+            }
+        }
+    }
+}
+
+fn refusal(frame: DaemonFrame) -> String {
+    match frame {
+        DaemonFrame::Error { msg } => msg,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A daemon whose caucus was upgraded under it steps aside for a main of
+/// another protocol once it runs no panels, freeing the lock and both
+/// sockets before main hears of it and dials again.
+#[test]
+fn an_idle_daemon_steps_aside_for_its_upgraded_caucus() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut daemon = CopiedDaemon::start(tmp.path());
+    let (mut main, welcome) = daemon.hello(PROTO_VERSION);
+    assert!(matches!(welcome, DaemonFrame::Welcome(_)), "{welcome:?}");
+    let panel = PanelId::new();
+    main.send(&ClientFrame::Spawn {
+        panel,
+        spec: SpawnSpec {
+            program: "cat".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            trust_codex_cwd: false,
+        },
+    });
+    assert!(matches!(main.recv(), DaemonFrame::Spawned { .. }));
+    daemon.upgrade_its_caucus();
+
+    let (_, busy) = daemon.hello(PROTO_VERSION + 1);
+    let busy = refusal(busy);
+    assert!(busy.contains("keeps running for its 1 panels"), "{busy}");
+    assert!(daemon.child.try_wait().unwrap().is_none(), "{busy}");
+
+    main.send(&ClientFrame::Kill { panel });
+    loop {
+        match main.recv() {
+            DaemonFrame::Exited { .. } => break,
+            DaemonFrame::Output { .. } => {}
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+    let (_, idle) = daemon.hello(PROTO_VERSION + 1);
+    let idle = refusal(idle);
+    assert!(idle.contains("has stopped"), "{idle}");
+    assert!(daemon.lock_is_free(), "the lock is free by the refusal");
+    assert!(!daemon.paths.control_sock.exists());
+    assert!(!daemon.paths.signal_sock.exists());
+    let deadline = Instant::now() + WAIT;
+    while daemon.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the daemon did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

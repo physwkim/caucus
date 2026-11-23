@@ -287,7 +287,9 @@ On every host:
 
 - with a `caucus` key, install a caucus there that speaks main's protocol
   version (`list_hosts` shows the mismatch otherwise);
-- after upgrading caucus, stop the host's old daemon;
+- after upgrading caucus there, a daemon still running the old protocol
+  steps aside when main connects if it runs no panels; stop one with
+  panels yourself;
 - run `caucus init --install-hook` there: remote panels post their turn
   signals through the host's own Claude Stop hook;
 - keep `caucus` on the login shell's `PATH`, since the hook runs it by bare

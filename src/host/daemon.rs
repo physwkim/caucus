@@ -31,6 +31,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+use super::install::{build_id, running_build_id};
 use super::proto::{
     Bytes, ClientFrame, DaemonFrame, HostInfo, HostPanel, MAX_FRAME_BYTES, OUTPUT_CHUNK,
     PROTO_VERSION, SpawnSpec, encode,
@@ -135,10 +136,12 @@ async fn terminated() {
     }
 }
 
-/// Serve until `shutdown` resolves, then kill every panel.
+/// Serve until `shutdown` resolves, or until a main in another protocol finds
+/// no panel here and another build in this daemon's file; then kill every
+/// panel.
 pub async fn run(
     paths: HostPaths,
-    _lock: DaemonLock,
+    lock: DaemonLock,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     paths
@@ -167,11 +170,24 @@ pub async fn run(
     let mut forget_tick = tokio::time::interval(FORGET_CHECK);
     forget_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(shutdown);
+    let mut stepped_aside = None;
     loop {
         tokio::select! {
             biased;
             () = &mut shutdown => break,
-            Some(event) = events.recv() => daemon.on_event(event),
+            Some(event) = events.recv() => if let Some(other) = daemon.on_event(event) {
+                if replaced(&daemon.caucus_bin).await {
+                    stepped_aside = Some(other);
+                    break;
+                }
+                let msg = format!(
+                    "protocol {} not supported; this host speaks {PROTO_VERSION}, as does {} \
+                     there",
+                    other.proto,
+                    daemon.caucus_bin.display()
+                );
+                tokio::spawn(refuse(other.write, msg));
+            },
             Some((link, frame)) = chore_replies.recv() => daemon.reply(&link, &frame),
             Some((signal, reply)) = signals.signals().recv() => {
                 // Main answers a sub-host signal too late to hold a hook, so
@@ -187,8 +203,32 @@ pub async fn run(
     accept.abort();
     daemon.shutdown().await;
     let _ = std::fs::remove_file(&paths.control_sock);
+    if let Some(OtherProtocol { proto, write }) = stepped_aside {
+        // Main dials again once it reads this, and the daemon that answers
+        // must find the lock and both sockets free.
+        drop(signals);
+        drop(lock);
+        let msg = format!(
+            "protocol {proto} not supported; this host's daemon spoke {PROTO_VERSION} and has \
+             stopped, so the next connection starts {} there",
+            daemon.caucus_bin.display()
+        );
+        refuse(write, msg).await;
+    }
     info!("caucus host daemon stopped");
     Ok(())
+}
+
+/// Whether `bin`, the file this daemon started from, now holds another build,
+/// which a daemon started from it again would be.
+async fn replaced(bin: &Path) -> bool {
+    let bin = bin.to_path_buf();
+    tokio::task::spawn_blocking(move || match running_build_id() {
+        Ok(own) => !build_id(&bin).is_ok_and(|id| id == own),
+        Err(_) => false,
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// One main caucus's link to this daemon: its session and the name its
@@ -216,6 +256,14 @@ enum ConnEvent {
     Closed {
         conn: u64,
     },
+    /// A hello in another protocol than this daemon's.
+    OtherProtocol(OtherProtocol),
+}
+
+/// A main speaking protocol `proto`, waiting on `write` for its refusal.
+struct OtherProtocol {
+    proto: u32,
+    write: OwnedWriteHalf,
 }
 
 async fn accept_loop(listener: UnixListener, events: mpsc::Sender<ConnEvent>) {
@@ -254,11 +302,8 @@ async fn connection(conn: u64, stream: UnixStream, events: mpsc::Sender<ConnEven
             host,
         }) if proto == PROTO_VERSION => Link { session, host },
         Ok(ClientFrame::Hello { proto, .. }) => {
-            refuse(
-                write,
-                format!("protocol {proto} not supported; this host speaks {PROTO_VERSION}"),
-            )
-            .await;
+            let other = ConnEvent::OtherProtocol(OtherProtocol { proto, write });
+            let _ = events.send(other).await;
             return;
         }
         Ok(ClientFrame::Doctor) => {
@@ -748,7 +793,9 @@ impl Daemon {
             })
     }
 
-    fn on_event(&mut self, event: ConnEvent) {
+    /// Handle `event`. A main in another protocol comes back when no panel
+    /// runs here, for [`run`] to decide whether to step aside for it.
+    fn on_event(&mut self, event: ConnEvent) -> Option<OtherProtocol> {
         match event {
             ConnEvent::Hello {
                 conn,
@@ -758,13 +805,12 @@ impl Daemon {
             } => self.on_hello(conn, link, tx, kick),
             ConnEvent::Frame { conn, frame } => {
                 // A replaced connection's last frames are dropped.
-                let Some(link) = self
+                let link = self
                     .clients()
-                    .find_map(|(l, c)| (c.conn == conn).then(|| l.clone()))
-                else {
-                    return;
-                };
-                self.on_frame(link, frame);
+                    .find_map(|(l, c)| (c.conn == conn).then(|| l.clone()));
+                if let Some(link) = link {
+                    self.on_frame(link, frame);
+                }
             }
             ConnEvent::Closed { conn } => {
                 let now = Instant::now();
@@ -779,7 +825,18 @@ impl Daemon {
                         || self.panels.values().any(|p| p.link == *link)
                 });
             }
+            ConnEvent::OtherProtocol(other) if self.panels.is_empty() => return Some(other),
+            ConnEvent::OtherProtocol(OtherProtocol { proto, write }) => {
+                let msg = format!(
+                    "protocol {proto} not supported; this host's daemon speaks \
+                     {PROTO_VERSION} and keeps running for its {} panels; stop it there to \
+                     replace it",
+                    self.panels.len()
+                );
+                tokio::spawn(refuse(write, msg));
+            }
         }
+        None
     }
 
     fn on_hello(

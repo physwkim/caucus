@@ -355,8 +355,9 @@ fn sub_host_report(host: &str, report: Result<HostReport, String>) -> Vec<Check>
             severity: Severity::Warn,
             detail: format!(
                 "caucus v{} there speaks protocol {}, this caucus {PROTO_VERSION}, so the \
-                 host will not connect; install a matching caucus there and stop its old \
-                 daemon",
+                 host will not connect until caucus there matches and its daemon is \
+                 replaced; a daemon with no panels steps aside for an upgraded caucus, \
+                 others must be stopped there",
                 report.version, report.proto
             ),
         }

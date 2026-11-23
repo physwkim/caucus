@@ -602,18 +602,30 @@ async fn the_daemon_refuses_another_protocol_version() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = test_paths(&tmp);
     let mut host = TestDaemon::start(&paths).await;
-    let mut stream = UnixStream::connect(&paths.control_sock).await.unwrap();
-    let hello = ClientFrame::Hello {
-        proto: PROTO_VERSION + 1,
-        session: SessionId::new(),
-        host: "sub-1".into(),
+    let first_line = |proto| {
+        let sock = paths.control_sock.clone();
+        async move {
+            let mut stream = UnixStream::connect(sock).await.unwrap();
+            let hello = ClientFrame::Hello {
+                proto,
+                session: SessionId::new(),
+                host: "sub-1".into(),
+            };
+            stream.write_all(encode(&hello).as_bytes()).await.unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).await.unwrap();
+            serde_json::from_str::<DaemonFrame>(&line).unwrap()
+        }
     };
-    stream.write_all(encode(&hello).as_bytes()).await.unwrap();
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).await.unwrap();
+    // Started again, this daemon's own file would be the same build, so it
+    // stays for the mains that speak its protocol.
     assert!(matches!(
-        serde_json::from_str::<DaemonFrame>(&line).unwrap(),
+        first_line(PROTO_VERSION + 1).await,
         DaemonFrame::Error { msg } if msg.contains("protocol")
+    ));
+    assert!(matches!(
+        first_line(PROTO_VERSION).await,
+        DaemonFrame::Welcome(_)
     ));
     host.stop().await;
 }
