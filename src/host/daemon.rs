@@ -737,6 +737,8 @@ struct Daemon {
     hostname: String,
     machine_id: Option<String>,
     caucus_bin: PathBuf,
+    /// `PATH` for panels ([`panel_path`]).
+    panel_path: Option<String>,
     panels: HashMap<PanelId, DPanel>,
     /// Every link with a connection or a panel here.
     links: HashMap<Link, LinkState>,
@@ -749,11 +751,13 @@ impl Daemon {
     /// A worktree request's answer goes to `chores_done`, for the run loop to
     /// send to the link's connection.
     fn new(paths: HostPaths, chores_done: mpsc::UnboundedSender<(Link, DaemonFrame)>) -> Self {
+        let caucus_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caucus"));
         Self {
-            paths,
             hostname: hostname(),
             machine_id: super::machine_id(),
-            caucus_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caucus")),
+            panel_path: panel_path(&paths.state_dir, &caucus_bin),
+            caucus_bin,
+            paths,
             panels: HashMap::new(),
             links: HashMap::new(),
             last_probe: Instant::now(),
@@ -1020,9 +1024,9 @@ impl Daemon {
             | ClientFrame::RemoveWorktree { .. }
             | ClientFrame::SignalsSeen { panel: None, .. } => unreachable!("answered above"),
             ClientFrame::Spawn { panel, spec } => {
-                self.panels
-                    .entry(panel)
-                    .or_insert_with(|| spawn_panel(link.clone(), &spec));
+                self.panels.entry(panel).or_insert_with(|| {
+                    spawn_panel(link.clone(), &spec, self.panel_path.as_deref())
+                });
                 self.reply(&link, &DaemonFrame::Spawned { panel });
             }
             ClientFrame::Input {
@@ -1273,9 +1277,36 @@ fn remove_worktree(
     }
 }
 
-fn spawn_panel(link: Link, spec: &SpawnSpec) -> DPanel {
+/// `PATH` for panels: the daemon's own, behind a directory holding only a
+/// link to the daemon's caucus, so a hook running `caucus` by name reaches
+/// the build that serves it. `None` leaves panels the daemon's `PATH`.
+fn panel_path(state_dir: &Path, caucus_bin: &Path) -> Option<String> {
+    let path = std::env::var("PATH").ok()?;
+    let bin = state_dir.join("bin");
+    let link = bin.join("caucus");
+    let linked = std::fs::create_dir_all(&bin)
+        .and_then(|()| match std::fs::remove_file(&link) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+            _ => Ok(()),
+        })
+        .and_then(|()| std::os::unix::fs::symlink(caucus_bin, &link));
+    if let Err(err) = linked {
+        warn!(link = %link.display(), error = %err, "cannot put caucus on panels' PATH");
+        return None;
+    }
+    let bin = bin.to_str().filter(|bin| !bin.contains(':'))?;
+    Some(format!("{bin}:{path}"))
+}
+
+fn spawn_panel(link: Link, spec: &SpawnSpec, path: Option<&str>) -> DPanel {
     let mut command = spec.to_command();
     command.cwd = command.cwd.map(home_relative);
+    if let Some(path) = path {
+        command
+            .env
+            .entry("PATH".into())
+            .or_insert_with(|| path.into());
+    }
     if spec.trust_codex_cwd
         && let Some(cwd) = command.cwd.as_deref()
         && let Err(err) = crate::agent::codex_trust::ensure_trusted(cwd)

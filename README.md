@@ -258,19 +258,21 @@ socket = "/run/user/1000/caucus-host/daemon.sock"   # a daemon on this machine
 dir = "~/src/project-box"   # required: a clone of this repo apart from this one
 ```
 
-An ssh host runs `caucus host bridge` in the remote user's login shell, which
-starts that user's host daemon if none is running. Without a `caucus` key,
-the bridge is main's own build, which main copies to `~/.caucus/bin/caucus`
-there over the same ssh whenever that copy is missing or another build. The
-copy must run there (same OS and CPU, compatible system libraries); if it
-does not, the host stays disconnected and `list_hosts` says why. The daemon owns the
-host's panels and outlives the connection: after an ssh drop main reconnects,
-re-reads each panel's missed output (up to its last 8 MiB), and the input
-and turn signals the drop lost are delivered once. It runs until it gets
-`SIGTERM`, which kills its panels. ssh runs with `BatchMode=yes`, so login
-must already work without a prompt. A `socket` host is
-a daemon on this machine that you start yourself with `caucus host serve`
-(its default socket is `~/.caucus/host/<hostname>/daemon.sock`).
+An ssh host runs `caucus host bridge` in the remote user's login shell,
+which starts that user's host daemon if none is running. Without a `caucus`
+key, the bridge is main's own build, which main copies to
+`~/.caucus/bin/caucus` there over the same ssh whenever that copy is missing
+or another build. The copy must run there (same OS and CPU, compatible
+system libraries); if it does not, the host stays disconnected and
+`list_hosts` says why. The daemon owns the host's panels and outlives the
+connection: after an ssh drop main reconnects, re-reads each panel's missed
+output (up to its last 8 MiB), and the input and turn signals the drop lost
+are delivered once. It runs until it gets `SIGTERM`, which kills its panels.
+Its panels find the daemon's own caucus first on `PATH`, so the hook, which
+runs `caucus` by name, reaches the build serving them. ssh runs with
+`BatchMode=yes`, so login must already work without a prompt. A `socket`
+host is a daemon on this machine that you start yourself with `caucus host
+serve` (its default socket is `~/.caucus/host/<hostname>/daemon.sock`).
 
 Each host works in its own clone, `dir`. A worktree panel's lane starts as
 main's `HEAD` pushed to a branch of that clone, and the branch is fetched
@@ -292,8 +294,6 @@ On every host:
   panels yourself;
 - run `caucus init --install-hook` there: remote panels post their turn
   signals through the host's own Claude Stop hook;
-- keep `caucus` on the login shell's `PATH`, since the hook runs it by bare
-  name; the `caucus` key only tells main how to start the bridge;
 - install the agent CLIs the roles placed there use.
 
 `caucus doctor` has each host's daemon check these in its own environment,

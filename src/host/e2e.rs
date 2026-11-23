@@ -598,6 +598,33 @@ async fn a_restarted_host_reports_the_old_panels_gone() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_panel_runs_the_daemons_own_caucus_by_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(&tmp);
+    let mut host = TestDaemon::start(&paths).await;
+    let (link, _signals) = link(&paths, SessionId::new());
+    link.wait_connected(WAIT).await.unwrap();
+    let mut pty = link
+        .spawn(
+            PanelId::new(),
+            &sh("echo \"found $(command -v caucus)\"; exec cat"),
+            200,
+            24,
+            false,
+        )
+        .unwrap();
+    let mut out = String::new();
+    let linked = paths.state_dir.join("bin").join("caucus");
+    read_until(&mut pty, &mut out, &format!("found {}", linked.display())).await;
+    assert_eq!(
+        std::fs::read_link(&linked).unwrap(),
+        std::env::current_exe().unwrap()
+    );
+    link.close(WAIT).await;
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_daemon_refuses_another_protocol_version() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = test_paths(&tmp);
