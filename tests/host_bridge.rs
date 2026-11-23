@@ -30,6 +30,8 @@ impl Bridge {
             .arg(dir.join("ctl").join("daemon.sock"))
             .arg("--signal-sock")
             .arg(dir.join("signal.sock"))
+            // The bridge installs the Stop hook under its home.
+            .env("HOME", dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -226,8 +228,10 @@ async fn a_login_profile_printing_before_the_bridge_does_not_stop_the_link() {
     let profile_then_bridge = "printf 'Agent pid 1\\npartial'; \
         exec \"$0\" host bridge --state-dir \"$1\" --control-sock \"$2\" --signal-sock \"$3\"";
     let transport = Transport::Command {
-        program: "sh".into(),
+        program: "env".into(),
         args: vec![
+            format!("HOME={}", tmp.path().display()).into(),
+            "sh".into(),
             "-c".into(),
             profile_then_bridge.into(),
             env!("CARGO_BIN_EXE_caucus").into(),
@@ -315,6 +319,12 @@ async fn connects_through_the_copy(home: &Path) {
     assert!(
         std::fs::read(&copy).unwrap() == std::fs::read(image).unwrap(),
         "the copy is this build"
+    );
+    let claude = home.join(".claude");
+    let settings = std::fs::read_to_string(claude.join("settings.json")).unwrap();
+    assert!(
+        settings.contains("caucus-turn-signal") && claude.join("hooks/caucus-turn-signal").exists(),
+        "the bridge installed the Stop hook: {settings}"
     );
 }
 

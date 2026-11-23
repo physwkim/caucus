@@ -33,9 +33,11 @@ use crate::hook::{
 /// server decide ownership from the payload itself. Only the binary knows
 /// where the sockets live; the script never looks for them, so moving one
 /// cannot leave the hook skipping it. With no live socket the post is a
-/// no-op, and without `caucus` installed the hook exits quietly. The kind
-/// rides that branch unchanged — the binary, not the script, decides which
-/// kinds the unbound path can carry.
+/// no-op. A `caucus` not on `PATH` is looked for where a main keeps its build
+/// on a sub-host ([`MANAGED_CAUCUS`](crate::host::install::MANAGED_CAUCUS));
+/// without either the hook exits quietly. The kind rides that branch unchanged
+/// — the binary, not the script, decides which kinds the unbound path can
+/// carry.
 const TURN_SIGNAL_SCRIPT: &str = "#!/bin/sh\n\
 # caucus turn-signal hook. CAUCUS_* env is injected by caucus at panel spawn;\n\
 # the Claude hook payload is read from stdin by `caucus signal post`.\n\
@@ -51,7 +53,9 @@ kind=\"${1:-stop}\"\n\
 # caucus panels whose env was lost to a daemon re-host. With the env present,\n\
 # post directly; otherwise post unbound to every live caucus socket, which\n\
 # caucus finds itself (each server resolves ownership from the payload).\n\
-# Without caucus installed, exit quietly so the hook is a harmless no-op.\n\
+# A caucus not on PATH may be the copy a main keeps on this host. Without\n\
+# caucus installed, exit quietly so the hook is a harmless no-op.\n\
+command -v caucus >/dev/null 2>&1 || PATH=\"$HOME/.caucus/bin:$PATH\"\n\
 if [ -n \"$CAUCUS_SOCK\" ]; then\n\
   exec caucus signal post \\\n\
     --sock    \"$CAUCUS_SOCK\" \\\n\
@@ -134,13 +138,20 @@ pub fn run(repo: &Path, install_hook: bool) -> Result<InitOutcome> {
     };
 
     if install_hook {
-        let home = std::env::var_os("HOME").context("$HOME not set — cannot locate ~/.claude")?;
-        let (script, install) = install_claude_hook(&PathBuf::from(home).join(".claude"))?;
+        let (script, install) = install_home_hook()?;
         outcome.hook_script = Some(script);
         outcome.hook_install = Some(install);
     }
 
     Ok(outcome)
+}
+
+/// Install caucus's turn-signal hook into this user's `~/.claude`, as `caucus
+/// init --install-hook` and a sub-host's bridge do: `settings.json` changes,
+/// after a `.bak` of it, only when the hook is missing or stale.
+pub fn install_home_hook() -> Result<(PathBuf, HookInstall)> {
+    let home = std::env::var_os("HOME").context("$HOME not set — cannot locate ~/.claude")?;
+    install_claude_hook(&PathBuf::from(home).join(".claude"))
 }
 
 /// The single `.gitignore` line `caucus init` ensures is present. Scoped to the
@@ -1108,11 +1119,11 @@ mod tests {
     /// Run [`TURN_SIGNAL_SCRIPT`] for real and return the argv a stub `caucus`
     /// was invoked with (empty when it was never invoked).
     ///
-    /// `env_sock` sets (or clears) `CAUCUS_SOCK`; `installed` puts the stub on
-    /// a `PATH` that holds nothing else. Those two are the script's only
-    /// branch inputs besides its argument. `TMPDIR` is an empty directory, so
-    /// no socket file is there to find.
-    fn run_hook_script(arg: Option<&str>, env_sock: bool, installed: bool) -> Vec<String> {
+    /// `env_sock` sets (or clears) `CAUCUS_SOCK`; `stub` says where the stub
+    /// lives, `PATH` holding nothing else and `HOME` being the temp dir.
+    /// Those two are the script's only branch inputs besides its argument.
+    /// `TMPDIR` is an empty directory, so no socket file is there to find.
+    fn run_hook_script(arg: Option<&str>, env_sock: bool, stub: Stub) -> Vec<String> {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = TempDir::new().unwrap();
@@ -1124,8 +1135,16 @@ mod tests {
         let bin = tmp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let argv_out = tmp.path().join("argv.txt");
-        if installed {
-            let stub = bin.join("caucus");
+        let stub = match stub {
+            Stub::OnPath => Some(bin.join("caucus")),
+            Stub::Managed => {
+                let managed = crate::host::install::MANAGED_CAUCUS;
+                Some(tmp.path().join(managed.strip_prefix("~/").unwrap()))
+            }
+            Stub::Absent => None,
+        };
+        if let Some(stub) = stub {
+            std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
             std::fs::write(
                 &stub,
                 format!(
@@ -1144,6 +1163,7 @@ mod tests {
             cmd.arg(arg);
         }
         cmd.env("PATH", &bin)
+            .env("HOME", tmp.path())
             .env("TMPDIR", &empty)
             .env("CAUCUS_SESSION_ID", "S")
             .env("CAUCUS_PANEL_ID", "P");
@@ -1160,6 +1180,15 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Where [`run_hook_script`] puts its stub `caucus`.
+    #[derive(Clone, Copy)]
+    enum Stub {
+        OnPath,
+        /// Off `PATH`, where a main keeps its build on a sub-host.
+        Managed,
+        Absent,
+    }
+
     /// The value that followed `--kind` in an argv, if any.
     fn kind_of(argv: &[String]) -> Option<&str> {
         let i = argv.iter().position(|a| a == "--kind")?;
@@ -1172,25 +1201,25 @@ mod tests {
     #[test]
     fn hook_script_carries_the_event_kind_down_every_branch() {
         // Env path: identity flags plus the event.
-        let argv = run_hook_script(Some("session-start"), true, true);
+        let argv = run_hook_script(Some("session-start"), true, Stub::OnPath);
         assert_eq!(kind_of(&argv), Some("session-start"), "env path: {argv:?}");
         assert!(!argv.iter().any(|a| a == "--discover"), "{argv:?}");
 
         // Env path, bare invocation (the Stop entry) defaults to `stop`.
-        let argv = run_hook_script(None, true, true);
+        let argv = run_hook_script(None, true, Stub::OnPath);
         assert_eq!(kind_of(&argv), Some("stop"), "env path, no arg: {argv:?}");
 
         // Discovery path: no env.
-        let argv = run_hook_script(Some("session-start"), false, true);
+        let argv = run_hook_script(Some("session-start"), false, Stub::OnPath);
         assert!(argv.iter().any(|a| a == "--discover"), "{argv:?}");
         assert_eq!(kind_of(&argv), Some("session-start"), "discovery: {argv:?}");
 
         // Discovery path, bare invocation.
-        let argv = run_hook_script(None, false, true);
+        let argv = run_hook_script(None, false, Stub::OnPath);
         assert_eq!(kind_of(&argv), Some("stop"), "discovery, no arg: {argv:?}");
 
         // No env and no caucus: a quiet no-op.
-        let argv = run_hook_script(Some("session-start"), false, false);
+        let argv = run_hook_script(Some("session-start"), false, Stub::Absent);
         assert!(argv.is_empty(), "no caucus on this machine: {argv:?}");
     }
 
@@ -1199,7 +1228,18 @@ mod tests {
     /// home, the hook still posts unbound.
     #[test]
     fn hook_script_discovers_without_a_socket_in_the_temp_dir() {
-        let argv = run_hook_script(None, false, true);
+        let argv = run_hook_script(None, false, Stub::OnPath);
         assert!(argv.iter().any(|a| a == "--discover"), "{argv:?}");
+    }
+
+    /// A sub-host whose login `PATH` lacks caucus still signals, both bound
+    /// and unbound, through the copy its main keeps there.
+    #[test]
+    fn hook_script_runs_the_managed_copy_when_path_has_no_caucus() {
+        let argv = run_hook_script(None, true, Stub::Managed);
+        assert_eq!(kind_of(&argv), Some("stop"), "bound: {argv:?}");
+        assert!(argv.iter().any(|a| a == "--sock"), "{argv:?}");
+        let argv = run_hook_script(None, false, Stub::Managed);
+        assert!(argv.iter().any(|a| a == "--discover"), "unbound: {argv:?}");
     }
 }

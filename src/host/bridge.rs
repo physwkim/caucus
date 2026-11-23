@@ -18,9 +18,17 @@ use super::{HostPaths, private_dir};
 /// How long a freshly started daemon has to open its control socket.
 const DAEMON_START_WAIT: Duration = Duration::from_secs(5);
 
-/// Connect to the daemon (starting it if needed) and copy bytes both ways
-/// until either side closes.
+/// Install this user's turn-signal hook
+/// ([`install_home_hook`](crate::init::install_home_hook)), then connect to
+/// the daemon (starting it if needed) and copy bytes both ways until either
+/// side closes.
 pub fn run(paths: &HostPaths) -> Result<()> {
+    // Panels here post their turn signals through this host's own Stop hook.
+    // Without it they only go quiet, so a failure to install it is said, not
+    // fatal.
+    if let Err(err) = crate::init::install_home_hook() {
+        eprintln!("caucus: cannot install the turn-signal hook: {err:#}");
+    }
     // Ends a line the login profile printed without one, so the daemon's
     // first frame starts a line of its own.
     let mut stdout = io::stdout().lock();

@@ -292,8 +292,10 @@ On every host:
 - after upgrading caucus there, a daemon still running the old protocol
   steps aside when main connects if it runs no panels; stop one with
   panels yourself;
-- run `caucus init --install-hook` there: remote panels post their turn
-  signals through the host's own Claude Stop hook;
+- give a `socket` host's user caucus's Claude Stop hook (`caucus init
+  --install-hook`); an ssh host's bridge installs it itself, as that command
+  does, whenever it is missing or stale: remote panels post their turn
+  signals through the host's own hook;
 - install the agent CLIs the roles placed there use.
 
 `caucus doctor` has each host's daemon check these in its own environment,
@@ -354,7 +356,8 @@ path on *this* machine, so:
 - run `caucus init --install-hook` on **every machine** you use caucus on —
   a `~/.claude/settings.json` synced from another machine carries a `$HOME`
   that does not exist locally, and turn signals silently die;
-- keep `caucus` on `PATH` (a `cargo install` already does).
+- keep `caucus` on `PATH` (a `cargo install` already does); on a sub-host
+  the script also finds the copy main keeps at `~/.caucus/bin/caucus`.
 
 If you used caucus before this hook moved out of `.caucus/bin/`, re-run
 `caucus init --install-hook` once: it prunes the old per-project hook entry and

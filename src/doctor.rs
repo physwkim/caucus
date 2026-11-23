@@ -115,8 +115,8 @@ pub fn run(repo: &Path, config: &Config) -> Report {
 /// through [`host_report`].
 fn machine_checks() -> Vec<Check> {
     let mut checks = vec![
-        // Identify the running build first — and confirm `caucus` is on PATH,
-        // since the turn-signal hook script execs it by bare name.
+        // Identify the running build first — and confirm the turn-signal
+        // hook script, which execs `caucus` by bare name, finds one.
         caucus_check(),
         // `git` is mandatory — worktree creation/cleanup shell out to it.
         binary_check(
@@ -373,8 +373,12 @@ fn sub_host_report(host: &str, report: Result<HostReport, String>) -> Vec<Check>
 /// Whether `bin` is resolvable on `PATH`. A bare `which`-style probe walking
 /// `$PATH` entries — no extra process spawn.
 fn which(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    which_in(&std::env::var_os("PATH")?, bin)
+}
+
+/// [`which`] with `path` as `PATH`.
+fn which_in(path: &std::ffi::OsStr, bin: &str) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path) {
         let candidate = dir.join(bin);
         if is_executable(&candidate) {
             return Some(candidate);
@@ -412,39 +416,53 @@ fn binary_check(bin: &str, missing_severity: Severity, why: &str) -> Check {
     }
 }
 
-/// Report the running caucus version and confirm a `caucus` binary is on
-/// `PATH`. The turn-signal hook script execs bare `caucus signal post`
-/// (`crate::init`), so a caucus that is not on `PATH` — run via `cargo run` or
+/// Report the running caucus version and confirm the turn-signal hook finds
+/// a `caucus` ([`hook_caucus`]). The hook script execs bare `caucus signal
+/// post` (`crate::init`), so a caucus it cannot find — run via `cargo run` or
 /// an absolute path — leaves turn-completion signals dead even though the TUI
 /// itself works. The version is surfaced so `caucus doctor` output pins the
 /// exact build for bug reports and upgrade confirmation.
 fn caucus_check() -> Check {
-    let on_path = which("caucus");
-    let path_version = on_path.as_deref().and_then(path_binary_version);
+    let home = std::env::var_os("HOME");
+    let found = hook_caucus(
+        std::env::var_os("PATH").as_deref(),
+        home.as_deref().map(Path::new),
+    );
+    let found_version = found.as_deref().and_then(path_binary_version);
     caucus_check_from(
         env!("CARGO_PKG_VERSION"),
-        on_path.as_deref(),
-        path_version.as_deref(),
+        found.as_deref(),
+        found_version.as_deref(),
     )
 }
 
-/// The pure body of [`caucus_check`]: running version vs what `PATH` resolves.
+/// The `caucus` the turn-signal hook runs under `path` and `home`, looked for
+/// as the script looks: on `PATH`, then where a main keeps its build on a
+/// sub-host ([`MANAGED_CAUCUS`]).
+fn hook_caucus(path: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    path.and_then(|path| which_in(path, "caucus")).or_else(|| {
+        let managed = home?.join(MANAGED_CAUCUS.strip_prefix("~/")?);
+        is_executable(&managed).then_some(managed)
+    })
+}
+
+/// The pure body of [`caucus_check`]: running version vs what the hook runs.
 /// A version mismatch is the one *silent* degradation in the signal chain —
 /// the stale PATH binary still posts signals (the live selftest passes), but
 /// it speaks an older wire, so newer capabilities (e.g. the `wants_reply`
 /// hook-reply of §7.6) quietly degrade to fire-and-forget.
-fn caucus_check_from(running: &str, on_path: Option<&Path>, path_version: Option<&str>) -> Check {
+fn caucus_check_from(running: &str, found: Option<&Path>, found_version: Option<&str>) -> Check {
     let name = "caucus".to_string();
-    match on_path {
-        Some(p) => match path_version {
-            Some(found) if found != running => Check {
+    match found {
+        Some(p) => match found_version {
+            Some(other) if other != running => Check {
                 name,
                 severity: Severity::Warn,
                 detail: format!(
-                    "v{running} running, but `caucus` on PATH ({}) is v{found} — the \
-                     turn-signal hook execs the PATH binary, so signals go through \
-                     the other build and newer wire features degrade silently; \
-                     reinstall caucus so PATH matches",
+                    "v{running} running, but the `caucus` the turn-signal hook runs \
+                     ({}) is v{other}, so signals go through the other build and \
+                     newer wire features degrade silently; reinstall caucus so the \
+                     two match",
                     p.display()
                 ),
             },
@@ -454,15 +472,16 @@ fn caucus_check_from(running: &str, on_path: Option<&Path>, path_version: Option
             _ => Check {
                 name,
                 severity: Severity::Ok,
-                detail: format!("v{running} (on PATH at {})", p.display()),
+                detail: format!("v{running} (the hook runs {})", p.display()),
             },
         },
         None => Check {
             name,
             severity: Severity::Warn,
             detail: format!(
-                "v{running} running, but `caucus` is not on PATH — the turn-signal \
-                 hook (`exec caucus signal post`) cannot run; install caucus on PATH"
+                "v{running} running, but `caucus` is neither on PATH nor at \
+                 {MANAGED_CAUCUS} — the turn-signal hook (`exec caucus signal post`) \
+                 cannot run; install caucus on PATH"
             ),
         },
     }
@@ -956,7 +975,33 @@ mod tests {
     fn caucus_check_warns_when_not_on_path() {
         let check = caucus_check_from("0.9.1", None, None);
         assert_eq!(check.severity, Severity::Warn, "{}", check.detail);
-        assert!(check.detail.contains("not on PATH"), "{}", check.detail);
+        assert!(check.detail.contains("neither on PATH"), "{}", check.detail);
+    }
+
+    /// The check looks for `caucus` where the hook script does: on `PATH`
+    /// first, then at a main's copy under the home.
+    #[test]
+    fn the_hook_caucus_is_on_path_else_a_mains_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = Some(bin.as_os_str());
+        assert_eq!(hook_caucus(path, Some(tmp.path())), None);
+
+        let stub = |at: &Path| {
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(at, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let managed = tmp.path().join(".caucus/bin/caucus");
+        stub(&managed);
+        assert_eq!(hook_caucus(path, Some(tmp.path())), Some(managed));
+        stub(&bin.join("caucus"));
+        assert_eq!(
+            hook_caucus(path, Some(tmp.path())),
+            Some(bin.join("caucus"))
+        );
     }
 
     #[test]

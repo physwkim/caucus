@@ -544,6 +544,8 @@ caucus가 tmux 안에서 돌든 밖에서 돌든 구성상 동일하고, 패널 
 ### 7.2 작성 주체
 **Claude `Stop` hook**. caucus는 이 hook을 `caucus init --install-hook`으로
 설치한다 — Claude `~/.claude/settings.json`에 merge하고 `.bak` 백업을 남긴다.
+ssh 서브호스트에서는 `caucus host bridge`가 연결될 때마다 같은 설치를 돌린다 —
+hook이 이미 최신이면 settings.json은 건드리지 않는다.
 같은 설치가 `PostCompact` / `SessionStart` hook도 함께 wire한다 — 스크립트는
 하나이고, 이벤트별 인자만 다르다 (§7.9). 설치는 `HOOK_EVENTS`가 나열한
 이벤트만 남기고, settings.json에 있는 **다른 모든** 이벤트의 caucus hook은
@@ -572,6 +574,8 @@ hook을 실행하게 되어 어떤 패널도 신호를 보내지 못하고 어�
 # $1은 hook 이벤트 인자: Stop 항목은 인자 없이(기본 stop), PostCompact/
 # SessionStart 항목은 post-compact / session-start를 넘긴다 (§7.9).
 kind="${1:-stop}"
+# PATH에 caucus가 없으면 main이 이 호스트에 둔 사본을 쓴다.
+command -v caucus >/dev/null 2>&1 || PATH="$HOME/.caucus/bin:$PATH"
 if [ -n "$CAUCUS_SOCK" ]; then
   exec caucus signal post \
     --sock    "$CAUCUS_SOCK" \
@@ -586,7 +590,9 @@ exec caucus signal post --discover --kind "$kind"
 env가 없으면 `--discover`로 fallback한다(§7.8) — env 부재가 "caucus 패널이
 아니다"를 뜻하지 않기 때문이다(daemon re-host). 소켓이 어디 있는지는 바이너리만
 안다: 스크립트가 소켓을 미리 찾으면 소켓 위치가 바뀔 때 그 소켓을 건너뛴다.
-살아 있는 소켓이 없으면 post는 no-op이고, caucus가 없으면 조용히 끝난다.
+살아 있는 소켓이 없으면 post는 no-op이다. PATH에 caucus가 없으면 main이
+서브호스트에 두는 사본(`~/.caucus/bin/caucus`)을 쓰고, 그것도 없으면 조용히
+끝난다.
 
 `caucus signal post`는 stdin JSON에서 `last_message`를 추출해 소켓에 한 줄 JSON으로
 쓴다. 파일도, 폴링도 없다 — caucus 실행 프로세스가 소켓 read로 즉시 수신한다.
