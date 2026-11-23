@@ -4,7 +4,8 @@
 //! [[host]]
 //! name = "build-1"            # what spawn_role's `host` and list_hosts use
 //! ssh = "me@build-1.lan"      # ssh destination; defaults to `name`
-//! caucus = "~/bin/caucus"     # caucus on that host; defaults to `caucus`
+//! caucus = "~/bin/caucus"     # caucus there; without it main copies its own
+//!                             # build to ~/.caucus/bin/caucus there
 //! dir = "~/src/project"       # the repo checkout there; defaults to this repo's path
 //!
 //! [[host]]
@@ -22,7 +23,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::host::{Transport, home_relative};
+use crate::host::{RemoteCaucus, Transport, home_relative};
 use crate::worktree::same_repository;
 
 /// The name `list_hosts` gives the machine main runs on.
@@ -43,7 +44,7 @@ pub struct HostConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostReach {
     /// `dest` is an ssh destination (`[user@]host` or `ssh://[user@]host[:port]`).
-    Ssh { dest: String, caucus: String },
+    Ssh { dest: String, caucus: RemoteCaucus },
     /// A daemon on this machine, at its control socket.
     Socket(PathBuf),
 }
@@ -152,7 +153,7 @@ impl HostEntry {
             (Some(socket), None) => HostReach::Socket(socket),
             (None, ssh) => HostReach::Ssh {
                 dest: ssh.unwrap_or_else(|| self.name.clone()),
-                caucus: self.caucus.unwrap_or_else(|| "caucus".to_string()),
+                caucus: self.caucus.map_or(RemoteCaucus::Managed, RemoteCaucus::At),
             },
         };
         // A socket host is on this machine, where this repo's own path is
@@ -267,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_defaults_to_the_name_and_socket_hosts_connect_locally() {
+    fn ssh_defaults_to_the_name_and_this_build_and_socket_hosts_connect_locally() {
         let tmp = TempDir::new().unwrap();
         write_project(
             tmp.path(),
@@ -278,6 +279,7 @@ mod tests {
 
             [[host]]
             name = "build-2"
+            caucus = "~/bin/caucus"
 
             [[host]]
             name = "box"
@@ -287,9 +289,16 @@ mod tests {
         );
         let hosts = load(None, tmp.path()).unwrap();
         assert_eq!(hosts[0].name, "build-1");
-        assert_eq!(hosts[0].transport(), Transport::ssh("build-1", "caucus"));
+        assert_eq!(
+            hosts[0].transport(),
+            Transport::ssh("build-1", &RemoteCaucus::Managed)
+        );
         assert_eq!(hosts[0].dir, PathBuf::from("~/src/p"));
         assert_eq!(hosts[1].dir, tmp.path(), "this repo's path, on that host");
+        assert_eq!(
+            hosts[1].transport(),
+            Transport::ssh("build-2", &RemoteCaucus::At("~/bin/caucus".into()))
+        );
         assert_eq!(
             hosts[2].transport(),
             Transport::Socket("/tmp/d.sock".into())
@@ -354,7 +363,10 @@ mod tests {
         let hosts = load(Some(&global), tmp.path()).unwrap();
         let names: Vec<_> = hosts.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, ["a", "b"]);
-        assert_eq!(hosts[1].transport(), Transport::ssh("new", "caucus"));
+        assert_eq!(
+            hosts[1].transport(),
+            Transport::ssh("new", &RemoteCaucus::Managed)
+        );
     }
 
     #[test]
@@ -363,7 +375,7 @@ mod tests {
             name: "h".into(),
             reach: HostReach::Ssh {
                 dest: dest.into(),
-                caucus: "caucus".into(),
+                caucus: RemoteCaucus::Managed,
             },
             dir: dir.into(),
         };

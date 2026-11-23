@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use caucus::host::proto::{Bytes, ClientFrame, DaemonFrame, PROTO_VERSION, SpawnSpec};
-use caucus::host::{HostLink, Transport};
+use caucus::host::{HostLink, HostPaths, LinkError, RemoteShell, Transport};
 use caucus::session::id::{PanelId, SessionId};
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -248,4 +248,159 @@ async fn a_login_profile_printing_before_the_bridge_does_not_stop_the_link() {
     let connected = link.wait_connected(WAIT).await;
     link.close(WAIT).await;
     connected.unwrap();
+}
+
+/// A "host" reached by running sh locally with `home` as its user's home.
+fn local_shell(home: &Path) -> RemoteShell {
+    RemoteShell {
+        program: "env".into(),
+        args: vec![
+            format!("HOME={}", home.display()).into(),
+            "sh".into(),
+            "-c".into(),
+        ],
+    }
+}
+
+/// The daemon a managed bridge starts under `home`.
+fn managed_daemon(home: &Path) -> DaemonGuard {
+    DaemonGuard {
+        lock: HostPaths::default_state_dir(home).join("daemon.lock"),
+    }
+}
+
+fn managed_link(home: &Path, image: &Path) -> HostLink {
+    let transport = Transport::Managed {
+        shell: local_shell(home),
+        image: image.to_path_buf(),
+    };
+    let (tx, _signals) = tokio::sync::mpsc::unbounded_channel();
+    HostLink::connect(
+        "managed",
+        SessionId::new(),
+        transport,
+        tx,
+        Default::default(),
+        None,
+    )
+}
+
+fn managed_copy(home: &Path) -> PathBuf {
+    home.join(".caucus").join("bin").join("caucus")
+}
+
+/// An executable script at `path` running `body`.
+fn script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Connect to the managed host `home` with this build, then check the host
+/// runs the copy main put there.
+async fn connects_through_the_copy(home: &Path) {
+    let _daemon = managed_daemon(home);
+    let image = Path::new(env!("CARGO_BIN_EXE_caucus"));
+    let link = managed_link(home, image);
+    let connected = link.wait_connected(WAIT).await;
+    link.close(WAIT).await;
+    let info = connected.unwrap();
+    let copy = managed_copy(home);
+    assert_eq!(
+        info.caucus_bin.canonicalize().unwrap(),
+        copy.canonicalize().unwrap(),
+        "the daemon runs the copy"
+    );
+    assert!(
+        std::fs::read(&copy).unwrap() == std::fs::read(image).unwrap(),
+        "the copy is this build"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_without_caucus_gets_this_build_and_connects() {
+    let tmp = tempfile::tempdir().unwrap();
+    connects_through_the_copy(tmp.path()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_build_on_the_host_is_replaced() {
+    let tmp = tempfile::tempdir().unwrap();
+    script(
+        &managed_copy(tmp.path()),
+        "echo older-build; echo ran >>\"$HOME/older-ran\"",
+    );
+    connects_through_the_copy(tmp.path()).await;
+    assert!(
+        tmp.path().join("older-ran").exists(),
+        "the older copy was asked which build it is"
+    );
+}
+
+/// The link parks with `reason`, and `runs` stops growing: nothing is
+/// copied again.
+async fn parks(link: &HostLink, reason: &str, runs: &Path) {
+    let err = link
+        .wait_connected(Duration::from_secs(3))
+        .await
+        .unwrap_err();
+    let LinkError::Timeout { last_error, .. } = err else {
+        panic!("expected a timeout, got {err:?}");
+    };
+    let last_error = last_error.unwrap_or_default();
+    assert!(last_error.contains(reason), "{last_error}");
+    let count = || {
+        std::fs::read_to_string(runs)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before = count();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(count(), before, "the link stopped trying");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_that_does_not_run_there_is_copied_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let image = tmp.path().join("image");
+    script(
+        &image,
+        "echo ran >>\"$HOME/runs\"; echo 'cannot execute binary file' >&2; exit 126",
+    );
+    let link = managed_link(tmp.path(), &image);
+    parks(
+        &link,
+        "cannot execute binary file",
+        &tmp.path().join("runs"),
+    )
+    .await;
+    link.close(WAIT).await;
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("runs")).unwrap(),
+        "ran\n",
+        "only the check after the one copy ran it"
+    );
+    assert!(
+        !managed_copy(tmp.path()).exists(),
+        "nothing was put in place"
+    );
+}
+
+/// A copy that lands but does not answer to its build stops the link after
+/// one copy, rather than copying it forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_that_disowns_its_build_is_copied_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let image = tmp.path().join("image");
+    script(&image, "echo ran >>\"$HOME/runs\"; echo not-this-build");
+    let link = managed_link(tmp.path(), &image);
+    parks(&link, "still does not run it", &tmp.path().join("runs")).await;
+    link.close(WAIT).await;
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("runs")).unwrap(),
+        "ran\nran\n",
+        "the install's check and the one connect after it"
+    );
 }

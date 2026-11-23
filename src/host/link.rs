@@ -22,11 +22,14 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use super::install::{
+    InstallError, MANAGED_CAUCUS, NOT_INSTALLED, RemoteCaucus, RemoteShell, build_id, install,
+    login_script, managed_script, running_image,
+};
 use super::load::HostLoad;
 use super::proto::{
     Bytes, ClientFrame, DaemonFrame, HostInfo, MAX_FRAME_BYTES, PROTO_VERSION, SpawnSpec, encode,
 };
-use super::{sh_quote, sh_quote_path};
 use crate::line_io::{CappedLine, read_capped_line};
 use crate::pty::{PtyCommand, PtyError};
 use crate::session::id::{PanelId, SessionId};
@@ -50,46 +53,34 @@ const STABLE_LINK: Duration = Duration::from_secs(10);
 /// How the link reaches the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
-    /// A command whose stdin/stdout reach a daemon — normally
-    /// [`Transport::ssh`] running `caucus host bridge`.
+    /// A command whose stdin/stdout reach a daemon — normally `ssh` running
+    /// `caucus host bridge` ([`Transport::ssh`]).
     Command {
         program: OsString,
         args: Vec<OsString>,
     },
     /// The daemon's control socket on this machine.
     Socket(PathBuf),
+    /// The bridge of main's own build, run through `shell`: the link copies
+    /// `image` there first when the host lacks it ([`super::install`]).
+    Managed { shell: RemoteShell, image: PathBuf },
 }
 
 impl Transport {
-    /// `ssh <destination>` running `<caucus> host bridge` ([`ssh_args`]).
-    pub fn ssh(destination: &str, caucus: &str) -> Self {
-        Self::Command {
-            program: "ssh".into(),
-            args: ssh_args(destination, caucus, "host bridge"),
+    /// `ssh <destination>` running `caucus host bridge`.
+    pub fn ssh(destination: &str, caucus: &RemoteCaucus) -> Self {
+        let shell = RemoteShell::ssh(destination);
+        match caucus {
+            RemoteCaucus::At(caucus) => Self::Command {
+                args: shell.args(&login_script(caucus, "host bridge")),
+                program: shell.program,
+            },
+            RemoteCaucus::Managed => Self::Managed {
+                shell,
+                image: running_image(),
+            },
         }
     }
-}
-
-/// `ssh`'s arguments for running `<caucus> <subcommand>` on `destination`, in
-/// the remote user's login shell so `caucus` resolves on the PATH their
-/// profile sets.
-pub fn ssh_args(destination: &str, caucus: &str, subcommand: &str) -> Vec<OsString> {
-    let run = format!("exec {} {subcommand}", sh_quote_path(caucus));
-    let login = format!("exec \"${{SHELL:-/bin/sh}}\" -lc {}", sh_quote(&run));
-    let remote = format!("sh -c {}", sh_quote(&login));
-    let args = [
-        "-T",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ServerAliveInterval=10",
-        "-o",
-        "ServerAliveCountMax=3",
-        "--",
-        destination,
-        &remote,
-    ];
-    args.into_iter().map(OsString::from).collect()
 }
 
 /// A host's checkout of this repo: `dir` there, which git over ssh resolves
@@ -781,46 +772,9 @@ async fn supervise(
     signals: mpsc::UnboundedSender<RemoteSignal>,
 ) {
     let mut stop = inner.stop.subscribe();
-    let mut backoff = MIN_BACKOFF;
-    // A frame whose write failed, sent first on the next connection.
-    let mut retry = None;
-    loop {
-        let attempt = connection(
-            &inner,
-            session,
-            &transport,
-            &mut outbound,
-            &mut retry,
-            &signals,
-        );
-        let ended = tokio::select! {
-            ended = attempt => ended,
-            _ = stop.wait_for(|stop| *stop) => break,
-        };
-        let last_error = match ended {
-            Ended::Dropped { connected } => {
-                // A host that hangs up soon after its welcome is failing, and
-                // redialling it every MIN_BACKOFF would never settle.
-                if connected.elapsed() >= STABLE_LINK {
-                    backoff = MIN_BACKOFF;
-                }
-                info!(host = %inner.name, "sub-host link dropped; reconnecting");
-                "link dropped".to_string()
-            }
-            Ended::Failed(err) => {
-                warn!(host = %inner.name, error = %err, "sub-host connect failed");
-                err
-            }
-        };
-        inner.lock().load = None;
-        inner.status.send_replace(LinkStatus::Connecting {
-            last_error: Some(last_error),
-        });
-        tokio::select! {
-            () = tokio::time::sleep(backoff) => {}
-            _ = stop.wait_for(|stop| *stop) => break,
-        }
-        backoff = (backoff * 2).min(MAX_BACKOFF);
+    tokio::select! {
+        () = keep_connected(&inner, session, &transport, &mut outbound, &signals) => {}
+        _ = stop.wait_for(|stop| *stop) => {}
     }
     let mut state = inner.lock();
     state.closed = true;
@@ -833,55 +787,184 @@ async fn supervise(
     inner.status.send_replace(LinkStatus::Closed);
 }
 
-enum Ended {
+/// Connect, and connect again after every drop. Returns only when no further
+/// attempt can succeed, leaving the reason in the status.
+async fn keep_connected(
+    inner: &Inner,
+    session: SessionId,
+    transport: &Transport,
+    outbound: &mut mpsc::Receiver<ClientFrame>,
+    signals: &mpsc::UnboundedSender<RemoteSignal>,
+) {
+    let give_up = |reason: String| {
+        warn!(host = %inner.name, %reason, "sub-host link gives up");
+        inner.status.send_replace(LinkStatus::Connecting {
+            last_error: Some(reason),
+        });
+        std::future::pending::<()>()
+    };
+    let dial = match Dial::of(transport).await {
+        Ok(dial) => dial,
+        Err(err) => return give_up(err).await,
+    };
+    let mut backoff = MIN_BACKOFF;
+    // A frame whose write failed, sent first on the next connection.
+    let mut retry = None;
+    // Whether this build was copied since the last connection.
+    let mut installed = false;
+    loop {
+        let last_error =
+            match connection(inner, session, &dial, outbound, &mut retry, signals).await {
+                Ended::Dropped { connected } => {
+                    installed = false;
+                    // A host that hangs up soon after its welcome is failing, and
+                    // redialling it every MIN_BACKOFF would never settle.
+                    if connected.elapsed() >= STABLE_LINK {
+                        backoff = MIN_BACKOFF;
+                    }
+                    info!(host = %inner.name, "sub-host link dropped; reconnecting");
+                    "link dropped".to_string()
+                }
+                Ended::Failed(err) => {
+                    warn!(host = %inner.name, error = %err, "sub-host connect failed");
+                    err
+                }
+                Ended::NotInstalled { .. } if installed => {
+                    return give_up(format!(
+                        "copied this build of caucus to {MANAGED_CAUCUS} there, but the host \
+                     still does not run it"
+                    ))
+                    .await;
+                }
+                Ended::NotInstalled { shell, image } => {
+                    info!(host = %inner.name, "copying this build of caucus to the sub-host");
+                    inner.status.send_replace(LinkStatus::Connecting {
+                        last_error: Some(format!(
+                            "this build of caucus is not at {MANAGED_CAUCUS} there; copying it"
+                        )),
+                    });
+                    match install(shell, image).await {
+                        Ok(()) => {
+                            installed = true;
+                            continue;
+                        }
+                        Err(InstallError::CannotRun(reason)) => return give_up(reason).await,
+                        Err(InstallError::Failed(err)) => {
+                            warn!(host = %inner.name, error = %err, "copying caucus failed");
+                            err
+                        }
+                    }
+                }
+            };
+        inner.lock().load = None;
+        inner.status.send_replace(LinkStatus::Connecting {
+            last_error: Some(last_error),
+        });
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// What [`open`] runs for a [`Transport`], with a managed host's build read.
+enum Dial {
+    Command {
+        program: OsString,
+        args: Vec<OsString>,
+    },
+    Socket(PathBuf),
+    /// `shell` running `bridge` exits [`NOT_INSTALLED`] when the host lacks
+    /// `image`'s build.
+    Managed {
+        shell: RemoteShell,
+        image: PathBuf,
+        bridge: Vec<OsString>,
+    },
+}
+
+impl Dial {
+    async fn of(transport: &Transport) -> Result<Self, String> {
+        Ok(match transport.clone() {
+            Transport::Command { program, args } => Self::Command { program, args },
+            Transport::Socket(path) => Self::Socket(path),
+            Transport::Managed { shell, image } => {
+                let read = image.clone();
+                let id = tokio::task::spawn_blocking(move || build_id(&read))
+                    .await
+                    .map_err(|e| format!("read this build: {e}"))?
+                    .map_err(|e| format!("read this build at {}: {e}", image.display()))?;
+                Self::Managed {
+                    bridge: shell.args(&managed_script(&id, "host bridge")),
+                    shell,
+                    image,
+                }
+            }
+        })
+    }
+}
+
+enum Ended<'d> {
     /// Got a welcome at `connected`, then lost the connection.
     Dropped { connected: Instant },
     /// Never got a welcome.
     Failed(String),
+    /// The managed host `shell` reaches lacks the build at `image`.
+    NotInstalled {
+        shell: &'d RemoteShell,
+        image: &'d Path,
+    },
 }
 
 struct Conn {
     reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     /// The transport process, killed when the connection is dropped.
-    _child: Option<tokio::process::Child>,
+    child: Option<tokio::process::Child>,
     /// The transport's last stderr line (ssh says why it failed there).
     stderr: Arc<Mutex<Option<String>>>,
 }
 
-async fn open(transport: &Transport) -> std::io::Result<Conn> {
-    match transport {
-        Transport::Socket(path) => {
+impl Conn {
+    /// The transport process's exit code, once it has exited.
+    async fn exit_code(&mut self) -> Option<i32> {
+        let child = self.child.as_mut()?;
+        let status = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+        status.ok()?.ok()?.code()
+    }
+}
+
+async fn open(dial: &Dial) -> std::io::Result<Conn> {
+    let (program, args) = match dial {
+        Dial::Socket(path) => {
             let (read, write) = tokio::net::UnixStream::connect(path).await?.into_split();
-            Ok(Conn {
+            return Ok(Conn {
                 reader: BufReader::new(Box::new(read)),
                 writer: Box::new(write),
-                _child: None,
+                child: None,
                 stderr: Arc::default(),
-            })
+            });
         }
-        Transport::Command { program, args } => {
-            let mut child = tokio::process::Command::new(program)
-                .args(args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()?;
-            let stdin = child.stdin.take().expect("piped stdin");
-            let stdout = child.stdout.take().expect("piped stdout");
-            let stderr_tail = Arc::new(Mutex::new(None));
-            if let Some(stderr) = child.stderr.take() {
-                tokio::spawn(keep_stderr_tail(stderr, Arc::clone(&stderr_tail)));
-            }
-            Ok(Conn {
-                reader: BufReader::new(Box::new(stdout)),
-                writer: Box::new(stdin),
-                _child: Some(child),
-                stderr: stderr_tail,
-            })
-        }
+        Dial::Command { program, args } => (program, args),
+        Dial::Managed { shell, bridge, .. } => (&shell.program, bridge),
+    };
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr_tail = Arc::new(Mutex::new(None));
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(keep_stderr_tail(stderr, Arc::clone(&stderr_tail)));
     }
+    Ok(Conn {
+        reader: BufReader::new(Box::new(stdout)),
+        writer: Box::new(stdin),
+        child: Some(child),
+        stderr: stderr_tail,
+    })
 }
 
 async fn keep_stderr_tail(stderr: tokio::process::ChildStderr, tail: Arc<Mutex<Option<String>>>) {
@@ -896,15 +979,15 @@ async fn keep_stderr_tail(stderr: tokio::process::ChildStderr, tail: Arc<Mutex<O
 }
 
 /// One connection: handshake, re-attach, then relay until it drops.
-async fn connection(
+async fn connection<'d>(
     inner: &Inner,
     session: SessionId,
-    transport: &Transport,
+    dial: &'d Dial,
     outbound: &mut mpsc::Receiver<ClientFrame>,
     retry: &mut Option<ClientFrame>,
     signals: &mpsc::UnboundedSender<RemoteSignal>,
-) -> Ended {
-    let mut conn = match open(transport).await {
+) -> Ended<'d> {
+    let mut conn = match open(dial).await {
         Ok(conn) => conn,
         Err(err) => return Ended::Failed(err.to_string()),
     };
@@ -912,6 +995,11 @@ async fn connection(
     let info = match tokio::time::timeout(HANDSHAKE_WAIT, hello).await {
         Ok(Ok(info)) => info,
         Ok(Err(err)) => {
+            if let Dial::Managed { shell, image, .. } = dial
+                && conn.exit_code().await == Some(NOT_INSTALLED)
+            {
+                return Ended::NotInstalled { shell, image };
+            }
             // Let a failing transport finish printing why.
             tokio::time::sleep(Duration::from_millis(50)).await;
             let stderr = conn.stderr.lock().expect("stderr tail").clone();
@@ -1227,7 +1315,8 @@ mod tests {
 
     #[test]
     fn ssh_transport_runs_the_bridge_through_a_login_shell() {
-        let Transport::Command { program, args } = Transport::ssh("build-1", "caucus") else {
+        let caucus = RemoteCaucus::At("caucus".into());
+        let Transport::Command { program, args } = Transport::ssh("build-1", &caucus) else {
             panic!("ssh is a command transport");
         };
         assert_eq!(program, "ssh");
@@ -1260,6 +1349,19 @@ mod tests {
         );
     }
 
+    /// A host without a `caucus` of its own runs this build, through the
+    /// same ssh.
+    #[test]
+    fn ssh_without_a_caucus_runs_this_build() {
+        assert_eq!(
+            Transport::ssh("h", &RemoteCaucus::Managed),
+            Transport::Managed {
+                shell: RemoteShell::ssh("h"),
+                image: running_image(),
+            }
+        );
+    }
+
     #[test]
     fn a_caucus_path_under_home_is_found_on_the_host() {
         let home = tempfile::tempdir().unwrap();
@@ -1269,7 +1371,8 @@ mod tests {
         std::fs::write(&caucus, "#!/bin/sh\nprintf 'ran %s' \"$*\"\n").unwrap();
         std::fs::set_permissions(&caucus, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
-        let Transport::Command { args, .. } = Transport::ssh("h", "~/my bin/caucus") else {
+        let caucus = RemoteCaucus::At("~/my bin/caucus".into());
+        let Transport::Command { args, .. } = Transport::ssh("h", &caucus) else {
             panic!("ssh is a command transport");
         };
         // A plain shell stands in for the login shell, whose profile is the

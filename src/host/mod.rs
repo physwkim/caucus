@@ -12,11 +12,15 @@
 //! - [`link`] — main's side: a [`HostLink`] per sub-host keeps one connection
 //!   alive across drops, and each remote panel is a [`RemotePty`] behind the
 //!   same [`Pty`](crate::pty::Pty) façade a local panel uses.
+//!
+//! [`install`] puts main's own build on an ssh host whose entry names no
+//! `caucus`, for the link to run there.
 
 pub mod bridge;
 pub mod daemon;
 #[cfg(test)]
 pub(crate) mod e2e;
+pub mod install;
 pub mod link;
 pub mod load;
 pub mod proto;
@@ -25,9 +29,8 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub use link::{
-    Checkout, HostLink, LinkError, LinkStatus, RemotePty, RemoteSignal, Transport, ssh_args,
-};
+pub use install::{RemoteCaucus, RemoteShell};
+pub use link::{Checkout, HostLink, LinkError, LinkStatus, RemotePty, RemoteSignal, Transport};
 pub use load::HostLoad;
 pub use proto::{HostInfo, HostPanel};
 

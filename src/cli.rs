@@ -320,6 +320,10 @@ pub enum HostCommand {
     /// Check this host for a main's `caucus doctor`: the running daemon's
     /// checks, or this process's when none runs; the report is one JSON line.
     Doctor,
+    /// Print this build's id, which a main compares with its own before
+    /// running the copy of itself it keeps on this host.
+    #[command(hide = true)]
+    BuildId,
 }
 
 /// Overrides for where the sub-host daemon keeps state and listens.
@@ -396,6 +400,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 .context("resolve caucus host paths")?;
             let report = doctor::host_doctor(&paths).map_err(anyhow::Error::msg)?;
             println!("\n{}", serde_json::to_string(&report)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Host(HostCommand::BuildId)) => {
+            println!(
+                "{}",
+                crate::host::install::running_build_id().map_err(anyhow::Error::msg)?
+            );
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::McpServe { control_sock }) => run_mcp_serve(&control_sock),

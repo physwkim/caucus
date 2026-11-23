@@ -249,7 +249,7 @@ a project entry replaces the global entry of the same name.
 [[host]]
 name = "build-1"            # what spawn_role's `host` and list_hosts use
 ssh = "me@build-1.lan"      # ssh destination; defaults to `name`
-caucus = "~/bin/caucus"     # caucus on that host; defaults to `caucus`
+caucus = "~/bin/caucus"     # caucus on that host; defaults to main's own build
 dir = "~/src/project"       # the host's clone of this repo; defaults to this repo's path
 
 [[host]]
@@ -259,7 +259,11 @@ dir = "~/src/project-box"   # required: a clone of this repo apart from this one
 ```
 
 An ssh host runs `caucus host bridge` in the remote user's login shell, which
-starts that user's host daemon if none is running. The daemon owns the
+starts that user's host daemon if none is running. Without a `caucus` key,
+the bridge is main's own build, which main copies to `~/.caucus/bin/caucus`
+there over the same ssh whenever that copy is missing or another build. The
+copy must run there (same OS and CPU, compatible system libraries); if it
+does not, the host stays disconnected and `list_hosts` says why. The daemon owns the
 host's panels and outlives the connection: after an ssh drop main reconnects,
 re-reads each panel's missed output (up to its last 8 MiB), and the input
 and turn signals the drop lost are delivered once. It runs until it gets
@@ -281,8 +285,9 @@ main or other hosts.
 
 On every host:
 
-- install a caucus that speaks main's protocol version (`list_hosts` shows
-  the mismatch otherwise); after upgrading it, stop the old daemon;
+- with a `caucus` key, install a caucus there that speaks main's protocol
+  version (`list_hosts` shows the mismatch otherwise);
+- after upgrading caucus, stop the host's old daemon;
 - run `caucus init --install-hook` there: remote panels post their turn
   signals through the host's own Claude Stop hook;
 - keep `caucus` on the login shell's `PATH`, since the hook runs it by bare

@@ -24,8 +24,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::config::hosts::{HostConfig, HostReach};
+use crate::host::HostPaths;
+use crate::host::install::{
+    MANAGED_CAUCUS, NOT_INSTALLED, RemoteCaucus, RemoteShell, login_script, managed_script,
+    running_build_id,
+};
 use crate::host::proto::{ClientFrame, DaemonFrame, PROTO_VERSION, encode};
-use crate::host::{HostPaths, ssh_args};
 
 /// Severity of a single check result.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -181,15 +185,32 @@ fn sub_host_check(host: &HostConfig) -> Vec<Check> {
         HostReach::Socket(sock) => UnixStream::connect(sock)
             .map_err(|e| format!("not checked: no daemon at {}: {e}", sock.display()))
             .and_then(ask_daemon),
-        HostReach::Ssh { dest, caucus } => {
-            let mut command = Command::new("ssh");
-            command.args(ssh_args(dest, caucus, "host doctor"));
-            output_within(&mut command, SUB_HOST_WAIT)
-                .map_err(|e| format!("not checked: {e}"))
-                .and_then(printed_report)
-        }
+        HostReach::Ssh { dest, caucus } => ssh_host_report(&RemoteShell::ssh(dest), caucus),
     };
     sub_host_report(&host.name, report)
+}
+
+/// What `caucus host doctor` reports on the host `shell` reaches, run as
+/// main's link would run its bridge there.
+fn ssh_host_report(shell: &RemoteShell, caucus: &RemoteCaucus) -> Result<HostReport, String> {
+    let script = match caucus {
+        RemoteCaucus::At(caucus) => login_script(caucus, "host doctor"),
+        RemoteCaucus::Managed => managed_script(
+            running_build_id().map_err(|e| format!("not checked: {e}"))?,
+            "host doctor",
+        ),
+    };
+    let mut command = Command::new(&shell.program);
+    command.args(shell.args(&script));
+    let out =
+        output_within(&mut command, SUB_HOST_WAIT).map_err(|e| format!("not checked: {e}"))?;
+    if *caucus == RemoteCaucus::Managed && out.status.code() == Some(NOT_INSTALLED) {
+        return Err(format!(
+            "not checked: this build of caucus is not at {MANAGED_CAUCUS} there yet; main \
+             copies it there when it connects"
+        ));
+    }
+    printed_report(out)
 }
 
 /// What `caucus host doctor` prints: the report of the daemon a bridge
@@ -1085,6 +1106,41 @@ mod tests {
         assert!(checks[0].detail.contains("--help"), "{}", checks[0].detail);
         let checks = sub_host_report("gone", Err("no answer within 20s".into()));
         assert_eq!(summary(&checks), [("host:gone", Severity::Warn)]);
+    }
+
+    /// A managed host is asked through main's build only: until main has
+    /// copied it there, the doctor says so rather than running another.
+    #[test]
+    fn a_managed_host_is_checked_through_this_build_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shell = RemoteShell {
+            program: "env".into(),
+            args: vec![
+                format!("HOME={}", tmp.path().display()).into(),
+                "sh".into(),
+                "-c".into(),
+            ],
+        };
+        let err = ssh_host_report(&shell, &RemoteCaucus::Managed).unwrap_err();
+        assert!(err.contains("copies it there"), "{err}");
+
+        // A copy that answers to this build is what the check runs.
+        let copy = tmp.path().join(".caucus/bin/caucus");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::write(
+            &copy,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n'host build-id') echo {} ;;\n\
+                 'host doctor') echo '{}' ;;\nesac\n",
+                running_build_id().unwrap(),
+                report_line(PROTO_VERSION)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&copy, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let report = ssh_host_report(&shell, &RemoteCaucus::Managed).unwrap();
+        assert_eq!(report.version, "9.9.9");
     }
 
     #[test]
