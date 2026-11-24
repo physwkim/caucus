@@ -64,7 +64,7 @@ jobs:
       # other tests' open files until it execs, so a dropped lock still reads
       # as held and a just-written script fails with ETXTBSY.
       - name: Test
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --no-fail-fast
 
       - name: Doctests
         run: cargo test --doc --workspace
