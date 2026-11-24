@@ -13,7 +13,7 @@
 | 1 | 이름: `caucus`. 경로: `~/codes/caucus`. |
 | 2 | 실행 모델 = **caucus 자체 멀티플렉서**. 장기 실행 풀스크린 TUI 프로세스. agent는 caucus가 관리하는 **패널별 PTY**에서 도는 `claude` / `codex` CLI 프로세스. tmux / zellij 의존 없음 — 둘은 분석 레퍼런스(kodex 적재)일 뿐. |
 | 3 | VT 레이어 = **공개 크레이트** (경로 B-i): `vte`(escape-sequence 파서) + `portable-pty`(PTY 관리) + `ratatui`(패널 레이아웃·렌더). caucus가 직접 짜는 것은 grid `vte::Perform` 구현(~2-4k LOC) 하나뿐이며 zellij `zellij-server/src/panes/grid.rs`를 라인 단위 레퍼런스로 쓴다. zellij 크레이트 통째 vendor는 기각 — grid가 `output`/`tab`/`ui`/`route`/`screen`/`thread_bus` + `zellij-utils` ~140k LOC와 결합되어 깨끗한 추출 불가. |
-| 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버**의 15개 툴(`send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `queue_tasks` / `collect_workers` / `stop_watching` / `read_menu` / `select_option` / `wait`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. main 백엔드 CLI는 `--agent-cli claude\|codex`로 선택한다(기본 `claude`). codex를 고르면 caucus MCP 서버를 `-c mcp_servers.caucus.command/args/tool_timeout_sec`로 등록한다 — codex에는 `--mcp-config`가 없고 `[mcp_servers.<name>]` config로만 MCP를 받기 때문(claude는 `--mcp-config`를 쓴다). 어느 백엔드든 동일한 15개 툴로 sub-agent를 지휘한다. |
+| 4 | **main worker** = caucus 패널 중 하나에서 도는 주(主) 에이전트(Claude Code). 사용자가 직접 대화한다. main은 작업을 sub-task로 분해해 — 간단한 건 자기 패널에서 직접 처리하고, 병렬화 이득이 있는 건 **caucus MCP 서버**의 16개 툴(`send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `list_hosts` / `queue_tasks` / `collect_workers` / `stop_watching` / `read_menu` / `select_option` / `wait`)로 sub-agent 패널을 띄워 분배·관리·병합한다. 구 'CEO' 명칭은 폐기 — 수동적 보스가 아니라 직접 일하며 sub-agent를 지휘하는 메인 워커. main 백엔드 CLI는 `--agent-cli claude\|codex`로 선택한다(기본 `claude`). codex를 고르면 caucus MCP 서버를 `-c mcp_servers.caucus.command/args/tool_timeout_sec`로 등록한다 — codex에는 `--mcp-config`가 없고 `[mcp_servers.<name>]` config로만 MCP를 받기 때문(claude는 `--mcp-config`를 쓴다). 어느 백엔드든 동일한 16개 툴로 sub-agent를 지휘한다. |
 | 5 | 턴 완료 신호 = Claude `Stop` hook이 **caucus 실행 프로세스의 소켓에 post**한다. 파일 sentinel(`*.sentinel.json`) + 폴링 watcher는 폐기. codex에는 Stop hook이 없으므로 codex 패널마다 `-c notify=[caucus, "signal", "codex-notify", …]`를 주입한다 — codex는 `agent-turn-complete`에 그 program을 호출하며 이벤트 JSON을 마지막 argv로 붙인다(실측 검증). `caucus signal codex-notify`가 그 JSON을 파싱해 claude Stop hook과 **동일한 `TurnSignal{Stop}`을 같은 소켓에 post**하므로, 두 백엔드가 단일 턴-완료 소유자(`handle_signal`)로 수렴한다. 이게 없으면 codex 패널은 영원히 `Working`으로 남아 그 워커는 정체 경보로만 main에 알려진다. |
 | 6 | "라운드" 개념은 **폐지** — 파일 안건 broadcast + `response-*.md` 수집도, 여러 패널을 한 묶음으로 기다리는 배리어도 없다. main이 패널에 라이브로 키를 입력하면 caucus가 그 워커를 감시하고, §5의 턴 완료 신호로 **워커별로** 결과를 되돌린다(main이 바쁜 동안 정착한 워커들은 메시지 하나로 함께 간다). |
 | 7 | Role 정의: `~/.caucus/roles.toml` (전역) + `<repo>/.caucus/roles.toml` (프로젝트 오버라이드, 우선). |
@@ -87,7 +87,7 @@ sync). 사용자는 main worker 패널과 대화하고, main worker는 작업을
 | **Round** | main worker가 여러 패널에 같은 안건을 라이브로 던지고 각 패널의 turn signal로 완료를 판정하는 한 묶음. |
 | **Manifest** | 한 agent의 LaneEvent 타임라인 + derived_state + commit_provenance 영속화. |
 | **Lane** | 한 agent의 작업 흐름. claw-code 용어 차용. |
-| **MCP 서버** | caucus가 main worker에게 노출하는 제어 인터페이스 — 15개 툴(`send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `queue_tasks` / `collect_workers` / `stop_watching` / `read_menu` / `select_option` / `wait`). |
+| **MCP 서버** | caucus가 main worker에게 노출하는 제어 인터페이스 — 16개 툴(`send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `list_hosts` / `queue_tasks` / `collect_workers` / `stop_watching` / `read_menu` / `select_option` / `wait`). |
 | **Session record** | 한 세션의 패널 roster 영속 스냅샷(`.caucus/sessions/<id>/session.json`). `caucus resume`가 이를 읽어 패널을 재생성. |
 
 ---
@@ -544,6 +544,8 @@ caucus가 tmux 안에서 돌든 밖에서 돌든 구성상 동일하고, 패널 
 ### 7.2 작성 주체
 **Claude `Stop` hook**. caucus는 이 hook을 `caucus init --install-hook`으로
 설치한다 — Claude `~/.claude/settings.json`에 merge하고 `.bak` 백업을 남긴다.
+ssh 서브호스트에서는 `caucus host bridge`가 연결될 때마다 같은 설치를 돌린다 —
+hook이 이미 최신이면 settings.json은 건드리지 않는다.
 같은 설치가 `PostCompact` / `SessionStart` hook도 함께 wire한다 — 스크립트는
 하나이고, 이벤트별 인자만 다르다 (§7.9). 설치는 `HOOK_EVENTS`가 나열한
 이벤트만 남기고, settings.json에 있는 **다른 모든** 이벤트의 caucus hook은
@@ -571,8 +573,9 @@ hook을 실행하게 되어 어떤 패널도 신호를 보내지 못하고 어�
 # CAUCUS_* env는 caucus가 패널 spawn 시 주입. Claude hook payload는 stdin JSON.
 # $1은 hook 이벤트 인자: Stop 항목은 인자 없이(기본 stop), PostCompact/
 # SessionStart 항목은 post-compact / session-start를 넘긴다 (§7.9).
-# 아래 discovery 분기가 위치 파라미터를 소켓 glob으로 덮어쓰므로 먼저 캡처한다.
 kind="${1:-stop}"
+# PATH에 caucus가 없으면 main이 이 호스트에 둔 사본을 쓴다.
+command -v caucus >/dev/null 2>&1 || PATH="$HOME/.caucus/bin:$PATH"
 if [ -n "$CAUCUS_SOCK" ]; then
   exec caucus signal post \
     --sock    "$CAUCUS_SOCK" \
@@ -580,14 +583,16 @@ if [ -n "$CAUCUS_SOCK" ]; then
     --panel   "$CAUCUS_PANEL_ID" \
     --kind    "$kind"
 fi
-set -- "${TMPDIR:-/tmp}"/caucus-*.sock
-[ -e "$1" ] || exit 0
+command -v caucus >/dev/null 2>&1 || exit 0
 exec caucus signal post --discover --kind "$kind"
 ```
 
-env가 없는데 caucus 소켓이 하나라도 살아 있으면 `--discover`로 fallback한다
-(§7.8) — env 부재가 "caucus 패널이 아니다"를 뜻하지 않기 때문이다(daemon
-re-host). 소켓도 없으면 종전처럼 조용한 no-op.
+env가 없으면 `--discover`로 fallback한다(§7.8) — env 부재가 "caucus 패널이
+아니다"를 뜻하지 않기 때문이다(daemon re-host). 소켓이 어디 있는지는 바이너리만
+안다: 스크립트가 소켓을 미리 찾으면 소켓 위치가 바뀔 때 그 소켓을 건너뛴다.
+살아 있는 소켓이 없으면 post는 no-op이다. PATH에 caucus가 없으면 main이
+서브호스트에 두는 사본(`~/.caucus/bin/caucus`)을 쓰고, 그것도 없으면 조용히
+끝난다.
 
 `caucus signal post`는 stdin JSON에서 `last_message`를 추출해 소켓에 한 줄 JSON으로
 쓴다. 파일도, 폴링도 없다 — caucus 실행 프로세스가 소켓 read로 즉시 수신한다.
@@ -833,9 +838,11 @@ resume`이 fork 이전 대화를 되살린다. env 상속을 끊는 **모든** �
 - **클라이언트** (`caucus signal post --discover`, §7.3 스크립트의 fallback):
   payload만으로 `UnboundSignal`(wire 마커 `unbound: true`, untagged
   `SignalEvent`가 shape로 판별)을 만들어 temp dir의 모든 `caucus-*.sock`
-  (`-ctl.sock` 제외)에 브로드캐스트하고, 소켓당 응답 한 줄을 읽는다. 소켓
-  파일이 곧 레지스트리다 — 별도 상태 파일 없음, 죽은 소켓은 connect 실패로
-  자체 스킵. 첫 deliver reason이 이긴다(한 대화의 owner는 최대 하나).
+  (`-ctl.sock` 제외)과 이 머신의 호스트 daemon 신호 소켓
+  (`~/.caucus/host/<hostname>/signal.sock`, 32바이트를 넘는 hostname은
+  앞부분과 해시로 줄임)에 브로드캐스트하고, 소켓당 응답
+  한 줄을 읽는다. 소켓 파일이 곧 레지스트리다 — 별도 상태 파일 없음, 죽은
+  소켓은 connect 실패로 자체 스킵. 첫 deliver reason이 이긴다(한 대화의 owner는 최대 하나).
 - **서버**: unbound 라인은 항상 reply slot을 받는다(§7.6과 동일한 대기).
   런타임의 `Multiplexer::handle_unbound_signal`이 단일 owner로서 unbound→bound
   변환을 수행한다. 해석 순서:
@@ -1275,7 +1282,7 @@ caucus/
     ├── input/               (키 라우팅: `Ctrl-A` 프리픽스 키맵, focus·임의 키 → PTY, §9.2)
     ├── panel/
     │   └── lifecycle.rs     (Panel 구조체 + spawn/kill + 레이아웃 reflow, transition 단일 owner)
-    ├── mcp/                 (main worker용 MCP 서버: 15개 툴 — send_keys/send_key/broadcast/ctrl_c/read_panel/spawn_role/kill_panel/restart_panel/list_panels/queue_tasks/collect_workers/stop_watching/read_menu/select_option/wait)
+    ├── mcp/                 (main worker용 MCP 서버: 16개 툴 — send_keys/send_key/broadcast/ctrl_c/read_panel/spawn_role/kill_panel/restart_panel/list_panels/list_hosts/queue_tasks/collect_workers/stop_watching/read_menu/select_option/wait)
     ├── signal/              (turn-signal 소켓 서버 + `caucus signal post` 클라이언트)
     ├── agent/
     │   ├── spawn.rs         (RoleSpec → 새 패널 + 새 AgentManifest)
@@ -1731,7 +1738,7 @@ main worker → (자기 MCP 툴박스로) Notion / kodex 동기화 — caucus �
 - caucus 멀티플렉서 TUI — 풀스크린, 패널별 PTY(`portable-pty`), `vte` 기반 grid, `ratatui` 렌더
 - 패널 동적 spawn / kill + 레이아웃 reflow
 - 입력 라우팅 — focus 패널 전환, `Enter` / `Ctrl-C` / 임의 키, 완전 양방향 인터랙티브 입력(로그인·OAuth 흐름 포함)
-- main worker용 MCP 서버 — 15개 툴: `send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `queue_tasks` / `collect_workers` / `stop_watching` / `read_menu` / `select_option` / `wait`
+- main worker용 MCP 서버 — 16개 툴: `send_keys` / `send_key` / `broadcast` / `ctrl_c` / `read_panel` / `spawn_role` / `kill_panel` / `restart_panel` / `list_panels` / `list_hosts` / `queue_tasks` / `collect_workers` / `stop_watching` / `read_menu` / `select_option` / `wait`
 - 레이아웃 제어 — `Ctrl-A` 프리픽스 키맵, 4종 레이아웃 모드 순환, transcript 오버레이 + 스크롤백 페이저(§9.2)
 - 세션 영속화 & resume — `session.json` 레코드, `caucus sessions` / `caucus resume`(§3.1)
 - agent 백엔드 다중화 — `claude` / `codex`, role별 `model`·`agent_cli` override, main worker 자체 판단 지정

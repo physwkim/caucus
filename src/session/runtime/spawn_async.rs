@@ -10,26 +10,51 @@
 //! has launched. Besides `wait` (`session::runtime::wait`), this is the one
 //! deferred-reply path in the control protocol (`docs/design.md` §0 #4);
 //! every other request still answers synchronously.
+//!
+//! A worktree on a sub-host is made by a task instead of a thread: this
+//! repo's `HEAD` is pushed to the host's checkout as the lane's branch, then
+//! the host's daemon checks the branch out as the worktree.
 
+use super::hosts::{HostRepo, within};
+use super::spawn::Orphan;
 use super::*;
 use crate::mcp::McpError;
 use crate::mcp::protocol::ControlResponse;
 use crate::role::spec::AgentCli;
 use crate::session::id::PanelId;
-use crate::worktree::cleanup::CleanupJob;
-use crate::worktree::manager::{WorktreeHandle, create as create_worktree};
+use crate::worktree::manager::{WorktreeHandle, WorktreeRequest, create as create_worktree};
+use crate::worktree::remote::push_head;
 use tokio::sync::oneshot;
 use tracing::warn;
 
-/// A `spawn_role(worktree=true)` whose `git worktree add` is running on a worker
-/// thread. Once the worktree result arrives on `rx`, the panel is launched on
-/// the event loop and `reply` answers the deferred MCP tool call.
+/// Where [`Multiplexer::finish_spawn_role`] launches a panel.
+pub(crate) struct Site {
+    /// The sub-host; `None` is this machine.
+    pub(crate) host: Option<String>,
+    /// The worktree already made for it on that machine.
+    pub(crate) worktree: Option<WorktreeHandle>,
+}
+
+/// How a pending spawn's worktree is being made.
+enum Making {
+    /// `git worktree add` on a worker thread here.
+    Here(std::sync::mpsc::Receiver<Result<WorktreeHandle, String>>),
+    /// The push and the daemon's checkout, in a task against `host`. The task
+    /// removes a worktree whose receiver is gone.
+    Host {
+        host: String,
+        rx: oneshot::Receiver<Result<WorktreeHandle, String>>,
+    },
+}
+
+/// A `spawn_role(worktree=true)` whose worktree is being made off the event
+/// loop. Once it arrives, the panel is launched on the event loop and `reply`
+/// answers the deferred MCP tool call.
 pub(crate) struct PendingSpawn {
     /// The role label — also counted by [`Multiplexer::role_worktree_request`]
     /// so a second concurrent same-role spawn gets a distinct sequence number.
     pub(crate) role: String,
-    /// Result of `git worktree add` from the worker thread.
-    rx: std::sync::mpsc::Receiver<Result<WorktreeHandle, String>>,
+    making: Making,
     model: Option<String>,
     agent_cli: Option<AgentCli>,
     prompt: Option<String>,
@@ -49,8 +74,12 @@ impl Multiplexer {
         model: Option<&str>,
         agent_cli: Option<AgentCli>,
         prompt: Option<&str>,
-        wt_handle: Option<WorktreeHandle>,
+        site: Site,
     ) -> Result<PanelId, McpError> {
+        let Site {
+            host,
+            worktree: wt_handle,
+        } = site;
         let worktree_path = wt_handle.as_ref().map(|h| h.path.clone());
         let worktree_branch = wt_handle.as_ref().map(|h| h.branch.clone());
         // `spawn_panel_resume` with no resume id is a plain spawn that also
@@ -65,6 +94,7 @@ impl Multiplexer {
             worktree_branch,
             None,
             prompt.map(str::to_string),
+            host.clone(),
         );
         match spawned {
             Ok(id) => {
@@ -73,46 +103,58 @@ impl Multiplexer {
             }
             Err(e) => {
                 if let Some(h) = wt_handle {
-                    let _ = self.cleanup.enqueue(CleanupJob {
-                        repo_root: self.session.repo_path.clone(),
-                        worktree_paths: vec![h.path],
-                        branches_to_delete: vec![h.branch],
-                        // No agent ever ran in this worktree — nothing to credit.
-                        owners: Vec::new(),
-                        done: None,
-                    });
+                    self.dispose_worktrees(vec![Orphan::unworked(host, h)], false);
                 }
                 Err(McpError::Tool(format!("spawn_role: {e:#}")))
             }
         }
     }
 
-    /// Begin a deferred `spawn_role(worktree=true)`: build the worktree request
-    /// on the event loop (cheap), run `git worktree add` on a worker thread, and
-    /// register a [`PendingSpawn`] that [`Multiplexer::poll_pending_spawns`]
-    /// finishes. The `reply` is *not* answered here — it is moved into the
-    /// pending entry and sent once the spawn completes (or fails).
+    /// Begin a deferred `spawn_role(worktree=true)` on `host` (`None`: this
+    /// machine): build the worktree request on the event loop (cheap), make
+    /// the worktree off it, and register a [`PendingSpawn`] that
+    /// [`Multiplexer::poll_pending_spawns`] finishes. The `reply` is *not*
+    /// answered here — it is moved into the pending entry and sent once the
+    /// spawn completes (or fails). A host that cannot take a panel now is
+    /// refused at once.
     pub(crate) fn begin_spawn_role_worktree(
         &mut self,
         role: String,
+        host: Option<String>,
         model: Option<String>,
         agent_cli: Option<AgentCli>,
         prompt: Option<String>,
         reply: oneshot::Sender<ControlResponse>,
     ) {
         let req = self.role_worktree_request(&role);
-        let (tx, rx) = std::sync::mpsc::channel();
-        // The worker thread owns only the request; it touches no `Multiplexer`
-        // state, so nothing `!Send` crosses the boundary.
-        std::thread::spawn(move || {
-            let result = create_worktree(&req).map_err(|e| format!("worktree create: {e}"));
-            // The receiver lives in the event loop's `pending_spawns`; a send
-            // failure just means the multiplexer is gone — nothing to do.
-            let _ = tx.send(result);
-        });
+        let making = match host {
+            None => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                // The worker thread owns only the request; it touches no
+                // `Multiplexer` state, so nothing `!Send` crosses the boundary.
+                std::thread::spawn(move || {
+                    let result = create_worktree(&req).map_err(|e| format!("worktree create: {e}"));
+                    // The receiver lives in the event loop's `pending_spawns`; a
+                    // send failure just means the multiplexer is gone — nothing
+                    // to do.
+                    let _ = tx.send(result);
+                });
+                Making::Here(rx)
+            }
+            Some(host) => match self.remote_target(&host) {
+                Ok(target) => Making::Host {
+                    rx: self.make_host_worktree(&host, target.repo, req),
+                    host,
+                },
+                Err(err) => {
+                    let _ = reply.send(ControlResponse::error(format!("spawn_role: {err:#}")));
+                    return;
+                }
+            },
+        };
         self.pending_spawns.push(PendingSpawn {
             role,
-            rx,
+            making,
             model,
             agent_cli,
             prompt,
@@ -120,32 +162,102 @@ impl Multiplexer {
         });
     }
 
-    /// Finish every deferred spawn whose `git worktree add` has completed:
-    /// launch its panel and answer the MCP call. Called once per event-loop
-    /// tick. Entries whose worktree is still building are left in place.
+    /// Push this repo's `HEAD` to `repo` as `req`'s branch and have the host
+    /// check it out at `req`'s path in its checkout. The answer comes on the
+    /// returned receiver; a worktree it can no longer be delivered on, or
+    /// whose making failed part way, is removed with its branch: neither ever
+    /// held an agent's work.
+    pub(super) fn make_host_worktree(
+        &mut self,
+        host: &str,
+        repo: HostRepo,
+        req: WorktreeRequest,
+    ) -> oneshot::Receiver<Result<WorktreeHandle, String>> {
+        let HostRepo { link, dir, url } = repo;
+        let branch = req.default_branch();
+        let path = WorktreeRequest {
+            repo_root: dir.clone(),
+            ..req
+        }
+        .default_path();
+        let here = self.session.repo_path.clone();
+        let host = host.to_string();
+        let (tx, rx) = oneshot::channel();
+        self.spawn_host_task(async move {
+            let made = within(async {
+                push_head(&here, &url, &branch).await?;
+                link.add_worktree(&dir, &path, &branch).await
+            })
+            .await;
+            let unclaimed = match made {
+                Ok(resolved) => tx
+                    .send(Ok(WorktreeHandle {
+                        path: resolved,
+                        branch: branch.clone(),
+                        repo_root: dir.clone(),
+                    }))
+                    .is_err(),
+                Err(err) => {
+                    let _ = tx.send(Err(format!("worktree on host {host}: {err}")));
+                    true
+                }
+            };
+            if unclaimed
+                && let Err(err) = within(link.remove_worktree(&dir, &path, Some(&branch))).await
+            {
+                warn!(%host, path = %path.display(), %branch, error = %err, "unclaimed sub-host worktree not removed");
+            }
+        });
+        rx
+    }
+
+    /// Finish every deferred spawn whose worktree has been made: launch its
+    /// panel and answer the MCP call. Called once per event-loop tick.
+    /// Entries whose worktree is still being made are left in place.
     pub(crate) fn poll_pending_spawns(&mut self) {
         let mut i = 0;
         while i < self.pending_spawns.len() {
-            let outcome = match self.pending_spawns[i].rx.try_recv() {
-                Ok(result) => result,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    i += 1;
-                    continue;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            let outcome = match &mut self.pending_spawns[i].making {
+                Making::Here(rx) => match rx.try_recv() {
+                    Ok(result) => result,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        i += 1;
+                        continue;
+                    }
                     // The worker thread vanished without a result (panic). No
                     // worktree was created, so there is nothing to clean up.
-                    Err("worktree creation thread failed".to_string())
-                }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Err("worktree creation thread failed".to_string())
+                    }
+                },
+                Making::Host { rx, .. } => match rx.try_recv() {
+                    Ok(result) => result,
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        i += 1;
+                        continue;
+                    }
+                    // The task was dropped before it answered: shutdown is
+                    // tearing the host work down, and it made nothing it kept.
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        Err("sub-host worktree task ended without an answer".to_string())
+                    }
+                },
             };
             let pending = self.pending_spawns.remove(i);
+            let host = match pending.making {
+                Making::Here(_) => None,
+                Making::Host { host, .. } => Some(host),
+            };
             let response = match outcome {
                 Ok(handle) => match self.finish_spawn_role(
                     &pending.role,
                     pending.model.as_deref(),
                     pending.agent_cli,
                     pending.prompt.as_deref(),
-                    Some(handle),
+                    Site {
+                        host,
+                        worktree: Some(handle),
+                    },
                 ) {
                     Ok(panel) => ControlResponse::Spawned { panel },
                     Err(err) => ControlResponse::error(err),
@@ -164,30 +276,31 @@ impl Multiplexer {
     /// so block briefly for its result; any worktree it created is removed
     /// synchronously here — the panel will never launch, so the dir+branch must
     /// not be left behind (the cleanup queue's consumer is torn down with the
-    /// runtime, so deferring is not an option). Each blocked MCP call is told
-    /// the multiplexer is shutting down.
+    /// runtime, so deferring is not an option). A sub-host task is not waited
+    /// for: closing its receiver makes the task remove what it makes, and a
+    /// worktree it already delivered is removed from here. Each blocked MCP
+    /// call is told the multiplexer is shutting down.
     pub(crate) fn abort_pending_spawns(&mut self) {
-        for pending in self.pending_spawns.drain(..) {
-            // The worker thread sends exactly once then exits; recv blocks only
-            // until `git worktree add` returns.
-            if let Ok(Ok(handle)) = pending.rx.recv() {
-                let summary = crate::worktree::cleanup::run_blocking(&CleanupJob {
-                    repo_root: self.session.repo_path.clone(),
-                    worktree_paths: vec![handle.path],
-                    // The agent never ran — delete the empty branch too, and
-                    // credit the removal to nobody.
-                    branches_to_delete: vec![handle.branch],
-                    owners: Vec::new(),
-                    done: None,
-                });
-                for (path, msg) in &summary.failed_worktrees {
-                    warn!(?path, %msg, "pending-spawn worktree cleanup on shutdown failed");
+        let mut orphans = Vec::new();
+        for pending in std::mem::take(&mut self.pending_spawns) {
+            let made = match pending.making {
+                // The worker thread sends exactly once then exits; recv blocks
+                // only until `git worktree add` returns.
+                Making::Here(rx) => rx.recv().ok().and_then(Result::ok).map(|h| (None, h)),
+                Making::Host { host, mut rx } => {
+                    rx.close();
+                    rx.try_recv()
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|h| (Some(host), h))
                 }
-            }
+            };
+            orphans.extend(made.map(|(host, handle)| Orphan::unworked(host, handle)));
             let _ = pending.reply.send(ControlResponse::error(
                 "caucus multiplexer is shutting down",
             ));
         }
+        self.dispose_worktrees(orphans, true);
     }
 }
 
@@ -242,7 +355,7 @@ mod tests {
         // Register an in-flight spawn (its git add will fail outside a repo, but
         // the pending entry is recorded immediately — we never poll it).
         let (tx, _rx) = oneshot::channel();
-        mux.begin_spawn_role_worktree("worker".into(), None, None, None, tx);
+        mux.begin_spawn_role_worktree("worker".into(), None, None, None, None, tx);
         assert_eq!(mux.pending_spawns.len(), 1);
 
         let second = mux.role_worktree_request("worker");
@@ -261,7 +374,7 @@ mod tests {
         let mut mux = mux(&tmp);
 
         let (tx, rx) = oneshot::channel();
-        mux.begin_spawn_role_worktree("reviewer".into(), None, None, None, tx);
+        mux.begin_spawn_role_worktree("reviewer".into(), None, None, None, None, tx);
         assert!(
             drain(&mut mux).await,
             "a failed worktree create still drains"
@@ -286,7 +399,7 @@ mod tests {
         let mut mux = mux(&tmp);
 
         let (tx, rx) = oneshot::channel();
-        mux.begin_spawn_role_worktree("reviewer".into(), None, None, None, tx);
+        mux.begin_spawn_role_worktree("reviewer".into(), None, None, None, None, tx);
         assert_eq!(
             mux.pending_spawns.len(),
             1,
@@ -314,7 +427,7 @@ mod tests {
         let worktrees = tmp.path().join(".caucus").join("worktrees");
 
         let (tx, rx) = oneshot::channel();
-        mux.begin_spawn_role_worktree("reviewer".into(), None, None, None, tx);
+        mux.begin_spawn_role_worktree("reviewer".into(), None, None, None, None, tx);
 
         // Tear down without ever polling: abort owns the cleanup.
         mux.abort_pending_spawns();

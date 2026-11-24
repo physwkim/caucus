@@ -24,6 +24,10 @@
 //! 3. Otherwise the signal is not ours: the reply sender is dropped (the
 //!    server answers allow) and nothing changes.
 //!
+//! A signal that came through a sub-host's link is matched against that
+//! host's panels by rule 1 alone: its transcript and cwd name that host's
+//! filesystem, which main cannot read.
+//!
 //! A conversation judged not-ours after a complete lineage read is cached
 //! (`Multiplexer::unbound_unclaimed`) so ordinary env-less Claude sessions on
 //! the machine do not cost a transcript read per turn. A panel spawned later
@@ -72,12 +76,16 @@ impl Multiplexer {
     /// the exact path where `CAUCUS_HOOK_REPLY=1` is injected into the main
     /// panel alone; every gate `handle_signal_with_reply` applies (compose
     /// hold, alternation) applies here unchanged.
+    ///
+    /// `source` is the sub-host the signal came through (`None`: this
+    /// machine); only panels running there can claim it.
     pub fn handle_unbound_signal(
         &mut self,
         sig: UnboundSignal,
         reply: Option<tokio::sync::oneshot::Sender<StopDirective>>,
+        source: Option<&str>,
     ) {
-        let Some((panel_id, matched_by)) = self.resolve_unbound_panel(&sig) else {
+        let Some((panel_id, matched_by)) = self.resolve_unbound_panel(&sig, source) else {
             return;
         };
         if matched_by == UnboundMatch::Lineage {
@@ -133,7 +141,11 @@ impl Multiplexer {
         );
     }
 
-    fn resolve_unbound_panel(&mut self, sig: &UnboundSignal) -> Option<(PanelId, UnboundMatch)> {
+    fn resolve_unbound_panel(
+        &mut self,
+        sig: &UnboundSignal,
+        source: Option<&str>,
+    ) -> Option<(PanelId, UnboundMatch)> {
         // Without a conversation id there is nothing to match on — and
         // nothing to key a cache entry by.
         let sid = sig.claude_session_id.as_deref()?;
@@ -141,8 +153,12 @@ impl Multiplexer {
         // Rule 1 — exact. Checked before the not-ours cache so a panel that
         // *becomes* known (spawned or healed after a cache entry landed) can
         // never be shadowed by it.
-        if let Some(id) = self.panel_by_claude_session_id(sid) {
+        if let Some(id) = self.panel_by_claude_session_id(sid, source) {
             return Some((id, UnboundMatch::Exact));
+        }
+        // A sub-host's transcript and cwd are not on this machine.
+        if source.is_some() {
+            return None;
         }
 
         if self.unbound_unclaimed.contains(sid) {
@@ -170,6 +186,7 @@ impl Multiplexer {
             .iter()
             .filter(|(_, m)| m.claude_session_id().is_some_and(|k| head_ids.contains(k)))
             .map(|(&id, _)| id)
+            .filter(|&id| self.panel_runs_on(id, None))
             .collect();
         match matches.as_slice() {
             [id] => Some((*id, UnboundMatch::Lineage)),
@@ -196,23 +213,26 @@ impl Multiplexer {
         }
     }
 
-    /// The panel whose manifest holds `sid` as its Claude conversation id.
-    fn panel_by_claude_session_id(&self, sid: &str) -> Option<PanelId> {
+    /// The panel on `host` whose manifest holds `sid` as its Claude
+    /// conversation id.
+    fn panel_by_claude_session_id(&self, sid: &str, host: Option<&str>) -> Option<PanelId> {
         self.manifests
             .iter()
-            .find(|(_, m)| m.claude_session_id() == Some(sid))
+            .find(|&(&id, m)| m.claude_session_id() == Some(sid) && self.panel_runs_on(id, host))
             .map(|(&id, _)| id)
     }
 
-    /// Whether `cwd` could belong to one of this session's panels: inside the
-    /// session repo, or inside any panel's worktree (worktrees live *outside*
-    /// the repo checkout).
+    /// Whether `cwd` could belong to one of this machine's panels: inside the
+    /// session repo, or inside any of their worktrees (worktrees live
+    /// *outside* the repo checkout). A sub-host panel's worktree path names a
+    /// directory on that host.
     fn unbound_cwd_plausible(&self, cwd: &Path) -> bool {
         cwd.starts_with(&self.session.repo_path)
             || self
                 .manifests
-                .values()
-                .filter_map(|m| m.worktree_path.as_deref())
+                .iter()
+                .filter(|&(&id, _)| self.panel_runs_on(id, None))
+                .filter_map(|(_, m)| m.worktree_path.as_deref())
                 .any(|wt| cwd.starts_with(wt))
     }
 }
@@ -342,7 +362,7 @@ mod tests {
         let id = panel_with_known_id(&mut mux, "conv-known");
         let cwd = mux.session.repo_path.clone();
 
-        mux.handle_unbound_signal(unbound_stop("conv-known", None, &cwd), None);
+        mux.handle_unbound_signal(unbound_stop("conv-known", None, &cwd), None, None);
 
         assert_eq!(
             mux.panels.iter().find(|p| p.id == id).unwrap().state(),
@@ -375,7 +395,11 @@ mod tests {
         )
         .unwrap();
 
-        mux.handle_unbound_signal(unbound_stop("conv-fork", Some(&transcript), &cwd), None);
+        mux.handle_unbound_signal(
+            unbound_stop("conv-fork", Some(&transcript), &cwd),
+            None,
+            None,
+        );
 
         assert_eq!(
             mux.panels.iter().find(|p| p.id == id).unwrap().state(),
@@ -403,7 +427,7 @@ mod tests {
         let cwd = mux.session.repo_path.clone();
 
         assert_eq!(
-            mux.resolve_unbound_panel(&unbound_stop("conv-parent", None, &cwd)),
+            mux.resolve_unbound_panel(&unbound_stop("conv-parent", None, &cwd), None),
             Some((id, UnboundMatch::Exact)),
             "a known conversation id is proof, not inference"
         );
@@ -415,7 +439,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mux.resolve_unbound_panel(&unbound_stop("conv-fork", Some(&transcript), &cwd)),
+            mux.resolve_unbound_panel(&unbound_stop("conv-fork", Some(&transcript), &cwd), None),
             Some((id, UnboundMatch::Lineage)),
             "an unknown id matched through the transcript head is inference"
         );
@@ -439,6 +463,7 @@ mod tests {
 
         mux.handle_unbound_signal(
             unbound_stop("conv-foreign", Some(&transcript), elsewhere.path()),
+            None,
             None,
         );
 
@@ -468,13 +493,21 @@ mod tests {
         // cached (the file was read to EOF).
         let transcript = tmp.path().join("t.jsonl");
         std::fs::write(&transcript, "{\"sessionId\":\"conv-stranger\"}\n{}\n").unwrap();
-        mux.handle_unbound_signal(unbound_stop("conv-stranger", Some(&transcript), &cwd), None);
+        mux.handle_unbound_signal(
+            unbound_stop("conv-stranger", Some(&transcript), &cwd),
+            None,
+            None,
+        );
         assert!(mux.unbound_unclaimed.contains("conv-stranger"));
 
         // Rewrite the transcript so lineage WOULD match now: the cache must
         // still answer, proving no re-read happens.
         std::fs::write(&transcript, "{\"session_id\":\"conv-parent\"}\n{}\n").unwrap();
-        mux.handle_unbound_signal(unbound_stop("conv-stranger", Some(&transcript), &cwd), None);
+        mux.handle_unbound_signal(
+            unbound_stop("conv-stranger", Some(&transcript), &cwd),
+            None,
+            None,
+        );
         assert_eq!(
             mux.panels.iter().find(|p| p.id == id).unwrap().state(),
             PanelState::Working,
@@ -501,7 +534,11 @@ mod tests {
         )
         .unwrap();
 
-        mux.handle_unbound_signal(unbound_stop("conv-fork", Some(&transcript), &cwd), None);
+        mux.handle_unbound_signal(
+            unbound_stop("conv-fork", Some(&transcript), &cwd),
+            None,
+            None,
+        );
 
         for id in [a, b] {
             assert_eq!(
@@ -525,7 +562,7 @@ mod tests {
         let id = panel_with_known_id(&mut mux, "conv-known");
 
         let sig = UnboundSignal::now(TurnKind::Stop, None, serde_json::json!({}));
-        mux.handle_unbound_signal(sig, None);
+        mux.handle_unbound_signal(sig, None, None);
 
         assert_eq!(
             mux.panels.iter().find(|p| p.id == id).unwrap().state(),
@@ -549,7 +586,7 @@ mod tests {
         mux.enqueue_question_notice(PanelId::new(), "reviewer".into(), "which API?".into());
 
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        mux.handle_unbound_signal(unbound_stop("conv-main", None, &cwd), Some(tx));
+        mux.handle_unbound_signal(unbound_stop("conv-main", None, &cwd), Some(tx), None);
 
         let StopDirective::Deliver { reason } = rx.try_recv().expect("directive must be sent");
         assert!(
@@ -573,7 +610,7 @@ mod tests {
         mux.enqueue_question_notice(PanelId::new(), "reviewer".into(), "pending?".into());
 
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        mux.handle_unbound_signal(unbound_stop("conv-sub", None, &cwd), Some(tx));
+        mux.handle_unbound_signal(unbound_stop("conv-sub", None, &cwd), Some(tx), None);
 
         assert!(
             rx.try_recv().is_err(),

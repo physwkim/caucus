@@ -18,7 +18,7 @@ use tracing::warn;
 use crate::render::LayoutMode;
 use crate::role::spec::AgentCli;
 
-use super::id::SessionId;
+use super::id::{AgentId, SessionId};
 
 /// File name of the session record under a session root.
 pub const SESSION_RECORD_FILE: &str = "session.json";
@@ -49,6 +49,34 @@ pub struct PanelRecord {
     /// --resume <id>` continues the conversation on the resume launch path.
     #[serde(default)]
     pub claude_session_id: Option<String>,
+    /// The `hosts.toml` sub-host the panel ran on; `None` for this machine.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// The agent the panel ran. Resume reads a sub-host panel's manifest
+    /// through it, to re-adopt the panel if its host still runs it.
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
+}
+
+impl PanelRecord {
+    /// A fresh worktree directory for this panel's resumed lane under
+    /// `<repo>/.caucus/worktrees/`.
+    pub fn resume_worktree_path(&self, repo: &Path, session_id: SessionId) -> PathBuf {
+        let id = session_id.to_string();
+        let suffix: String = id
+            .chars()
+            .rev()
+            .take(8)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        repo.join(".caucus").join("worktrees").join(format!(
+            "{suffix}-{}-resume{}",
+            crate::worktree::manager::role_slug(&self.role),
+            self.order_index
+        ))
+    }
 }
 
 /// The persistent record of one caucus session — written to
@@ -180,6 +208,8 @@ mod tests {
                     is_main: true,
                     worktree_branch: None,
                     claude_session_id: Some("conv-abc".into()),
+                    host: None,
+                    agent_id: None,
                 },
                 PanelRecord {
                     role: "backend".into(),
@@ -189,6 +219,8 @@ mod tests {
                     is_main: false,
                     worktree_branch: Some("caucus/s1/backend".into()),
                     claude_session_id: None,
+                    host: Some("build-1".into()),
+                    agent_id: Some(AgentId::new()),
                 },
             ],
             role_counts: std::collections::HashMap::from([("backend".to_string(), 2)]),

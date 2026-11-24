@@ -4,7 +4,8 @@
 //! area. The real lifecycle lives here, at the panel level.
 //!
 //! **Invariant I-5** (`docs/design.md` §12): panels are created/destroyed only
-//! by `spawn` / `kill`, and panel state transitions only by `transition`.
+//! by `spawn` (or `adopt`, for a sub-host panel that outlived its caucus) /
+//! `kill`, and panel state transitions only by `transition`.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -13,8 +14,10 @@ use thiserror::Error;
 
 use crate::agent::spawn::SpawnRequest;
 use crate::config::settings::Settings;
+use crate::host::HostLink;
 use crate::pty::{Pty, PtyCommand, PtyError};
 use crate::render::Rect;
+use crate::role::spec::AgentCli;
 use crate::session::id::{AgentId, PanelId};
 use crate::term::{Grid, OutputCapture};
 
@@ -109,6 +112,14 @@ impl Panel {
     /// Read-only view of the panel's grid.
     pub fn grid(&self) -> &Grid {
         &self.grid
+    }
+
+    /// The grid generation as evidence of what the panel is doing; `None`
+    /// while its output cannot reach us (its sub-host link is down), when a
+    /// screen holding still says nothing. Silence clocks read this, not
+    /// [`Grid::generation`].
+    pub fn live_generation(&self) -> Option<u64> {
+        self.pty.feed_live().then(|| self.grid.generation())
     }
 
     /// Read-only view of the panel's output capture.
@@ -250,6 +261,7 @@ pub(crate) fn transition(panel: &mut Panel, to: PanelState) -> Result<(), Illega
 /// persists; `panel_id` must equal the manifest's `panel_id`. `settings`
 /// supplies the panel's scrollback depth and capture caps (the `[settings]`
 /// tunables), applied at construction so the panel is born fully configured.
+/// `host` is the sub-host whose daemon runs the PTY; `None` runs it here.
 pub(crate) fn spawn(
     request: &SpawnRequest,
     command: PtyCommand,
@@ -257,27 +269,98 @@ pub(crate) fn spawn(
     agent_id: AgentId,
     rect: Rect,
     settings: &Settings,
+    host: Option<&HostLink>,
 ) -> Result<Panel, PanelError> {
+    let (cols, rows) = grid_size(rect);
+
+    // codex stalls on its interactive "Do you trust this directory?" gate the
+    // first time it runs in a directory, before the turn caucus drives. The
+    // trust entry lives in the codex config of the machine the panel runs on,
+    // so a sub-host's daemon writes it there.
+    let trust_codex = request.effective_cli() == AgentCli::Codex;
+    let pty = match host {
+        None => {
+            if trust_codex && let Some(cwd) = command.cwd.as_deref() {
+                // Best-effort: the panel still launches and the gate can be
+                // answered by hand.
+                if let Err(err) = crate::agent::codex_trust::ensure_trusted(cwd) {
+                    tracing::warn!(
+                        cwd = %cwd.display(),
+                        error = %err,
+                        "codex directory-trust pre-grant failed; codex may stall on its trust gate"
+                    );
+                }
+            }
+            Pty::spawn(&command, cols, rows)
+        }
+        Some(link) => link
+            .spawn(panel_id, &command, cols, rows, trust_codex)
+            .map(Pty::Remote),
+    }
+    .map_err(|e| PanelError::Spawn(e.to_string()))?;
+    Ok(assemble(
+        panel_id,
+        request.role.name.clone(),
+        agent_id,
+        request.worktree_path.clone(),
+        pty,
+        settings,
+    ))
+}
+
+/// The other creation path (Invariant I-5): a panel for `manifest`'s agent,
+/// which `host` still runs from before this caucus started. It starts in
+/// `Spawning` like a new one; the replayed output settles it.
+pub(crate) fn adopt(
+    manifest: &crate::agent::AgentManifest,
+    rect: Rect,
+    settings: &Settings,
+    host: &HostLink,
+) -> Result<Panel, PanelError> {
+    let (cols, rows) = grid_size(rect);
+    let pty = host
+        .adopt(manifest.panel_id, cols, rows)
+        .map_err(|e| PanelError::Spawn(e.to_string()))?;
+    Ok(assemble(
+        manifest.panel_id,
+        manifest.role.clone(),
+        manifest.agent_id,
+        manifest.worktree_path.clone(),
+        Pty::Remote(pty),
+        settings,
+    ))
+}
+
+fn grid_size(rect: Rect) -> (u16, u16) {
     let inner = rect.inner();
-    let cols = inner.width.max(MIN_GRID_COLS);
-    let rows = inner.height.max(MIN_GRID_ROWS);
+    (
+        inner.width.max(MIN_GRID_COLS),
+        inner.height.max(MIN_GRID_ROWS),
+    )
+}
 
-    let pty = Pty::spawn(&command, cols, rows).map_err(|e| PanelError::Spawn(e.to_string()))?;
-    let grid = Grid::with_scrollback(cols as usize, rows as usize, settings.scrollback_lines);
-
-    Ok(Panel {
-        id: panel_id,
-        role: request.role.name.clone(),
+fn assemble(
+    id: PanelId,
+    role: String,
+    agent_id: AgentId,
+    worktree_path: Option<PathBuf>,
+    pty: Pty,
+    settings: &Settings,
+) -> Panel {
+    let (cols, rows) = pty.size();
+    Panel {
+        id,
+        role,
         agent_id,
         state: PanelState::Spawning,
-        worktree_path: request.worktree_path.clone(),
+        worktree_path,
         pty,
-        grid,
+        grid: Grid::with_scrollback(cols as usize, rows as usize, settings.scrollback_lines),
         capture: OutputCapture::with_limits(
             settings.capture_turn_limit,
             settings.capture_open_turn_bytes,
         ),
-    })
+    }
 }
 
 /// Single owner of panel destruction (Invariant I-5).

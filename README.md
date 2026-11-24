@@ -58,7 +58,7 @@ and renders the panels (`ratatui`). tmux and zellij are *not* dependencies —
 they are studied as references for the grid and layout design.
 
 **The main worker drives sub-agents over MCP.** caucus runs an MCP server.
-The main worker gets fifteen caucus tools (see [MCP tools](#mcp-tools) below)
+The main worker gets sixteen caucus tools (see [MCP tools](#mcp-tools) below)
 so a single instruction from you turns into the main worker decomposing the
 task, spawning sub-agent panels, and feeding each one its sub-task as real
 keystrokes.
@@ -152,7 +152,7 @@ pages the pager, exactly as the key does.
 
 ## MCP tools
 
-caucus exposes fifteen tools to the main worker over MCP. The main worker
+caucus exposes sixteen tools to the main worker over MCP. The main worker
 calls them to spawn, drive, observe, and reap sub-agent panels:
 
 | Tool              | What it does                                                              |
@@ -162,10 +162,11 @@ calls them to spawn, drive, observe, and reap sub-agent panels:
 | `broadcast`       | Send the same text to several panels at once — a round's fan-out.         |
 | `ctrl_c`          | Send `Ctrl-C` (interrupt) to a panel.                                     |
 | `read_panel`      | Read a panel's captured output (modes below).                             |
-| `spawn_role`      | Spawn a sub-agent panel. `role` is a free-form label; an inline `prompt` becomes the role's instructions; `worktree` / `model` / `agent_cli` overrides. |
+| `spawn_role`      | Spawn a sub-agent panel. `role` is a free-form label; an inline `prompt` becomes the role's instructions; `worktree` / `model` / `agent_cli` overrides; `host` runs it on a sub-host. |
 | `kill_panel`      | Kill a panel; its worktree (if any) is enqueued for cleanup.              |
 | `restart_panel`   | Restart a panel's agent CLI in place, reusing its role and worktree.      |
 | `list_panels`     | List every live panel with its role and derived state.                   |
+| `list_hosts`      | List this machine and the `hosts.toml` sub-hosts with connection status, panel count and load, for `spawn_role`'s `host`. |
 | `queue_tasks`     | Queue follow-up tasks on one worker and tune its watch (`read_mode`, `fallback_secs`, `selection_hints`). Not needed to hear back: caucus watches every panel it hands a prompt to and pushes each worker's result the moment it finishes. Queued tasks keep an early finisher working until they drain; `selection_hints` let caucus auto-answer that worker's direction menus by option-label keyword. |
 | `collect_workers` | Pull every worker that is ready right now, from inside the main worker's turn; the rest are reported as still working and stay watched. |
 | `stop_watching`   | Stop reporting one worker and drop its queued tasks; the panel itself is untouched, and the next prompt re-arms the watch. |
@@ -201,7 +202,7 @@ caucus --agent-cli codex            # run the main worker on codex instead of
 caucus init [--install-hook]        # create .caucus/; --install-hook writes the
                                     # machine-wide turn-signal script and merges
                                     # the Claude Stop hook
-caucus doctor                       # check caucus version, git + repo, agent CLIs, hook, role allowlists
+caucus doctor                       # check caucus version, git + repo, agent CLIs, hook, role allowlists, sub-hosts
 caucus role list                    # list known roles
 caucus role show <name>             # show one role's full spec
 caucus sessions [--format json]     # list resumable sessions, newest first
@@ -232,6 +233,84 @@ branch, and the Claude conversation id.
 `caucus resume <session_id>` relaunches the TUI and recreates the panels
 from the record — re-attaching worktrees on their branches and continuing
 each Claude conversation via `claude --resume`.
+
+## Sub-hosts
+
+The main worker can run sub-agent panels on other machines and spread the
+work across them. `list_hosts` reports each host's connection, panel count,
+load averages, CPUs and free memory; `spawn_role`'s `host` places a panel
+there. A remote panel is a full panel in the TUI: you watch it, type into
+it, and its turn signals reach the main worker as a local panel's do.
+
+Hosts are listed in `~/.caucus/hosts.toml` and `<repo>/.caucus/hosts.toml`;
+a project entry replaces the global entry of the same name.
+
+```toml
+[[host]]
+name = "build-1"            # what spawn_role's `host` and list_hosts use
+ssh = "me@build-1.lan"      # ssh destination; defaults to `name`
+caucus = "~/bin/caucus"     # caucus on that host; defaults to main's own build
+dir = "~/src/project"       # the host's clone of this repo; defaults to this repo's path
+
+[[host]]
+name = "box"
+socket = "/run/user/1000/caucus-host/daemon.sock"   # a daemon on this machine
+dir = "~/src/project-box"   # required: a clone of this repo apart from this one
+```
+
+An ssh host runs `caucus host bridge` in the remote user's login shell,
+which starts that user's host daemon if none is running. Without a `caucus`
+key, the bridge is main's own build, which main copies to
+`~/.caucus/bin/caucus` there over the same ssh whenever that copy is missing
+or another build. The copy must run there (same OS and CPU, compatible
+system libraries); if it does not, the host stays disconnected and
+`list_hosts` says why. The daemon owns the host's panels and outlives the
+connection: after an ssh drop main reconnects, re-reads each panel's missed
+output (up to its last 8 MiB), and the input and turn signals the drop lost
+are delivered once. It runs until it gets `SIGTERM`, which kills its panels.
+Its panels find the daemon's own caucus first on `PATH`, so the hook, which
+runs `caucus` by name, reaches the build serving them. ssh runs with
+`BatchMode=yes`, so login must already work without a prompt. A `socket`
+host is a daemon on this machine that you start yourself with `caucus host
+serve` (its default socket is `~/.caucus/host/<hostname>/daemon.sock`, the
+hostname shortened with a hash when longer than 32 bytes).
+
+Each host works in its own clone, `dir`. A worktree panel's lane starts as
+main's `HEAD` pushed to a branch of that clone, and the branch is fetched
+back into this repo after every turn, so the main worker reviews and merges
+the lane here. The clone must never be this repo: a `socket` host therefore
+needs `dir`, and so does an `ssh` host that is this machine. A host whose
+daemon runs on this machine (by its machine id) and whose `dir` is this repo
+is refused at connect, and `list_hosts` shows why. Two entries
+may reach one daemon, each with its own `dir`; they are separate hosts to
+the main worker. A host's `CAUCUS_SESSION_DIR` is its own, not shared with
+main or other hosts.
+
+On every host:
+
+- with a `caucus` key, install a caucus there that speaks main's protocol
+  version (`list_hosts` shows the mismatch otherwise);
+- after upgrading caucus there, a daemon still running the old protocol
+  steps aside when main connects if it runs no panels; stop one with
+  panels yourself;
+- give a `socket` host's user caucus's Claude Stop hook (`caucus init
+  --install-hook`); an ssh host's bridge installs it itself, as that command
+  does, whenever it is missing or stale: remote panels post their turn
+  signals through the host's own hook;
+- install the agent CLIs the roles placed there use.
+
+`caucus doctor` has each host's daemon check these in its own environment,
+the one its panels inherit, including a live test of the host's hook; on an
+ssh host with no daemon running yet, `caucus host doctor` checks the login
+shell the bridge would start one from.
+
+On `caucus resume`, a panel its host still runs is adopted again with its
+output replayed; any other starts again on its host, resuming its
+conversation in a worktree checked out again on its lane's branch. A panel
+the host still has for the session that the session record does not name is
+killed there. A host daemon kills the panels of a session no main has been
+connected to for a week; resuming it later starts them again, and their
+worktrees stay.
 
 ## Install
 
@@ -278,7 +357,8 @@ path on *this* machine, so:
 - run `caucus init --install-hook` on **every machine** you use caucus on —
   a `~/.claude/settings.json` synced from another machine carries a `$HOME`
   that does not exist locally, and turn signals silently die;
-- keep `caucus` on `PATH` (a `cargo install` already does).
+- keep `caucus` on `PATH` (a `cargo install` already does); on a sub-host
+  the script also finds the copy main keeps at `~/.caucus/bin/caucus`.
 
 If you used caucus before this hook moved out of `.caucus/bin/`, re-run
 `caucus init --install-hook` once: it prunes the old per-project hook entry and

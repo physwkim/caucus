@@ -30,6 +30,8 @@ use crate::signal::server::SignalServer;
 use crate::worktree::cleanup::CleanupQueue;
 
 mod control;
+mod host_restore;
+mod hosts;
 mod input;
 mod layout;
 mod mcp;
@@ -313,6 +315,8 @@ pub struct Multiplexer {
     /// The `subscribe_events` feed: the `list_panels` rows last published and
     /// their `seq` ([`Multiplexer::publish_panel_events`]).
     events: EventFeed,
+    /// Links to the `hosts.toml` sub-hosts ([`Multiplexer::connect_hosts`]).
+    hosts: hosts::Hosts,
 }
 
 /// Whether [`Multiplexer::new`] is opening a brand-new session or reopening a
@@ -458,6 +462,7 @@ impl Multiplexer {
                 pending_clipboard: None,
                 unbound_unclaimed: HashSet::new(),
                 events,
+                hosts: hosts::Hosts::new(),
             },
             signal_server,
             control_server,
@@ -670,6 +675,29 @@ mod tests {
             !root.exists(),
             "a failed resume must not resurrect the session directory"
         );
+    }
+
+    /// A session has one main while it is open, new or resumed: a second
+    /// would link the same session to its sub-hosts, whose welcome has a link
+    /// kill the panels its main does not hold.
+    #[tokio::test]
+    async fn a_second_main_cannot_open_a_live_session() {
+        let tmp = TempDir::new().unwrap();
+        let session = Session::new("test", tmp.path().to_path_buf());
+        let config = Config::load(tmp.path()).unwrap();
+        let _first = Multiplexer::new(
+            session.clone(),
+            config.clone(),
+            area(),
+            'a',
+            LaunchMode::Fresh,
+        )
+        .unwrap();
+        let err = match Multiplexer::new(session, config, area(), 'a', LaunchMode::Resume) {
+            Ok(_) => panic!("a second main opened a live session"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("already open"), "{err}");
     }
 
     /// `Resume` on an existing root opens it in place (the normal resume path),

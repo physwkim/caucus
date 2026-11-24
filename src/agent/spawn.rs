@@ -114,6 +114,9 @@ pub struct SpawnRequest {
     /// orchestrator). The codex backend consumes it via `-c mcp_servers.caucus.*`;
     /// the claude backend uses `mcp_config_path` instead. `None` for sub-agents.
     pub caucus_mcp: Option<CaucusMcp>,
+    /// The caucus a codex panel's `notify` runs. `None` is this running binary;
+    /// a sub-host panel names the one on its host.
+    pub caucus_bin: Option<PathBuf>,
 }
 
 impl Default for SpawnRequest {
@@ -141,6 +144,7 @@ impl Default for SpawnRequest {
             resume_session_id: None,
             system_prompt: None,
             caucus_mcp: None,
+            caucus_bin: None,
         }
     }
 }
@@ -264,10 +268,13 @@ pub(crate) fn build_command(request: &SpawnRequest, panel_id: PanelId) -> PtyCom
             // `notify` program, baking in this panel's signal socket / session
             // / panel id. Skipped only when no signal socket is wired (unit
             // tests) — then the panel relies on the round fallback as before.
-            // The notify program is this exact running caucus binary
-            // (`current_exe`, the same path `tui::caucus_bin` resolves).
+            // The notify program is `request.caucus_bin`, by default this
+            // exact running caucus binary (`current_exe`, the same path
+            // `tui::caucus_bin` resolves).
             let notify = request.sock_path.as_ref().map(|sock| CodexNotify {
-                caucus_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caucus")),
+                caucus_bin: request.caucus_bin.clone().unwrap_or_else(|| {
+                    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caucus"))
+                }),
                 signal_sock: sock.clone(),
                 session_id: request.session_id,
                 panel_id,
@@ -507,14 +514,19 @@ fn codex_args(
 pub(crate) fn spawn(request: &SpawnRequest) -> Result<SpawnOutcome, SpawnError> {
     let panel_id = PanelId::new();
     let command = build_command(request, panel_id);
-    let manifest = AgentManifest::new(
+    let cli = request.effective_cli();
+    let mut manifest = AgentManifest::new(
         request.session_id,
         panel_id,
         request.role.name.clone(),
         request.agent_name.clone(),
-        request.effective_cli(),
+        cli,
         request.effective_model(),
     );
+    // Until its first turn reports one, the conversation is the one resumed.
+    if cli == AgentCli::Claude {
+        manifest.claude_session_id = request.resume_session_id.clone();
+    }
     Ok(SpawnOutcome {
         panel_id,
         manifest,
@@ -1219,6 +1231,28 @@ mod tests {
             "codex must ignore resume_session_id: {args:?}"
         );
         assert!(!args.contains(&"conv-xyz".to_string()));
+    }
+
+    /// A resumed claude agent's manifest holds the conversation it resumes
+    /// before its first turn ends, so a record written meanwhile still names
+    /// it; codex resumes nothing, so its manifest names none.
+    #[test]
+    fn a_resumed_claude_manifest_names_its_conversation_from_the_start() {
+        let req = SpawnRequest {
+            role: role(),
+            agent_name: "reviewer-r1".into(),
+            resume_session_id: Some("conv-9f3a".into()),
+            ..SpawnRequest::default()
+        };
+        let outcome = spawn(&req).unwrap();
+        assert_eq!(outcome.manifest.claude_session_id(), Some("conv-9f3a"));
+
+        let codex = SpawnRequest {
+            agent_cli_override: Some(AgentCli::Codex),
+            ..req
+        };
+        let outcome = spawn(&codex).unwrap();
+        assert_eq!(outcome.manifest.claude_session_id(), None);
     }
 
     #[test]

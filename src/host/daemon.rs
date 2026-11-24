@@ -1,0 +1,1793 @@
+//! `caucus host serve` — the sub-host daemon.
+//!
+//! One task owns every panel on the host; connections only parse frames and
+//! write lines. A panel's output is numbered from its first byte and kept in a
+//! ring of the last 8 MiB, so a main caucus that lost its link
+//! re-attaches from the first byte it has not seen.
+//!
+//! Each connection belongs to one link, named by its `hello`: a session and
+//! the name that session's `hosts.toml` gives this host. A newer connection
+//! for the same link replaces the older one; a session reaching the daemon
+//! through two host entries holds two links. A connection streams only the
+//! panels it attached, and only as fast as it reads: output goes out through
+//! a bounded queue and waits in the ring while the queue is full.
+//!
+//! Turn signals from panels here land on the daemon's own signal socket. A
+//! signal for a panel is held until that panel's output has gone out, so main
+//! never sees a turn end before the bytes the turn printed.
+
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::future::Future;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::unix::OwnedWriteHalf;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{info, warn};
+
+use super::install::{build_id, running_build_id};
+use super::proto::{
+    Bytes, ClientFrame, DaemonFrame, HostInfo, HostPanel, MAX_FRAME_BYTES, OUTPUT_CHUNK,
+    PROTO_VERSION, SpawnSpec, encode,
+};
+use super::{HostPaths, home_relative, private_dir};
+use crate::line_io::{CappedLine, read_capped_line};
+use crate::pty::LocalPty;
+use crate::session::id::{PanelId, SessionId};
+use crate::signal::SignalEvent;
+use crate::signal::server::SignalServer;
+use crate::worktree::cleanup::{self, CleanupJob};
+use crate::worktree::manager::{self, run_git};
+
+/// Output a panel keeps for a client to re-read after a drop.
+const LOG_CAP: usize = 8 << 20;
+/// How often the daemon drains its PTYs while it has panels.
+const TICK: Duration = Duration::from_millis(5);
+/// How often it asks whether each child is still running.
+const LIVENESS_PROBE: Duration = Duration::from_millis(250);
+/// Lines queued toward one connection before output waits in the ring.
+const CONNECTION_QUEUE: usize = 64;
+/// Unconfirmed signals held for one panel or link before the oldest is dropped.
+const SIGNAL_BACKLOG: usize = 1024;
+/// How long a fresh connection has to say `hello`.
+const HELLO_WAIT: Duration = Duration::from_secs(10);
+/// How often each connection is sent the host's load.
+const LOAD_EVERY: Duration = Duration::from_secs(5);
+/// How long a link may go without a connection before the daemon kills its
+/// panels and drops its signals. A resume after that starts them again.
+const FORGET_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How often the daemon looks for links past [`FORGET_AFTER`].
+const FORGET_CHECK: Duration = Duration::from_secs(60 * 60);
+
+/// The daemon's single-instance lock. Holding it is what makes removing a
+/// stale control socket safe, so [`run`] takes it as an argument.
+#[derive(Debug)]
+pub struct DaemonLock {
+    _file: File,
+}
+
+/// Take the daemon lock, or `None` when another daemon holds it.
+pub fn lock(paths: &HostPaths) -> Result<Option<DaemonLock>> {
+    private_dir(&paths.state_dir)
+        .with_context(|| format!("prepare {}", paths.state_dir.display()))?;
+    let path = paths.lock_file();
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {
+            // The pid is for a human (or a test) looking for the daemon.
+            let _ = file.set_len(0);
+            let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
+            Ok(Some(DaemonLock { _file: file }))
+        }
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(err)) => {
+            Err(err).with_context(|| format!("lock {}", path.display()))
+        }
+    }
+}
+
+/// `caucus host serve`: run the daemon until `SIGTERM`/`SIGINT`, or return at
+/// once when another daemon already holds the lock.
+pub fn serve(paths: HostPaths) -> Result<()> {
+    // The daemon outlives the SSH session that started it. Panels get the
+    // default disposition back (portable-pty resets it in the child).
+    // SAFETY: runs before any thread exists; `SIG_IGN` is a valid disposition.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("caucus=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
+    let Some(lock) = lock(&paths)? else {
+        info!(lock = %paths.lock_file().display(), "a caucus host daemon is already running");
+        return Ok(());
+    };
+    let runtime = tokio::runtime::Runtime::new().context("start tokio runtime")?;
+    runtime.block_on(run(paths, lock, terminated()))
+}
+
+async fn terminated() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut int)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        // No handler means the default disposition still ends the process.
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+}
+
+/// Serve until `shutdown` resolves, or until a main in another protocol finds
+/// no panel here and another build in this daemon's file; then kill every
+/// panel.
+pub async fn run(
+    paths: HostPaths,
+    lock: DaemonLock,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
+    // Read now: off Linux the image is read by path, which an upgrade may
+    // replace before a main of another protocol asks.
+    let own_build = tokio::task::spawn_blocking(running_build_id)
+        .await
+        .ok()
+        .and_then(Result::ok);
+    paths
+        .own_control_dir()
+        .with_context(|| format!("prepare {}", paths.control_sock.display()))?;
+    // A socket file left by a dead daemon; the lock says none is alive.
+    let _ = std::fs::remove_file(&paths.control_sock);
+    let listener = UnixListener::bind(&paths.control_sock)
+        .with_context(|| format!("bind {}", paths.control_sock.display()))?;
+    let mut signals = SignalServer::bind(&paths.signal_sock)
+        .with_context(|| format!("bind {}", paths.signal_sock.display()))?;
+    info!(
+        control = %paths.control_sock.display(),
+        signal = %paths.signal_sock.display(),
+        "caucus host daemon listening"
+    );
+
+    let (events_tx, mut events) = mpsc::channel(1024);
+    let accept = tokio::spawn(accept_loop(listener, events_tx));
+    let (chores_done, mut chore_replies) = mpsc::unbounded_channel();
+    let mut daemon = Daemon::new(paths.clone(), chores_done);
+    let mut tick = tokio::time::interval(TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut load_tick = tokio::time::interval(LOAD_EVERY);
+    load_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut forget_tick = tokio::time::interval(FORGET_CHECK);
+    forget_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(shutdown);
+    let mut stepped_aside = None;
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut shutdown => break,
+            Some(event) = events.recv() => if let Some(other) = daemon.on_event(event) {
+                if replaced(&daemon.caucus_bin, own_build).await {
+                    stepped_aside = Some(other);
+                    break;
+                }
+                let msg = format!(
+                    "protocol {} not supported; this host speaks {PROTO_VERSION}, as does {} \
+                     there",
+                    other.proto,
+                    daemon.caucus_bin.display()
+                );
+                tokio::spawn(refuse(other.write, msg));
+            },
+            Some((link, frame)) = chore_replies.recv() => daemon.reply(&link, &frame),
+            Some((signal, reply)) = signals.signals().recv() => {
+                // Main answers a sub-host signal too late to hold a hook, so
+                // the hook is released at once (an empty reply means allow).
+                drop(reply);
+                daemon.on_signal(&signal);
+            }
+            _ = tick.tick(), if daemon.wants_tick() => daemon.pump(Instant::now()),
+            _ = load_tick.tick(), if daemon.clients().next().is_some() => daemon.push_load(),
+            _ = forget_tick.tick() => daemon.forget_idle(Instant::now()),
+        }
+    }
+    accept.abort();
+    daemon.shutdown().await;
+    let _ = std::fs::remove_file(&paths.control_sock);
+    if let Some(OtherProtocol { proto, write }) = stepped_aside {
+        // Main dials again once it reads this, and the daemon that answers
+        // must find the lock and both sockets free.
+        drop(signals);
+        drop(lock);
+        let msg = format!(
+            "protocol {proto} not supported; this host's daemon spoke {PROTO_VERSION} and has \
+             stopped, so the next connection starts {} there",
+            daemon.caucus_bin.display()
+        );
+        refuse(write, msg).await;
+    }
+    info!("caucus host daemon stopped");
+    Ok(())
+}
+
+/// Whether `bin`, the file this daemon started from as build `own`, now holds
+/// another build, which a daemon started from it again would be.
+async fn replaced(bin: &Path, own: Option<&'static str>) -> bool {
+    let Some(own) = own else {
+        return false;
+    };
+    let bin = bin.to_path_buf();
+    tokio::task::spawn_blocking(move || !build_id(&bin).is_ok_and(|id| id == own))
+        .await
+        .unwrap_or(false)
+}
+
+/// One main caucus's link to this daemon: its session and the name its
+/// `hosts.toml` gives this host. Panels, connections and replies belong to a
+/// link, so two host entries reaching one daemon never stand in for each other.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Link {
+    session: SessionId,
+    host: String,
+}
+
+/// What a connection task tells the daemon.
+enum ConnEvent {
+    Hello {
+        conn: u64,
+        link: Link,
+        tx: mpsc::Sender<String>,
+        /// Dropping this ends the connection.
+        kick: oneshot::Sender<()>,
+    },
+    Frame {
+        conn: u64,
+        frame: ClientFrame,
+    },
+    Closed {
+        conn: u64,
+    },
+    /// A hello in another protocol than this daemon's.
+    OtherProtocol(OtherProtocol),
+}
+
+/// A main speaking protocol `proto`, waiting on `write` for its refusal.
+struct OtherProtocol {
+    proto: u32,
+    write: OwnedWriteHalf,
+}
+
+async fn accept_loop(listener: UnixListener, events: mpsc::Sender<ConnEvent>) {
+    let mut next = 0u64;
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                next += 1;
+                tokio::spawn(connection(next, stream, events.clone()));
+            }
+            Err(err) => {
+                warn!(error = %err, "host control accept failed");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Read one connection's frames until it closes or the daemon kicks it.
+async fn connection(conn: u64, stream: UnixStream, events: mpsc::Sender<ConnEvent>) {
+    let (read, write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    let hello = tokio::time::timeout(
+        HELLO_WAIT,
+        read_capped_line(&mut reader, &mut line, MAX_FRAME_BYTES),
+    )
+    .await;
+    if !matches!(hello, Ok(Ok(CappedLine::Line))) {
+        return;
+    }
+    let link = match serde_json::from_str::<ClientFrame>(&line) {
+        Ok(ClientFrame::Hello {
+            proto,
+            session,
+            host,
+        }) if proto == PROTO_VERSION => Link { session, host },
+        Ok(ClientFrame::Hello { proto, .. }) => {
+            let other = ConnEvent::OtherProtocol(OtherProtocol { proto, write });
+            let _ = events.send(other).await;
+            return;
+        }
+        Ok(ClientFrame::Doctor) => {
+            report(write).await;
+            return;
+        }
+        _ => {
+            refuse(write, "first frame must be hello or doctor".into()).await;
+            return;
+        }
+    };
+    let (tx, rx) = mpsc::channel(CONNECTION_QUEUE);
+    let (kick, mut kicked) = oneshot::channel();
+    tokio::spawn(write_loop(write, rx));
+    let hello = ConnEvent::Hello {
+        conn,
+        link,
+        tx,
+        kick,
+    };
+    if events.send(hello).await.is_err() {
+        return;
+    }
+    loop {
+        tokio::select! {
+            _ = &mut kicked => return,
+            read = read_capped_line(&mut reader, &mut line, MAX_FRAME_BYTES) => match read {
+                Ok(CappedLine::Line) if line.is_empty() => {}
+                Ok(CappedLine::Line) => match serde_json::from_str::<ClientFrame>(&line) {
+                    Ok(frame) => {
+                        if events.send(ConnEvent::Frame { conn, frame }).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) => warn!(conn, error = %err, "unreadable client frame"),
+                },
+                Ok(CappedLine::TooLong) => {
+                    warn!(conn, "client frame over {MAX_FRAME_BYTES} bytes; closing");
+                    break;
+                }
+                Ok(CappedLine::Eof) | Err(_) => break,
+            },
+        }
+    }
+    let _ = events.send(ConnEvent::Closed { conn }).await;
+}
+
+/// Answer a doctor request with checks run in this process, whose
+/// environment every panel the daemon spawns inherits.
+async fn report(mut write: OwnedWriteHalf) {
+    let Ok(report) = tokio::task::spawn_blocking(crate::doctor::host_report).await else {
+        return;
+    };
+    let _ = write
+        .write_all(encode(&DaemonFrame::Report(report)).as_bytes())
+        .await;
+}
+
+async fn refuse(mut write: OwnedWriteHalf, msg: String) {
+    warn!(%msg, "refusing host connection");
+    let _ = write
+        .write_all(encode(&DaemonFrame::Error { msg }).as_bytes())
+        .await;
+    let _ = write.shutdown().await;
+}
+
+/// Write queued lines until the daemon drops the queue's sender.
+async fn write_loop(write: OwnedWriteHalf, mut rx: mpsc::Receiver<String>) {
+    let mut out = BufWriter::new(write);
+    while let Some(line) = rx.recv().await {
+        if out.write_all(line.as_bytes()).await.is_err() {
+            return;
+        }
+        if rx.is_empty() && out.flush().await.is_err() {
+            return;
+        }
+    }
+    let _ = out.flush().await;
+    let _ = out.shutdown().await;
+}
+
+/// The connection currently serving one link.
+struct Client {
+    conn: u64,
+    tx: mpsc::Sender<String>,
+    _kick: oneshot::Sender<()>,
+    /// Replies, sent ahead of panel output.
+    queued: VecDeque<String>,
+}
+
+impl Client {
+    /// Send queued lines until the connection's queue fills. `true` when
+    /// nothing is left waiting.
+    fn flush(&mut self) -> bool {
+        while let Some(line) = self.queued.pop_front() {
+            if let Err(err) = self.tx.try_send(line) {
+                match err {
+                    mpsc::error::TrySendError::Full(line) => self.queued.push_front(line),
+                    // The connection is gone; its `Closed` event is on the way.
+                    mpsc::error::TrySendError::Closed(_) => self.queued.clear(),
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    fn has_room(&self) -> bool {
+        self.tx.capacity() > 0
+    }
+
+    fn send_now(&self, frame: &DaemonFrame) {
+        // Only called after `has_room`, and the daemon is the only sender.
+        let _ = self.tx.try_send(encode(frame));
+    }
+}
+
+/// What the daemon holds for a link besides its panels.
+struct LinkState {
+    attached: Attachment,
+    /// Signals for the link rather than one of its panels.
+    signals: SignalLog,
+}
+
+/// A link's connection, or since when it has had none.
+enum Attachment {
+    Connected(Client),
+    /// Its last connection closed then. The link stays while it has panels
+    /// here, until [`FORGET_AFTER`] has passed.
+    Detached(Instant),
+}
+
+/// Signals for one receiver, kept until main confirms them: a line handed to
+/// a connection that dies goes out again on the next. `lines[0]` is signal
+/// `base`.
+#[derive(Default)]
+struct SignalLog {
+    base: u64,
+    lines: VecDeque<String>,
+    /// Next to send on the current connection.
+    sent: u64,
+}
+
+impl SignalLog {
+    fn end(&self) -> u64 {
+        self.base + self.lines.len() as u64
+    }
+
+    fn push(&mut self, line: String) {
+        if self.lines.len() >= SIGNAL_BACKLOG {
+            self.lines.pop_front();
+            self.base += 1;
+            warn!("sub-host signal backlog full; dropped the oldest signal");
+        }
+        self.lines.push_back(line);
+    }
+
+    /// Main has every signal before `next`.
+    fn confirm(&mut self, next: u64) {
+        let seen = (next.saturating_sub(self.base) as usize).min(self.lines.len());
+        self.lines.drain(..seen);
+        self.base += seen as u64;
+    }
+
+    /// Send from the oldest unconfirmed signal on, as a new connection needs.
+    fn rewind(&mut self) {
+        self.sent = self.base;
+    }
+
+    fn unsent(&self) -> bool {
+        self.sent < self.end()
+    }
+
+    /// Send to `client` until its queue fills. `true` once all has gone out.
+    fn stream(&mut self, panel: Option<PanelId>, client: &Client) -> bool {
+        self.sent = self.sent.max(self.base);
+        while self.unsent() {
+            if !client.has_room() {
+                return false;
+            }
+            client.send_now(&DaemonFrame::Signal {
+                panel,
+                seq: self.sent,
+                line: self.lines[(self.sent - self.base) as usize].clone(),
+            });
+            self.sent += 1;
+        }
+        true
+    }
+}
+
+/// Where a panel's child is in dying. A child seen dead stays `Dying` for one
+/// probe interval so output its reader thread still holds reaches the ring
+/// before the panel is reported gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Life {
+    Running,
+    Dying,
+    Exited(Option<String>),
+}
+
+struct DPanel {
+    link: Link,
+    /// `None` when the launch failed; the error is in the output.
+    pty: Option<LocalPty>,
+    /// The last [`LOG_CAP`] output bytes; `log[0]` is byte `base`.
+    log: VecDeque<u8>,
+    base: u64,
+    /// The modes the bytes before `base` set.
+    dropped: PrivateModes,
+    /// Next byte to send, while the link's connection has attached the panel.
+    /// `None` until it attaches.
+    sent: Option<u64>,
+    life: Life,
+    /// Whether this connection has been told about the exit.
+    exit_sent: bool,
+    /// Signals the panel posted; each goes out after the output before it.
+    signals: SignalLog,
+    /// The first input byte not yet taken, counted from the spawn.
+    input_next: u64,
+}
+
+impl DPanel {
+    fn new(link: Link, pty: Option<LocalPty>) -> Self {
+        Self {
+            link,
+            pty,
+            log: VecDeque::new(),
+            base: 0,
+            dropped: PrivateModes::default(),
+            sent: None,
+            life: Life::Running,
+            exit_sent: false,
+            signals: SignalLog::default(),
+            input_next: 0,
+        }
+    }
+
+    fn end(&self) -> u64 {
+        self.base + self.log.len() as u64
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        self.log.extend(bytes);
+        let over = self.log.len().saturating_sub(LOG_CAP);
+        if over > 0 {
+            let (front, back) = self.log.as_slices();
+            let in_front = over.min(front.len());
+            self.dropped.advance(&front[..in_front]);
+            self.dropped.advance(&back[..over - in_front]);
+            self.log.drain(..over);
+            self.base += over as u64;
+        }
+    }
+
+    /// Stream to `client` until its queue fills. `true` once everything the
+    /// panel has — output, held signals, its exit — has gone out.
+    fn stream(&mut self, id: PanelId, client: &mut Client) -> bool {
+        let Some(mut sent) = self.sent else {
+            return true;
+        };
+        if sent < self.base {
+            if !client.has_room() {
+                return false;
+            }
+            // The client's grid misses bytes it can never get back: it is
+            // told the modes they set, and a size change makes the agent
+            // repaint its screen.
+            warn!(panel = %id, lost = self.base - sent, "client missed output the ring dropped");
+            client.send_now(&DaemonFrame::Skipped {
+                panel: id,
+                to: self.base,
+                modes: self.dropped.set.clone(),
+            });
+            jiggle(self);
+            sent = self.base;
+        }
+        while sent < self.end() {
+            if !client.has_room() {
+                self.sent = Some(sent);
+                return false;
+            }
+            let start = (sent - self.base) as usize;
+            let stop = (start + OUTPUT_CHUNK).min(self.log.len());
+            let data: Vec<u8> = self.log.range(start..stop).copied().collect();
+            client.send_now(&DaemonFrame::Output {
+                panel: id,
+                offset: sent,
+                data: Bytes(data),
+            });
+            sent += (stop - start) as u64;
+        }
+        self.sent = Some(sent);
+        if !self.signals.stream(Some(id), client) {
+            return false;
+        }
+        if let Life::Exited(reason) = &self.life
+            && !self.exit_sent
+        {
+            if !client.has_room() {
+                return false;
+            }
+            client.send_now(&DaemonFrame::Exited {
+                panel: id,
+                reason: reason.clone(),
+            });
+            self.exit_sent = true;
+        }
+        true
+    }
+
+    /// Write main's input from byte `offset` on to the child, skipping what
+    /// it already took: main re-sends what a dropped connection may have
+    /// lost.
+    fn take_input(&mut self, id: PanelId, offset: u64, data: &[u8]) {
+        let end = offset + data.len() as u64;
+        if end <= self.input_next {
+            return;
+        }
+        if offset > self.input_next {
+            warn!(panel = %id, lost = offset - self.input_next, "sub-host input gap");
+        }
+        let skip = self.input_next.saturating_sub(offset) as usize;
+        self.input_next = end;
+        if let Some(pty) = self.pty.as_mut()
+            && let Err(err) = pty.write(&data[skip..])
+        {
+            warn!(panel = %id, error = %err, "input to a sub-host panel was dropped");
+        }
+    }
+}
+
+/// The DEC private modes (`CSI ? Pn h` / `l`) a byte stream set, read as a
+/// panel's grid reads them.
+#[derive(Default)]
+struct PrivateModes {
+    parser: vte::Parser,
+    /// Each mode's last setting, in the order made: replayed in this order,
+    /// modes that act on one another (the alternate screens) end as they did.
+    set: Vec<(u16, bool)>,
+}
+
+impl PrivateModes {
+    fn advance(&mut self, bytes: &[u8]) {
+        self.parser.advance(&mut ModeSettings(&mut self.set), bytes);
+    }
+}
+
+struct ModeSettings<'a>(&'a mut Vec<(u16, bool)>);
+
+impl vte::Perform for ModeSettings<'_> {
+    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], _: bool, action: char) {
+        if intermediates.first() != Some(&b'?') || !matches!(action, 'h' | 'l') {
+            return;
+        }
+        for &mode in params.iter().flatten() {
+            self.0.retain(|&(set, _)| set != mode);
+            self.0.push((mode, action == 'h'));
+        }
+    }
+}
+
+/// Blocking work the daemon hands off its loop. One thread runs it in
+/// arrival order, so a worktree removal never starts before the kills of the
+/// panels working there have ended.
+enum Chore {
+    /// `LocalPty::kill` joins threads and waits for the child.
+    Kill(LocalPty),
+    Worktree {
+        link: Link,
+        req: u64,
+        op: WorktreeOp,
+    },
+}
+
+enum WorktreeOp {
+    Add {
+        repo: PathBuf,
+        path: PathBuf,
+        branch: String,
+    },
+    Remove {
+        repo: PathBuf,
+        path: PathBuf,
+        delete_branch: Option<String>,
+    },
+}
+
+impl WorktreeOp {
+    fn run(self) -> Result<PathBuf, String> {
+        match self {
+            Self::Add { repo, path, branch } => add_worktree(&repo, &path, &branch),
+            Self::Remove {
+                repo,
+                path,
+                delete_branch,
+            } => remove_worktree(&repo, &path, delete_branch),
+        }
+    }
+}
+
+/// The chore thread and its queue; dropping `tx` lets the thread finish the
+/// queue and exit.
+struct Chores {
+    tx: std::sync::mpsc::Sender<Chore>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Chores {
+    fn start(done: mpsc::UnboundedSender<(Link, DaemonFrame)>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Chore>();
+        let thread = std::thread::spawn(move || {
+            for chore in rx {
+                match chore {
+                    Chore::Kill(mut pty) => {
+                        let _ = pty.kill();
+                    }
+                    Chore::Worktree { link, req, op } => {
+                        let result = op.run().map(|path| path.display().to_string());
+                        let _ = done.send((link, DaemonFrame::WorktreeDone { req, result }));
+                    }
+                }
+            }
+        });
+        Self { tx, thread }
+    }
+}
+
+struct Daemon {
+    paths: HostPaths,
+    hostname: String,
+    machine_id: Option<String>,
+    caucus_bin: PathBuf,
+    /// `PATH` for panels ([`panel_path`]).
+    panel_path: Option<String>,
+    panels: HashMap<PanelId, DPanel>,
+    /// Every link with a connection or a panel here.
+    links: HashMap<Link, LinkState>,
+    last_probe: Instant,
+    /// `None` once shutdown has drained it.
+    chores: Option<Chores>,
+}
+
+impl Daemon {
+    /// A worktree request's answer goes to `chores_done`, for the run loop to
+    /// send to the link's connection.
+    fn new(paths: HostPaths, chores_done: mpsc::UnboundedSender<(Link, DaemonFrame)>) -> Self {
+        let caucus_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("caucus"));
+        Self {
+            hostname: hostname(),
+            machine_id: super::machine_id(),
+            panel_path: panel_path(&paths.state_dir, &caucus_bin),
+            caucus_bin,
+            paths,
+            panels: HashMap::new(),
+            links: HashMap::new(),
+            last_probe: Instant::now(),
+            chores: Some(Chores::start(chores_done)),
+        }
+    }
+
+    fn chore(&self, chore: Chore) {
+        if let Some(chores) = &self.chores {
+            let _ = chores.tx.send(chore);
+        }
+    }
+
+    fn clients(&self) -> impl Iterator<Item = (&Link, &Client)> {
+        self.links
+            .iter()
+            .filter_map(|(link, state)| match &state.attached {
+                Attachment::Connected(client) => Some((link, client)),
+                Attachment::Detached(_) => None,
+            })
+    }
+
+    fn client_mut(&mut self, link: &Link) -> Option<&mut Client> {
+        match &mut self.links.get_mut(link)?.attached {
+            Attachment::Connected(client) => Some(client),
+            Attachment::Detached(_) => None,
+        }
+    }
+
+    fn wants_tick(&self) -> bool {
+        !self.panels.is_empty()
+            || self.links.values().any(|state| match &state.attached {
+                Attachment::Connected(client) => {
+                    !client.queued.is_empty() || state.signals.unsent()
+                }
+                Attachment::Detached(_) => false,
+            })
+    }
+
+    /// Handle `event`. A main in another protocol comes back when no panel
+    /// runs here, for [`run`] to decide whether to step aside for it.
+    fn on_event(&mut self, event: ConnEvent) -> Option<OtherProtocol> {
+        match event {
+            ConnEvent::Hello {
+                conn,
+                link,
+                tx,
+                kick,
+            } => self.on_hello(conn, link, tx, kick),
+            ConnEvent::Frame { conn, frame } => {
+                // A replaced connection's last frames are dropped.
+                let link = self
+                    .clients()
+                    .find_map(|(l, c)| (c.conn == conn).then(|| l.clone()));
+                if let Some(link) = link {
+                    self.on_frame(link, frame);
+                }
+            }
+            ConnEvent::Closed { conn } => {
+                let now = Instant::now();
+                for state in self.links.values_mut() {
+                    if matches!(&state.attached, Attachment::Connected(c) if c.conn == conn) {
+                        state.attached = Attachment::Detached(now);
+                    }
+                }
+                // A link with no panel here is one no main still runs.
+                self.links.retain(|link, state| {
+                    matches!(state.attached, Attachment::Connected(_))
+                        || self.panels.values().any(|p| p.link == *link)
+                });
+            }
+            ConnEvent::OtherProtocol(other) if self.panels.is_empty() => return Some(other),
+            ConnEvent::OtherProtocol(OtherProtocol { proto, write }) => {
+                let msg = format!(
+                    "protocol {proto} not supported; this host's daemon speaks \
+                     {PROTO_VERSION} and keeps running for its {} panels; stop it there to \
+                     replace it",
+                    self.panels.len()
+                );
+                tokio::spawn(refuse(write, msg));
+            }
+        }
+        None
+    }
+
+    fn on_hello(
+        &mut self,
+        conn: u64,
+        link: Link,
+        tx: mpsc::Sender<String>,
+        kick: oneshot::Sender<()>,
+    ) {
+        let session_dir = self
+            .paths
+            .state_dir
+            .join("sessions")
+            .join(link.session.to_string());
+        let first = match std::fs::create_dir_all(&session_dir) {
+            Ok(()) => DaemonFrame::Welcome(HostInfo {
+                proto: PROTO_VERSION,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                hostname: self.hostname.clone(),
+                machine_id: self.machine_id.clone(),
+                home: std::env::var_os("HOME").map(PathBuf::from),
+                caucus_bin: self.caucus_bin.clone(),
+                signal_sock: self.paths.signal_sock.clone(),
+                session_dir,
+                panels: self
+                    .panels
+                    .iter()
+                    .filter(|(_, p)| p.link == link)
+                    .map(|(&id, p)| HostPanel {
+                        id,
+                        input: p.input_next,
+                        exited: matches!(p.life, Life::Exited(_)),
+                    })
+                    .collect(),
+            }),
+            Err(err) => {
+                let _ = tx.try_send(encode(&DaemonFrame::Error {
+                    msg: format!("create {}: {err}", session_dir.display()),
+                }));
+                return;
+            }
+        };
+        let mut client = Client {
+            conn,
+            tx,
+            _kick: kick,
+            queued: VecDeque::from([
+                encode(&first),
+                encode(&DaemonFrame::Load(super::load::sample())),
+            ]),
+        };
+        client.flush();
+        // Dropping the replaced client kicks its connection.
+        let replaced = match self.links.entry(link.clone()) {
+            Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                state.signals.rewind();
+                Some(std::mem::replace(
+                    &mut state.attached,
+                    Attachment::Connected(client),
+                ))
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(LinkState {
+                    attached: Attachment::Connected(client),
+                    signals: SignalLog::default(),
+                });
+                None
+            }
+        };
+        if matches!(replaced, Some(Attachment::Connected(_))) {
+            info!(session = %link.session, host = %link.host, "link reconnected; replacing its old connection");
+        }
+        // Nothing streams until the new connection says where it left off.
+        for panel in self.panels.values_mut().filter(|p| p.link == link) {
+            panel.sent = None;
+            panel.exit_sent = false;
+        }
+    }
+
+    /// Send every connection the host's load. A connection that is backed up
+    /// skips this sample; the next one supersedes it.
+    fn push_load(&self) {
+        let line = encode(&DaemonFrame::Load(super::load::sample()));
+        for (_, client) in self.clients() {
+            let _ = client.tx.try_send(line.clone());
+        }
+    }
+
+    fn reply(&mut self, link: &Link, frame: &DaemonFrame) {
+        if let Some(client) = self.client_mut(link) {
+            client.queued.push_back(encode(frame));
+            client.flush();
+        }
+    }
+
+    fn on_frame(&mut self, link: Link, frame: ClientFrame) {
+        let frame = match frame {
+            ClientFrame::Hello { .. } => {
+                self.reply(
+                    &link,
+                    &DaemonFrame::Error {
+                        msg: "hello sent twice".into(),
+                    },
+                );
+                return;
+            }
+            ClientFrame::Doctor => {
+                self.reply(
+                    &link,
+                    &DaemonFrame::Error {
+                        msg: "doctor is only a connection's first frame".into(),
+                    },
+                );
+                return;
+            }
+            ClientFrame::AddWorktree {
+                req,
+                repo,
+                path,
+                branch,
+            } => {
+                let op = WorktreeOp::Add {
+                    repo: home_relative(repo.into()),
+                    path: home_relative(path.into()),
+                    branch,
+                };
+                self.chore(Chore::Worktree { link, req, op });
+                return;
+            }
+            ClientFrame::RemoveWorktree {
+                req,
+                repo,
+                path,
+                delete_branch,
+            } => {
+                let op = WorktreeOp::Remove {
+                    repo: home_relative(repo.into()),
+                    path: home_relative(path.into()),
+                    delete_branch,
+                };
+                self.chore(Chore::Worktree { link, req, op });
+                return;
+            }
+            ClientFrame::SignalsSeen { panel: None, next } => {
+                if let Some(state) = self.links.get_mut(&link) {
+                    state.signals.confirm(next);
+                }
+                return;
+            }
+            frame => frame,
+        };
+        let panel_id = match &frame {
+            ClientFrame::Spawn { panel, .. }
+            | ClientFrame::Input { panel, .. }
+            | ClientFrame::Resize { panel, .. }
+            | ClientFrame::Attach { panel, .. }
+            | ClientFrame::Kill { panel }
+            | ClientFrame::SignalsSeen {
+                panel: Some(panel), ..
+            } => *panel,
+            ClientFrame::Hello { .. }
+            | ClientFrame::Doctor
+            | ClientFrame::AddWorktree { .. }
+            | ClientFrame::RemoveWorktree { .. }
+            | ClientFrame::SignalsSeen { panel: None, .. } => unreachable!("answered above"),
+        };
+        if self.panels.get(&panel_id).is_some_and(|p| p.link != link) {
+            self.reply(
+                &link,
+                &DaemonFrame::Error {
+                    msg: format!("panel {panel_id} belongs to another session or host"),
+                },
+            );
+            return;
+        }
+        match frame {
+            ClientFrame::Hello { .. }
+            | ClientFrame::Doctor
+            | ClientFrame::AddWorktree { .. }
+            | ClientFrame::RemoveWorktree { .. }
+            | ClientFrame::SignalsSeen { panel: None, .. } => unreachable!("answered above"),
+            ClientFrame::Spawn { panel, spec } => {
+                self.panels.entry(panel).or_insert_with(|| {
+                    spawn_panel(link.clone(), &spec, self.panel_path.as_deref())
+                });
+                self.reply(&link, &DaemonFrame::Spawned { panel });
+            }
+            ClientFrame::Input {
+                panel,
+                offset,
+                data,
+            } => {
+                if let Some(p) = self.panels.get_mut(&panel) {
+                    p.take_input(panel, offset, &data.0);
+                }
+            }
+            ClientFrame::Resize { panel, cols, rows } => {
+                if let Some(pty) = self.panels.get_mut(&panel).and_then(|p| p.pty.as_mut())
+                    && let Err(err) = pty.resize(cols, rows)
+                {
+                    warn!(%panel, error = %err, "sub-host panel resize failed");
+                }
+            }
+            ClientFrame::Attach { panel, from } => match self.panels.get_mut(&panel) {
+                Some(p) => {
+                    p.sent = Some(from.min(p.end()));
+                    p.exit_sent = false;
+                    p.signals.rewind();
+                }
+                None => self.reply(
+                    &link,
+                    &DaemonFrame::Exited {
+                        panel,
+                        reason: Some("no such panel on this host (daemon restarted?)".into()),
+                    },
+                ),
+            },
+            ClientFrame::SignalsSeen {
+                panel: Some(panel),
+                next,
+            } => {
+                if let Some(p) = self.panels.get_mut(&panel) {
+                    p.signals.confirm(next);
+                }
+            }
+            ClientFrame::Kill { panel } => {
+                self.kill(panel);
+                self.reply(
+                    &link,
+                    &DaemonFrame::Exited {
+                        panel,
+                        reason: Some("killed".into()),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Route a signal posted on this host to the connections of its session.
+    fn on_signal(&mut self, event: &SignalEvent) {
+        let line = match serde_json::to_string(event) {
+            Ok(line) => line,
+            Err(err) => {
+                warn!(error = %err, "signal does not re-serialise");
+                return;
+            }
+        };
+        let target = match event {
+            SignalEvent::Turn(s) => Some((s.session_id, s.panel_id)),
+            SignalEvent::Note(n) => Some((n.session_id, n.panel_id)),
+            SignalEvent::Lifecycle(l) => Some((l.session_id, l.panel_id)),
+            SignalEvent::Unbound(_) => None,
+        };
+        match target {
+            Some((session, panel)) => {
+                if let Some(p) = self.panels.get_mut(&panel)
+                    && p.link.session == session
+                {
+                    p.signals.push(line);
+                } else {
+                    // Main takes a panel's signal only through the host the
+                    // panel runs on, so each of the session's links gets it.
+                    for (_, state) in self
+                        .links
+                        .iter_mut()
+                        .filter(|(link, _)| link.session == session)
+                    {
+                        state.signals.push(line.clone());
+                    }
+                }
+            }
+            // An unbound hook names no session; each link decides whether
+            // the conversation is one of its panels' sub-agents.
+            None => {
+                for state in self.links.values_mut() {
+                    state.signals.push(line.clone());
+                }
+            }
+        }
+    }
+
+    fn pump(&mut self, now: Instant) {
+        for panel in self.panels.values_mut() {
+            if let Some(pty) = panel.pty.as_mut()
+                && let Ok(bytes) = pty.read()
+                && !bytes.is_empty()
+            {
+                panel.append(&bytes);
+            }
+        }
+        if now.duration_since(self.last_probe) >= LIVENESS_PROBE {
+            self.last_probe = now;
+            for panel in self.panels.values_mut() {
+                match &panel.life {
+                    Life::Running => {
+                        if panel.pty.as_mut().is_some_and(|pty| !pty.is_alive()) {
+                            panel.life = Life::Dying;
+                        }
+                    }
+                    Life::Dying => panel.life = Life::Exited(None),
+                    Life::Exited(_) => {}
+                }
+            }
+        }
+        self.stream();
+    }
+
+    /// Remove `panel` and have its child killed.
+    fn kill(&mut self, panel: PanelId) {
+        if let Some(mut p) = self.panels.remove(&panel)
+            && let Some(mut pty) = p.pty.take()
+        {
+            // Hung up now: kills queued behind one another wait out their
+            // graces together, not one after another on the chore thread.
+            pty.hang_up();
+            self.chore(Chore::Kill(pty));
+        }
+    }
+
+    /// Forget every link without a connection for [`FORGET_AFTER`] by `now`:
+    /// kill its panels and drop its signals. Its worktrees and session
+    /// directory stay for a resume to start the panels in again.
+    fn forget_idle(&mut self, now: Instant) {
+        let idle: Vec<Link> = self
+            .links
+            .iter()
+            .filter(|(_, state)| {
+                matches!(state.attached, Attachment::Detached(since)
+                    if now.saturating_duration_since(since) >= FORGET_AFTER)
+            })
+            .map(|(link, _)| link.clone())
+            .collect();
+        for link in idle {
+            self.links.remove(&link);
+            let panels: Vec<PanelId> = self
+                .panels
+                .iter()
+                .filter(|(_, p)| p.link == link)
+                .map(|(&id, _)| id)
+                .collect();
+            info!(session = %link.session, host = %link.host, panels = panels.len(), "forgetting a link idle for {FORGET_AFTER:?}");
+            for panel in panels {
+                self.kill(panel);
+            }
+        }
+    }
+
+    fn stream(&mut self) {
+        for (link, state) in &mut self.links {
+            let Attachment::Connected(client) = &mut state.attached else {
+                continue;
+            };
+            if !client.flush() || !state.signals.stream(None, client) {
+                continue;
+            }
+            for (id, panel) in self.panels.iter_mut() {
+                if panel.link == *link && !panel.stream(*id, client) {
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        let kills: Vec<_> = self
+            .panels
+            .drain()
+            .filter_map(|(_, mut p)| p.pty.take())
+            .map(|mut pty| tokio::task::spawn_blocking(move || pty.kill()))
+            .collect();
+        for kill in kills {
+            let _ = kill.await;
+        }
+        // Let queued kills and worktree requests finish.
+        if let Some(Chores { tx, thread }) = self.chores.take() {
+            drop(tx);
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
+    }
+}
+
+/// Check `branch` out at `path`. A worktree already there on `branch` is the
+/// one an earlier copy of the same request made.
+fn add_worktree(repo: &Path, path: &Path, branch: &str) -> Result<PathBuf, String> {
+    if path.exists() {
+        let head = run_git(
+            path,
+            &["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()],
+        );
+        return match head {
+            Ok(head) if head.trim() == branch => Ok(path.to_path_buf()),
+            _ => Err(format!(
+                "{} already exists and is not a worktree on {branch}",
+                path.display()
+            )),
+        };
+    }
+    manager::attach(repo, path, branch)
+        .map(|handle| handle.path)
+        .map_err(|err| err.to_string())
+}
+
+/// Remove the worktree at `path` through the cleanup owner, which commits its
+/// uncommitted work onto its branch first (Invariant I-8).
+fn remove_worktree(
+    repo: &Path,
+    path: &Path,
+    delete_branch: Option<String>,
+) -> Result<PathBuf, String> {
+    let summary = cleanup::run_blocking(&CleanupJob {
+        repo_root: repo.to_path_buf(),
+        worktree_paths: if path.exists() {
+            vec![path.to_path_buf()]
+        } else {
+            Vec::new()
+        },
+        branches_to_delete: delete_branch.into_iter().collect(),
+        owners: Vec::new(),
+        done: None,
+    });
+    let failed: Vec<String> = summary
+        .failed_worktrees
+        .iter()
+        .map(|(path, msg)| format!("{}: {msg}", path.display()))
+        .chain(
+            summary
+                .failed_branches
+                .iter()
+                .map(|(branch, msg)| format!("{branch}: {msg}")),
+        )
+        .collect();
+    if failed.is_empty() {
+        Ok(path.to_path_buf())
+    } else {
+        Err(failed.join("; "))
+    }
+}
+
+/// `PATH` for panels: the daemon's own, behind a directory holding only a
+/// link to the daemon's caucus, so a hook running `caucus` by name reaches
+/// the build that serves it. `None` leaves panels the daemon's `PATH`.
+fn panel_path(state_dir: &Path, caucus_bin: &Path) -> Option<String> {
+    let path = std::env::var("PATH").ok()?;
+    let bin = state_dir.join("bin");
+    let link = bin.join("caucus");
+    let linked = std::fs::create_dir_all(&bin)
+        .and_then(|()| match std::fs::remove_file(&link) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+            _ => Ok(()),
+        })
+        .and_then(|()| std::os::unix::fs::symlink(caucus_bin, &link));
+    if let Err(err) = linked {
+        warn!(link = %link.display(), error = %err, "cannot put caucus on panels' PATH");
+        return None;
+    }
+    let bin = bin.to_str().filter(|bin| !bin.contains(':'))?;
+    Some(format!("{bin}:{path}"))
+}
+
+fn spawn_panel(link: Link, spec: &SpawnSpec, path: Option<&str>) -> DPanel {
+    let mut command = spec.to_command();
+    command.cwd = command.cwd.map(home_relative);
+    if let Some(path) = path {
+        command
+            .env
+            .entry("PATH".into())
+            .or_insert_with(|| path.into());
+    }
+    if spec.trust_codex_cwd
+        && let Some(cwd) = command.cwd.as_deref()
+        && let Err(err) = crate::agent::codex_trust::ensure_trusted(cwd)
+    {
+        warn!(cwd = %cwd.display(), error = %err, "codex directory-trust pre-grant failed");
+    }
+    match LocalPty::spawn(&command, spec.cols, spec.rows) {
+        Ok(pty) => {
+            let mut panel = DPanel::new(link, Some(pty));
+            panel.sent = Some(0);
+            panel
+        }
+        Err(err) => {
+            let mut panel = DPanel::new(link, None);
+            panel.append(
+                format!("caucus host: cannot start {}: {err}\r\n", spec.program).as_bytes(),
+            );
+            panel.life = Life::Exited(Some(err.to_string()));
+            panel.sent = Some(0);
+            panel
+        }
+    }
+}
+
+/// Resize one row short and back, so the child gets a `SIGWINCH` and redraws.
+fn jiggle(panel: &mut DPanel) {
+    if let Some(pty) = panel.pty.as_mut() {
+        let (cols, rows) = pty.size();
+        let _ = pty.resize(cols, rows.saturating_sub(1).max(1));
+        let _ = pty.resize(cols, rows);
+    }
+}
+
+pub(crate) fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for `buf.len()` bytes; gethostname writes at most
+    // that many.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return "unknown".into();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::signal::{TurnKind, TurnSignal};
+
+    fn frames(rx: &mut mpsc::Receiver<String>) -> Vec<DaemonFrame> {
+        let mut out = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            out.push(serde_json::from_str(line.trim_end()).unwrap());
+        }
+        out
+    }
+
+    fn link(session: SessionId, host: &str) -> Link {
+        Link {
+            session,
+            host: host.into(),
+        }
+    }
+
+    /// The daemon's state lives in the returned dir, removed when it drops.
+    fn daemon_with_client(link: Link) -> (Daemon, mpsc::Receiver<String>, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (chores_done, _) = mpsc::unbounded_channel();
+        let mut daemon = Daemon::new(
+            HostPaths {
+                state_dir: tmp.path().join("state"),
+                control_sock: tmp.path().join("unused.sock"),
+                signal_sock: tmp.path().join("unused-signal.sock"),
+            },
+            chores_done,
+        );
+        let (tx, rx) = mpsc::channel(CONNECTION_QUEUE);
+        let (kick, _kicked) = oneshot::channel();
+        daemon.links.insert(
+            link,
+            LinkState {
+                attached: Attachment::Connected(Client {
+                    conn: 1,
+                    tx,
+                    _kick: kick,
+                    queued: VecDeque::new(),
+                }),
+                signals: SignalLog::default(),
+            },
+        );
+        (daemon, rx, tmp)
+    }
+
+    /// A panel's turn signal goes out only after the output in front of it,
+    /// even when the output takes several ticks to drain.
+    #[test]
+    fn a_panel_signal_waits_for_the_panel_output() {
+        let session = SessionId::new();
+        let (mut daemon, mut rx, _state) = daemon_with_client(link(session, "sub-1"));
+        let id = PanelId::new();
+        let mut panel = DPanel::new(link(session, "sub-1"), None);
+        let big = vec![b'x'; OUTPUT_CHUNK * (CONNECTION_QUEUE + 3)];
+        panel.append(&big);
+        panel.sent = Some(0);
+        daemon.panels.insert(id, panel);
+        daemon.on_signal(&SignalEvent::Turn(TurnSignal::now(
+            session,
+            id,
+            TurnKind::Stop,
+            None,
+            serde_json::json!({}),
+        )));
+
+        daemon.pump(Instant::now());
+        let first = frames(&mut rx);
+        assert_eq!(first.len(), CONNECTION_QUEUE);
+        assert!(
+            first
+                .iter()
+                .all(|f| matches!(f, DaemonFrame::Output { .. })),
+            "the signal stays behind output still in the ring"
+        );
+
+        daemon.pump(Instant::now());
+        let rest = frames(&mut rx);
+        assert_eq!(rest.len(), 4, "{rest:?}");
+        assert!(
+            rest[..3]
+                .iter()
+                .all(|f| matches!(f, DaemonFrame::Output { .. }))
+        );
+        let DaemonFrame::Signal { panel, seq, line } = &rest[3] else {
+            panic!("expected the signal last, got {:?}", rest[3]);
+        };
+        assert_eq!((*panel, *seq), (Some(id), 0));
+        assert!(matches!(
+            crate::signal::server::ingest(line).unwrap(),
+            SignalEvent::Turn(sig) if sig.panel_id == id
+        ));
+    }
+
+    /// The ring keeps the newest bytes and advances `base` past what it drops.
+    #[test]
+    fn the_output_ring_keeps_the_newest_bytes() {
+        let mut panel = DPanel::new(link(SessionId::new(), "sub-1"), None);
+        panel.append(&vec![b'a'; LOG_CAP]);
+        panel.append(b"tail");
+        assert_eq!(panel.log.len(), LOG_CAP);
+        assert_eq!(panel.base, 4);
+        assert_eq!(panel.end(), LOG_CAP as u64 + 4);
+        assert!(panel.log.iter().rev().take(4).eq(b"liat".iter()));
+    }
+
+    /// A client behind the ring is told what it missed before the output
+    /// goes on: where, and the modes the dropped bytes set, in the order set,
+    /// a sequence split across writes included.
+    #[test]
+    fn a_client_behind_the_ring_gets_the_modes_it_missed() {
+        let ours = link(SessionId::new(), "sub-1");
+        let (mut daemon, mut rx, _state) = daemon_with_client(ours.clone());
+        let id = PanelId::new();
+        let mut panel = DPanel::new(ours, None);
+        panel.append(b"\x1b[?1049h\x1b[?2004h\x1b[?10");
+        panel.append(b"49l\x1b[?47h");
+        panel.append(&vec![b'x'; LOG_CAP]);
+        panel.sent = Some(0);
+        let base = panel.base;
+        daemon.panels.insert(id, panel);
+
+        daemon.pump(Instant::now());
+        let sent = frames(&mut rx);
+        assert_eq!(
+            sent[0],
+            DaemonFrame::Skipped {
+                panel: id,
+                to: base,
+                modes: vec![(2004, true), (1049, false), (47, true)],
+            }
+        );
+        assert!(matches!(sent[1], DaemonFrame::Output { offset, .. } if offset == base));
+    }
+
+    /// A hello for a link that already has a connection replaces it and
+    /// stops every panel of the link from streaming until it re-attaches.
+    #[test]
+    fn a_second_hello_replaces_the_connection_and_pauses_streaming() {
+        let ours = link(SessionId::new(), "sub-1");
+        let (mut daemon, _old, _state) = daemon_with_client(ours.clone());
+        let id = PanelId::new();
+        let mut panel = DPanel::new(ours.clone(), None);
+        panel.append(b"before");
+        panel.sent = Some(6);
+        panel.exit_sent = true;
+        daemon.panels.insert(id, panel);
+
+        let (tx, mut rx) = mpsc::channel(CONNECTION_QUEUE);
+        let (kick, mut kicked) = oneshot::channel::<()>();
+        daemon.on_event(ConnEvent::Hello {
+            conn: 2,
+            link: ours.clone(),
+            tx,
+            kick,
+        });
+        assert!(matches!(
+            frames(&mut rx).as_slice(),
+            [DaemonFrame::Welcome(_), DaemonFrame::Load(_)]
+        ));
+        assert_eq!(daemon.client_mut(&ours).unwrap().conn, 2);
+        assert!(kicked.try_recv().is_err(), "the new connection stays open");
+        let p = &daemon.panels[&id];
+        assert_eq!((p.sent, p.exit_sent), (None, false));
+    }
+
+    /// The welcome lists every panel of the link, an exited one marked so,
+    /// for a resumed main to adopt or kill.
+    #[test]
+    fn the_welcome_lists_the_links_exited_panels_too() {
+        let ours = link(SessionId::new(), "sub-1");
+        let (mut daemon, _old, _state) = daemon_with_client(ours.clone());
+        let (running, exited) = (PanelId::new(), PanelId::new());
+        daemon
+            .panels
+            .insert(running, DPanel::new(ours.clone(), None));
+        let mut panel = DPanel::new(ours.clone(), None);
+        panel.life = Life::Exited(None);
+        daemon.panels.insert(exited, panel);
+
+        let (tx, mut rx) = mpsc::channel(CONNECTION_QUEUE);
+        let (kick, _kicked) = oneshot::channel::<()>();
+        daemon.on_event(ConnEvent::Hello {
+            conn: 2,
+            link: ours,
+            tx,
+            kick,
+        });
+        let welcome = frames(&mut rx);
+        let [DaemonFrame::Welcome(info), DaemonFrame::Load(_)] = welcome.as_slice() else {
+            panic!("expected welcome and load, got {welcome:?}");
+        };
+        let mut listed: Vec<_> = info.panels.iter().map(|p| (p.id, p.exited)).collect();
+        listed.sort();
+        let mut want = vec![(running, false), (exited, true)];
+        want.sort();
+        assert_eq!(listed, want);
+    }
+
+    /// A signal for the link itself goes out again on each new connection
+    /// until main confirms it, and is forgotten with the link once it has
+    /// neither a connection nor a panel here.
+    #[test]
+    fn a_link_signal_is_sent_again_until_confirmed() {
+        let session = SessionId::new();
+        let ours = link(session, "sub-1");
+        let (mut daemon, _old, _state) = daemon_with_client(ours.clone());
+        let hello = |daemon: &mut Daemon, conn| {
+            let (tx, rx) = mpsc::channel(CONNECTION_QUEUE);
+            let (kick, _kicked) = oneshot::channel::<()>();
+            daemon.on_event(ConnEvent::Hello {
+                conn,
+                link: ours.clone(),
+                tx,
+                kick,
+            });
+            rx
+        };
+        let signals = |rx: &mut mpsc::Receiver<String>| -> Vec<(Option<PanelId>, u64)> {
+            frames(rx)
+                .into_iter()
+                .filter_map(|f| match f {
+                    DaemonFrame::Signal { panel, seq, .. } => Some((panel, seq)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let id = PanelId::new();
+        daemon.panels.insert(id, DPanel::new(ours.clone(), None));
+
+        let mut first = hello(&mut daemon, 2);
+        // A panel this daemon does not run, so the link gets it.
+        daemon.on_signal(&SignalEvent::Turn(TurnSignal::now(
+            session,
+            PanelId::new(),
+            TurnKind::Stop,
+            None,
+            serde_json::json!({}),
+        )));
+        daemon.pump(Instant::now());
+        assert_eq!(signals(&mut first), [(None, 0)]);
+        daemon.on_event(ConnEvent::Closed { conn: 2 });
+
+        let mut second = hello(&mut daemon, 3);
+        daemon.pump(Instant::now());
+        assert_eq!(signals(&mut second), [(None, 0)], "sent again");
+        daemon.on_event(ConnEvent::Frame {
+            conn: 3,
+            frame: ClientFrame::SignalsSeen {
+                panel: None,
+                next: 1,
+            },
+        });
+        daemon.on_event(ConnEvent::Closed { conn: 3 });
+
+        let mut third = hello(&mut daemon, 4);
+        daemon.pump(Instant::now());
+        assert!(signals(&mut third).is_empty(), "confirmed, so not again");
+
+        daemon.panels.remove(&id);
+        daemon.on_event(ConnEvent::Closed { conn: 4 });
+        assert!(!daemon.links.contains_key(&ours));
+    }
+
+    /// A link without a connection keeps its panels and signals until
+    /// `FORGET_AFTER` has passed since its connection closed, then loses
+    /// them; a connected link is never forgotten.
+    #[test]
+    fn a_link_without_a_connection_is_forgotten_after_forget_after() {
+        let left = link(SessionId::new(), "sub-1");
+        let (mut daemon, _left_rx, _state) = daemon_with_client(left.clone());
+        let held = link(SessionId::new(), "sub-1");
+        let (tx, _held_rx) = mpsc::channel(CONNECTION_QUEUE);
+        let (kick, _kicked) = oneshot::channel::<()>();
+        daemon.on_event(ConnEvent::Hello {
+            conn: 2,
+            link: held.clone(),
+            tx,
+            kick,
+        });
+        let (left_panel, held_panel) = (PanelId::new(), PanelId::new());
+        daemon
+            .panels
+            .insert(left_panel, DPanel::new(left.clone(), None));
+        daemon
+            .panels
+            .insert(held_panel, DPanel::new(held.clone(), None));
+        daemon.on_event(ConnEvent::Closed { conn: 1 });
+        let Attachment::Detached(since) = daemon.links[&left].attached else {
+            panic!("a closed link is detached");
+        };
+
+        daemon.forget_idle(since + FORGET_AFTER - Duration::from_secs(1));
+        assert!(daemon.panels.contains_key(&left_panel));
+        assert!(daemon.links.contains_key(&left));
+
+        daemon.forget_idle(since + FORGET_AFTER);
+        assert!(!daemon.panels.contains_key(&left_panel));
+        assert!(!daemon.links.contains_key(&left));
+        assert!(daemon.panels.contains_key(&held_panel));
+        assert!(daemon.links.contains_key(&held));
+    }
+
+    /// A hello for a detached link connects it again, so the time it spent
+    /// detached never counts toward forgetting it.
+    #[test]
+    fn a_reconnected_link_is_not_forgotten() {
+        let ours = link(SessionId::new(), "sub-1");
+        let (mut daemon, _old, _state) = daemon_with_client(ours.clone());
+        let id = PanelId::new();
+        daemon.panels.insert(id, DPanel::new(ours.clone(), None));
+        daemon.on_event(ConnEvent::Closed { conn: 1 });
+        let (tx, _rx) = mpsc::channel(CONNECTION_QUEUE);
+        let (kick, _kicked) = oneshot::channel::<()>();
+        daemon.on_event(ConnEvent::Hello {
+            conn: 2,
+            link: ours.clone(),
+            tx,
+            kick,
+        });
+        daemon.forget_idle(Instant::now() + FORGET_AFTER);
+        assert!(daemon.panels.contains_key(&id));
+        assert_eq!(daemon.client_mut(&ours).unwrap().conn, 2);
+    }
+
+    /// A session reaching the daemon through two host entries holds two
+    /// links: either one's hello, frames and replies leave the other alone.
+    #[test]
+    fn two_hosts_of_one_session_are_two_links() {
+        let session = SessionId::new();
+        let (a, b) = (link(session, "gpu-a"), link(session, "gpu-b"));
+        let (mut daemon, mut a_rx, _state) = daemon_with_client(a.clone());
+        let id = PanelId::new();
+        let mut panel = DPanel::new(a.clone(), None);
+        panel.append(b"a's output");
+        panel.sent = Some(0);
+        daemon.panels.insert(id, panel);
+
+        let (tx, mut b_rx) = mpsc::channel(CONNECTION_QUEUE);
+        let (kick, _b_kicked) = oneshot::channel::<()>();
+        daemon.on_event(ConnEvent::Hello {
+            conn: 2,
+            link: b.clone(),
+            tx,
+            kick,
+        });
+        let welcome = frames(&mut b_rx);
+        let [DaemonFrame::Welcome(info), DaemonFrame::Load(_)] = welcome.as_slice() else {
+            panic!("expected welcome and load, got {welcome:?}");
+        };
+        assert!(info.panels.is_empty(), "b is not offered a's panel");
+        assert_eq!(
+            daemon.client_mut(&a).unwrap().conn,
+            1,
+            "b's hello left a connected"
+        );
+        assert_eq!(daemon.panels[&id].sent, Some(0), "a's panel still streams");
+
+        daemon.on_event(ConnEvent::Frame {
+            conn: 2,
+            frame: ClientFrame::Kill { panel: id },
+        });
+        assert!(daemon.panels.contains_key(&id), "b cannot kill a's panel");
+        assert!(matches!(
+            frames(&mut b_rx).as_slice(),
+            [DaemonFrame::Error { msg }] if msg.contains("another session or host")
+        ));
+
+        daemon.reply(
+            &a,
+            &DaemonFrame::WorktreeDone {
+                req: 0,
+                result: Ok("/a".into()),
+            },
+        );
+        daemon.pump(Instant::now());
+        let to_a = frames(&mut a_rx);
+        assert!(
+            matches!(
+                to_a.as_slice(),
+                [DaemonFrame::WorktreeDone { .. }, DaemonFrame::Output { .. }]
+            ),
+            "{to_a:?}"
+        );
+        assert!(
+            frames(&mut b_rx).is_empty(),
+            "a's reply and output stay on a"
+        );
+    }
+
+    /// A worktree request re-sent after a reconnect gets the answer the first
+    /// one got: the add finds its worktree, the remove finds it gone.
+    #[test]
+    fn worktree_requests_repeat_safely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            run_git(dir, &args).map(|out| out.trim().to_string())
+        };
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@example.com"],
+            &["config", "user.name", "t"],
+            &["commit", "-q", "--allow-empty", "-m", "root"],
+            &["branch", "lane"],
+        ] {
+            git(&repo, args).unwrap();
+        }
+        let path = repo.join(".caucus").join("worktrees").join("lane");
+
+        assert_eq!(add_worktree(&repo, &path, "lane"), Ok(path.clone()));
+        assert_eq!(add_worktree(&repo, &path, "lane"), Ok(path.clone()));
+        let err = add_worktree(&repo, &path, "main").unwrap_err();
+        assert!(err.contains("not a worktree on main"), "{err}");
+
+        for _ in 0..2 {
+            assert_eq!(
+                remove_worktree(&repo, &path, Some("lane".into())),
+                Ok(path.clone())
+            );
+        }
+        assert!(!path.exists());
+        assert!(git(&repo, &["rev-parse", "--verify", "lane"]).is_err());
+    }
+}

@@ -347,6 +347,7 @@ pub fn run(
         let _guard = TerminalGuard::enter(config.settings.mouse)?;
         let (terminal, mut mux, signal, control) =
             setup(config, session, prefix, LaunchMode::Fresh)?;
+        mux.connect_hosts(Vec::new());
         spawn_fresh_roster(&mut mux, &roles, main_cli)?;
         event_loop(terminal, mux, signal, control).await
     })
@@ -478,16 +479,27 @@ fn spawn_fresh_roster(
 /// `spawn_main_panel_resume` so its agent reloads the caucus MCP server. Legacy
 /// records without an explicit marker fall back to `order_index == 0`. Worktree
 /// panels re-attach a worktree on their persisted branch; if the branch is gone
-/// the panel spawns fresh (no worktree, no `--resume`). The layout mode is
-/// restored last.
+/// the panel spawns fresh (no worktree, no `--resume`). A panel that ran on
+/// a sub-host comes back once its host connects. The layout mode is restored
+/// last.
 fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
     let bin = caucus_bin();
     let mut panels = record.panels.clone();
     panels.sort_by_key(|p| p.order_index);
     let has_explicit_main = panels.iter().any(|p| p.is_main);
     let mut restored_main = false;
+    mux.connect_hosts(
+        panels
+            .iter()
+            .filter(|p| p.host.is_some())
+            .cloned()
+            .collect(),
+    );
 
     for panel in &panels {
+        if panel.host.is_some() {
+            continue;
+        }
         let is_main = should_restore_panel_as_main(panel, has_explicit_main, restored_main);
         if is_main {
             restored_main = true;
@@ -506,7 +518,7 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
         // even that fails is the panel skipped, never run un-isolated.
         let worktree_path = match &panel.worktree_branch {
             Some(branch) => {
-                let path = resume_worktree_path(&record.repo_path, record.id, panel);
+                let path = panel.resume_worktree_path(&record.repo_path, record.id);
                 crate::worktree::manager::reconcile_stale(&record.repo_path, branch);
                 match crate::worktree::manager::attach(&record.repo_path, &path, branch) {
                     Ok(handle) => Some((handle.path, handle.branch)),
@@ -550,6 +562,7 @@ fn restore_roster(mux: &mut Multiplexer, record: &SessionRecord) -> Result<()> {
                 // A restored panel keeps its preset role's prompt template; the
                 // inline-prompt path is live `spawn_role` only.
                 None,
+                None,
             )
         };
         if let Err(err) = result {
@@ -592,29 +605,6 @@ fn should_restore_panel_as_main(
         } else {
             panel.order_index == 0
         }
-}
-
-/// Worktree directory for a resumed panel under `<repo>/.caucus/worktrees/`.
-/// A fresh, collision-safe leaf — the prior directory was cleaned on shutdown.
-fn resume_worktree_path(
-    repo: &std::path::Path,
-    session_id: crate::session::SessionId,
-    panel: &crate::session::record::PanelRecord,
-) -> std::path::PathBuf {
-    let id = session_id.to_string();
-    let suffix: String = id
-        .chars()
-        .rev()
-        .take(8)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    repo.join(".caucus").join("worktrees").join(format!(
-        "{suffix}-{}-resume{}",
-        crate::worktree::manager::role_slug(&panel.role),
-        panel.order_index
-    ))
 }
 
 /// The shared event loop: input → signals → control → pump → redraw, until
@@ -771,15 +761,11 @@ async fn event_loop(
         //    agent turn. A note's or lifecycle signal's reply slot is always
         //    `None`; dropping a turn signal's slot answers allow.
         while let Ok((event, reply)) = signal_server.signals().try_recv() {
-            match event {
-                crate::signal::SignalEvent::Turn(signal) => {
-                    mux.handle_signal_with_reply(signal, reply)
-                }
-                crate::signal::SignalEvent::Unbound(sig) => mux.handle_unbound_signal(sig, reply),
-                crate::signal::SignalEvent::Note(note) => mux.handle_note(note),
-                crate::signal::SignalEvent::Lifecycle(sig) => mux.handle_lifecycle(sig),
-            }
+            mux.ingest_signal(event, reply, None);
         }
+        // Sub-host signals are applied after the pump below, which takes in
+        // the output their panels printed before them.
+        let remote_signals = mux.take_remote_signals();
         prof.lap("signals");
 
         // 3. Control jobs — execute the main worker's queued MCP tool calls against
@@ -794,8 +780,19 @@ async fn event_loop(
         mux.poll_pending_spawns();
         prof.lap("poll_pending_spawns");
 
+        // 3c. Sub-host lane fetches — record the commits of each remote
+        //     worktree lane whose branch has just been fetched here.
+        mux.poll_lane_fetches();
+        prof.lap("poll_lane_fetches");
+
+        // 3d. Sub-host panels of a resumed session — bring each back once its
+        //     host connects.
+        mux.poll_host_restores();
+        prof.lap("poll_host_restores");
+
         // 4. PTY pump — drain every panel into its grid + capture, reap exits.
         mux.pump_all();
+        mux.ingest_remote_signals(remote_signals);
         prof.lap("pump_all");
 
         // 4b. Deferred submits — a bracketed paste's submitting Enter is held
@@ -926,6 +923,7 @@ async fn event_loop(
     }
 
     mux.shutdown();
+    mux.close_hosts().await;
     terminal.show_cursor().ok();
     Ok(())
 }
@@ -1071,6 +1069,8 @@ mod tests {
             is_main,
             worktree_branch: None,
             claude_session_id: None,
+            host: None,
+            agent_id: None,
         }
     }
 

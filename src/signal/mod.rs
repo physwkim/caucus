@@ -259,7 +259,10 @@ impl LifecycleSignal {
 /// `post_compact|session_start`), a note lacks `raw_hook_payload` while the
 /// others lack `body`, and an unbound line is the only one carrying the
 /// `unbound` marker while lacking `panel_id`.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Serialising an event yields a line that parses back to the same variant,
+/// which is how a sub-host daemon forwards what its own signal server parsed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SignalEvent {
     /// A turn ended ([`TurnSignal`]).
@@ -569,5 +572,50 @@ mod tests {
         )
         .truncated();
         assert_eq!(note.body, "src/report.md");
+    }
+
+    /// A serialised event parses back to the same variant — the property a
+    /// sub-host daemon relies on when it forwards what its server parsed.
+    #[test]
+    fn every_event_variant_survives_serialise_then_parse() {
+        let session = SessionId::new();
+        let panel = PanelId::new();
+        let events = [
+            SignalEvent::Turn(TurnSignal::now(
+                session,
+                panel,
+                TurnKind::Stop,
+                Some("done".into()),
+                serde_json::json!({}),
+            )),
+            SignalEvent::Note(AgentNote::now(
+                session,
+                panel,
+                NoteKind::Question,
+                "which base?".into(),
+            )),
+            SignalEvent::Unbound(UnboundSignal::now(
+                TurnKind::Stop,
+                None,
+                serde_json::json!({ "session_id": "conv-1" }),
+            )),
+            SignalEvent::Lifecycle(LifecycleSignal::now(
+                session,
+                panel,
+                LifecycleKind::PostCompact {
+                    trigger: CompactTrigger::Manual,
+                },
+                serde_json::json!({}),
+            )),
+        ];
+        for event in events {
+            let line = serde_json::to_string(&event).unwrap();
+            let back: SignalEvent = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&back),
+                std::mem::discriminant(&event),
+                "{line}"
+            );
+        }
     }
 }

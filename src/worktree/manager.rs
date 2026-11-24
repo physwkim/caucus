@@ -179,6 +179,7 @@ pub(crate) fn create(req: &WorktreeRequest) -> Result<WorktreeHandle, WorktreeEr
         "add".to_string(),
         "-b".to_string(),
         branch.clone(),
+        "--".to_string(),
         path.display().to_string(),
     ];
     if let Some(base) = &req.base_ref {
@@ -223,6 +224,7 @@ pub(crate) fn attach(
     let args = vec![
         "worktree".to_string(),
         "add".to_string(),
+        "--".to_string(),
         path.display().to_string(),
         branch.to_string(),
     ];
@@ -291,6 +293,7 @@ pub(crate) fn reconcile_stale(repo_root: &Path, branch: &str) {
             "worktree".to_string(),
             "remove".to_string(),
             "--force".to_string(),
+            "--".to_string(),
             stale.display().to_string(),
         ];
         if let Err(err) = run_git(repo_root, &args) {

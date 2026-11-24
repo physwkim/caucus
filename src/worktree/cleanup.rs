@@ -198,22 +198,28 @@ fn run_one(job: &CleanupJob) -> CleanupSummary {
 /// cleanup over its bookkeeping would strand the queue.
 fn record_removals(job: &CleanupJob, summary: &CleanupSummary) {
     for owner in &job.owners {
-        if !summary.removed_worktrees.contains(&owner.worktree) {
-            continue;
+        if summary.removed_worktrees.contains(&owner.worktree) {
+            record_removal(owner);
         }
-        let mut manifest = match manifest::read(&owner.session_root, owner.agent_id) {
-            Ok(m) => m,
-            Err(err) => {
-                warn!(agent = %owner.agent_id, error = %err, "worktree-removed manifest read failed");
-                continue;
-            }
-        };
-        let event = LaneEvent::now(LaneEventKind::WorktreeRemoved {
-            path: owner.worktree.clone(),
-        });
-        if let Err(err) = manifest::write(&mut manifest, &owner.session_root, Some(event)) {
-            warn!(agent = %owner.agent_id, error = %err, "worktree-removed manifest write failed");
+    }
+}
+
+/// Credit the removal of `owner.worktree` to its agent's timeline. Called
+/// only once the worktree is gone; a sub-host's daemon removes its worktrees,
+/// so main credits those itself.
+pub(crate) fn record_removal(owner: &WorktreeOwner) {
+    let mut manifest = match manifest::read(&owner.session_root, owner.agent_id) {
+        Ok(m) => m,
+        Err(err) => {
+            warn!(agent = %owner.agent_id, error = %err, "worktree-removed manifest read failed");
+            return;
         }
+    };
+    let event = LaneEvent::now(LaneEventKind::WorktreeRemoved {
+        path: owner.worktree.clone(),
+    });
+    if let Err(err) = manifest::write(&mut manifest, &owner.session_root, Some(event)) {
+        warn!(agent = %owner.agent_id, error = %err, "worktree-removed manifest write failed");
     }
 }
 
@@ -270,6 +276,7 @@ fn remove_worktree(repo: &Path, path: &Path) -> Result<(), WorktreeError> {
             "worktree".into(),
             "remove".into(),
             "--force".into(),
+            "--".into(),
             path.display().to_string(),
         ],
     )?;

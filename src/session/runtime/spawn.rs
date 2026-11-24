@@ -35,6 +35,8 @@ struct SpawnPanelOpts<'a> {
     /// via `-c mcp_servers.caucus.*`; claude uses `mcp_config_path`). `None` for
     /// every sub-agent panel.
     caucus_mcp: Option<CaucusMcp>,
+    /// The `hosts.toml` sub-host the panel runs on; `None` runs it here.
+    host: Option<String>,
 }
 
 /// The worktree a [`Multiplexer::detach_panel`] left behind, for the caller to
@@ -44,6 +46,8 @@ struct SpawnPanelOpts<'a> {
 /// checkout.
 #[derive(Clone)]
 struct DetachedPanel {
+    /// The sub-host the panel ran on, which its worktree is on.
+    host: Option<String>,
     worktree_path: Option<PathBuf>,
     worktree_branch: Option<String>,
     /// The agent that occupied the panel. Carried out of the detach because the
@@ -51,6 +55,37 @@ struct DetachedPanel {
     /// of the worktree still has to credit its removal to this agent's timeline
     /// (`worktree::cleanup::WorktreeOwner`).
     agent_id: AgentId,
+    /// The ended turns of its sub-host lane whose fetch had not landed
+    /// ([`super::hosts::Hosts::take_unrecorded_turns`]); whoever fetches the
+    /// branch next records them.
+    unrecorded_turns: Vec<Option<String>>,
+}
+
+/// A worktree no panel holds any more, for [`Multiplexer::dispose_worktrees`].
+pub(super) struct Orphan {
+    /// The sub-host it is on; `None` is this machine.
+    pub(super) host: Option<String>,
+    pub(super) path: PathBuf,
+    pub(super) branch: Option<String>,
+    /// The agent that worked in it. Its branch holds that agent's commits and
+    /// is kept; with no agent, the branch holds nothing and goes too.
+    pub(super) owner: Option<AgentId>,
+    /// The ended turns of the owner's sub-host lane not yet recorded, for
+    /// the fetch that follows the removal to record.
+    pub(super) unrecorded_turns: Vec<Option<String>>,
+}
+
+impl Orphan {
+    /// A worktree made for a panel that never launched.
+    pub(super) fn unworked(host: Option<String>, handle: WorktreeHandle) -> Self {
+        Self {
+            host,
+            path: handle.path,
+            branch: Some(handle.branch),
+            owner: None,
+            unrecorded_turns: Vec::new(),
+        }
+    }
 }
 
 impl Multiplexer {
@@ -77,6 +112,7 @@ impl Multiplexer {
             resume_session_id: None,
             inline_prompt: None,
             caucus_mcp: None,
+            host: None,
         })?;
         self.persist_record();
         Ok(id)
@@ -145,6 +181,7 @@ impl Multiplexer {
             resume_session_id,
             inline_prompt: None,
             caucus_mcp: Some(caucus_mcp),
+            host: None,
         })?;
         // The main worker panel is caucus's round-delivery target.
         self.main_panel_id = Some(id);
@@ -159,7 +196,8 @@ impl Multiplexer {
     /// `inline_prompt`, when `Some`, becomes the role's system prompt and
     /// replaces the spec's prompt template (`docs/design.md` §6); `None` keeps
     /// the template-resolved prompt. The resume path passes `None` (a restored
-    /// agent keeps its preset role's prompt).
+    /// agent keeps its preset role's prompt). `host` names the sub-host to run
+    /// the panel on (`None`: this machine).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_panel_resume(
         &mut self,
@@ -170,6 +208,7 @@ impl Multiplexer {
         worktree_branch: Option<String>,
         resume_session_id: Option<String>,
         inline_prompt: Option<String>,
+        host: Option<String>,
     ) -> Result<PanelId> {
         self.spawn_panel_inner(SpawnPanelOpts {
             role,
@@ -181,6 +220,7 @@ impl Multiplexer {
             resume_session_id,
             inline_prompt,
             caucus_mcp: None,
+            host,
         })
     }
 
@@ -197,7 +237,16 @@ impl Multiplexer {
             resume_session_id,
             inline_prompt,
             caucus_mcp,
+            host,
         } = opts;
+
+        // A sub-host panel runs in the host's checkout (or a worktree made
+        // there) and reaches the signal socket, session dir and caucus binary
+        // of that host's daemon.
+        let remote = host
+            .as_deref()
+            .map(|name| self.remote_target(name))
+            .transpose()?;
 
         // `role` is a free-form label (`docs/design.md` §6): a known preset
         // reuses its spec (tool allowlist + permission mode), any other name is
@@ -232,6 +281,20 @@ impl Multiplexer {
         *count += 1;
         let agent_name = format!("{role}-{count}");
 
+        let (repo_root, session_dir, sock_path, caucus_bin) = match &remote {
+            None => (
+                self.session.repo_path.clone(),
+                self.session.root_dir.clone(),
+                self.sock_path.clone(),
+                None,
+            ),
+            Some(target) => (
+                target.repo.dir.clone(),
+                target.info.session_dir.clone(),
+                target.info.signal_sock.clone(),
+                Some(target.info.caucus_bin.clone()),
+            ),
+        };
         let request = SpawnRequest {
             session_id: self.session.id,
             role: spec,
@@ -239,9 +302,9 @@ impl Multiplexer {
             agent_cli_override: agent_cli,
             model_override: model,
             worktree_path: worktree_path.clone(),
-            repo_root: self.session.repo_path.clone(),
-            session_dir: self.session.root_dir.clone(),
-            sock_path: Some(self.sock_path.clone()),
+            repo_root,
+            session_dir,
+            sock_path: Some(sock_path),
             // Panels are non-interactive for the agent's own prompts; the
             // role allowlist remains the real boundary (`SpawnRequest` doc).
             skip_permissions: true,
@@ -249,6 +312,7 @@ impl Multiplexer {
             resume_session_id,
             system_prompt,
             caucus_mcp,
+            caucus_bin,
         };
 
         // Provisional layout: compute the slot the new panel will occupy so
@@ -257,45 +321,20 @@ impl Multiplexer {
         let outcome = crate::agent::spawn::spawn(&request)
             .map_err(|e| anyhow::anyhow!("agent spawn: {e}"))?;
 
-        // codex stalls on its interactive "Do you trust this directory?" gate
-        // the first time it runs in a directory, before the agent turn caucus
-        // drives — nothing answers it and the panel hangs. Pre-grant trust for
-        // the panel's cwd in codex's config (the same entry codex persists on
-        // "Yes"; codex honors only its on-disk config, not a `-c` override).
-        // Best-effort: a failure must not fail the spawn — the panel still
-        // launches and the user can answer the gate by hand.
-        if request.effective_cli() == AgentCli::Codex
-            && let Some(cwd) = outcome.command.cwd.as_deref()
-            && let Err(err) = crate::agent::codex_trust::ensure_trusted(cwd)
-        {
-            warn!(
-                cwd = %cwd.display(),
-                error = %err,
-                "codex directory-trust pre-grant failed; codex may stall on its trust gate"
-            );
-        }
-
         ids.push(outcome.panel_id);
         let provisional = Layout::reflow(&ids, self.area, self.layout_mode);
         let rect = provisional.rect_of(outcome.panel_id).unwrap_or(self.area);
 
-        let mut panel = lifecycle::spawn(
+        let panel = lifecycle::spawn(
             &request,
             outcome.command,
             outcome.panel_id,
             outcome.manifest.agent_id,
             rect,
             &self.config.settings,
+            remote.as_ref().map(|target| &target.repo.link),
         )?;
         let panel_id = panel.id;
-        // Turn-segmented capture spills to `<session>/panels/<panel>.log`
-        // (`docs/design.md` §8.5).
-        panel.set_capture_log_path(
-            self.session
-                .root_dir
-                .join("panels")
-                .join(format!("{panel_id}.log")),
-        );
 
         // Persist the manifest (Invariant I-2). A worktree panel opens its
         // timeline with the worktree it owns: the directory already exists by
@@ -311,7 +350,48 @@ impl Multiplexer {
         if let Err(err) = manifest::write(&mut mf, &self.session.root_dir, created) {
             warn!(panel = %panel_id, error = %err, "manifest write failed");
         }
-        self.manifests.insert(panel_id, mf);
+        self.install_panel(panel, mf, worktree_branch);
+        Ok(panel_id)
+    }
+
+    /// Take over `manifest`'s panel, which `link`'s host still runs for this
+    /// session from before this caucus started (`caucus resume`). The agent
+    /// keeps its manifest, its panel id and its worktree.
+    pub(super) fn adopt_panel(
+        &mut self,
+        link: &crate::host::HostLink,
+        manifest: AgentManifest,
+        worktree_branch: Option<String>,
+    ) -> Result<PanelId> {
+        let mut ids: Vec<PanelId> = self.panels.iter().map(|p| p.id).collect();
+        ids.push(manifest.panel_id);
+        let rect = Layout::reflow(&ids, self.area, self.layout_mode)
+            .rect_of(manifest.panel_id)
+            .unwrap_or(self.area);
+        let panel = lifecycle::adopt(&manifest, rect, &self.config.settings, link)?;
+        let panel_id = panel.id;
+        self.install_panel(panel, manifest, worktree_branch);
+        Ok(panel_id)
+    }
+
+    /// Put a panel just created by `panel::lifecycle` on screen, with its
+    /// agent's manifest.
+    fn install_panel(
+        &mut self,
+        mut panel: Panel,
+        manifest: AgentManifest,
+        worktree_branch: Option<String>,
+    ) {
+        let panel_id = panel.id;
+        // Turn-segmented capture spills to `<session>/panels/<panel>.log`
+        // (`docs/design.md` §8.5).
+        panel.set_capture_log_path(
+            self.session
+                .root_dir
+                .join("panels")
+                .join(format!("{panel_id}.log")),
+        );
+        self.manifests.insert(panel_id, manifest);
 
         // Remember the worktree branch — the branch persists across shutdown
         // and is what `caucus resume` re-attaches a worktree on.
@@ -324,7 +404,6 @@ impl Multiplexer {
             self.focus.set_focus(Some(panel_id));
         }
         self.rebuild_layout_tree();
-        Ok(panel_id)
     }
 
     /// Kill a panel: tear down the PTY, drop it from the registry, enqueue any
@@ -347,39 +426,80 @@ impl Multiplexer {
             anyhow::bail!("cannot kill the main worker panel");
         }
         let detached = self.detach_panel(panel_id)?;
-        self.retire_worktree(&detached, panel_id);
+        self.retire_worktree(&detached);
         Ok(())
     }
 
-    /// Retire a detached panel's worktree: enqueue the checked-out directory for
-    /// serial cleanup (Invariant I-3) while KEEPING its branch — the branch
-    /// holds the sub-agent's commits and `caucus resume` re-attaches a fresh
-    /// worktree on it, so only the working copy is reclaimed.
+    /// Retire a detached panel's worktree: reclaim the checked-out directory
+    /// while KEEPING its branch — the branch holds the sub-agent's commits and
+    /// `caucus resume` re-attaches a fresh worktree on it.
     ///
-    /// The single owner of the "reclaim the directory, preserve the branch"
-    /// disposition: every exit path that leaves a worktree ownerless — a
-    /// [`Self::kill_panel`], or a [`Self::restart_panel`] that fails *after* its
-    /// teardown — routes the orphan through here, so none can leak on disk.
-    fn retire_worktree(&mut self, detached: &DetachedPanel, panel_id: PanelId) {
-        let Some(worktree) = detached.worktree_path.clone() else {
+    /// Every exit path that leaves a panel's worktree ownerless — a
+    /// [`Self::kill_panel`], or a [`Self::restart_panel`] that fails *after*
+    /// its teardown — routes the orphan through here, so none can leak on disk.
+    fn retire_worktree(&mut self, detached: &DetachedPanel) {
+        let Some(path) = detached.worktree_path.clone() else {
             return;
         };
-        let job = CleanupJob {
-            repo_root: self.session.repo_path.clone(),
-            worktree_paths: vec![worktree.clone()],
-            branches_to_delete: Vec::new(),
-            // The agent is gone from the live map, so the worker records the
-            // removal on its behalf — from what actually happened, not from this
-            // enqueue (Invariant I-8 can refuse the removal outright).
-            owners: vec![WorktreeOwner {
-                worktree,
-                session_root: self.session.root_dir.clone(),
-                agent_id: detached.agent_id,
+        self.dispose_worktrees(
+            vec![Orphan {
+                host: detached.host.clone(),
+                path,
+                branch: detached.worktree_branch.clone(),
+                owner: Some(detached.agent_id),
+                unrecorded_turns: detached.unrecorded_turns.clone(),
             }],
+            false,
+        );
+    }
+
+    /// Remove worktrees no panel holds any more — the one disposition every
+    /// exit path uses (a kill, a failed restart or spawn, an aborted spawn,
+    /// shutdown). Removal goes through the cleanup owner on the worktree's
+    /// own machine (Invariant I-3), which commits uncommitted work onto the
+    /// branch first (Invariant I-8); an [`Orphan::owner`] is credited with
+    /// the removal, and a sub-host lane's branch, salvage commit included, is
+    /// fetched back here.
+    ///
+    /// Local worktrees go on the cleanup queue, or are removed before this
+    /// returns when `now` — on shutdown, whose runtime takes the queue's
+    /// consumer down with it. Sub-host worktrees are removed by their daemon
+    /// from a host task, which [`Self::close_hosts`] waits for.
+    pub(super) fn dispose_worktrees(&mut self, orphans: Vec<Orphan>, now: bool) {
+        let mut local = CleanupJob {
+            repo_root: self.session.repo_path.clone(),
+            worktree_paths: Vec::new(),
+            branches_to_delete: Vec::new(),
+            owners: Vec::new(),
             done: None,
         };
-        if self.cleanup.enqueue(job).is_err() {
-            warn!(panel = %panel_id, "worktree cleanup queue closed");
+        for orphan in orphans {
+            if let Some(host) = orphan.host.clone() {
+                self.dispose_host_worktree(&host, orphan);
+                continue;
+            }
+            match orphan.owner {
+                // The cleanup worker records the removal on the agent's
+                // behalf, from what actually happened (I-8 can refuse it).
+                Some(agent_id) => local.owners.push(WorktreeOwner {
+                    worktree: orphan.path.clone(),
+                    session_root: self.session.root_dir.clone(),
+                    agent_id,
+                }),
+                None => local.branches_to_delete.extend(orphan.branch),
+            }
+            local.worktree_paths.push(orphan.path);
+        }
+        if local.worktree_paths.is_empty() {
+            return;
+        }
+        if now {
+            let summary = crate::worktree::cleanup::run_blocking(&local);
+            for (path, msg) in &summary.failed_worktrees {
+                warn!(?path, %msg, "worktree cleanup failed");
+            }
+        } else if self.cleanup.enqueue(local).is_err() {
+            warn!("worktree cleanup queue closed");
         }
     }
 
@@ -412,6 +532,17 @@ impl Multiplexer {
         let agent_cli = Some(manifest.agent_cli);
         let model = manifest.model.clone();
         let resume_session_id = manifest.claude_session_id().map(str::to_string);
+        // A restarted panel stays on its host. A host that cannot take the
+        // replacement now refuses the restart before the old panel is torn
+        // down.
+        let host = self
+            .panels
+            .iter()
+            .find(|p| p.id == panel_id)
+            .and_then(|p| p.pty.host().map(str::to_string));
+        if let Some(host) = &host {
+            self.remote_target(host)?;
+        }
 
         // Tear down through the single owner. The worktree it leaves behind is
         // now ownerless and MUST reach a disposition on every exit path below:
@@ -431,6 +562,7 @@ impl Multiplexer {
             // A restarted panel keeps its preset role's prompt; the inline
             // prompt is a live-`spawn_role` concern only.
             None,
+            host,
         ) {
             Ok(id) => id,
             Err(err) => {
@@ -438,10 +570,15 @@ impl Multiplexer {
                 // torn down. Retire the now-ownerless worktree (same disposition
                 // as a kill — directory reclaimed, branch + commits kept), then
                 // surface the spawn failure.
-                self.retire_worktree(&orphan, panel_id);
+                self.retire_worktree(&orphan);
                 return Err(err);
             }
         };
+        // The worktree goes on under a new agent; the turns the old one left
+        // unrecorded are still its own.
+        if let (Some(host), Some(branch)) = (orphan.host, orphan.worktree_branch) {
+            self.record_left_lane(&host, orphan.agent_id, branch, orphan.unrecorded_turns);
+        }
         // The fresh PTY carries a fresh PanelId, but the panel is the same
         // logical round member. Re-key its membership so live rounds follow it
         // to the new id instead of dropping it as a vanished panel.
@@ -471,9 +608,11 @@ impl Multiplexer {
         lifecycle::kill(&mut panel)?;
 
         let detached = DetachedPanel {
+            host: panel.pty.host().map(str::to_string),
             worktree_path: panel.worktree_path.clone(),
             worktree_branch: self.worktree_branches.remove(&panel_id),
             agent_id: panel.agent_id,
+            unrecorded_turns: self.hosts.take_unrecorded_turns(panel_id),
         };
         self.manifests.remove(&panel_id);
         self.screen_scan_cache.remove(&panel_id);
@@ -649,7 +788,7 @@ impl Multiplexer {
 
 #[cfg(test)]
 mod tests {
-    use crate::mcp::protocol::{ControlRequest, ControlResponse};
+    use crate::mcp::protocol::{ControlRequest, ControlResponse, Placement};
     use crate::session::id::PanelId;
     use crate::session::runtime::test_support::*;
     use std::collections::HashMap;
@@ -699,7 +838,10 @@ mod tests {
 
         let resp = mux.execute_control(ControlRequest::SpawnRole {
             role: "bad-template".into(),
-            worktree: true,
+            placement: Placement {
+                host: None,
+                worktree: true,
+            },
             model: None,
             agent_cli: None,
             prompt: None,

@@ -104,7 +104,8 @@ pub(crate) fn run(
 /// `Working` forever.
 ///
 /// So: build an [`UnboundSignal`] from the hook payload alone and post it to
-/// **every** live caucus signal socket in the temp dir. Each server resolves
+/// **every** live caucus signal socket in the temp dir, and to this machine's
+/// host daemon, which relays it to each main it serves. Each server resolves
 /// from the payload whether the conversation is one of its panels
 /// (`Multiplexer::handle_unbound_signal`); non-owners answer allow. One reply
 /// line is read per socket — the owning server may ride a round delivery back
@@ -122,7 +123,13 @@ pub(crate) fn run_discover(kind: TurnKind) -> Result<()> {
     let last_message = extract_last_message(&raw_hook_payload);
     let signal = UnboundSignal::now(kind, last_message, raw_hook_payload);
 
-    if let Some(reason) = broadcast_unbound(&std::env::temp_dir(), &signal) {
+    let mut socks = discover_socks(&std::env::temp_dir());
+    socks.extend(
+        crate::host::HostPaths::resolve(None, None, None)
+            .ok()
+            .map(|paths| paths.signal_sock),
+    );
+    if let Some(reason) = broadcast_unbound(&socks, &signal) {
         println!(
             "{}",
             serde_json::json!({ "decision": "block", "reason": reason })
@@ -131,15 +138,15 @@ pub(crate) fn run_discover(kind: TurnKind) -> Result<()> {
     Ok(())
 }
 
-/// Post `signal` to every discovered caucus signal socket under `dir`, reading
-/// one reply line per socket; returns the first deliver reason, if any server
-/// sent one. Split from [`run_discover`] so tests can point it at a temp dir.
-fn broadcast_unbound(dir: &Path, signal: &UnboundSignal) -> Option<String> {
+/// Post `signal` to every socket in `socks`, reading one reply line per
+/// socket; returns the first deliver reason, if any server sent one. Split
+/// from [`run_discover`] so tests can point it at a temp dir.
+fn broadcast_unbound(socks: &[std::path::PathBuf], signal: &UnboundSignal) -> Option<String> {
     let mut reason = None;
-    for sock in discover_socks(dir) {
+    for sock in socks {
         // A dead socket file or a foreign-user socket refuses the connect —
         // skip it; the signal still reaches every live server.
-        let Ok(stream) = send_line_on(&sock, signal) else {
+        let Ok(stream) = send_line_on(sock, signal) else {
             continue;
         };
         let delivered = read_deliver_reason(stream);
@@ -673,8 +680,9 @@ mod tests {
         // The poster blocks on its reply read; answer from the server side
         // concurrently, as the runtime would.
         let dir_path = dir.path().to_path_buf();
-        let poster =
-            tokio::task::spawn_blocking(move || broadcast_unbound(&dir_path, &signal.clone()));
+        let poster = tokio::task::spawn_blocking(move || {
+            broadcast_unbound(&discover_socks(&dir_path), &signal.clone())
+        });
         let (event, reply) = server.signals().recv().await.expect("signal received");
         let crate::signal::SignalEvent::Unbound(sig) = event else {
             panic!("expected an unbound signal");

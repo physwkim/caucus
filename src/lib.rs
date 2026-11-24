@@ -11,6 +11,7 @@ pub mod ctl;
 pub mod doctor;
 pub mod gc;
 pub mod hook;
+pub mod host;
 pub mod init;
 pub mod input;
 pub mod line_io;

@@ -52,11 +52,22 @@ jobs:
       - name: Build
         run: cargo build --workspace --verbose
 
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       # The test suite is self-contained — it does not require the
       # claude / codex agent CLIs on PATH (real-agent paths skip gracefully
-      # or use /bin/sh stand-ins). Only git is needed.
+      # or use /bin/sh stand-ins). Only git is needed. Each test gets its own
+      # process: under `cargo test`, a child forked for one test holds the
+      # other tests' open files until it execs, so a dropped lock still reads
+      # as held and a just-written script fails with ETXTBSY.
       - name: Test
-        run: cargo test --workspace --verbose
+        run: cargo nextest run --workspace --no-fail-fast
+
+      - name: Doctests
+        run: cargo test --doc --workspace
 
       # x86_64 macOS gets build coverage without depending on the scarce,
       # deprecated Intel (macos-13) runner pool: cross-check the x86_64

@@ -1,14 +1,14 @@
+use super::spawn::Orphan;
 use super::*;
 use crate::panel::lifecycle;
 use crate::role::spec::AgentCli;
-use crate::worktree::cleanup::{CleanupJob, WorktreeOwner};
 use tracing::warn;
 
 impl Multiplexer {
     /// Build a [`SessionRecord`](crate::session::record::SessionRecord) from the live panels + manifests.
     fn build_record(&self) -> crate::session::record::SessionRecord {
         use crate::session::record::{PanelRecord, SessionRecord};
-        let panels = self
+        let mut panels: Vec<PanelRecord> = self
             .panels
             .iter()
             .enumerate()
@@ -23,9 +23,18 @@ impl Multiplexer {
                     worktree_branch: self.worktree_branches.get(&panel.id).cloned(),
                     claude_session_id: manifest
                         .and_then(|m| m.claude_session_id().map(str::to_string)),
+                    host: panel.pty.host().map(str::to_string),
+                    agent_id: Some(panel.agent_id),
                 }
             })
             .collect();
+        // Sub-host panels not back yet keep their places for the next resume.
+        for restore in &self.hosts.restores {
+            panels.push(PanelRecord {
+                order_index: panels.len(),
+                ..restore.record.clone()
+            });
+        }
         SessionRecord {
             id: self.session.id,
             topic: self.session.topic.clone(),
@@ -65,6 +74,7 @@ impl Multiplexer {
         // record `caucus resume` reads. Worktree directories are removed
         // below, but their branches persist, so the record stays resumable.
         self.persist_record();
+        self.abort_host_restores();
 
         // Kill every panel's PTY and collect its worktree. `kill_panel` is
         // avoided here: it enqueues worktree cleanup onto the async queue,
@@ -73,40 +83,35 @@ impl Multiplexer {
         // Each worktree is credited to the agent that occupied it, so a panel's
         // timeline records the removal even though the whole session is going
         // away — the manifests outlive the process and are what a later reader
-        // has.
-        let mut worktrees: Vec<PathBuf> = Vec::new();
-        let mut owners: Vec<WorktreeOwner> = Vec::new();
+        // has. Branches are kept — they hold the sub-agents' commits and
+        // merging is the user's call (`docs/design.md` §5).
+        // Every agent is hung up before any is waited on, so their exits run
+        // side by side instead of one grace after another.
+        for panel in &mut self.panels {
+            panel.pty.hang_up();
+        }
+        let mut orphans = Vec::new();
         for panel in &mut self.panels {
             if let Err(err) = lifecycle::kill(panel) {
                 warn!(panel = %panel.id, error = %err, "panel kill on shutdown failed");
             }
-            if let Some(wt) = panel.worktree_path.clone() {
-                owners.push(WorktreeOwner {
-                    worktree: wt.clone(),
-                    session_root: self.session.root_dir.clone(),
-                    agent_id: panel.agent_id,
+            if let Some(path) = panel.worktree_path.clone() {
+                orphans.push(Orphan {
+                    host: panel.pty.host().map(str::to_string),
+                    path,
+                    branch: self.worktree_branches.get(&panel.id).cloned(),
+                    owner: Some(panel.agent_id),
+                    unrecorded_turns: self.hosts.take_unrecorded_turns(panel.id),
                 });
-                worktrees.push(wt);
             }
         }
         self.panels.clear();
         self.manifests.clear();
 
-        // Clean the worktrees synchronously, before the runtime goes away.
-        // Branches are kept (`branches_to_delete` empty) — they hold the
-        // sub-agents' commits and merging is the user's call (`docs/design.md` §5).
-        if !worktrees.is_empty() {
-            let summary = crate::worktree::cleanup::run_blocking(&CleanupJob {
-                repo_root: self.session.repo_path.clone(),
-                worktree_paths: worktrees,
-                branches_to_delete: Vec::new(),
-                owners,
-                done: None,
-            });
-            for (path, msg) in &summary.failed_worktrees {
-                warn!(?path, %msg, "worktree cleanup on shutdown failed");
-            }
-        }
+        // Local worktrees are removed before this returns, sub-host ones by
+        // host tasks that `close_hosts` waits for — both before the runtime
+        // goes away.
+        self.dispose_worktrees(orphans, true);
 
         if self.session.state() == crate::session::state::SessionState::Active {
             let _ = crate::session::state::transition(
@@ -119,7 +124,7 @@ impl Multiplexer {
 
 #[cfg(test)]
 mod tests {
-    use crate::mcp::protocol::{ControlRequest, ControlResponse};
+    use crate::mcp::protocol::{ControlRequest, ControlResponse, Placement};
     use crate::panel::lifecycle::{Panel, PanelState};
     use crate::pty::{Pty, PtyCommand};
     use crate::render::LayoutMode;
@@ -129,9 +134,17 @@ mod tests {
     use tempfile::TempDir;
 
     fn push_cat_panel(mux: &mut super::Multiplexer, role: &str) -> crate::session::PanelId {
+        push_panel(mux, role, &PtyCommand::new("/bin/cat"))
+    }
+
+    fn push_panel(
+        mux: &mut super::Multiplexer,
+        role: &str,
+        cmd: &PtyCommand,
+    ) -> crate::session::PanelId {
         let id = crate::session::PanelId::new();
         let inner = area().inner();
-        let pty = Pty::spawn(&PtyCommand::new("/bin/cat"), inner.width, inner.height).unwrap();
+        let pty = Pty::spawn(cmd, inner.width, inner.height).unwrap();
         mux.panels.push(Panel {
             id,
             role: role.to_string(),
@@ -162,6 +175,42 @@ mod tests {
         assert_eq!(record.id, id);
         assert_eq!(record.layout_mode, LayoutMode::Tiled);
         assert!(record.panels.is_empty(), "no panels were spawned");
+    }
+
+    /// Two agents that each take 1 s to exit on `SIGHUP` both finish, and
+    /// their exits overlap instead of running one after the other.
+    #[tokio::test]
+    async fn shutdown_waits_for_every_agent_to_exit_side_by_side() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let markers = [tmp.path().join("a"), tmp.path().join("b")];
+        for marker in &markers {
+            let mut cmd = PtyCommand::new("/bin/sh");
+            cmd.args = vec![
+                "-c".into(),
+                "trap ': > \"$0.start\"; sleep 1; : > \"$0\"; exit 0' HUP; \
+                 while :; do sleep 0.05; done"
+                    .into(),
+                marker.clone().into(),
+            ];
+            push_panel(&mut mux, "worker", &cmd);
+        }
+        // Let each shell install its trap.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        mux.shutdown();
+
+        let mtime = |path: std::path::PathBuf| {
+            std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or_else(|e| panic!("{} was killed mid-exit: {e}", path.display()))
+        };
+        let [(a_start, a_end), (b_start, b_end)] =
+            markers.map(|m| (mtime(m.with_extension("start")), mtime(m)));
+        assert!(
+            a_start < b_end && b_start < a_end,
+            "the exits ran one after the other"
+        );
     }
 
     /// The main worker identity is persisted independently from panel order:
@@ -230,7 +279,10 @@ mod tests {
         let mut mux = mux(&tmp);
         let resp = mux.execute_control(ControlRequest::SpawnRole {
             role: "worker".into(),
-            worktree: true,
+            placement: Placement {
+                host: None,
+                worktree: true,
+            },
             model: None,
             agent_cli: None,
             prompt: None,

@@ -5,6 +5,69 @@ All notable changes to caucus are recorded here. The format follows
 CLI, MCP tool surface, and keybindings may still shift between minor
 versions.
 
+## [0.13.0] — 2026-11-24
+
+The main worker can run sub-agent panels on other machines. Hosts listed in
+`hosts.toml` are reached over ssh or a local socket, `list_hosts` reports
+their load, and `spawn_role`'s `host` places a panel there; a remote panel is
+watched, typed into and reported on as a local one is. A host's daemon owns
+its panels and outlives the connection, and an ssh host needs nothing
+installed but the agent CLIs. A Claude panel is no longer killed mid-exit, which
+had made the next Claude Code launch drop to its classic renderer and lose
+Page Up/Down. No hook reinstall is needed on machines already set up.
+
+### Added
+
+- **Sub-hosts — `list_hosts`, and `spawn_role`'s `host`; the MCP surface is
+  now sixteen.** Hosts come from `~/.caucus/hosts.toml` and
+  `<repo>/.caucus/hosts.toml`. An ssh host runs `caucus host bridge` in the
+  remote login shell, which starts that user's host daemon (`caucus host
+  serve`); a `socket` host is a daemon on this machine. After a dropped
+  connection main reconnects, replays each panel's missed output (up to its
+  last 8 MiB), and delivers the input and turn signals the drop lost once.
+- **Worktree lanes on sub-hosts.** A lane starts as main's `HEAD` pushed to a
+  branch of the host's own clone (`dir`), and the branch is fetched back into
+  this repo after every turn, so review and merge happen here. A host whose
+  checkout is this repo is refused at connect.
+- **`caucus resume` brings sub-host panels back.** A panel its host still runs
+  is adopted with its output replayed; any other restarts on its host,
+  resuming its conversation on its lane's branch. A host panel the session
+  record does not name is killed, and a daemon kills the panels of a session
+  no main has reached for a week; their worktrees stay for a later resume.
+- **An ssh host sets itself up.** Without a `caucus` key, main copies its own
+  build to `~/.caucus/bin/caucus` there whenever that copy is missing or
+  another build; the bridge installs the Claude Stop hook; the daemon puts
+  its own caucus first on its panels' `PATH`; and an idle daemon of an older
+  protocol exits so the next bridge starts the new build.
+- **`caucus doctor` checks every sub-host** through that host's daemon, in the
+  environment its panels inherit, including a live test of the host's hook.
+  `caucus host doctor` checks an ssh host's login shell before any daemon
+  runs there.
+
+### Changed
+
+- **The hook script leaves finding sockets to caucus.** It posted an unbound
+  signal only when it saw `$TMPDIR/caucus-*.sock`, which a host daemon's
+  socket under `~/.caucus/host/<hostname>/` never matches; it now posts
+  whenever caucus is installed, falling back to `~/.caucus/bin/caucus`. The
+  previous script still works for local panels.
+
+### Fixed
+
+- **Page Up/Down keep working in Claude panels.** Closing a panel turned
+  `SIGHUP` into `SIGKILL` after 200 ms, but Claude Code needs about 0.6 s to
+  exit, and a launch killed that early makes the next one start in the
+  classic renderer, which has no Page Up/Down. An agent now gets up to 3 s to
+  exit, so killing or restarting a Claude panel takes about 0.6 s, and
+  quitting caucus waits for all panels' exits at once.
+- **A resumed Claude panel keeps its conversation through another resume.**
+  Its new manifest named no conversation until its first turn ended, so a
+  session record written before then dropped the id and the next resume
+  started the agent over.
+- **`caucus doctor` no longer stalls on output larger than a pipe.** A hook
+  test or a checked command that wrote more than a pipe holds blocked on the
+  write and was reported only at its deadline, or not at all.
+
 ## [0.12.0] — 2026-11-04
 
 caucus wakes the main worker less. Every main turn re-reads main's whole

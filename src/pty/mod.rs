@@ -1,17 +1,22 @@
 //! PTY layer: a thin wrapper over `portable-pty` — one PTY per panel.
 //! See `docs/design.md` §0 #3, §9.
 //!
-//! **Invariant I-5** (`docs/design.md` §12): PTYs are created and destroyed
-//! only by `Pty::spawn` / `Pty::kill`. No module calls `openpty`/`fork`
-//! directly.
+//! A panel holds a [`Pty`], which is either a [`LocalPty`] on this machine or
+//! a [`RemotePty`](crate::host::RemotePty) whose [`LocalPty`] lives in a
+//! sub-host's `caucus host serve` daemon. Both answer the same calls, so the
+//! panel, grid and capture code never branch on where the agent runs.
 //!
-//! Layout: `Pty::spawn` opens a PTY pair, spawns the child on the slave,
+//! **Invariant I-5** (`docs/design.md` §12): PTYs are created and destroyed
+//! only by `LocalPty::spawn` / `LocalPty::kill`, on whichever host runs them.
+//! No module calls `openpty`/`fork` directly.
+//!
+//! Layout: `LocalPty::spawn` opens a PTY pair, spawns the child on the slave,
 //! drops the slave, and starts two threads: a *reader* thread draining the
 //! master reader into an `mpsc` channel, and a *writer* thread draining a
-//! second `mpsc` channel into the master writer. `Pty::read` non-blockingly
-//! drains the reader channel; `Pty::write` non-blockingly *enqueues* onto the
+//! second `mpsc` channel into the master writer. `read` non-blockingly
+//! drains the reader channel; `write` non-blockingly *enqueues* onto the
 //! writer channel (`docs/design.md` §0 #11, the fully bidirectional input
-//! path); `Pty::kill` kills the child and joins both threads so no fd or
+//! path); `kill` kills the child and joins both threads so no fd or
 //! thread leaks.
 //!
 //! The writer thread exists so the blocking `write_all` to the PTY master
@@ -30,6 +35,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use thiserror::Error;
@@ -133,7 +139,7 @@ pub enum PtyError {
 
 /// One pseudo-terminal owning a child agent process (`docs/design.md` §9.1,
 /// Invariant I-5).
-pub struct Pty {
+pub struct LocalPty {
     size: PtySize,
     /// Master side of the PTY pair. Owns the master fd; used for `resize`.
     /// `None` after `kill` drops it. Held as an `Option` so `kill` can close it
@@ -163,9 +169,11 @@ pub struct Pty {
     reader: Option<JoinHandle<()>>,
     /// Join handle for the writer thread; `kill` joins it.
     writer: Option<JoinHandle<()>>,
+    /// When [`hang_up`](Self::hang_up) sent the child `SIGHUP`.
+    hung_up_at: Option<Instant>,
 }
 
-impl Pty {
+impl LocalPty {
     /// Max chunks buffered between the reader thread and the event loop before
     /// back-pressure kicks in. The event loop drains the whole queue every tick
     /// (~4 ms), so this only fills when the loop stalls; at 8 KiB/chunk it caps
@@ -181,6 +189,11 @@ impl Pty {
     /// when a child stops draining its stdin: without it, every keystroke or
     /// `send_keys` while the child is wedged would accumulate without limit.
     const WRITER_CHANNEL_BOUND: usize = 1024;
+
+    /// How long `kill` lets the child exit on its own after `SIGHUP`. Claude
+    /// Code needs about 0.6 s to finish its exit handler; only a child that
+    /// ignores `SIGHUP` waits this out.
+    const HANGUP_GRACE: Duration = Duration::from_secs(3);
 
     /// Spawn `command` inside a fresh PTY sized `cols x rows`.
     ///
@@ -270,6 +283,7 @@ impl Pty {
             rx: Some(rx),
             reader: Some(reader),
             writer: Some(writer_thread),
+            hung_up_at: None,
         })
     }
 
@@ -347,6 +361,25 @@ impl Pty {
         Ok(())
     }
 
+    /// Send the child `SIGHUP` once and return when it was sent. `kill` gives
+    /// the child [`HANGUP_GRACE`](Self::HANGUP_GRACE) from then, so hanging
+    /// up several panels before killing any lets their exits overlap.
+    pub(crate) fn hang_up(&mut self) -> Instant {
+        let child = &mut self.child;
+        *self.hung_up_at.get_or_insert_with(|| {
+            // Unreaped, the child still owns its pid, so no other process can.
+            if matches!(child.try_wait(), Ok(None))
+                && let Some(pid) = child.process_id()
+            {
+                // SAFETY: `kill` has no preconditions; a failure is ignored.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGHUP);
+                }
+            }
+            Instant::now()
+        })
+    }
+
     /// Kill the child process and tear down the PTY in bounded time.
     ///
     /// Single owner of PTY destruction (Invariant I-5). A naive
@@ -365,9 +398,8 @@ impl Pty {
     ///    fail with `EIO`, which is the only thing that unwedges the child.
     /// 3. **Descendants outlive the direct child.** The agent (`claude`) spawns
     ///    its own children — MCP servers, language servers, helpers — that share
-    ///    the child's process group. `portable-pty`'s `kill` (which escalates
-    ///    `SIGHUP` to `SIGKILL` after a grace period) signals only the direct
-    ///    child, so those descendants survive as orphans after every teardown.
+    ///    the child's process group. `SIGHUP` reaches only the direct child, so
+    ///    those descendants survive as orphans after every teardown.
     ///    The child is a session leader (`portable-pty` calls `setsid`), so its
     ///    process-group id equals its pid; one `SIGKILL` to that whole group
     ///    reaps them. On Linux a surviving descendant also holds the slave open,
@@ -375,14 +407,20 @@ impl Pty {
     ///    macOS revokes the controlling terminal when the session leader exits,
     ///    so there the group kill is purely leak prevention.
     pub(crate) fn kill(&mut self) -> Result<(), PtyError> {
-        // 1. Graceful: `SIGHUP` via portable-pty lets a well-behaved agent exit
-        //    on its own. An already-exited child yields an error we ignore so a
-        //    second `kill` (or `kill` after natural exit) still tears down.
-        let _ = self.child.kill();
+        // 1. Graceful: the agent persists its state on `SIGHUP` — Claude Code
+        //    clears the record whose survival turns its next launch's
+        //    fullscreen off — so it must not be killed mid-exit. Draining its
+        //    output keeps a parked reader from blocking its final writes.
+        let deadline = self.hang_up() + Self::HANGUP_GRACE;
+        while Instant::now() < deadline && matches!(self.child.try_wait(), Ok(None)) {
+            if let Some(rx) = &self.rx {
+                while rx.try_recv().is_ok() {}
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
-        // 2. Forceful, whole-group: `child.kill()` above already escalates
-        //    `SIGHUP` to `SIGKILL` on the *single* child pid, but never signals
-        //    the child's descendants (failure mode 3). `killpg` to the group the
+        // 2. Forceful, whole-group: a child still running past its grace, and
+        //    every descendant (failure mode 3). `killpg` to the group the
         //    child leads reaps every descendant so none leaks; on Linux it is
         //    also what closes their slave handles so the reader can reach EOF.
         //    Best-effort: `ESRCH`/`EPERM` on an already-dead or unsignalable
@@ -426,18 +464,100 @@ impl Pty {
         for _ in 0..50 {
             match self.child.try_wait() {
                 Ok(Some(_)) | Err(_) => break,
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
         Ok(())
     }
 }
 
-impl Drop for Pty {
-    /// Backstop teardown: if a `Pty` is dropped without an explicit `kill`,
-    /// still kill the child and join the reader thread so nothing leaks.
+impl Drop for LocalPty {
+    /// Backstop teardown: if a `LocalPty` is dropped without an explicit
+    /// `kill`, still kill the child and join the reader thread so nothing leaks.
     fn drop(&mut self) {
         let _ = self.kill();
+    }
+}
+
+/// A panel's terminal: a PTY on this machine, or one owned by a sub-host
+/// daemon and reached over its [`HostLink`](crate::host::HostLink).
+pub enum Pty {
+    Local(LocalPty),
+    Remote(crate::host::RemotePty),
+}
+
+impl Pty {
+    /// Spawn `command` in a local PTY sized `cols x rows`.
+    pub(crate) fn spawn(command: &PtyCommand, cols: u16, rows: u16) -> Result<Self, PtyError> {
+        LocalPty::spawn(command, cols, rows).map(Pty::Local)
+    }
+
+    /// The sub-host this PTY runs on, or `None` for a local one.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Pty::Local(_) => None,
+            Pty::Remote(remote) => Some(remote.host()),
+        }
+    }
+
+    /// Whether output the panel makes now reaches this process: always for a
+    /// local PTY, only while its host link is up for a remote one.
+    pub(crate) fn feed_live(&self) -> bool {
+        match self {
+            Pty::Local(_) => true,
+            Pty::Remote(remote) => remote.feed_live(),
+        }
+    }
+
+    /// Current PTY size, `(cols, rows)`.
+    pub fn size(&self) -> (u16, u16) {
+        match self {
+            Pty::Local(local) => local.size(),
+            Pty::Remote(remote) => remote.size(),
+        }
+    }
+
+    pub(crate) fn read(&mut self) -> Result<Vec<u8>, PtyError> {
+        match self {
+            Pty::Local(local) => local.read(),
+            Pty::Remote(remote) => remote.read(),
+        }
+    }
+
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
+        match self {
+            Pty::Local(local) => local.write(bytes),
+            Pty::Remote(remote) => remote.write(bytes),
+        }
+    }
+
+    pub(crate) fn is_alive(&mut self) -> bool {
+        match self {
+            Pty::Local(local) => local.is_alive(),
+            Pty::Remote(remote) => remote.is_alive(),
+        }
+    }
+
+    pub(crate) fn resize(&mut self, cols: u16, rows: u16) -> Result<(), PtyError> {
+        match self {
+            Pty::Local(local) => local.resize(cols, rows),
+            Pty::Remote(remote) => remote.resize(cols, rows),
+        }
+    }
+
+    pub(crate) fn kill(&mut self) -> Result<(), PtyError> {
+        match self {
+            Pty::Local(local) => local.kill(),
+            Pty::Remote(remote) => remote.kill(),
+        }
+    }
+
+    /// Start a local child's exit grace ([`LocalPty::hang_up`]). A remote
+    /// `kill` already returns at once; the daemon waits out the grace.
+    pub(crate) fn hang_up(&mut self) {
+        if let Pty::Local(local) = self {
+            local.hang_up();
+        }
     }
 }
 
@@ -651,7 +771,7 @@ mod tests {
         // wedges almost immediately and stops draining the channel.
         let chunk = vec![b'x'; 8192];
         let mut full_at = None;
-        let ceiling = Pty::WRITER_CHANNEL_BOUND + 256;
+        let ceiling = LocalPty::WRITER_CHANNEL_BOUND + 256;
         for i in 0..ceiling {
             let start = Instant::now();
             let result = pty.write(&chunk);
@@ -755,6 +875,27 @@ mod tests {
             survivors.is_empty(),
             "descendant {survivors:?} survived kill; the child's process group was not reaped"
         );
+    }
+
+    /// A child whose `SIGHUP` handler takes longer than `portable-pty`'s
+    /// 200 ms grace still finishes it: `kill` waits for the child to exit.
+    #[test]
+    fn kill_lets_the_child_finish_its_hangup_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("exited");
+        let mut cmd = PtyCommand::new("/bin/sh");
+        cmd.args = vec![
+            "-c".into(),
+            "trap 'sleep 0.5; : > \"$0\"; exit 0' HUP; echo ready; while :; do sleep 0.05; done"
+                .into(),
+            marker.clone().into(),
+        ];
+        let mut pty = Pty::spawn(&cmd, 80, 24).unwrap();
+        let out = drain_until_nonempty(&mut pty, Duration::from_secs(5));
+        assert!(String::from_utf8_lossy(&out).contains("ready"), "{out:?}");
+
+        pty.kill().unwrap();
+        assert!(marker.exists(), "the child was killed inside its handler");
     }
 
     #[test]
