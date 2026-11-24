@@ -144,6 +144,12 @@ pub async fn run(
     lock: DaemonLock,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    // Read now: off Linux the image is read by path, which an upgrade may
+    // replace before a main of another protocol asks.
+    let own_build = tokio::task::spawn_blocking(running_build_id)
+        .await
+        .ok()
+        .and_then(Result::ok);
     paths
         .own_control_dir()
         .with_context(|| format!("prepare {}", paths.control_sock.display()))?;
@@ -176,7 +182,7 @@ pub async fn run(
             biased;
             () = &mut shutdown => break,
             Some(event) = events.recv() => if let Some(other) = daemon.on_event(event) {
-                if replaced(&daemon.caucus_bin).await {
+                if replaced(&daemon.caucus_bin, own_build).await {
                     stepped_aside = Some(other);
                     break;
                 }
@@ -219,16 +225,16 @@ pub async fn run(
     Ok(())
 }
 
-/// Whether `bin`, the file this daemon started from, now holds another build,
-/// which a daemon started from it again would be.
-async fn replaced(bin: &Path) -> bool {
+/// Whether `bin`, the file this daemon started from as build `own`, now holds
+/// another build, which a daemon started from it again would be.
+async fn replaced(bin: &Path, own: Option<&'static str>) -> bool {
+    let Some(own) = own else {
+        return false;
+    };
     let bin = bin.to_path_buf();
-    tokio::task::spawn_blocking(move || match running_build_id() {
-        Ok(own) => !build_id(&bin).is_ok_and(|id| id == own),
-        Err(_) => false,
-    })
-    .await
-    .unwrap_or(false)
+    tokio::task::spawn_blocking(move || !build_id(&bin).is_ok_and(|id| id == own))
+        .await
+        .unwrap_or(false)
 }
 
 /// One main caucus's link to this daemon: its session and the name its
