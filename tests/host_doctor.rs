@@ -16,7 +16,7 @@ use caucus::host::proto::PROTO_VERSION;
 #[test]
 fn host_doctor_reports_this_host_on_one_line() {
     // No daemon under this home, so the process checks itself.
-    let home = tempfile::tempdir().unwrap();
+    let home = short_home();
     let tmp = tempfile::tempdir().unwrap();
     let report = host_doctor(home.path(), tmp.path());
     assert_eq!(report.proto, PROTO_VERSION);
@@ -32,7 +32,7 @@ fn host_doctor_reports_this_host_on_one_line() {
 
 #[test]
 fn host_doctor_reports_the_running_daemon_in_its_environment() {
-    let home = tempfile::tempdir().unwrap();
+    let home = short_home();
     let tmp = tempfile::tempdir().unwrap();
     let no_git = tempfile::tempdir().unwrap();
     let _daemon = Daemon::start(
@@ -87,6 +87,12 @@ fn doctor_reports_a_socket_host_without_a_daemon() {
     assert_eq!(host.len(), 1, "{host:?}");
     assert_eq!(host[0].severity, Severity::Warn, "{}", host[0].detail);
     assert!(host[0].detail.contains("no daemon"), "{}", host[0].detail);
+}
+
+/// A temp dir under `/tmp` to serve as a home: under a macOS `$TMPDIR`, the
+/// default sockets beneath it run past what a socket address holds.
+fn short_home() -> tempfile::TempDir {
+    tempfile::Builder::new().tempdir_in("/tmp").unwrap()
 }
 
 /// Run `caucus host doctor` with `home` and `tmp` as its `$HOME` and temp

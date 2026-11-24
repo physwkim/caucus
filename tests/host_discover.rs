@@ -10,7 +10,9 @@ use caucus::host::HostPaths;
 
 #[test]
 fn an_unbound_hook_posts_to_the_host_daemon_signal_socket() {
-    let home = tempfile::tempdir().unwrap();
+    // Under /tmp: beneath a macOS $TMPDIR the default sockets run past what
+    // a socket address holds.
+    let home = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
     // An empty temp dir, so no live session on this machine gets the post.
     let tmp = tempfile::tempdir().unwrap();
     let paths =

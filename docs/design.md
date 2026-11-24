@@ -839,7 +839,8 @@ resume`이 fork 이전 대화를 되살린다. env 상속을 끊는 **모든** �
   payload만으로 `UnboundSignal`(wire 마커 `unbound: true`, untagged
   `SignalEvent`가 shape로 판별)을 만들어 temp dir의 모든 `caucus-*.sock`
   (`-ctl.sock` 제외)과 이 머신의 호스트 daemon 신호 소켓
-  (`~/.caucus/host/<hostname>/signal.sock`)에 브로드캐스트하고, 소켓당 응답
+  (`~/.caucus/host/<hostname>/signal.sock`, 32바이트를 넘는 hostname은
+  앞부분과 해시로 줄임)에 브로드캐스트하고, 소켓당 응답
   한 줄을 읽는다. 소켓 파일이 곧 레지스트리다 — 별도 상태 파일 없음, 죽은
   소켓은 connect 실패로 자체 스킵. 첫 deliver reason이 이긴다(한 대화의 owner는 최대 하나).
 - **서버**: unbound 라인은 항상 reply slot을 받는다(§7.6과 동일한 대기).

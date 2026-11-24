@@ -272,7 +272,8 @@ Its panels find the daemon's own caucus first on `PATH`, so the hook, which
 runs `caucus` by name, reaches the build serving them. ssh runs with
 `BatchMode=yes`, so login must already work without a prompt. A `socket`
 host is a daemon on this machine that you start yourself with `caucus host
-serve` (its default socket is `~/.caucus/host/<hostname>/daemon.sock`).
+serve` (its default socket is `~/.caucus/host/<hostname>/daemon.sock`, the
+hostname shortened with a hash when longer than 32 bytes).
 
 Each host works in its own clone, `dir`. A worktree panel's lane starts as
 main's `HEAD` pushed to a branch of that clone, and the branch is fetched

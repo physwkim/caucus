@@ -90,9 +90,12 @@ impl HostPaths {
     }
 
     /// `~/.caucus/host/<hostname>`: one per machine, since several can share
-    /// a home.
+    /// a home. A hostname over 32 bytes is cut to its head and a hash, so the
+    /// sockets inside still fit an address.
     pub fn default_state_dir(home: &Path) -> PathBuf {
-        home.join(".caucus").join("host").join(daemon::hostname())
+        home.join(".caucus")
+            .join("host")
+            .join(host_key(&daemon::hostname()))
     }
 
     /// Lock file a live daemon holds; it also carries the daemon's pid.
@@ -114,6 +117,28 @@ impl HostPaths {
             None => Ok(()),
         }
     }
+}
+
+/// Longest hostname [`HostPaths::default_state_dir`] keeps whole. A macOS
+/// socket path holds 103 bytes, and a CI runner's hostname alone can be 67.
+const HOST_KEY_MAX: usize = 32;
+
+/// `hostname`, or past [`HOST_KEY_MAX`] bytes its head and an FNV-1a hash of
+/// the whole name. The hash is spelled out, not std's, because the hook, the
+/// managed copy and the daemon on one host may be different builds and must
+/// all reach the same directory.
+fn host_key(hostname: &str) -> String {
+    if hostname.len() <= HOST_KEY_MAX {
+        return hostname.to_string();
+    }
+    let hash = hostname.bytes().fold(0x811c_9dc5_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    });
+    let mut head = HOST_KEY_MAX - 9;
+    while !hostname.is_char_boundary(head) {
+        head -= 1;
+    }
+    format!("{}-{hash:08x}", &hostname[..head])
 }
 
 /// Create `dir` mode 0700, or accept an existing one only if this user owns it
@@ -214,6 +239,21 @@ mod tests {
         assert!(err.to_string().contains("--state-dir"), "{err}");
         let longest = PathBuf::from("/").join("s".repeat(SUN_PATH - 2));
         HostPaths::resolve(None, Some(longest.clone()), Some(longest)).unwrap();
+    }
+
+    /// A short hostname names its directory as is; a long one is cut to
+    /// [`HOST_KEY_MAX`] bytes, and two long names sharing a head still differ.
+    #[test]
+    fn a_long_hostname_is_shortened_to_a_distinct_key() {
+        assert_eq!(host_key("box.local"), "box.local");
+        let runner = "sat12-bq161-ffab5ad4-1386-4d72-9af8-0e36243f6c8a-8A6C0F48FD40.local";
+        let key = host_key(runner);
+        // FNV-1a of the whole name, pinned so every build agrees.
+        assert_eq!(key, "sat12-bq161-ffab5ad4-13-a4972a16");
+        assert_eq!(key.len(), HOST_KEY_MAX);
+        assert_ne!(key, host_key(&runner.replace("8A6C", "8A6D")));
+        let wide = "é".repeat(HOST_KEY_MAX);
+        assert!(host_key(&wide).len() <= HOST_KEY_MAX);
     }
 
     #[test]

@@ -254,6 +254,12 @@ async fn a_login_profile_printing_before_the_bridge_does_not_stop_the_link() {
     connected.unwrap();
 }
 
+/// A temp dir under `/tmp` to serve as a home: under a macOS `$TMPDIR`, the
+/// default sockets beneath it run past what a socket address holds.
+fn short_home() -> tempfile::TempDir {
+    tempfile::Builder::new().tempdir_in("/tmp").unwrap()
+}
+
 /// A "host" reached by running sh locally with `home` as its user's home.
 fn local_shell(home: &Path) -> RemoteShell {
     RemoteShell {
@@ -330,13 +336,13 @@ async fn connects_through_the_copy(home: &Path) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_host_without_caucus_gets_this_build_and_connects() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = short_home();
     connects_through_the_copy(tmp.path()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn another_build_on_the_host_is_replaced() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = short_home();
     script(
         &managed_copy(tmp.path()),
         "echo older-build; echo ran >>\"$HOME/older-ran\"",
@@ -373,7 +379,7 @@ async fn parks(link: &HostLink, reason: &str, runs: &Path) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_build_that_does_not_run_there_is_copied_once() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = short_home();
     let image = tmp.path().join("image");
     script(
         &image,
@@ -402,7 +408,7 @@ async fn a_build_that_does_not_run_there_is_copied_once() {
 /// one copy, rather than copying it forever.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_copy_that_disowns_its_build_is_copied_once() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = short_home();
     let image = tmp.path().join("image");
     script(&image, "echo ran >>\"$HOME/runs\"; echo not-this-build");
     let link = managed_link(tmp.path(), &image);

@@ -330,7 +330,8 @@ pub enum HostCommand {
 #[derive(Debug, clap::Args)]
 pub struct HostPathArgs {
     /// State directory (lock, log, session directories). Default
-    /// `~/.caucus/host/<hostname>`.
+    /// `~/.caucus/host/<hostname>`, the hostname shortened with a hash when
+    /// longer than 32 bytes.
     #[arg(long)]
     state_dir: Option<PathBuf>,
     /// Control socket. Default `daemon.sock` in the state directory.
