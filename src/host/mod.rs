@@ -145,9 +145,21 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// This machine's systemd or D-Bus machine id; `None` on a machine with
-/// neither.
+/// This machine's systemd or D-Bus machine id, or on macOS its hardware UUID;
+/// `None` on a machine with none of them.
 pub(crate) fn machine_id() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut uuid = [0u8; 16];
+        let wait = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        // SAFETY: `uuid` has room for the 16 bytes `gethostuuid` writes.
+        if unsafe { libc::gethostuuid(uuid.as_mut_ptr(), &wait) } == 0 {
+            return Some(uuid.iter().map(|b| format!("{b:02x}")).collect());
+        }
+    }
     ["/etc/machine-id", "/var/lib/dbus/machine-id"]
         .iter()
         .find_map(|path| {
