@@ -473,7 +473,7 @@ impl Multiplexer {
 
     /// Close every link after [`Multiplexer::shutdown`] queued its remote
     /// panels' kills and worktree removals: the host tasks get
-    /// [`HOST_TASKS_WAIT`] to finish, then each host [`HOST_CLOSE_WAIT`] to
+    /// `HOST_TASKS_WAIT` to finish, then each host `HOST_CLOSE_WAIT` to
     /// take what is still queued.
     pub async fn close_hosts(&mut self) {
         let tasks = &mut self.hosts.tasks;
