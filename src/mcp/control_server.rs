@@ -105,6 +105,15 @@ impl ControlServer {
     pub fn jobs(&mut self) -> &mut mpsc::UnboundedReceiver<ControlJob> {
         &mut self.rx
     }
+
+    /// Take jobs from the returned sender instead of the socket, so a test
+    /// can queue more calls than it could hold connections open.
+    #[cfg(test)]
+    pub(crate) fn queue_directly(&mut self) -> mpsc::UnboundedSender<ControlJob> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.rx = rx;
+        tx
+    }
 }
 
 impl Drop for ControlServer {

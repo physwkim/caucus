@@ -260,29 +260,25 @@ mod tests {
     /// A burst over [`CONTROL_DRAIN_LIMIT`] is answered in loop-turn-sized
     /// batches: each drain answers at most the limit and leaves the rest
     /// queued for the next turn.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn drain_control_answers_at_most_the_limit_per_turn() {
-        use crate::mcp::control_client::call;
         let tmp = TempDir::new().unwrap();
         let session = Session::new("test", tmp.path().to_path_buf());
         let config = Config::load(tmp.path()).unwrap();
         let (mut mux, _signal, mut control) =
             Multiplexer::new(session, config, area(), 'a', LaunchMode::Fresh).unwrap();
-        let sock = control.sock_path().to_path_buf();
+        // Over the socket a burst this size holds two descriptors per call,
+        // past macOS's default limit of 256.
+        let queue = control.queue_directly();
         let count = CONTROL_DRAIN_LIMIT * 2 + 1;
-        let clients: Vec<_> = (0..count)
+        let replies: Vec<_> = (0..count)
             .map(|_| {
-                let sock = sock.clone();
-                tokio::spawn(async move {
-                    call(&sock, "t", "list_panels", &serde_json::Value::Null).await
-                })
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                let request = ControlRequest::ListPanels;
+                queue.send(ControlJob { request, reply }).unwrap();
+                answer
             })
             .collect();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while control.jobs().len() < count {
-            assert!(std::time::Instant::now() < deadline, "burst never queued");
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
 
         let mut left = count;
         while left > 0 {
@@ -290,11 +286,8 @@ mod tests {
             left -= CONTROL_DRAIN_LIMIT.min(left);
             assert_eq!(control.jobs().len(), left);
         }
-        for client in clients {
-            assert!(matches!(
-                client.await.unwrap().unwrap(),
-                Ok(ControlResponse::Panels { .. })
-            ));
+        for answer in replies {
+            assert!(matches!(answer.await, Ok(ControlResponse::Panels { .. })));
         }
     }
 
