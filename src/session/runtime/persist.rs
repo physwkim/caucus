@@ -178,7 +178,7 @@ mod tests {
     }
 
     /// Two agents that each take 1 s to exit on `SIGHUP` both finish, and
-    /// shutdown takes one exit's time, not two.
+    /// their exits overlap instead of running one after the other.
     #[tokio::test]
     async fn shutdown_waits_for_every_agent_to_exit_side_by_side() {
         let tmp = TempDir::new().unwrap();
@@ -188,7 +188,9 @@ mod tests {
             let mut cmd = PtyCommand::new("/bin/sh");
             cmd.args = vec![
                 "-c".into(),
-                "trap 'sleep 1; : > \"$0\"; exit 0' HUP; while :; do sleep 0.05; done".into(),
+                "trap ': > \"$0.start\"; sleep 1; : > \"$0\"; exit 0' HUP; \
+                 while :; do sleep 0.05; done"
+                    .into(),
                 marker.clone().into(),
             ];
             push_panel(&mut mux, "worker", &cmd);
@@ -196,16 +198,18 @@ mod tests {
         // Let each shell install its trap.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let start = std::time::Instant::now();
         mux.shutdown();
-        let elapsed = start.elapsed();
 
-        for marker in &markers {
-            assert!(marker.exists(), "{} was killed mid-exit", marker.display());
-        }
+        let mtime = |path: std::path::PathBuf| {
+            std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or_else(|e| panic!("{} was killed mid-exit: {e}", path.display()))
+        };
+        let [(a_start, a_end), (b_start, b_end)] =
+            markers.map(|m| (mtime(m.with_extension("start")), mtime(m)));
         assert!(
-            elapsed < std::time::Duration::from_millis(1800),
-            "shutdown took {elapsed:?}; the exits ran one after another"
+            a_start < b_end && b_start < a_end,
+            "the exits ran one after the other"
         );
     }
 
