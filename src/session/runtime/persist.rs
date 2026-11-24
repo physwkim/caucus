@@ -85,6 +85,11 @@ impl Multiplexer {
         // away — the manifests outlive the process and are what a later reader
         // has. Branches are kept — they hold the sub-agents' commits and
         // merging is the user's call (`docs/design.md` §5).
+        // Every agent is hung up before any is waited on, so their exits run
+        // side by side instead of one grace after another.
+        for panel in &mut self.panels {
+            panel.pty.hang_up();
+        }
         let mut orphans = Vec::new();
         for panel in &mut self.panels {
             if let Err(err) = lifecycle::kill(panel) {
@@ -129,9 +134,17 @@ mod tests {
     use tempfile::TempDir;
 
     fn push_cat_panel(mux: &mut super::Multiplexer, role: &str) -> crate::session::PanelId {
+        push_panel(mux, role, &PtyCommand::new("/bin/cat"))
+    }
+
+    fn push_panel(
+        mux: &mut super::Multiplexer,
+        role: &str,
+        cmd: &PtyCommand,
+    ) -> crate::session::PanelId {
         let id = crate::session::PanelId::new();
         let inner = area().inner();
-        let pty = Pty::spawn(&PtyCommand::new("/bin/cat"), inner.width, inner.height).unwrap();
+        let pty = Pty::spawn(cmd, inner.width, inner.height).unwrap();
         mux.panels.push(Panel {
             id,
             role: role.to_string(),
@@ -162,6 +175,38 @@ mod tests {
         assert_eq!(record.id, id);
         assert_eq!(record.layout_mode, LayoutMode::Tiled);
         assert!(record.panels.is_empty(), "no panels were spawned");
+    }
+
+    /// Two agents that each take 1 s to exit on `SIGHUP` both finish, and
+    /// shutdown takes one exit's time, not two.
+    #[tokio::test]
+    async fn shutdown_waits_for_every_agent_to_exit_side_by_side() {
+        let tmp = TempDir::new().unwrap();
+        let mut mux = mux(&tmp);
+        let markers = [tmp.path().join("a"), tmp.path().join("b")];
+        for marker in &markers {
+            let mut cmd = PtyCommand::new("/bin/sh");
+            cmd.args = vec![
+                "-c".into(),
+                "trap 'sleep 1; : > \"$0\"; exit 0' HUP; while :; do sleep 0.05; done".into(),
+                marker.clone().into(),
+            ];
+            push_panel(&mut mux, "worker", &cmd);
+        }
+        // Let each shell install its trap.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let start = std::time::Instant::now();
+        mux.shutdown();
+        let elapsed = start.elapsed();
+
+        for marker in &markers {
+            assert!(marker.exists(), "{} was killed mid-exit", marker.display());
+        }
+        assert!(
+            elapsed < std::time::Duration::from_millis(1800),
+            "shutdown took {elapsed:?}; the exits ran one after another"
+        );
     }
 
     /// The main worker identity is persisted independently from panel order:

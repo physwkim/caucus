@@ -1152,8 +1152,11 @@ impl Daemon {
     /// Remove `panel` and have its child killed.
     fn kill(&mut self, panel: PanelId) {
         if let Some(mut p) = self.panels.remove(&panel)
-            && let Some(pty) = p.pty.take()
+            && let Some(mut pty) = p.pty.take()
         {
+            // Hung up now: kills queued behind one another wait out their
+            // graces together, not one after another on the chore thread.
+            pty.hang_up();
             self.chore(Chore::Kill(pty));
         }
     }
